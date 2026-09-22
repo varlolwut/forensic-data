@@ -6,10 +6,8 @@ CLAUDE.md
 .agents/
 .codex/
 .cursor/
-docs/project-status.md
 data-forensics-brief.md
-docs/product-brief.md
-docs/review.md
+docs/
 .local/
 
 # Secrets and local environments
