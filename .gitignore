@@ -1,0 +1,29 @@
+# Local agent instructions and orchestration state
+AGENTS.md
+**/AGENTS.md
+CLAUDE.md
+**/CLAUDE.md
+.agents/
+.codex/
+.cursor/
+docs/project-status.md
+data-forensics-brief.md
+docs/product-brief.md
+docs/review.md
+.local/
+
+# Secrets and local environments
+.env
+.env.*
+!.env.example
+.venv/
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.ruff_cache/
+.coverage
+htmlcov/
+dist/
+build/
+*.egg-info/
+work/
