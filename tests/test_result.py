@@ -832,8 +832,25 @@ def test_fingerprint_guarantee_rejects_exact_matched_total() -> None:
         )
 
 
-def test_completed_fingerprint_evidence_survives_persistence_error_json_round_trip() -> None:
-    coverage = ComparisonCoverage(
+@pytest.mark.parametrize(
+    ("execution_status", "persistence"),
+    [
+        (ExecutionStatus.COMPLETED, CONFIRMED_PERSISTENCE),
+        (
+            ExecutionStatus.ERROR,
+            PersistenceStatus(
+                state=PersistenceState.FAILED,
+                operation_id=PERSISTENCE_OPERATION_ID,
+                reason=_reason(ReasonCode.PERSISTENCE_ERROR),
+            ),
+        ),
+    ],
+)
+def test_fully_pruned_fingerprint_rejects_unproven_positive_difference(
+    execution_status: ExecutionStatus,
+    persistence: PersistenceStatus,
+) -> None:
+    fully_pruned_coverage = ComparisonCoverage(
         total_partitions=1,
         covered_partitions=1,
         resolved_segments=1,
@@ -842,49 +859,77 @@ def test_completed_fingerprint_evidence_survives_persistence_error_json_round_tr
         unresolved_segments=0,
         unresolved_reasons=(),
     )
-    totals = ComparisonTotals(
+    false_difference_totals = ComparisonTotals(
+        matched=InferredTotal(precision="inferred_under_fingerprint", value="4"),
+        missing=InferredTotal(precision="inferred_under_fingerprint", value="0"),
+        extra=InferredTotal(precision="inferred_under_fingerprint", value="0"),
+        modified=ExactTotal(precision="exact", value="1"),
+    )
+
+    with pytest.raises(ValidationError, match="requires an exact terminal segment"):
+        _result(
+            execution_status,
+            Verdict.MISMATCH,
+            (_reason(ReasonCode.DATA_MISMATCH),),
+            persistence,
+            VERIFIED_CONSISTENCY,
+            Guarantee.FINGERPRINT,
+            fully_pruned_coverage,
+            false_difference_totals,
+        )
+
+
+@pytest.mark.parametrize(
+    ("persistence_state", "reason_code"),
+    [
+        (PersistenceState.FAILED, ReasonCode.PERSISTENCE_ERROR),
+        (PersistenceState.COMMIT_UNKNOWN, ReasonCode.COMMIT_UNKNOWN),
+    ],
+)
+def test_fingerprint_evidence_survives_uncertain_persistence_json_round_trip(
+    persistence_state: PersistenceState,
+    reason_code: ReasonCode,
+) -> None:
+    fully_pruned_coverage = ComparisonCoverage(
+        total_partitions=1,
+        covered_partitions=1,
+        resolved_segments=1,
+        pruned_segments=1,
+        exact_segments=0,
+        unresolved_segments=0,
+        unresolved_reasons=(),
+    )
+    inferred_totals = ComparisonTotals(
         matched=InferredTotal(precision="inferred_under_fingerprint", value="4"),
         missing=InferredTotal(precision="inferred_under_fingerprint", value="0"),
         extra=InferredTotal(precision="inferred_under_fingerprint", value="0"),
         modified=InferredTotal(precision="inferred_under_fingerprint", value="0"),
     )
-    failed_persistence = PersistenceStatus(
-        state=PersistenceState.FAILED,
+    uncertain_persistence = PersistenceStatus(
+        state=persistence_state,
         operation_id=PERSISTENCE_OPERATION_ID,
-        reason=_reason(ReasonCode.PERSISTENCE_ERROR),
+        reason=_reason(reason_code),
     )
     result = _result(
         ExecutionStatus.ERROR,
         Verdict.INCONCLUSIVE,
         (),
-        failed_persistence,
+        uncertain_persistence,
         VERIFIED_CONSISTENCY,
         Guarantee.FINGERPRINT,
-        coverage,
-        totals,
+        fully_pruned_coverage,
+        inferred_totals,
     )
 
     assert exit_code_for_result(result) is ExitCode.ERROR
     assert RunResult.model_validate_json(result.model_dump_json()) == result
 
-    with pytest.raises(ValidationError, match="fingerprint data_mismatch requires"):
-        _result(
-            ExecutionStatus.ERROR,
-            Verdict.MISMATCH,
-            (_reason(ReasonCode.DATA_MISMATCH),),
-            failed_persistence,
-            VERIFIED_CONSISTENCY,
-            Guarantee.FINGERPRINT,
-            coverage,
-            totals,
-        )
-
-    erased_totals = totals.model_copy(
+    erased_totals = inferred_totals.model_copy(
         update={
             "modified": UnavailableTotal(
                 precision="unavailable",
                 value=None,
-                reason=ReasonCode.PERSISTENCE_ERROR,
+                reason=reason_code,
             )
         }
     )
@@ -893,12 +938,40 @@ def test_completed_fingerprint_evidence_survives_persistence_error_json_round_tr
             ExecutionStatus.ERROR,
             Verdict.INCONCLUSIVE,
             (),
-            failed_persistence,
+            uncertain_persistence,
             VERIFIED_CONSISTENCY,
             Guarantee.FINGERPRINT,
-            coverage,
+            fully_pruned_coverage,
             erased_totals,
         )
+
+    mixed_coverage = ComparisonCoverage(
+        total_partitions=1,
+        covered_partitions=1,
+        resolved_segments=2,
+        pruned_segments=1,
+        exact_segments=1,
+        unresolved_segments=0,
+        unresolved_reasons=(),
+    )
+    mixed_totals = ComparisonTotals(
+        matched=InferredTotal(precision="inferred_under_fingerprint", value="3"),
+        missing=ExactTotal(precision="exact", value="0"),
+        extra=ExactTotal(precision="exact", value="0"),
+        modified=ExactTotal(precision="exact", value="1"),
+    )
+    mixed_result = _result(
+        ExecutionStatus.ERROR,
+        Verdict.MISMATCH,
+        (_reason(ReasonCode.DATA_MISMATCH),),
+        uncertain_persistence,
+        VERIFIED_CONSISTENCY,
+        Guarantee.FINGERPRINT,
+        mixed_coverage,
+        mixed_totals,
+    )
+
+    assert exit_code_for_result(mixed_result) is ExitCode.ERROR
 
 
 def test_verdict_requires_and_preserves_proven_mismatch() -> None:

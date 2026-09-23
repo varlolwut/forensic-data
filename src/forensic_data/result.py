@@ -443,6 +443,12 @@ def _validate_totals(result: RunResult, reason_codes: set[ReasonCode]) -> None:
         )
     if (
         result.guarantee is Guarantee.FINGERPRINT
+        and has_positive_difference
+        and result.comparison_coverage.exact_segments == 0
+    ):
+        raise ValueError("fingerprint difference requires an exact terminal segment")
+    if (
+        result.guarantee is Guarantee.FINGERPRINT
         and has_data_mismatch_reason
         and not has_positive_difference
     ):
@@ -466,7 +472,7 @@ def _validate_totals(result: RunResult, reason_codes: set[ReasonCode]) -> None:
         isinstance(total, UnavailableTotal) for total in result.totals.values()
     ):
         raise ValueError("contract violation requires unavailable row totals")
-    _validate_fingerprint_evidence(result, has_positive_difference)
+    _validate_fingerprint_evidence(result)
     _validate_late_persistence_evidence(result)
 
 
@@ -485,13 +491,10 @@ def _validate_match_totals(result: RunResult) -> None:
         raise ValueError("non-fingerprint match requires exact zero difference totals")
 
 
-def _validate_fingerprint_evidence(
-    result: RunResult,
-    has_positive_difference: bool,
-) -> None:
+def _validate_fingerprint_evidence(result: RunResult) -> None:
     if result.guarantee is not Guarantee.FINGERPRINT:
         return
-    if result.verdict is Verdict.INCONCLUSIVE and not has_positive_difference:
+    if result.verdict is Verdict.INCONCLUSIVE:
         if not all(isinstance(total, InferredTotal) for total in result.totals.values()):
             raise ValueError("inconclusive full fingerprint requires preserved inferred totals")
 
