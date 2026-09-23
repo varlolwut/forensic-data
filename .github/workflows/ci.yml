@@ -13,7 +13,7 @@ concurrency:
 
 jobs:
   quality:
-    name: Quality and PostgreSQL 17.11 conformance
+    name: Quality and PostgreSQL 17.11/9.6.24 conformance
     runs-on: ubuntu-24.04
     env:
       DFE_PG_ADMIN_PASSWORD: phase01-admin
@@ -29,6 +29,14 @@ jobs:
       DFE_TEST_POSTGRES_METADATA_MIGRATOR_DSN: postgresql://dfe_metadata_migrator_login:phase02-metadata-migrator@127.0.0.1:55432/dfe_fixture
       DFE_TEST_POSTGRES_METADATA_WRITER_DSN: postgresql://dfe_metadata_writer_login:phase02-metadata-writer@127.0.0.1:55432/dfe_fixture
       DFE_TEST_POSTGRES_METADATA_READER_DSN: postgresql://dfe_metadata_reader_login:phase02-metadata-reader@127.0.0.1:55432/dfe_fixture
+      DFE_LEGACY_SOURCE_ADMIN_PASSWORD: phase02-legacy-source-admin
+      DFE_LEGACY_SOURCE_READER_PASSWORD: phase02-legacy-source-reader
+      DFE_LEGACY_TARGET_ADMIN_PASSWORD: phase02-legacy-target-admin
+      DFE_LEGACY_TARGET_READER_PASSWORD: phase02-legacy-target-reader
+      DFE_LEGACY_SOURCE_PORT: "55496"
+      DFE_LEGACY_TARGET_PORT: "55417"
+      DFE_TEST_POSTGRES_LEGACY_SOURCE_DSN: postgresql://dfe_legacy_reader:phase02-legacy-source-reader@127.0.0.1:55496/dfe_legacy?sslmode=disable&connect_timeout=5
+      DFE_TEST_POSTGRES_LEGACY_TARGET_DSN: postgresql://dfe_legacy_reader:phase02-legacy-target-reader@127.0.0.1:55417/dfe_legacy?sslmode=disable&connect_timeout=5
     steps:
       - name: Check out source
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
@@ -52,16 +60,40 @@ jobs:
         run: uv run pyright
       - name: Start PostgreSQL 17.11 fixture
         run: docker compose --file tests/fixtures/postgres/compose.yaml up --detach --wait
+      - name: Start PostgreSQL 9.6.24 to 17.11 fixture
+        run: docker compose --file tests/fixtures/postgres-legacy/compose.yaml up --detach --wait
       - name: Run tests
         run: uv run pytest
-      - name: Stop PostgreSQL fixture
+      - name: Stop PostgreSQL fixtures
         if: always()
-        run: docker compose --file tests/fixtures/postgres/compose.yaml down --volumes
+        run: |
+          docker compose --file tests/fixtures/postgres-legacy/compose.yaml down --volumes
+          docker compose --file tests/fixtures/postgres/compose.yaml down --volumes
 
   build:
     name: Build package and container
     needs: quality
     runs-on: ubuntu-24.04
+    env:
+      DFE_PG_ADMIN_PASSWORD: phase01-admin
+      DFE_PG_READER_PASSWORD: phase01-reader
+      DFE_PG_WRITER_PASSWORD: phase01-writer
+      DFE_PG_METADATA_MIGRATOR_PASSWORD: phase02-metadata-migrator
+      DFE_PG_METADATA_WRITER_PASSWORD: phase02-metadata-writer
+      DFE_PG_METADATA_READER_PASSWORD: phase02-metadata-reader
+      DFE_PG_PORT: "55432"
+      DFE_TEST_POSTGRES_ADMIN_DSN: postgresql://postgres:phase01-admin@127.0.0.1:55432/postgres
+      DFE_TEST_POSTGRES_METADATA_MIGRATOR_DSN: postgresql://dfe_metadata_migrator_login:phase02-metadata-migrator@127.0.0.1:55432/dfe_fixture?sslmode=disable&connect_timeout=5
+      DFE_TEST_POSTGRES_METADATA_WRITER_DSN: postgresql://dfe_metadata_writer_login:phase02-metadata-writer@127.0.0.1:55432/dfe_fixture?sslmode=disable&connect_timeout=5
+      DFE_TEST_POSTGRES_METADATA_READER_DSN: postgresql://dfe_metadata_reader_login:phase02-metadata-reader@127.0.0.1:55432/dfe_fixture?sslmode=disable&connect_timeout=5
+      DFE_LEGACY_SOURCE_ADMIN_PASSWORD: phase02-legacy-source-admin
+      DFE_LEGACY_SOURCE_READER_PASSWORD: phase02-legacy-source-reader
+      DFE_LEGACY_TARGET_ADMIN_PASSWORD: phase02-legacy-target-admin
+      DFE_LEGACY_TARGET_READER_PASSWORD: phase02-legacy-target-reader
+      DFE_LEGACY_SOURCE_PORT: "55496"
+      DFE_LEGACY_TARGET_PORT: "55417"
+      DFE_TEST_POSTGRES_LEGACY_SOURCE_DSN: postgresql://dfe_legacy_reader:phase02-legacy-source-reader@127.0.0.1:55496/dfe_legacy?sslmode=disable&connect_timeout=5
+      DFE_TEST_POSTGRES_LEGACY_TARGET_DSN: postgresql://dfe_legacy_reader:phase02-legacy-target-reader@127.0.0.1:55417/dfe_legacy?sslmode=disable&connect_timeout=5
     steps:
       - name: Check out source
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
@@ -109,6 +141,32 @@ jobs:
           docker image load --input /tmp/forensic-data-ci.tar
           docker run --rm forensic-data:ci
           test "$(docker run --rm --entrypoint id forensic-data:ci -u)" = "10001"
+      - name: Start legacy box fixtures
+        run: |
+          docker compose --file tests/fixtures/postgres/compose.yaml up --detach --wait
+          docker compose --file tests/fixtures/postgres-legacy/compose.yaml up --detach --wait
+      - name: Migrate legacy box metadata
+        run: >-
+          docker run --rm --network host
+          --env DFE_TEST_POSTGRES_METADATA_MIGRATOR_DSN
+          forensic-data:ci metadata migrate
+          --secret-ref env:DFE_TEST_POSTGRES_METADATA_MIGRATOR_DSN
+          --statement-timeout-milliseconds 30000
+          --lock-timeout-milliseconds 5000
+      - name: Run PostgreSQL 9.6.24 to 17.11 box check
+        run: >-
+          docker run --rm --network host
+          --env DFE_TEST_POSTGRES_LEGACY_SOURCE_DSN
+          --env DFE_TEST_POSTGRES_LEGACY_TARGET_DSN
+          --env DFE_TEST_POSTGRES_METADATA_WRITER_DSN
+          --volume "${{ github.workspace }}/tests/fixtures/postgres-legacy:/fixture:ro"
+          --entrypoint python
+          forensic-data:ci /fixture/box_check.py
+      - name: Stop legacy box fixtures
+        if: always()
+        run: |
+          docker compose --file tests/fixtures/postgres-legacy/compose.yaml down --volumes
+          docker compose --file tests/fixtures/postgres/compose.yaml down --volumes
       - name: Run Docker quickstart and persistence smoke
         env:
           DFE_IMAGE: forensic-data:ci

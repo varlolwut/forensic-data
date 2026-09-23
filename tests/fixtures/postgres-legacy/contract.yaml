@@ -1,0 +1,136 @@
+version: 1
+connections:
+  reference_pg:
+    adapter: postgresql
+    driver: psycopg2
+    profile: postgresql_9_6
+    roles: [source]
+    secret_ref: env:DFE_TEST_POSTGRES_LEGACY_SOURCE_DSN
+  target_pg:
+    adapter: postgresql
+    driver: psycopg
+    profile: postgresql_17
+    roles: [target]
+    secret_ref: env:DFE_TEST_POSTGRES_LEGACY_TARGET_DSN
+  metadata_pg:
+    adapter: postgresql
+    driver: psycopg
+    profile: postgresql_17
+    roles: [metadata]
+    secret_ref: env:DFE_TEST_POSTGRES_METADATA_WRITER_DSN
+schemas:
+  order_line_v1:
+    fields:
+      - name: order_id
+        type: {kind: int64}
+        nullable: false
+        normalization: none
+        equality: {kind: exact}
+      - name: business_date
+        type: {kind: date}
+        nullable: false
+        normalization: none
+        equality: {kind: exact}
+      - name: amount
+        type: {kind: decimal, precision: 18, scale: 2}
+        nullable: true
+        normalization: none
+        equality: {kind: exact}
+datasets:
+  reference_orders:
+    connection: reference_pg
+    relation: {catalog: null, schema: dfe_legacy, name: daily_orders}
+    logical_schema: order_line_v1
+    projection:
+      - {field: order_id, column: order_id}
+      - {field: business_date, column: business_date}
+      - {field: amount, column: amount}
+    grain: [order_id]
+  target_orders:
+    connection: target_pg
+    relation: {catalog: null, schema: dfe_legacy, name: daily_orders}
+    logical_schema: order_line_v1
+    projection:
+      - {field: order_id, column: order_id}
+      - {field: business_date, column: business_date}
+      - {field: amount, column: amount}
+    grain: [order_id]
+scopes:
+  daily_scope:
+    parameters:
+      business_date: {type: {kind: date}}
+    bindings:
+      reference_orders: {column: business_date, operator: eq, parameter: business_date}
+      target_orders: {column: business_date, operator: eq, parameter: business_date}
+    null_partition: reject
+checks:
+  daily_orders:
+    revision: 1
+    invariant: row_equivalence
+    reference: reference_orders
+    target: target_orders
+    comparison_schema: order_line_v1
+    key: [order_id]
+    scope_ref: daily_scope
+    consistency_policy: daily_cut
+    assurance_policy: fingerprint_allowed
+consistency:
+  daily_cut:
+    minimum_evidence: verified
+    alignment_fields: [business_date, source_cut]
+    late_arrivals: next_batch
+    datasets:
+      reference_orders:
+        readiness:
+          kind: relation_manifest
+          relation: {catalog: null, schema: dfe_control, name: batch_manifest}
+          columns:
+            dataset_id: dataset_id
+            scope_digest: scope_digest
+            batch_id: batch_id
+            state: state
+            business_date: business_date
+            source_cut: source_cut
+            dataset_version: dataset_version
+            completed_at: completed_at
+        stable_read: {kind: transaction_snapshot}
+      target_orders:
+        readiness:
+          kind: relation_manifest
+          relation: {catalog: null, schema: dfe_control, name: batch_manifest}
+          columns:
+            dataset_id: dataset_id
+            scope_digest: scope_digest
+            batch_id: batch_id
+            state: state
+            business_date: business_date
+            source_cut: source_cut
+            dataset_version: dataset_version
+            completed_at: completed_at
+        stable_read: {kind: transaction_snapshot}
+execution:
+  version: 1
+  max_queries: 100
+  max_fetched_records: 10000
+  max_application_result_bytes: 1048576
+  max_evidence_rows: 50
+  max_evidence_bytes: 65536
+  max_fingerprint_nodes: 1000
+  max_coordinator_memory_bytes: 8388608
+  max_depth: 8
+  max_full_scans_per_side: 5
+  statement_timeout_milliseconds: 30000
+  run_timeout_milliseconds: 300000
+  max_attempts: 2
+  max_checks_concurrency: 2
+  max_source_concurrency: 1
+metadata:
+  connection: metadata_pg
+evidence:
+  sql_capture: disabled
+  ddl_capture: enabled
+  fields:
+    order_id: store
+    business_date: omit
+    amount: store
+  unspecified_fields: omit

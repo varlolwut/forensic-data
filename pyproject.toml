@@ -9,7 +9,8 @@ description = "Typed, read-only data reconciliation foundations"
 readme = "README.md"
 requires-python = ">=3.12,<3.13"
 dependencies = [
-    "psycopg[binary]>=3.3.6,<4",
+    "psycopg[c]==3.3.6",
+    "psycopg2==2.9.13",
     "pydantic>=2.13.5,<3",
     "pyyaml>=6.0.3,<7",
 ]
@@ -25,6 +26,7 @@ dev = [
     "pyright==1.1.414",
     "pytest==9.1.1",
     "ruff==0.16.8",
+    "types-psycopg2==2.9.21.20260911",
 ]
 
 [tool.pyright]

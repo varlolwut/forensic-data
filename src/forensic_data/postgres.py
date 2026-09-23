@@ -76,7 +76,7 @@ class PostgresConnectionError(PostgresConnectorError):
 
 
 class UnsupportedPostgresProfileError(PostgresConnectorError):
-    """The connected server cannot provide the PostgreSQL 17 profile."""
+    """The declared or connected server cannot provide its PostgreSQL profile."""
 
 
 class PostgresMetadataError(PostgresConnectorError):
@@ -1505,7 +1505,7 @@ class PostgresProtectedReadContext:
         max_total_bytes: int,
     ) -> tuple[PostgresCanonicalRow, ...]:
         self._require_protected_relation(protected_relation)
-        query = build_postgres_row_envelope_query(
+        query = self._build_row_envelope_query(
             protected_relation.acquisition.schema,
             protected_relation.inspection,
             max_encoded_envelope_bytes,
@@ -1525,7 +1525,7 @@ class PostgresProtectedReadContext:
         max_total_bytes: int,
     ) -> Fingerprint:
         self._require_protected_relation(protected_relation)
-        query = build_postgres_fingerprint_query(
+        query = self._build_fingerprint_query(
             protected_relation.acquisition.schema,
             protected_relation.inspection,
             max_encoded_envelope_bytes,
@@ -1548,7 +1548,7 @@ class PostgresProtectedReadContext:
         full_scans: int,
     ) -> PostgresIntegerKeySummaryRead:
         self._require_protected_relation(protected_relation)
-        query = build_postgres_integer_key_summary_query(
+        query = self._build_integer_key_summary_query(
             protected_relation.acquisition.schema,
             protected_relation.inspection,
             key_field_index,
@@ -1576,7 +1576,7 @@ class PostgresProtectedReadContext:
         full_scans: int,
     ) -> PostgresRangeFingerprintRead:
         self._require_protected_relation(protected_relation)
-        query = build_postgres_integer_range_fingerprint_query(
+        query = self._build_integer_range_fingerprint_query(
             protected_relation.acquisition.schema,
             protected_relation.inspection,
             key_field_index,
@@ -1624,6 +1624,64 @@ class PostgresProtectedReadContext:
             max_total_bytes,
             deadline,
             full_scans,
+        )
+
+    def _build_row_envelope_query(
+        self,
+        schema: CanonicalSchema,
+        inspection: PostgresInspectedRelation,
+        max_encoded_envelope_bytes: int,
+    ) -> PostgresQuery:
+        return build_postgres_row_envelope_query(
+            schema,
+            inspection,
+            max_encoded_envelope_bytes,
+        )
+
+    def _build_fingerprint_query(
+        self,
+        schema: CanonicalSchema,
+        inspection: PostgresInspectedRelation,
+        max_encoded_envelope_bytes: int,
+    ) -> PostgresQuery:
+        return build_postgres_fingerprint_query(
+            schema,
+            inspection,
+            max_encoded_envelope_bytes,
+        )
+
+    def _build_integer_range_fingerprint_query(
+        self,
+        schema: CanonicalSchema,
+        inspection: PostgresInspectedRelation,
+        key_field_index: int,
+        scope: PostgresScopePredicate | None,
+        ranges: tuple[PostgresIntegerRangeRequest, ...],
+        max_encoded_envelope_bytes: int,
+    ) -> PostgresQuery:
+        return build_postgres_integer_range_fingerprint_query(
+            schema,
+            inspection,
+            key_field_index,
+            scope,
+            ranges,
+            max_encoded_envelope_bytes,
+        )
+
+    def _build_integer_key_summary_query(
+        self,
+        schema: CanonicalSchema,
+        inspection: PostgresInspectedRelation,
+        key_field_index: int,
+        scope: PostgresScopePredicate | None,
+        max_encoded_envelope_bytes: int,
+    ) -> PostgresQuery:
+        return build_postgres_integer_key_summary_query(
+            schema,
+            inspection,
+            key_field_index,
+            scope,
+            max_encoded_envelope_bytes,
         )
 
     def read_relation_manifest(
@@ -3120,7 +3178,15 @@ def _canonical_row_from_database(
             f"observed={len(envelope)}, limit={query.max_encoded_envelope_bytes}"
         )
     digest = row[2]
-    if type(digest) is not bytes or len(digest) != SHA256_BYTES:
+    if type(digest) is memoryview:
+        if digest.nbytes != SHA256_BYTES:
+            raise PostgresDataValidationError(
+                "PostgreSQL canonical row SHA-256 must be exactly 32 bytes"
+            )
+        digest_bytes = digest.tobytes()
+    elif type(digest) is bytes and len(digest) == SHA256_BYTES:
+        digest_bytes = digest
+    else:
         raise PostgresDataValidationError(
             "PostgreSQL canonical row SHA-256 must be exactly 32 bytes"
         )
@@ -3132,11 +3198,11 @@ def _canonical_row_from_database(
             f"reason_type={type(error).__name__}"
         ) from None
     expected_digest = envelope_sha256(envelope)
-    if digest != expected_digest:
+    if digest_bytes != expected_digest:
         raise PostgresDataValidationError(
             "PostgreSQL canonical row SHA-256 does not match the returned envelope"
         )
-    return PostgresCanonicalRow(envelope=envelope, sha256=digest)
+    return PostgresCanonicalRow(envelope=envelope, sha256=digest_bytes)
 
 
 def _integer_key_summary_from_database(row: DatabaseRow) -> PostgresIntegerKeySummary:
@@ -3565,6 +3631,9 @@ def _database_row_bytes(row: DatabaseRow) -> int:
             continue
         if type(value) is bytes:
             total += len(value)
+            continue
+        if type(value) is memoryview:
+            total += value.nbytes
             continue
         if type(value) is bool:
             total += 1

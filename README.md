@@ -128,10 +128,19 @@ mode and certificates for external endpoints.
 
 ## Verified scope
 
-The PostgreSQL path is verified against PostgreSQL 17.11 on Linux/amd64 with Psycopg 3.3.6. The
-connector requires a PostgreSQL 17.x server, UTF-8 server/client encodings, integer datetimes, UTC,
-and a read-only Repeatable Read transaction. Other PostgreSQL majors and other database engines are
-not verified by the current code.
+The modern PostgreSQL path is verified against PostgreSQL 17.11 on Linux/amd64 with Psycopg 3.3.6
+and the explicit `psycopg` / `postgresql_17` driver-profile pair. Modern source, target, and metadata
+connections require PostgreSQL 17.x, UTF-8 server/client encodings, integer datetimes, UTC, and a
+read-only Repeatable Read transaction for source data.
+
+An additional source-only path is verified against the exact PostgreSQL 9.6.24 official
+Linux/amd64 image with Psycopg2 2.9.13 and the explicit `psycopg2` / `postgresql_9_6` pair. Its
+target and metadata connections must remain on the modern profile. The legacy source must use
+UTF-8, integer datetimes, UTC, and read-only Repeatable Read, and must already have pgcrypto 1.3 in
+schema `dfe_ext`; the reader needs `USAGE` on that schema and `EXECUTE` on
+`dfe_ext.digest(bytea,text)`. Runtime validates these capabilities and the canonical SHA-256 result;
+it never installs the extension or silently changes drivers. Other PostgreSQL 9.6 patches, other
+PostgreSQL majors, and other database engines are not verified by the current code.
 
 Relations must be given as an exact `(schema, table)` pair. The connector reads one physical
 regular table with `FROM ONLY`:
@@ -175,6 +184,11 @@ measurement of process RSS or allocator peak usage.
 - Python 3.12
 - [uv](https://docs.astral.sh/uv/) 0.12.18
 - Docker with Compose for PostgreSQL integration tests
+
+The locked drivers are C extensions built from source. A direct host installation therefore needs
+a C toolchain plus `pg_config` and matching libpq development headers. The production Docker build
+provides the reproducible path: it builds Psycopg 3.3.6 and Psycopg2 2.9.13 against the same pinned
+libpq 17.11 and excludes compilers and headers from the runtime image.
 
 Install the locked development environment:
 
@@ -432,19 +446,23 @@ change a fixture password, update the matching password in its DSN too.
 ```console
 # POSIX
 cp tests/fixtures/postgres/.env.example tests/fixtures/postgres/.env
+cp tests/fixtures/postgres-legacy/.env.example tests/fixtures/postgres-legacy/.env
 
 # PowerShell
 Copy-Item tests/fixtures/postgres/.env.example tests/fixtures/postgres/.env
+Copy-Item tests/fixtures/postgres-legacy/.env.example tests/fixtures/postgres-legacy/.env
 ```
 
-Start the pinned PostgreSQL 17.11 fixture and run the full gate:
+Start the pinned PostgreSQL 17.11 fixture plus the exact PostgreSQL 9.6.24 source-to-17.11
+fixture, then run the full gate:
 
 ```console
 docker compose --env-file tests/fixtures/postgres/.env --file tests/fixtures/postgres/compose.yaml up --detach --wait
+docker compose --env-file tests/fixtures/postgres-legacy/.env --file tests/fixtures/postgres-legacy/compose.yaml up --detach --wait
 uv run ruff check .
 uv run ruff format --check .
 uv run pyright
-uv run --env-file tests/fixtures/postgres/.env pytest
+uv run --env-file tests/fixtures/postgres/.env --env-file tests/fixtures/postgres-legacy/.env pytest
 ```
 
 PostgreSQL applies these credentials only when its data volume is initialized. If the fixture was
@@ -453,13 +471,14 @@ previously started with different values, run the cleanup command below before s
 The protocol/result tests can run without Docker, but this does not verify PostgreSQL support:
 
 ```console
-uv run pytest --ignore=tests/test_postgres_integration.py --ignore=tests/test_postgres_metadata_integration.py --ignore=tests/test_postgres_protected_integration.py --ignore=tests/test_postgres_lifecycle_schema_integration.py --ignore=tests/test_postgres_lifecycle_integration.py --ignore=tests/test_postgres_comparison_integration.py
+uv run pytest --ignore=tests/test_postgres_integration.py --ignore=tests/test_postgres_metadata_integration.py --ignore=tests/test_postgres_protected_integration.py --ignore=tests/test_postgres_lifecycle_schema_integration.py --ignore=tests/test_postgres_lifecycle_integration.py --ignore=tests/test_postgres_comparison_integration.py --ignore=tests/test_postgres_legacy_integration.py
 ```
 
 Stop and remove only this disposable fixture and its data volume:
 
 ```console
 docker compose --env-file tests/fixtures/postgres/.env --file tests/fixtures/postgres/compose.yaml down --volumes
+docker compose --env-file tests/fixtures/postgres-legacy/.env --file tests/fixtures/postgres-legacy/compose.yaml down --volumes
 ```
 
 The integration suite exercises real catalog inspection, canonical row/hash equivalence, bounded
@@ -468,6 +487,9 @@ level security, read-only enforcement, concurrent-writer snapshot stability, pro
 dataset/manifest locking, metadata migration serialization and rollback, role separation, immutable
 registration/readback, lifecycle fencing and identity constraints, million-row retained-difference
 paging after source mutation, typed numeric evidence, and durable partial-result replay.
+The legacy endpoint gate additionally proves the exact PostgreSQL 9.6.24 source profile, its
+preinstalled pgcrypto capability, PostgreSQL 17.11 target interoperability, persisted driver/server
+provenance, and an exact retained `1 matched / 1 missing / 1 extra / 1 modified` result.
 
 ## Build artifacts
 

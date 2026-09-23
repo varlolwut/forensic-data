@@ -1,3 +1,4 @@
+from collections.abc import Callable
 from dataclasses import dataclass
 from datetime import date
 from typing import cast, final
@@ -275,6 +276,33 @@ def build_postgres_row_envelope_query(
     inspection: PostgresInspectedRelation,
     max_encoded_envelope_bytes: int,
 ) -> PostgresQuery:
+    return _build_postgres_row_envelope_query(
+        schema,
+        inspection,
+        max_encoded_envelope_bytes,
+        _postgres_17_digest_expression,
+    )
+
+
+def build_postgres_legacy_row_envelope_query(
+    schema: CanonicalSchema,
+    inspection: PostgresInspectedRelation,
+    max_encoded_envelope_bytes: int,
+) -> PostgresQuery:
+    return _build_postgres_row_envelope_query(
+        schema,
+        inspection,
+        max_encoded_envelope_bytes,
+        _postgres_9_6_digest_expression,
+    )
+
+
+def _build_postgres_row_envelope_query(
+    schema: CanonicalSchema,
+    inspection: PostgresInspectedRelation,
+    max_encoded_envelope_bytes: int,
+    digest_expression: Callable[[sql.Composable], sql.Composable],
+) -> PostgresQuery:
     validate_postgres_inspection(schema, inspection)
     _validate_positive_integer(
         max_encoded_envelope_bytes,
@@ -286,8 +314,7 @@ def build_postgres_row_envelope_query(
     # Parenthesized alias.* is a whole-row value even when a column shares the alias name.
     statement = sql.SQL(
         "SELECT dfe_row.origin_type, dfe_row.envelope, "
-        "CASE WHEN dfe_row.envelope IS NULL THEN NULL::bytea "
-        "ELSE sha256(convert_to(dfe_row.envelope, 'UTF8')) END AS row_hash, "
+        "{row_hash} AS row_hash, "
         "dfe_row.invalid_row, dfe_row.oversized_row "
         "FROM ("
         "SELECT CASE WHEN FALSE THEN (dfe_source.*) ELSE NULL END AS origin_type, "
@@ -295,6 +322,7 @@ def build_postgres_row_envelope_query(
         "{oversized_row} AS oversized_row FROM ONLY {relation} AS dfe_source"
         ") AS dfe_row"
     ).format(
+        row_hash=digest_expression(sql.SQL("dfe_row.envelope")),
         envelope=row.envelope,
         invalid_row=row.invalid_row,
         oversized_row=row.oversized_row,
@@ -357,12 +385,96 @@ def build_postgres_fingerprint_query(
     )
 
 
+def build_postgres_legacy_fingerprint_query(
+    schema: CanonicalSchema,
+    inspection: PostgresInspectedRelation,
+    max_encoded_envelope_bytes: int,
+) -> PostgresQuery:
+    validate_postgres_inspection(schema, inspection)
+    _validate_positive_integer(
+        max_encoded_envelope_bytes,
+        "PostgreSQL max encoded envelope byte length",
+        INT64_MAX,
+    )
+    context = prepare_envelope_context(schema)
+    row = _row_lowering_for_alias(
+        schema,
+        inspection.bindings,
+        max_encoded_envelope_bytes,
+        "dfe_origin",
+    )
+    limb_sums = sql.SQL(", ").join(_limb_sum_expression(index) for index in range(8))
+    # PostgreSQL 9.6 materializes CTEs, so the legacy profile uses one direct aggregate scan.
+    statement = sql.SQL(
+        "SELECT (pg_catalog.array_agg((dfe_origin.*)) FILTER (WHERE FALSE))[1] "
+        "AS origin_type, "
+        "count(*) FILTER (WHERE NOT dfe_row.invalid_row "
+        "AND NOT dfe_row.oversized_row)::text AS valid_row_count, "
+        "{limb_sums}, "
+        "count(*) FILTER (WHERE dfe_row.invalid_row)::text AS invalid_row_count, "
+        "count(*) FILTER (WHERE dfe_row.oversized_row)::text AS oversized_row_count "
+        "FROM ONLY {relation} AS dfe_origin "
+        "CROSS JOIN LATERAL (SELECT {envelope} AS envelope, "
+        "{invalid_row} AS invalid_row, {oversized_row} AS oversized_row OFFSET 0) AS dfe_row "
+        "CROSS JOIN LATERAL (SELECT {row_hash} AS row_hash OFFSET 0) AS dfe_hash"
+    ).format(
+        limb_sums=limb_sums,
+        envelope=row.envelope,
+        invalid_row=row.invalid_row,
+        oversized_row=row.oversized_row,
+        relation=sql.Identifier(*inspection.relation.components),
+        row_hash=_postgres_9_6_digest_expression(sql.SQL("dfe_row.envelope")),
+    )
+    return PostgresQuery(
+        statement=statement,
+        parameters=(context.schema_digest_hex, len(context.schema.fields)),
+        context=context,
+        inspected_relation=inspection,
+        max_encoded_envelope_bytes=max_encoded_envelope_bytes,
+    )
+
+
 def build_postgres_integer_key_summary_query(
     schema: CanonicalSchema,
     inspection: PostgresInspectedRelation,
     key_field_index: int,
     scope: PostgresScopePredicate | None,
     max_encoded_envelope_bytes: int,
+) -> PostgresQuery:
+    return _build_postgres_integer_key_summary_query(
+        schema,
+        inspection,
+        key_field_index,
+        scope,
+        max_encoded_envelope_bytes,
+        _usable_integer_key_access_path,
+    )
+
+
+def build_postgres_legacy_integer_key_summary_query(
+    schema: CanonicalSchema,
+    inspection: PostgresInspectedRelation,
+    key_field_index: int,
+    scope: PostgresScopePredicate | None,
+    max_encoded_envelope_bytes: int,
+) -> PostgresQuery:
+    return _build_postgres_integer_key_summary_query(
+        schema,
+        inspection,
+        key_field_index,
+        scope,
+        max_encoded_envelope_bytes,
+        _usable_legacy_integer_key_access_path,
+    )
+
+
+def _build_postgres_integer_key_summary_query(
+    schema: CanonicalSchema,
+    inspection: PostgresInspectedRelation,
+    key_field_index: int,
+    scope: PostgresScopePredicate | None,
+    max_encoded_envelope_bytes: int,
+    access_path_expression: Callable[[PostgresInspectedRelation, str], sql.Composable],
 ) -> PostgresQuery:
     validate_postgres_inspection(schema, inspection)
     _validate_positive_integer(
@@ -376,7 +488,7 @@ def build_postgres_integer_key_summary_query(
         column=key.column,
         is_valid=key.is_valid,
     )
-    usable_access_path = _usable_integer_key_access_path(
+    usable_access_path = access_path_expression(
         inspection,
         inspection.bindings[key_field_index].column_name,
     )
@@ -419,6 +531,45 @@ def build_postgres_integer_range_fingerprint_query(
     scope: PostgresScopePredicate | None,
     ranges: tuple[PostgresIntegerRangeRequest, ...],
     max_encoded_envelope_bytes: int,
+) -> PostgresQuery:
+    return _build_postgres_integer_range_fingerprint_query(
+        schema,
+        inspection,
+        key_field_index,
+        scope,
+        ranges,
+        max_encoded_envelope_bytes,
+        _postgres_17_digest_expression,
+    )
+
+
+def build_postgres_legacy_integer_range_fingerprint_query(
+    schema: CanonicalSchema,
+    inspection: PostgresInspectedRelation,
+    key_field_index: int,
+    scope: PostgresScopePredicate | None,
+    ranges: tuple[PostgresIntegerRangeRequest, ...],
+    max_encoded_envelope_bytes: int,
+) -> PostgresQuery:
+    return _build_postgres_integer_range_fingerprint_query(
+        schema,
+        inspection,
+        key_field_index,
+        scope,
+        ranges,
+        max_encoded_envelope_bytes,
+        _postgres_9_6_digest_expression,
+    )
+
+
+def _build_postgres_integer_range_fingerprint_query(
+    schema: CanonicalSchema,
+    inspection: PostgresInspectedRelation,
+    key_field_index: int,
+    scope: PostgresScopePredicate | None,
+    ranges: tuple[PostgresIntegerRangeRequest, ...],
+    max_encoded_envelope_bytes: int,
+    digest_expression: Callable[[sql.Composable], sql.Composable],
 ) -> PostgresQuery:
     validate_postgres_inspection(schema, inspection)
     _validate_positive_integer(
@@ -465,9 +616,7 @@ def build_postgres_integer_range_fingerprint_query(
         "CROSS JOIN LATERAL (SELECT {row_envelope} AS row_envelope, "
         "{key_envelope} AS key_envelope, {invalid_row} AS invalid_row, "
         "{oversized_row} AS oversized_row OFFSET 0) AS dfe_row "
-        "CROSS JOIN LATERAL (SELECT CASE WHEN dfe_row.row_envelope IS NULL "
-        "THEN NULL::bytea ELSE sha256(convert_to(dfe_row.row_envelope, 'UTF8')) "
-        "END AS row_hash OFFSET 0) AS dfe_hash "
+        "CROSS JOIN LATERAL (SELECT {row_hash} AS row_hash OFFSET 0) AS dfe_hash "
         "WHERE {scope_filter} AND {key_column} IS NOT NULL AND ({key_valid}) "
         "AND {key_column} >= dfe_range.lower_inclusive "
         "AND (dfe_range.upper_exclusive IS NULL "
@@ -484,6 +633,7 @@ def build_postgres_integer_range_fingerprint_query(
         key_column=key.column,
         key_valid=key.is_valid,
         limb_sums=limb_sums,
+        row_hash=digest_expression(sql.SQL("dfe_row.row_envelope")),
     )
     return PostgresQuery(
         statement=statement,
@@ -492,6 +642,20 @@ def build_postgres_integer_range_fingerprint_query(
         inspected_relation=inspection,
         max_encoded_envelope_bytes=max_encoded_envelope_bytes,
     )
+
+
+def _postgres_17_digest_expression(envelope: sql.Composable) -> sql.Composable:
+    return sql.SQL(
+        "CASE WHEN {envelope} IS NULL THEN NULL::bytea "
+        "ELSE sha256(convert_to({envelope}, 'UTF8')) END"
+    ).format(envelope=envelope)
+
+
+def _postgres_9_6_digest_expression(envelope: sql.Composable) -> sql.Composable:
+    return sql.SQL(
+        "CASE WHEN {envelope} IS NULL THEN NULL::bytea "
+        "ELSE dfe_ext.digest(convert_to({envelope}, 'UTF8'), 'sha256') END"
+    ).format(envelope=envelope)
 
 
 def build_postgres_integer_range_rows_query(
@@ -690,6 +854,29 @@ def _usable_integer_key_access_path(
     inspection: PostgresInspectedRelation,
     key_column_name: str,
 ) -> sql.Composable:
+    return _usable_integer_key_access_path_with_count_column(
+        inspection,
+        key_column_name,
+        sql.SQL("indnkeyatts"),
+    )
+
+
+def _usable_legacy_integer_key_access_path(
+    inspection: PostgresInspectedRelation,
+    key_column_name: str,
+) -> sql.Composable:
+    return _usable_integer_key_access_path_with_count_column(
+        inspection,
+        key_column_name,
+        sql.SQL("indnatts"),
+    )
+
+
+def _usable_integer_key_access_path_with_count_column(
+    inspection: PostgresInspectedRelation,
+    key_column_name: str,
+    key_attribute_count_column: sql.SQL,
+) -> sql.Composable:
     return sql.SQL(
         "EXISTS (SELECT 1 FROM pg_catalog.pg_index AS dfe_index "
         "JOIN pg_catalog.pg_class AS dfe_index_relation "
@@ -708,12 +895,13 @@ def _usable_integer_key_access_path(
         "AND dfe_opclass_namespace.nspname = 'pg_catalog' "
         "AND dfe_key_attribute.attname = {key_column_name} "
         "AND NOT dfe_key_attribute.attisdropped "
-        "AND dfe_index.indnkeyatts >= 1 "
+        "AND dfe_index.{key_attribute_count_column} >= 1 "
         "AND dfe_index.indisvalid AND dfe_index.indisready AND dfe_index.indislive "
         "AND dfe_index.indpred IS NULL AND dfe_index.indexprs IS NULL)"
     ).format(
         relation_oid=sql.Literal(inspection.relation_oid),
         key_column_name=sql.Literal(key_column_name),
+        key_attribute_count_column=key_attribute_count_column,
     )
 
 

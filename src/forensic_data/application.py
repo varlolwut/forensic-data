@@ -122,6 +122,11 @@ from forensic_data.postgres import (
     UnsupportedPostgresProfileError,
     open_postgres_protected_read_context,
 )
+from forensic_data.postgres_legacy import open_postgres_9_6_protected_read_context
+from forensic_data.postgres_profile import (
+    PostgresRuntimeProfile,
+    match_postgres_runtime_profile,
+)
 from forensic_data.postgres_sql import PostgresRelation
 from forensic_data.reporting import DiffCursor, DiffPage, HistoryCursor, HistoryPage
 from forensic_data.result import (
@@ -405,6 +410,7 @@ def execute_check(
     _require_config(config)
     check = _find_check(config, request.check_id)
     _validate_service_closure(config, check, services)
+    _validate_runtime_profiles(config, check)
     scope = resolve_scope_values(check, _scope_mapping(request.scope_values))
     source_budget = PostgresSourceBudgetLedger(config.execution)
     invocation_owner_token = uuid4()
@@ -821,29 +827,56 @@ def _open_side(
         raise UnsupportedComparisonError(
             f"{direction.value} dataset and readiness manifest must use distinct physical relations"
         )
-    context = open_postgres_protected_read_context(
-        settings,
-        services.source_retry_policy,
-        (
-            PostgresRelationAcquisition(
-                schema=dataset.logical_schema.schema,
-                relation=dataset_relation,
-                column_names=tuple(field.column_name for field in dataset.projection),
-                max_metadata_record_bytes=services.metadata_record_bytes,
-                max_metadata_total_bytes=services.metadata_total_bytes,
-            ),
-            PostgresRelationAcquisition(
-                schema=_manifest_schema(),
-                relation=readiness_relation,
-                column_names=readiness.columns.values(),
-                max_metadata_record_bytes=services.metadata_record_bytes,
-                max_metadata_total_bytes=services.metadata_total_bytes,
-            ),
+    acquisitions = (
+        PostgresRelationAcquisition(
+            schema=dataset.logical_schema.schema,
+            relation=dataset_relation,
+            column_names=tuple(field.column_name for field in dataset.projection),
+            max_metadata_record_bytes=services.metadata_record_bytes,
+            max_metadata_total_bytes=services.metadata_total_bytes,
         ),
-        services.protected_lock_timeout_milliseconds,
-        source_budget,
-        PostgresSourceDirection(direction.value),
+        PostgresRelationAcquisition(
+            schema=_manifest_schema(),
+            relation=readiness_relation,
+            column_names=readiness.columns.values(),
+            max_metadata_record_bytes=services.metadata_record_bytes,
+            max_metadata_total_bytes=services.metadata_total_bytes,
+        ),
     )
+    runtime_profile = match_postgres_runtime_profile(
+        dataset.connection.driver,
+        dataset.connection.profile,
+    )
+    if runtime_profile is PostgresRuntimeProfile.POSTGRES_17:
+        context = open_postgres_protected_read_context(
+            settings,
+            services.source_retry_policy,
+            acquisitions,
+            services.protected_lock_timeout_milliseconds,
+            source_budget,
+            PostgresSourceDirection(direction.value),
+        )
+    elif (
+        runtime_profile is PostgresRuntimeProfile.POSTGRES_9_6
+        and direction is PlanDirection.REFERENCE
+    ):
+        context = open_postgres_9_6_protected_read_context(
+            settings,
+            services.source_retry_policy,
+            acquisitions,
+            services.protected_lock_timeout_milliseconds,
+            source_budget,
+            PostgresSourceDirection(direction.value),
+        )
+    elif runtime_profile is PostgresRuntimeProfile.POSTGRES_9_6:
+        raise UnsupportedPostgresProfileError(
+            "PostgreSQL 9.6.24 profile is source-only and cannot be used as a target"
+        )
+    else:
+        raise UnsupportedPostgresProfileError(
+            f"declared PostgreSQL {direction.value} driver/profile is unsupported: "
+            f"driver={dataset.connection.driver!r}, profile={dataset.connection.profile!r}"
+        )
     return _ProtectedSide(
         direction=direction,
         context=context,
@@ -2209,6 +2242,41 @@ def _validate_service_closure(
         raise ValueError(
             "execution service connection identities do not match the selected check closure: "
             f"expected={expected!r}, actual={actual!r}"
+        )
+
+
+def _validate_runtime_profiles(
+    config: LoadedContractConfig,
+    check: RowCheckDefinition,
+) -> None:
+    reference_profile = match_postgres_runtime_profile(
+        check.reference.connection.driver,
+        check.reference.connection.profile,
+    )
+    if reference_profile not in (
+        PostgresRuntimeProfile.POSTGRES_17,
+        PostgresRuntimeProfile.POSTGRES_9_6,
+    ):
+        raise UnsupportedPostgresProfileError(
+            "declared PostgreSQL reference driver/profile is unsupported: "
+            f"driver={check.reference.connection.driver!r}, "
+            f"profile={check.reference.connection.profile!r}"
+        )
+    target = check.target.connection
+    if (
+        match_postgres_runtime_profile(target.driver, target.profile)
+        is not PostgresRuntimeProfile.POSTGRES_17
+    ):
+        raise UnsupportedPostgresProfileError(
+            "PostgreSQL target requires driver='psycopg' and profile='postgresql_17'"
+        )
+    metadata = config.metadata.connection
+    if (
+        match_postgres_runtime_profile(metadata.driver, metadata.profile)
+        is not PostgresRuntimeProfile.POSTGRES_17
+    ):
+        raise UnsupportedPostgresProfileError(
+            "PostgreSQL metadata requires driver='psycopg' and profile='postgresql_17'"
         )
 
 

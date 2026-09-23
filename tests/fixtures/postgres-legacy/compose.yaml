@@ -1,0 +1,87 @@
+name: forensic-data-p0208-postgres-legacy
+
+services:
+  source:
+    image: postgres:9.6.24-bullseye@sha256:b46fe71e80ab8572c206b0645d6965547940d14de021b282fb1076c4d87e4aac
+    platform: linux/amd64
+    environment:
+      POSTGRES_DB: dfe_legacy
+      POSTGRES_USER: postgres
+      POSTGRES_PASSWORD: ${DFE_LEGACY_SOURCE_ADMIN_PASSWORD:?set DFE_LEGACY_SOURCE_ADMIN_PASSWORD}
+      DFE_LEGACY_READER_PASSWORD: ${DFE_LEGACY_SOURCE_READER_PASSWORD:?set DFE_LEGACY_SOURCE_READER_PASSWORD}
+    ports:
+      - 127.0.0.1:${DFE_LEGACY_SOURCE_PORT:?set DFE_LEGACY_SOURCE_PORT}:5432
+    volumes:
+      - source-data:/var/lib/postgresql/data
+      - ./init/001-fixture.sh:/docker-entrypoint-initdb.d/001-fixture.sh:ro
+      - ./init/002-source-pgcrypto.sh:/docker-entrypoint-initdb.d/002-source-pgcrypto.sh:ro
+      - ./init/source-data.sql:/opt/forensic-data/data.sql:ro
+    healthcheck:
+      test:
+        - CMD-SHELL
+        - >-
+          PGPASSWORD="$${DFE_LEGACY_READER_PASSWORD}"
+          psql --no-psqlrc --set=ON_ERROR_STOP=1
+          --host 127.0.0.1 --username dfe_legacy_reader --dbname dfe_legacy
+          --tuples-only --no-align
+          --command="SELECT
+          pg_catalog.current_setting('transaction_read_only') = 'on'
+          AND (SELECT pg_catalog.count(*) FROM dfe_legacy.daily_orders
+          WHERE business_date = DATE '2026-09-23') = 3
+          AND EXISTS (
+          SELECT 1 FROM pg_catalog.pg_extension AS extension
+          INNER JOIN pg_catalog.pg_namespace AS namespace
+          ON namespace.oid = extension.extnamespace
+          WHERE extension.extname = 'pgcrypto'
+          AND extension.extversion = '1.3'
+          AND namespace.nspname = 'dfe_ext')
+          AND pg_catalog.has_schema_privilege(
+          current_user, 'dfe_ext', 'USAGE')
+          AND pg_catalog.has_function_privilege(
+          current_user, 'dfe_ext.digest(bytea,text)', 'EXECUTE')
+          AND pg_catalog.encode(
+          dfe_ext.digest(pg_catalog.convert_to('abc', 'UTF8'), 'sha256'), 'hex') =
+          'ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad'"
+          | grep --quiet --line-regexp t
+      interval: 2s
+      timeout: 3s
+      retries: 60
+      start_period: 10s
+    restart: "no"
+
+  target:
+    image: postgres:17.11-bookworm@sha256:91eb910c44c7ed13f7f1a4ccadaa9ca72ef14cddc04cacb6e070e48eb44731a3
+    platform: linux/amd64
+    environment:
+      POSTGRES_DB: dfe_legacy
+      POSTGRES_USER: postgres
+      POSTGRES_PASSWORD: ${DFE_LEGACY_TARGET_ADMIN_PASSWORD:?set DFE_LEGACY_TARGET_ADMIN_PASSWORD}
+      DFE_LEGACY_READER_PASSWORD: ${DFE_LEGACY_TARGET_READER_PASSWORD:?set DFE_LEGACY_TARGET_READER_PASSWORD}
+    ports:
+      - 127.0.0.1:${DFE_LEGACY_TARGET_PORT:?set DFE_LEGACY_TARGET_PORT}:5432
+    volumes:
+      - target-data:/var/lib/postgresql/data
+      - ./init/001-fixture.sh:/docker-entrypoint-initdb.d/001-fixture.sh:ro
+      - ./init/target-data.sql:/opt/forensic-data/data.sql:ro
+    healthcheck:
+      test:
+        - CMD-SHELL
+        - >-
+          PGPASSWORD="$${DFE_LEGACY_READER_PASSWORD}"
+          psql --no-psqlrc --set=ON_ERROR_STOP=1
+          --host 127.0.0.1 --username dfe_legacy_reader --dbname dfe_legacy
+          --tuples-only --no-align
+          --command="SELECT
+          pg_catalog.current_setting('transaction_read_only') = 'on'
+          AND (SELECT pg_catalog.count(*) FROM dfe_legacy.daily_orders
+          WHERE business_date = DATE '2026-09-23') = 3"
+          | grep --quiet --line-regexp t
+      interval: 2s
+      timeout: 3s
+      retries: 60
+      start_period: 10s
+    restart: "no"
+
+volumes:
+  source-data:
+  target-data:

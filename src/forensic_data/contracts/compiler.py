@@ -68,6 +68,12 @@ from forensic_data.contracts.source import (
     SqlArtifactSource,
     load_contract_source,
 )
+from forensic_data.postgres_profile import (
+    POSTGRES_17_DRIVER,
+    POSTGRES_17_PROFILE,
+    PostgresRuntimeProfile,
+    match_postgres_runtime_profile,
+)
 
 _ROW_EQUIVALENCE = "row_equivalence"
 
@@ -142,6 +148,17 @@ def compile_contract(source: LoadedContractSource) -> LoadedContractConfig:
         raise ContractValidationError(
             f"metadata connection {metadata_connection.connection_id!r} must declare role 'metadata'"
         )
+    if (
+        match_postgres_runtime_profile(
+            metadata_connection.driver,
+            metadata_connection.profile,
+        )
+        is not PostgresRuntimeProfile.POSTGRES_17
+    ):
+        raise UnsupportedContractError(
+            f"metadata connection {metadata_connection.connection_id!r} requires "
+            f"driver={POSTGRES_17_DRIVER!r} and profile={POSTGRES_17_PROFILE!r}"
+        )
 
     execution = _compile_execution(source)
     evidence = _compile_evidence(source.evidence, schemas)
@@ -186,6 +203,13 @@ def _compile_connection(source: ConnectionSource) -> ConnectionDefinition:
                 f"connection {connection_id!r} contains duplicate role {role.value!r}"
             )
         roles.append(role)
+    if match_postgres_runtime_profile(
+        driver, profile
+    ) is PostgresRuntimeProfile.POSTGRES_9_6 and roles != [ConnectionRole.SOURCE]:
+        raise UnsupportedContractError(
+            f"connection {connection_id!r} profile 'postgresql_9_6' is source-only and "
+            "must declare exactly role 'source'"
+        )
     return ConnectionDefinition(
         connection_id=connection_id,
         adapter=adapter,
