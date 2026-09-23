@@ -1,0 +1,68 @@
+[build-system]
+requires = ["uv_build==0.12.18"]
+build-backend = "uv_build"
+
+[project]
+name = "forensic-data"
+version = "0.1.0.dev0"
+description = "Typed, read-only data reconciliation foundations"
+requires-python = ">=3.12,<3.13"
+dependencies = [
+    "psycopg[binary]>=3.3.6,<4",
+    "pydantic>=2.13.5,<3",
+]
+
+[dependency-groups]
+build = [
+    "uv-build==0.12.18",
+]
+dev = [
+    "pyright==1.1.414",
+    "pytest==9.1.1",
+    "ruff==0.16.8",
+]
+
+[tool.pyright]
+exclude = [".venv", "build", "dist"]
+include = ["src", "tests"]
+pythonVersion = "3.12"
+typeCheckingMode = "strict"
+
+[tool.pytest.ini_options]
+addopts = ["--strict-config", "--strict-markers", "-ra"]
+markers = [
+    "integration: tests that require a real external service",
+    "postgres: tests that require a real PostgreSQL service",
+]
+testpaths = ["tests"]
+xfail_strict = true
+
+[tool.ruff]
+line-length = 100
+src = ["src", "tests"]
+target-version = "py312"
+
+[tool.ruff.lint]
+select = ["B", "E4", "E7", "E9", "F", "I", "RUF", "UP"]
+
+[tool.uv]
+package = true
+required-version = "==0.12.18"
+
+[tool.uv.build-backend]
+module-name = "forensic_data"
+module-root = "src"
+source-include = ["uv.lock"]
+source-exclude = [
+    "/.agents",
+    "/.codex",
+    "/.cursor",
+    "/.env",
+    "/.env.*",
+    "/.gitignore",
+    "/.local",
+    "/AGENTS.md",
+    "/CLAUDE.md",
+    "/data-forensics-brief.md",
+    "/docs",
+]

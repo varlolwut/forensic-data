@@ -1,0 +1,104 @@
+name: CI
+
+on:
+  pull_request:
+  push:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  quality:
+    name: Quality and PostgreSQL 16 conformance
+    runs-on: ubuntu-24.04
+    services:
+      postgres:
+        image: postgres:16.15-bookworm@sha256:efdf07c2f9d4df592783dcc8ea5f6db02efbf5f6452b527225ff5e58364570e9
+        env:
+          POSTGRES_DB: dfe_test
+          POSTGRES_PASSWORD: dfe_admin
+          POSTGRES_USER: dfe_admin
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready --dbname=dfe_test --username=dfe_admin"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 12
+    env:
+      DFE_TEST_POSTGRES_DSN: postgresql://dfe_admin:dfe_admin@127.0.0.1:5432/dfe_test
+    steps:
+      - name: Check out source
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - name: Set up Python
+        uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
+        with:
+          python-version: "3.12.14"
+      - name: Set up uv
+        uses: astral-sh/setup-uv@c18668ad3cf93ea998bef934396af7bb5c839dc7 # v10.2.0
+        with:
+          cache-dependency-glob: uv.lock
+          enable-cache: true
+          version: "0.12.18"
+      - name: Install locked dependencies
+        run: uv sync --frozen --all-groups
+      - name: Lint
+        run: uv run ruff check .
+      - name: Check formatting
+        run: uv run ruff format --check .
+      - name: Check types
+        run: uv run pyright
+      - name: Run tests
+        run: uv run pytest
+
+  build:
+    name: Build package and container
+    needs: quality
+    runs-on: ubuntu-24.04
+    steps:
+      - name: Check out source
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - name: Set up Python
+        uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
+        with:
+          python-version: "3.12.14"
+      - name: Set up uv
+        uses: astral-sh/setup-uv@c18668ad3cf93ea998bef934396af7bb5c839dc7 # v10.2.0
+        with:
+          cache-dependency-glob: uv.lock
+          enable-cache: true
+          version: "0.12.18"
+      - name: Install locked build dependencies
+        run: uv sync --frozen --only-group build
+      - name: Build wheel and source distribution
+        run: |
+          uv lock --check
+          uv build --no-build-isolation --no-create-gitignore --clear
+      - name: Smoke-test built wheel
+        run: |
+          uv venv --python 3.12.14 .artifact-venv
+          uv export --frozen --no-dev --no-emit-project --output-file /tmp/forensic-data-runtime.txt
+          uv pip install \
+            --python .artifact-venv/bin/python \
+            --require-hashes \
+            --requirements /tmp/forensic-data-runtime.txt
+          uv pip install --python .artifact-venv/bin/python --no-deps dist/*.whl
+          .artifact-venv/bin/python -c "import forensic_data; print(forensic_data.__version__)"
+      - name: Upload package artifacts
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          if-no-files-found: error
+          name: forensic-data-python-package
+          path: dist/*
+      - name: Build container image
+        run: docker build --platform linux/amd64 --tag forensic-data:ci .
+      - name: Verify container export and import
+        run: |
+          docker image save forensic-data:ci --output /tmp/forensic-data-ci.tar
+          docker image rm forensic-data:ci
+          docker image load --input /tmp/forensic-data-ci.tar
+          docker run --rm forensic-data:ci

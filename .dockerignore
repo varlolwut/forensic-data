@@ -1,0 +1,10 @@
+# The image build context is an allowlist containing package inputs only.
+**
+!Dockerfile
+!pyproject.toml
+!uv.lock
+!src/
+!src/**
+src/**/__pycache__/
+src/**/*.py[cod]
+src/**/*.egg-info/
