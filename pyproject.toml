@@ -11,6 +11,7 @@ requires-python = ">=3.12,<3.13"
 dependencies = [
     "psycopg[binary]>=3.3.6,<4",
     "pydantic>=2.13.5,<3",
+    "pyyaml>=6.0.3,<7",
 ]
 
 [dependency-groups]
@@ -53,7 +54,7 @@ required-version = "==0.12.18"
 [tool.uv.build-backend]
 module-name = "forensic_data"
 module-root = "src"
-source-include = ["uv.lock"]
+source-include = ["examples/**", "uv.lock"]
 source-exclude = [
     "/.agents",
     "/.codex",

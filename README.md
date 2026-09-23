@@ -10,12 +10,14 @@ application. It provides:
 - strict comparison-result models with distinct completed, incomplete, and error outcomes;
 - the versioned `dfe_canon_v1` row/key envelope, schema digest, SHA-256 fingerprint, and segment
   identity primitives;
+- a strict version-1 YAML contract loader, pure reference/schema resolver, semantic digests, and
+  static plan report;
 - a bounded PostgreSQL read connector and SQL lowering for the initial common type profile; and
 - reproducible Python package, PostgreSQL fixture, container, and CI builds.
 
-There is no end-user CLI, configuration file format, metadata store, scheduler integration, or
-multi-engine execution workflow yet. Import the Python APIs directly for development and protocol
-experiments.
+There is no end-user CLI, metadata store, scheduler integration, or multi-engine execution workflow
+yet. Static planning does not connect to a database or prove readiness, capability, schema presence,
+or data equality. Import the Python APIs directly for development and protocol experiments.
 
 ## Verified scope
 
@@ -93,6 +95,50 @@ fingerprint = fingerprint_rows((envelope,))
 
 The envelope bytes are the comparison input. Do not substitute database-native text formatting or
 hash a different serialization and call it protocol-compatible.
+
+## Static contract and plan
+
+The version-1 contract requires explicit `connections`, `schemas`, `datasets`, `checks`,
+`consistency`, `execution`, `metadata`, and `evidence` mappings. Named `scopes` are optional, but
+every check must provide exactly one inline scope or resolvable scope reference. Unknown or duplicate
+YAML keys fail validation. Connections contain a `secret_ref`; inline credentials and DSNs are not
+part of the contract shape.
+
+Datasets use exactly one relation locator or SQL artifact. Relative SQL artifact paths are resolved
+from the contract directory; absolute and UNC paths are also accepted for operator-managed files.
+The loader assumes the contract and artifacts remain stable while they are captured, reads each
+distinct artifact once as strict UTF-8, and binds its exact bytes by SHA-256. Contract input is
+bounded to 1 MiB, composed YAML to 10,000 nodes, and nesting to 64 levels; YAML aliases are rejected.
+Each SQL artifact is bounded to 4 MiB and all distinct SQL artifacts to 32 MiB. The compiler resolves
+every reference and validates ordered schemas, projection, grain, keys, scope bindings, readiness
+parameters, and direction roles without opening an endpoint.
+
+```python
+from pathlib import Path
+
+from forensic_data.contracts import load_contract_config
+from forensic_data.planning import compile_static_plan
+
+config = load_contract_config(Path("examples/postgres-row/contract.yaml"))
+plan = compile_static_plan(
+    config,
+    "daily_orders",
+    {"business_date": "2026-09-23"},
+)
+print(plan.model_dump_json(indent=2))
+```
+
+The checked-in example is complete and loadable, but planning it remains static. Its readiness SQL
+describes operator-managed batch-manifest evidence; capturing that SQL does not execute it or prove
+the sources ready.
+
+`contract_digest` identifies the resolved comparison semantics but excludes runtime scope values,
+secrets, paths, budgets, evidence settings, and metadata settings. `scope_digest` binds the typed
+values for this invocation. A `PlanReport` is not a comparison result: its live probes and execution
+stages remain explicitly `required_not_run` or `planned_not_run`, and its estimates remain
+`unknown`. It is unsigned informational output, not an authenticated executable contract; digest
+fields in a deserialized report are sender claims. Execution must load and compile the source
+contract again rather than trusting a supplied report.
 
 ## PostgreSQL fixture and checks
 
