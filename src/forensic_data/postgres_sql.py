@@ -23,6 +23,7 @@ INT64_MIN = -(1 << 63)
 UINT32_MAX = (1 << 32) - 1
 _ROW_HEADER_BYTES = 77
 _FIELD_FRAME_BYTES = 19
+MAX_COMPILED_RELATION_MEMBERS = 1_600
 
 
 class PostgresLoweringError(ValueError):
@@ -176,18 +177,32 @@ class PostgresIntegerRangeRequest:
 
 @final
 @dataclass(frozen=True, slots=True)
+class PostgresQueryRelation:
+    inspection: PostgresInspectedRelation
+    contributes_rows: bool
+
+    def __post_init__(self) -> None:
+        _require_inspected_relation(self.inspection)
+        _require_boolean(
+            self.contributes_rows,
+            "PostgreSQL query relation contributes_rows",
+        )
+
+
+@final
+@dataclass(frozen=True, slots=True)
 class PostgresQuery:
     statement: sql.SQL | sql.Composed
     parameters: tuple[PostgresParameter, ...]
     context: CanonicalEnvelopeContext
-    inspected_relation: PostgresInspectedRelation
+    relations: tuple[PostgresQueryRelation, ...]
     max_encoded_envelope_bytes: int
 
     def __post_init__(self) -> None:
         _require_query_statement(self.statement)
         _require_query_parameters(self.parameters)
         _require_envelope_context(self.context)
-        _require_inspected_relation(self.inspected_relation)
+        _require_query_relations(self.relations)
         _validate_positive_integer(
             self.max_encoded_envelope_bytes,
             "PostgreSQL max encoded envelope byte length",
@@ -271,16 +286,120 @@ def validate_postgres_inspection(
         _validate_physical_mapping(field, binding.physical, index)
 
 
+def _single_query_relation(
+    inspection: PostgresInspectedRelation,
+) -> tuple[PostgresQueryRelation, ...]:
+    return (PostgresQueryRelation(inspection=inspection, contributes_rows=True),)
+
+
+def _validate_query_relations_for_schema(
+    schema: CanonicalSchema,
+    relations: tuple[PostgresQueryRelation, ...],
+) -> None:
+    _require_query_relations(relations)
+    for relation in relations:
+        validate_postgres_inspection(schema, relation.inspection)
+
+
+def _origin_type_branch_projections(
+    relations: tuple[PostgresQueryRelation, ...],
+    branch_index: int,
+    source_alias: str,
+) -> sql.Composable:
+    projections: list[sql.Composable] = []
+    for index, _relation in enumerate(relations):
+        column_alias = "origin_type" if index == 0 else f"origin_type_{index}"
+        if index == branch_index:
+            expression = sql.SQL("(pg_catalog.pg_typeof(({source_alias}.*)))::oid::bigint").format(
+                source_alias=sql.Identifier(source_alias)
+            )
+        else:
+            expression = sql.SQL("NULL::bigint")
+        projections.append(
+            sql.SQL("{expression} AS {column_alias}").format(
+                expression=expression,
+                column_alias=sql.Identifier(column_alias),
+            )
+        )
+    return sql.SQL(", ").join(projections)
+
+
+def _origin_type_columns(
+    relations: tuple[PostgresQueryRelation, ...],
+    source_alias: str,
+) -> sql.Composable:
+    return sql.SQL(", ").join(
+        sql.SQL("{source_alias}.{column_alias}").format(
+            source_alias=sql.Identifier(source_alias),
+            column_alias=sql.Identifier("origin_type" if index == 0 else f"origin_type_{index}"),
+        )
+        for index, _ in enumerate(relations)
+    )
+
+
+def _aggregate_origin_type_projections(
+    relations: tuple[PostgresQueryRelation, ...],
+    source_alias: str,
+) -> sql.Composable:
+    return sql.SQL(", ").join(
+        sql.SQL("max({source_alias}.{column_alias})::bigint AS {column_alias}").format(
+            source_alias=sql.Identifier(source_alias),
+            column_alias=sql.Identifier("origin_type" if index == 0 else f"origin_type_{index}"),
+        )
+        for index, _ in enumerate(relations)
+    )
+
+
+def _window_origin_type_projections(
+    relations: tuple[PostgresQueryRelation, ...],
+    source_alias: str,
+) -> sql.Composable:
+    return sql.SQL(", ").join(
+        sql.SQL("(max({source_alias}.{column_alias}) OVER ())::bigint AS {column_alias}").format(
+            source_alias=sql.Identifier(source_alias),
+            column_alias=sql.Identifier("origin_type" if index == 0 else f"origin_type_{index}"),
+        )
+        for index, _ in enumerate(relations)
+    )
+
+
+def _aggregate_origin_type_branch_projections(
+    relations: tuple[PostgresQueryRelation, ...],
+    branch_index: int,
+    source_alias: str,
+) -> sql.Composable:
+    projections: list[sql.Composable] = []
+    for index, _relation in enumerate(relations):
+        column_alias = "origin_type" if index == 0 else f"origin_type_{index}"
+        if index == branch_index:
+            expression = sql.SQL(
+                "(pg_catalog.pg_typeof((pg_catalog.array_agg(({source_alias}.*)) "
+                "FILTER (WHERE FALSE))[1]))::oid::bigint"
+            ).format(source_alias=sql.Identifier(source_alias))
+        else:
+            expression = sql.SQL("NULL::bigint")
+        projections.append(
+            sql.SQL("{expression} AS {column_alias}").format(
+                expression=expression,
+                column_alias=sql.Identifier(column_alias),
+            )
+        )
+    return sql.SQL(", ").join(projections)
+
+
+def _contribution_filter(relation: PostgresQueryRelation) -> sql.SQL:
+    return sql.SQL("TRUE") if relation.contributes_rows else sql.SQL("FALSE")
+
+
 def build_postgres_row_envelope_query(
     schema: CanonicalSchema,
     inspection: PostgresInspectedRelation,
     max_encoded_envelope_bytes: int,
 ) -> PostgresQuery:
-    return _build_postgres_row_envelope_query(
+    return build_postgres_union_row_envelope_query(
         schema,
-        inspection,
+        _single_query_relation(inspection),
         max_encoded_envelope_bytes,
-        _postgres_17_digest_expression,
     )
 
 
@@ -289,9 +408,34 @@ def build_postgres_legacy_row_envelope_query(
     inspection: PostgresInspectedRelation,
     max_encoded_envelope_bytes: int,
 ) -> PostgresQuery:
+    return build_postgres_legacy_union_row_envelope_query(
+        schema,
+        _single_query_relation(inspection),
+        max_encoded_envelope_bytes,
+    )
+
+
+def build_postgres_union_row_envelope_query(
+    schema: CanonicalSchema,
+    relations: tuple[PostgresQueryRelation, ...],
+    max_encoded_envelope_bytes: int,
+) -> PostgresQuery:
     return _build_postgres_row_envelope_query(
         schema,
-        inspection,
+        relations,
+        max_encoded_envelope_bytes,
+        _postgres_17_digest_expression,
+    )
+
+
+def build_postgres_legacy_union_row_envelope_query(
+    schema: CanonicalSchema,
+    relations: tuple[PostgresQueryRelation, ...],
+    max_encoded_envelope_bytes: int,
+) -> PostgresQuery:
+    return _build_postgres_row_envelope_query(
+        schema,
+        relations,
         max_encoded_envelope_bytes,
         _postgres_9_6_digest_expression,
     )
@@ -299,40 +443,71 @@ def build_postgres_legacy_row_envelope_query(
 
 def _build_postgres_row_envelope_query(
     schema: CanonicalSchema,
-    inspection: PostgresInspectedRelation,
+    relations: tuple[PostgresQueryRelation, ...],
     max_encoded_envelope_bytes: int,
     digest_expression: Callable[[sql.Composable], sql.Composable],
 ) -> PostgresQuery:
-    validate_postgres_inspection(schema, inspection)
+    _validate_query_relations_for_schema(schema, relations)
     _validate_positive_integer(
         max_encoded_envelope_bytes,
         "PostgreSQL max encoded envelope byte length",
         INT64_MAX,
     )
     context = prepare_envelope_context(schema)
-    row = _row_lowering(schema, inspection.bindings, max_encoded_envelope_bytes)
-    # Parenthesized alias.* is a whole-row value even when a column shares the alias name.
+    branches: list[sql.Composable] = []
+    parameters: list[PostgresParameter] = []
+    for index, relation in enumerate(relations):
+        source_alias = f"dfe_origin_{index}"
+        row = _row_lowering_for_alias(
+            schema,
+            relation.inspection.bindings,
+            max_encoded_envelope_bytes,
+            source_alias,
+        )
+        branches.append(
+            sql.SQL(
+                "SELECT {origin_types}, {envelope} AS envelope, "
+                "{invalid_row} AS invalid_row, "
+                "{oversized_row} AS oversized_row, "
+                "{source_alias}.tableoid IS NOT NULL AS has_data "
+                "FROM (VALUES (TRUE)) AS dfe_seed(seed) "
+                "LEFT JOIN ONLY {relation} AS {source_alias} ON {contributes_rows}"
+            ).format(
+                origin_types=_origin_type_branch_projections(
+                    relations,
+                    index,
+                    source_alias,
+                ),
+                envelope=row.envelope,
+                invalid_row=row.invalid_row,
+                oversized_row=row.oversized_row,
+                relation=sql.Identifier(*relation.inspection.relation.components),
+                source_alias=sql.Identifier(source_alias),
+                contributes_rows=_contribution_filter(relation),
+            )
+        )
+        parameters.extend((context.schema_digest_hex, len(context.schema.fields)))
     statement = sql.SQL(
-        "SELECT dfe_row.origin_type, dfe_row.envelope, "
-        "{row_hash} AS row_hash, "
-        "dfe_row.invalid_row, dfe_row.oversized_row "
-        "FROM ("
-        "SELECT CASE WHEN FALSE THEN (dfe_source.*) ELSE NULL END AS origin_type, "
-        "{envelope} AS envelope, {invalid_row} AS invalid_row, "
-        "{oversized_row} AS oversized_row FROM ONLY {relation} AS dfe_source"
-        ") AS dfe_row"
+        "SELECT {origin_types}, dfe_source.has_data, "
+        "CASE WHEN dfe_source.has_data THEN dfe_source.envelope "
+        "ELSE NULL::text END AS envelope, "
+        "CASE WHEN dfe_source.has_data THEN {row_hash} "
+        "ELSE NULL::bytea END AS row_hash, "
+        "CASE WHEN dfe_source.has_data THEN dfe_source.invalid_row "
+        "ELSE NULL::boolean END AS invalid_row, "
+        "CASE WHEN dfe_source.has_data THEN dfe_source.oversized_row "
+        "ELSE NULL::boolean END AS oversized_row "
+        "FROM ({source_branches}) AS dfe_source"
     ).format(
-        row_hash=digest_expression(sql.SQL("dfe_row.envelope")),
-        envelope=row.envelope,
-        invalid_row=row.invalid_row,
-        oversized_row=row.oversized_row,
-        relation=sql.Identifier(*inspection.relation.components),
+        source_branches=sql.SQL(" UNION ALL ").join(branches),
+        origin_types=_origin_type_columns(relations, "dfe_source"),
+        row_hash=digest_expression(sql.SQL("dfe_source.envelope")),
     )
     return PostgresQuery(
         statement=statement,
-        parameters=(context.schema_digest_hex, len(context.schema.fields)),
+        parameters=tuple(parameters),
         context=context,
-        inspected_relation=inspection,
+        relations=relations,
         max_encoded_envelope_bytes=max_encoded_envelope_bytes,
     )
 
@@ -342,46 +517,23 @@ def build_postgres_fingerprint_query(
     inspection: PostgresInspectedRelation,
     max_encoded_envelope_bytes: int,
 ) -> PostgresQuery:
-    validate_postgres_inspection(schema, inspection)
-    _validate_positive_integer(
+    return build_postgres_union_fingerprint_query(
+        schema,
+        _single_query_relation(inspection),
         max_encoded_envelope_bytes,
-        "PostgreSQL max encoded envelope byte length",
-        INT64_MAX,
     )
-    context = prepare_envelope_context(schema)
-    row = _row_lowering(schema, inspection.bindings, max_encoded_envelope_bytes)
-    limb_sums = sql.SQL(", ").join(_limb_sum_expression(index) for index in range(8))
-    # Parenthesized alias.* is a whole-row value even when a column shares the alias name.
-    statement = sql.SQL(
-        "WITH dfe_source AS NOT MATERIALIZED ("
-        "SELECT CASE WHEN FALSE THEN (dfe_origin.*) ELSE NULL END AS origin_type, "
-        "{envelope} AS envelope, {invalid_row} AS invalid_row, "
-        "{oversized_row} AS oversized_row FROM ONLY {relation} AS dfe_origin"
-        "), dfe_hash AS NOT MATERIALIZED ("
-        "SELECT dfe_source.origin_type, "
-        "CASE WHEN dfe_source.envelope IS NULL THEN NULL::bytea "
-        "ELSE sha256(convert_to(dfe_source.envelope, 'UTF8')) END AS row_hash, "
-        "dfe_source.invalid_row, dfe_source.oversized_row FROM dfe_source"
-        ") SELECT (SELECT origin_type FROM dfe_source LIMIT 0) AS origin_type, "
-        "count(*) FILTER (WHERE NOT dfe_hash.invalid_row "
-        "AND NOT dfe_hash.oversized_row)::text AS valid_row_count, "
-        "{limb_sums}, "
-        "count(*) FILTER (WHERE dfe_hash.invalid_row)::text AS invalid_row_count, "
-        "count(*) FILTER (WHERE dfe_hash.oversized_row)::text AS oversized_row_count "
-        "FROM dfe_hash"
-    ).format(
-        limb_sums=limb_sums,
-        envelope=row.envelope,
-        invalid_row=row.invalid_row,
-        oversized_row=row.oversized_row,
-        relation=sql.Identifier(*inspection.relation.components),
-    )
-    return PostgresQuery(
-        statement=statement,
-        parameters=(context.schema_digest_hex, len(context.schema.fields)),
-        context=context,
-        inspected_relation=inspection,
-        max_encoded_envelope_bytes=max_encoded_envelope_bytes,
+
+
+def build_postgres_union_fingerprint_query(
+    schema: CanonicalSchema,
+    relations: tuple[PostgresQueryRelation, ...],
+    max_encoded_envelope_bytes: int,
+) -> PostgresQuery:
+    return _build_postgres_fingerprint_query(
+        schema,
+        relations,
+        max_encoded_envelope_bytes,
+        _postgres_17_digest_expression,
     )
 
 
@@ -390,46 +542,107 @@ def build_postgres_legacy_fingerprint_query(
     inspection: PostgresInspectedRelation,
     max_encoded_envelope_bytes: int,
 ) -> PostgresQuery:
-    validate_postgres_inspection(schema, inspection)
+    return build_postgres_legacy_union_fingerprint_query(
+        schema,
+        _single_query_relation(inspection),
+        max_encoded_envelope_bytes,
+    )
+
+
+def build_postgres_legacy_union_fingerprint_query(
+    schema: CanonicalSchema,
+    relations: tuple[PostgresQueryRelation, ...],
+    max_encoded_envelope_bytes: int,
+) -> PostgresQuery:
+    return _build_postgres_fingerprint_query(
+        schema,
+        relations,
+        max_encoded_envelope_bytes,
+        _postgres_9_6_digest_expression,
+    )
+
+
+def _build_postgres_fingerprint_query(
+    schema: CanonicalSchema,
+    relations: tuple[PostgresQueryRelation, ...],
+    max_encoded_envelope_bytes: int,
+    digest_expression: Callable[[sql.Composable], sql.Composable],
+) -> PostgresQuery:
+    _validate_query_relations_for_schema(schema, relations)
     _validate_positive_integer(
         max_encoded_envelope_bytes,
         "PostgreSQL max encoded envelope byte length",
         INT64_MAX,
     )
     context = prepare_envelope_context(schema)
-    row = _row_lowering_for_alias(
-        schema,
-        inspection.bindings,
-        max_encoded_envelope_bytes,
-        "dfe_origin",
+    branches: list[sql.Composable] = []
+    parameters: list[PostgresParameter] = []
+    for index, relation in enumerate(relations):
+        source_alias = f"dfe_origin_{index}"
+        row = _row_lowering_for_alias(
+            schema,
+            relation.inspection.bindings,
+            max_encoded_envelope_bytes,
+            source_alias,
+        )
+        branch_limb_sums = sql.SQL(", ").join(
+            _limb_sum_expression(limb_index) for limb_index in range(8)
+        )
+        branches.append(
+            sql.SQL(
+                "SELECT {origin_types}, "
+                "count(*) FILTER (WHERE NOT dfe_row.invalid_row "
+                "AND NOT dfe_row.oversized_row)::text AS valid_row_count, "
+                "{limb_sums}, "
+                "count(*) FILTER (WHERE dfe_row.invalid_row)::text AS invalid_row_count, "
+                "count(*) FILTER (WHERE dfe_row.oversized_row)::text "
+                "AS oversized_row_count "
+                "FROM ONLY {relation} AS {source_alias} "
+                "CROSS JOIN LATERAL (SELECT {envelope} AS envelope, "
+                "{invalid_row} AS invalid_row, {oversized_row} AS oversized_row "
+                "OFFSET 0) AS dfe_row "
+                "CROSS JOIN LATERAL (SELECT {row_hash} AS row_hash OFFSET 0) AS dfe_hash "
+                "WHERE {contributes_rows}"
+            ).format(
+                origin_types=_aggregate_origin_type_branch_projections(
+                    relations,
+                    index,
+                    source_alias,
+                ),
+                envelope=row.envelope,
+                invalid_row=row.invalid_row,
+                oversized_row=row.oversized_row,
+                relation=sql.Identifier(*relation.inspection.relation.components),
+                source_alias=sql.Identifier(source_alias),
+                contributes_rows=_contribution_filter(relation),
+                row_hash=digest_expression(sql.SQL("dfe_row.envelope")),
+                limb_sums=branch_limb_sums,
+            )
+        )
+        parameters.extend((context.schema_digest_hex, len(context.schema.fields)))
+    combined_limb_sums = sql.SQL(", ").join(
+        sql.SQL(
+            "coalesce(sum((dfe_member.{column})::numeric), 0::numeric)::text AS {column}"
+        ).format(column=sql.Identifier(f"limb_{index}"))
+        for index in range(8)
     )
-    limb_sums = sql.SQL(", ").join(_limb_sum_expression(index) for index in range(8))
-    # PostgreSQL 9.6 materializes CTEs, so the legacy profile uses one direct aggregate scan.
     statement = sql.SQL(
-        "SELECT (pg_catalog.array_agg((dfe_origin.*)) FILTER (WHERE FALSE))[1] "
-        "AS origin_type, "
-        "count(*) FILTER (WHERE NOT dfe_row.invalid_row "
-        "AND NOT dfe_row.oversized_row)::text AS valid_row_count, "
+        "SELECT {origin_types}, "
+        "sum((dfe_member.valid_row_count)::numeric)::text AS valid_row_count, "
         "{limb_sums}, "
-        "count(*) FILTER (WHERE dfe_row.invalid_row)::text AS invalid_row_count, "
-        "count(*) FILTER (WHERE dfe_row.oversized_row)::text AS oversized_row_count "
-        "FROM ONLY {relation} AS dfe_origin "
-        "CROSS JOIN LATERAL (SELECT {envelope} AS envelope, "
-        "{invalid_row} AS invalid_row, {oversized_row} AS oversized_row OFFSET 0) AS dfe_row "
-        "CROSS JOIN LATERAL (SELECT {row_hash} AS row_hash OFFSET 0) AS dfe_hash"
+        "sum((dfe_member.invalid_row_count)::numeric)::text AS invalid_row_count, "
+        "sum((dfe_member.oversized_row_count)::numeric)::text AS oversized_row_count "
+        "FROM ({source_branches}) AS dfe_member"
     ).format(
-        limb_sums=limb_sums,
-        envelope=row.envelope,
-        invalid_row=row.invalid_row,
-        oversized_row=row.oversized_row,
-        relation=sql.Identifier(*inspection.relation.components),
-        row_hash=_postgres_9_6_digest_expression(sql.SQL("dfe_row.envelope")),
+        source_branches=sql.SQL(" UNION ALL ").join(branches),
+        origin_types=_aggregate_origin_type_projections(relations, "dfe_member"),
+        limb_sums=combined_limb_sums,
     )
     return PostgresQuery(
         statement=statement,
-        parameters=(context.schema_digest_hex, len(context.schema.fields)),
+        parameters=tuple(parameters),
         context=context,
-        inspected_relation=inspection,
+        relations=relations,
         max_encoded_envelope_bytes=max_encoded_envelope_bytes,
     )
 
@@ -441,13 +654,12 @@ def build_postgres_integer_key_summary_query(
     scope: PostgresScopePredicate | None,
     max_encoded_envelope_bytes: int,
 ) -> PostgresQuery:
-    return _build_postgres_integer_key_summary_query(
+    return build_postgres_union_integer_key_summary_query(
         schema,
-        inspection,
+        _single_query_relation(inspection),
         key_field_index,
         scope,
         max_encoded_envelope_bytes,
-        _usable_integer_key_access_path,
     )
 
 
@@ -458,9 +670,42 @@ def build_postgres_legacy_integer_key_summary_query(
     scope: PostgresScopePredicate | None,
     max_encoded_envelope_bytes: int,
 ) -> PostgresQuery:
+    return build_postgres_legacy_union_integer_key_summary_query(
+        schema,
+        _single_query_relation(inspection),
+        key_field_index,
+        scope,
+        max_encoded_envelope_bytes,
+    )
+
+
+def build_postgres_union_integer_key_summary_query(
+    schema: CanonicalSchema,
+    relations: tuple[PostgresQueryRelation, ...],
+    key_field_index: int,
+    scope: PostgresScopePredicate | None,
+    max_encoded_envelope_bytes: int,
+) -> PostgresQuery:
     return _build_postgres_integer_key_summary_query(
         schema,
-        inspection,
+        relations,
+        key_field_index,
+        scope,
+        max_encoded_envelope_bytes,
+        _usable_integer_key_access_path,
+    )
+
+
+def build_postgres_legacy_union_integer_key_summary_query(
+    schema: CanonicalSchema,
+    relations: tuple[PostgresQueryRelation, ...],
+    key_field_index: int,
+    scope: PostgresScopePredicate | None,
+    max_encoded_envelope_bytes: int,
+) -> PostgresQuery:
+    return _build_postgres_integer_key_summary_query(
+        schema,
+        relations,
         key_field_index,
         scope,
         max_encoded_envelope_bytes,
@@ -470,56 +715,89 @@ def build_postgres_legacy_integer_key_summary_query(
 
 def _build_postgres_integer_key_summary_query(
     schema: CanonicalSchema,
-    inspection: PostgresInspectedRelation,
+    relations: tuple[PostgresQueryRelation, ...],
     key_field_index: int,
     scope: PostgresScopePredicate | None,
     max_encoded_envelope_bytes: int,
     access_path_expression: Callable[[PostgresInspectedRelation, str], sql.Composable],
 ) -> PostgresQuery:
-    validate_postgres_inspection(schema, inspection)
+    _validate_query_relations_for_schema(schema, relations)
     _validate_positive_integer(
         max_encoded_envelope_bytes,
         "PostgreSQL max encoded envelope byte length",
         INT64_MAX,
     )
-    key = _integer_key_lowering(schema, inspection, key_field_index, "dfe_origin")
-    scope_filter, scope_parameters = _scope_filter(inspection, scope, "dfe_origin")
-    valid_key = sql.SQL("{column} IS NOT NULL AND ({is_valid})").format(
-        column=key.column,
-        is_valid=key.is_valid,
-    )
-    usable_access_path = access_path_expression(
-        inspection,
-        inspection.bindings[key_field_index].column_name,
-    )
+    branches: list[sql.Composable] = []
+    parameters: list[PostgresParameter] = []
+    access_paths: list[sql.Composable] = []
+    for index, relation in enumerate(relations):
+        inspection = relation.inspection
+        source_alias = f"dfe_origin_{index}"
+        key = _integer_key_lowering(schema, inspection, key_field_index, source_alias)
+        scope_filter, scope_parameters = _scope_filter(inspection, scope, source_alias)
+        branches.append(
+            sql.SQL(
+                "SELECT {origin_types}, ({key_column})::numeric AS key_value, "
+                "{key_column} IS NULL AS null_key, "
+                "{key_column} IS NOT NULL AND NOT ({key_valid}) AS invalid_key, "
+                "{key_column} IS NOT NULL AND ({key_valid}) AS valid_key, "
+                "{source_alias}.tableoid IS NOT NULL AS has_data "
+                "FROM (VALUES (TRUE)) AS dfe_seed(seed) "
+                "LEFT JOIN ONLY {relation} AS {source_alias} ON "
+                "({scope_filter}) AND {contributes_rows}"
+            ).format(
+                origin_types=_origin_type_branch_projections(
+                    relations,
+                    index,
+                    source_alias,
+                ),
+                key_column=key.column,
+                key_valid=key.is_valid,
+                relation=sql.Identifier(*inspection.relation.components),
+                source_alias=sql.Identifier(source_alias),
+                scope_filter=scope_filter,
+                contributes_rows=_contribution_filter(relation),
+            )
+        )
+        parameters.extend(scope_parameters)
+        if relation.contributes_rows:
+            access_paths.append(
+                access_path_expression(
+                    inspection,
+                    inspection.bindings[key_field_index].column_name,
+                )
+            )
+    usable_access_path = sql.SQL(" AND ").join(access_paths) if access_paths else sql.SQL("TRUE")
     statement = sql.SQL(
-        "SELECT (pg_catalog.array_agg((dfe_origin.*)) FILTER (WHERE FALSE))[1] "
-        "AS origin_type, "
-        "count(*)::text AS row_count, "
-        "count(*) FILTER (WHERE {key_column} IS NULL)::text AS null_key_count, "
-        "count(*) FILTER (WHERE {key_column} IS NOT NULL AND NOT ({valid_key}))::text "
+        "SELECT {origin_types}, "
+        "count(*) FILTER (WHERE dfe_source.has_data)::text AS row_count, "
+        "count(*) FILTER (WHERE dfe_source.has_data AND dfe_source.null_key)::text "
+        "AS null_key_count, "
+        "count(*) FILTER (WHERE dfe_source.has_data AND dfe_source.invalid_key)::text "
         "AS invalid_key_count, "
-        "count(*) FILTER (WHERE {valid_key})::text AS valid_key_count, "
-        "count(DISTINCT ({key_column})::numeric) FILTER (WHERE {valid_key})::text "
+        "count(*) FILTER (WHERE dfe_source.has_data AND dfe_source.valid_key)::text "
+        "AS valid_key_count, "
+        "count(DISTINCT dfe_source.key_value) FILTER "
+        "(WHERE dfe_source.has_data AND dfe_source.valid_key)::text "
         "AS distinct_key_count, "
-        "(min(({key_column})::numeric) FILTER (WHERE {valid_key}))::bigint::text "
+        "(min(dfe_source.key_value) FILTER "
+        "(WHERE dfe_source.has_data AND dfe_source.valid_key))::bigint::text "
         "AS minimum_key, "
-        "(max(({key_column})::numeric) FILTER (WHERE {valid_key}))::bigint::text "
+        "(max(dfe_source.key_value) FILTER "
+        "(WHERE dfe_source.has_data AND dfe_source.valid_key))::bigint::text "
         "AS maximum_key, "
         "{usable_access_path} AS usable_access_path "
-        "FROM ONLY {relation} AS dfe_origin WHERE {scope_filter}"
+        "FROM ({source_branches}) AS dfe_source"
     ).format(
-        key_column=key.column,
-        valid_key=valid_key,
-        relation=sql.Identifier(*inspection.relation.components),
-        scope_filter=scope_filter,
+        source_branches=sql.SQL(" UNION ALL ").join(branches),
+        origin_types=_aggregate_origin_type_projections(relations, "dfe_source"),
         usable_access_path=usable_access_path,
     )
     return PostgresQuery(
         statement=statement,
-        parameters=scope_parameters,
+        parameters=tuple(parameters),
         context=prepare_envelope_context(schema),
-        inspected_relation=inspection,
+        relations=relations,
         max_encoded_envelope_bytes=max_encoded_envelope_bytes,
     )
 
@@ -532,14 +810,13 @@ def build_postgres_integer_range_fingerprint_query(
     ranges: tuple[PostgresIntegerRangeRequest, ...],
     max_encoded_envelope_bytes: int,
 ) -> PostgresQuery:
-    return _build_postgres_integer_range_fingerprint_query(
+    return build_postgres_union_integer_range_fingerprint_query(
         schema,
-        inspection,
+        _single_query_relation(inspection),
         key_field_index,
         scope,
         ranges,
         max_encoded_envelope_bytes,
-        _postgres_17_digest_expression,
     )
 
 
@@ -551,9 +828,46 @@ def build_postgres_legacy_integer_range_fingerprint_query(
     ranges: tuple[PostgresIntegerRangeRequest, ...],
     max_encoded_envelope_bytes: int,
 ) -> PostgresQuery:
+    return build_postgres_legacy_union_integer_range_fingerprint_query(
+        schema,
+        _single_query_relation(inspection),
+        key_field_index,
+        scope,
+        ranges,
+        max_encoded_envelope_bytes,
+    )
+
+
+def build_postgres_union_integer_range_fingerprint_query(
+    schema: CanonicalSchema,
+    relations: tuple[PostgresQueryRelation, ...],
+    key_field_index: int,
+    scope: PostgresScopePredicate | None,
+    ranges: tuple[PostgresIntegerRangeRequest, ...],
+    max_encoded_envelope_bytes: int,
+) -> PostgresQuery:
     return _build_postgres_integer_range_fingerprint_query(
         schema,
-        inspection,
+        relations,
+        key_field_index,
+        scope,
+        ranges,
+        max_encoded_envelope_bytes,
+        _postgres_17_digest_expression,
+    )
+
+
+def build_postgres_legacy_union_integer_range_fingerprint_query(
+    schema: CanonicalSchema,
+    relations: tuple[PostgresQueryRelation, ...],
+    key_field_index: int,
+    scope: PostgresScopePredicate | None,
+    ranges: tuple[PostgresIntegerRangeRequest, ...],
+    max_encoded_envelope_bytes: int,
+) -> PostgresQuery:
+    return _build_postgres_integer_range_fingerprint_query(
+        schema,
+        relations,
         key_field_index,
         scope,
         ranges,
@@ -564,14 +878,14 @@ def build_postgres_legacy_integer_range_fingerprint_query(
 
 def _build_postgres_integer_range_fingerprint_query(
     schema: CanonicalSchema,
-    inspection: PostgresInspectedRelation,
+    relations: tuple[PostgresQueryRelation, ...],
     key_field_index: int,
     scope: PostgresScopePredicate | None,
     ranges: tuple[PostgresIntegerRangeRequest, ...],
     max_encoded_envelope_bytes: int,
     digest_expression: Callable[[sql.Composable], sql.Composable],
 ) -> PostgresQuery:
-    validate_postgres_inspection(schema, inspection)
+    _validate_query_relations_for_schema(schema, relations)
     _validate_positive_integer(
         max_encoded_envelope_bytes,
         "PostgreSQL max encoded envelope byte length",
@@ -579,67 +893,114 @@ def _build_postgres_integer_range_fingerprint_query(
     )
     _validate_integer_ranges(ranges)
     context = prepare_envelope_context(schema)
-    row = _row_lowering_for_alias(
-        schema,
-        inspection.bindings,
-        max_encoded_envelope_bytes,
-        "dfe_origin",
-    )
-    key = _integer_key_lowering(schema, inspection, key_field_index, "dfe_origin")
-    scope_filter, scope_parameters = _scope_filter(inspection, scope, "dfe_origin")
+    branches: list[sql.Composable] = []
+    parameters: list[PostgresParameter] = []
+    for index, relation in enumerate(relations):
+        inspection = relation.inspection
+        source_alias = f"dfe_origin_{index}"
+        row = _row_lowering_for_alias(
+            schema,
+            inspection.bindings,
+            max_encoded_envelope_bytes,
+            source_alias,
+        )
+        key = _integer_key_lowering(schema, inspection, key_field_index, source_alias)
+        scope_filter, scope_parameters = _scope_filter(inspection, scope, source_alias)
+        branch_limb_sums = sql.SQL(", ").join(
+            _limb_sum_expression(limb_index) for limb_index in range(8)
+        )
+        branches.append(
+            sql.SQL(
+                "SELECT {origin_types}, dfe_range.segment_id, dfe_range.ordinal, "
+                "dfe_member.valid_row_count, {member_limbs}, "
+                "dfe_member.invalid_row_count, dfe_member.oversized_row_count, "
+                "dfe_member.row_envelope_bytes, dfe_member.key_envelope_bytes "
+                "FROM dfe_ranges AS dfe_range CROSS JOIN LATERAL ("
+                "SELECT {aggregate_origin_types}, "
+                "count(*) FILTER (WHERE NOT dfe_row.invalid_row "
+                "AND NOT dfe_row.oversized_row)::text AS valid_row_count, "
+                "{branch_limb_sums}, "
+                "count(*) FILTER (WHERE dfe_row.invalid_row)::text AS invalid_row_count, "
+                "count(*) FILTER (WHERE dfe_row.oversized_row)::text "
+                "AS oversized_row_count, "
+                "coalesce(sum(octet_length(dfe_row.row_envelope)) FILTER "
+                "(WHERE NOT dfe_row.invalid_row AND NOT dfe_row.oversized_row), "
+                "0::numeric)::text AS row_envelope_bytes, "
+                "coalesce(sum(octet_length(dfe_row.key_envelope)) FILTER "
+                "(WHERE NOT dfe_row.invalid_row AND NOT dfe_row.oversized_row), "
+                "0::numeric)::text AS key_envelope_bytes "
+                "FROM ONLY {relation} AS {source_alias} "
+                "CROSS JOIN LATERAL (SELECT {row_envelope} AS row_envelope, "
+                "{key_envelope} AS key_envelope, {invalid_row} AS invalid_row, "
+                "{oversized_row} AS oversized_row OFFSET 0) AS dfe_row "
+                "CROSS JOIN LATERAL (SELECT {row_hash} AS row_hash OFFSET 0) AS dfe_hash "
+                "WHERE ({scope_filter}) AND {contributes_rows} "
+                "AND {key_column} IS NOT NULL AND ({key_valid}) "
+                "AND {key_column} >= dfe_range.lower_inclusive "
+                "AND (dfe_range.upper_exclusive IS NULL "
+                "OR {key_column} < dfe_range.upper_exclusive)"
+                ") AS dfe_member"
+            ).format(
+                origin_types=_origin_type_columns(relations, "dfe_member"),
+                aggregate_origin_types=_aggregate_origin_type_branch_projections(
+                    relations,
+                    index,
+                    source_alias,
+                ),
+                member_limbs=sql.SQL(", ").join(
+                    sql.Identifier("dfe_member", f"limb_{limb_index}") for limb_index in range(8)
+                ),
+                branch_limb_sums=branch_limb_sums,
+                key_column=key.column,
+                row_envelope=row.envelope,
+                key_envelope=key.envelope,
+                invalid_row=row.invalid_row,
+                oversized_row=row.oversized_row,
+                relation=sql.Identifier(*inspection.relation.components),
+                source_alias=sql.Identifier(source_alias),
+                scope_filter=scope_filter,
+                contributes_rows=_contribution_filter(relation),
+                key_valid=key.is_valid,
+                row_hash=digest_expression(sql.SQL("dfe_row.row_envelope")),
+            )
+        )
+        parameters.extend((context.schema_digest_hex, len(context.schema.fields)))
+        parameters.extend(scope_parameters)
     ranges_values = _integer_range_values(ranges)
-    limb_sums = sql.SQL(", ").join(_limb_sum_expression(index) for index in range(8))
+    combined_limb_sums = sql.SQL(", ").join(
+        sql.SQL(
+            "coalesce(sum((dfe_member.{column})::numeric), 0::numeric)::text AS {column}"
+        ).format(column=sql.Identifier(f"limb_{index}"))
+        for index in range(8)
+    )
     statement = sql.SQL(
         "WITH dfe_ranges(segment_id, lower_inclusive, upper_exclusive, ordinal) AS ("
         "VALUES {ranges_values}"
-        ") SELECT dfe_aggregate.origin_type, dfe_range.segment_id, "
-        "dfe_aggregate.valid_row_count, dfe_aggregate.limb_0, "
-        "dfe_aggregate.limb_1, dfe_aggregate.limb_2, dfe_aggregate.limb_3, "
-        "dfe_aggregate.limb_4, dfe_aggregate.limb_5, dfe_aggregate.limb_6, "
-        "dfe_aggregate.limb_7, dfe_aggregate.invalid_row_count, "
-        "dfe_aggregate.oversized_row_count, dfe_aggregate.row_envelope_bytes, "
-        "dfe_aggregate.key_envelope_bytes FROM dfe_ranges AS dfe_range "
-        "CROSS JOIN LATERAL (SELECT "
-        "(pg_catalog.array_agg((dfe_origin.*)) FILTER (WHERE FALSE))[1] "
-        "AS origin_type, "
-        "count(*) FILTER (WHERE NOT dfe_row.invalid_row "
-        "AND NOT dfe_row.oversized_row)::text AS valid_row_count, {limb_sums}, "
-        "count(*) FILTER (WHERE dfe_row.invalid_row)::text AS invalid_row_count, "
-        "count(*) FILTER (WHERE dfe_row.oversized_row)::text AS oversized_row_count, "
-        "coalesce(sum(octet_length(dfe_row.row_envelope)) FILTER "
-        "(WHERE NOT dfe_row.invalid_row AND NOT dfe_row.oversized_row), "
-        "0::numeric)::text AS row_envelope_bytes, "
-        "coalesce(sum(octet_length(dfe_row.key_envelope)) FILTER "
-        "(WHERE NOT dfe_row.invalid_row AND NOT dfe_row.oversized_row), "
-        "0::numeric)::text AS key_envelope_bytes "
-        "FROM ONLY {relation} AS dfe_origin "
-        "CROSS JOIN LATERAL (SELECT {row_envelope} AS row_envelope, "
-        "{key_envelope} AS key_envelope, {invalid_row} AS invalid_row, "
-        "{oversized_row} AS oversized_row OFFSET 0) AS dfe_row "
-        "CROSS JOIN LATERAL (SELECT {row_hash} AS row_hash OFFSET 0) AS dfe_hash "
-        "WHERE {scope_filter} AND {key_column} IS NOT NULL AND ({key_valid}) "
-        "AND {key_column} >= dfe_range.lower_inclusive "
-        "AND (dfe_range.upper_exclusive IS NULL "
-        "OR {key_column} < dfe_range.upper_exclusive)) AS dfe_aggregate "
-        "ORDER BY dfe_range.ordinal"
+        ") SELECT {origin_types}, dfe_member.segment_id, "
+        "coalesce(sum((dfe_member.valid_row_count)::numeric), 0::numeric)::text "
+        "AS valid_row_count, {limb_sums}, "
+        "coalesce(sum((dfe_member.invalid_row_count)::numeric), 0::numeric)::text "
+        "AS invalid_row_count, "
+        "coalesce(sum((dfe_member.oversized_row_count)::numeric), 0::numeric)::text "
+        "AS oversized_row_count, "
+        "coalesce(sum((dfe_member.row_envelope_bytes)::numeric), 0::numeric)::text "
+        "AS row_envelope_bytes, "
+        "coalesce(sum((dfe_member.key_envelope_bytes)::numeric), 0::numeric)::text "
+        "AS key_envelope_bytes "
+        "FROM ({source_branches}) AS dfe_member "
+        "GROUP BY dfe_member.ordinal, dfe_member.segment_id "
+        "ORDER BY dfe_member.ordinal"
     ).format(
+        source_branches=sql.SQL(" UNION ALL ").join(branches),
         ranges_values=ranges_values,
-        row_envelope=row.envelope,
-        key_envelope=key.envelope,
-        invalid_row=row.invalid_row,
-        oversized_row=row.oversized_row,
-        relation=sql.Identifier(*inspection.relation.components),
-        scope_filter=scope_filter,
-        key_column=key.column,
-        key_valid=key.is_valid,
-        limb_sums=limb_sums,
-        row_hash=digest_expression(sql.SQL("dfe_row.row_envelope")),
+        origin_types=_aggregate_origin_type_projections(relations, "dfe_member"),
+        limb_sums=combined_limb_sums,
     )
     return PostgresQuery(
         statement=statement,
-        parameters=(context.schema_digest_hex, len(context.schema.fields), *scope_parameters),
+        parameters=tuple(parameters),
         context=context,
-        inspected_relation=inspection,
+        relations=relations,
         max_encoded_envelope_bytes=max_encoded_envelope_bytes,
     )
 
@@ -666,7 +1027,25 @@ def build_postgres_integer_range_rows_query(
     ranges: tuple[PostgresIntegerRangeRequest, ...],
     max_encoded_envelope_bytes: int,
 ) -> PostgresQuery:
-    validate_postgres_inspection(schema, inspection)
+    return build_postgres_union_integer_range_rows_query(
+        schema,
+        _single_query_relation(inspection),
+        key_field_index,
+        scope,
+        ranges,
+        max_encoded_envelope_bytes,
+    )
+
+
+def build_postgres_union_integer_range_rows_query(
+    schema: CanonicalSchema,
+    relations: tuple[PostgresQueryRelation, ...],
+    key_field_index: int,
+    scope: PostgresScopePredicate | None,
+    ranges: tuple[PostgresIntegerRangeRequest, ...],
+    max_encoded_envelope_bytes: int,
+) -> PostgresQuery:
+    _validate_query_relations_for_schema(schema, relations)
     _validate_positive_integer(
         max_encoded_envelope_bytes,
         "PostgreSQL max encoded envelope byte length",
@@ -674,44 +1053,90 @@ def build_postgres_integer_range_rows_query(
     )
     _validate_integer_ranges(ranges)
     context = prepare_envelope_context(schema)
-    row = _row_lowering_for_alias(
-        schema,
-        inspection.bindings,
-        max_encoded_envelope_bytes,
-        "dfe_origin",
-    )
-    key = _integer_key_lowering(schema, inspection, key_field_index, "dfe_origin")
-    scope_filter, scope_parameters = _scope_filter(inspection, scope, "dfe_origin")
+    branches: list[sql.Composable] = []
+    parameters: list[PostgresParameter] = []
+    for index, relation in enumerate(relations):
+        inspection = relation.inspection
+        source_alias = f"dfe_origin_{index}"
+        row = _row_lowering_for_alias(
+            schema,
+            inspection.bindings,
+            max_encoded_envelope_bytes,
+            source_alias,
+        )
+        key = _integer_key_lowering(schema, inspection, key_field_index, source_alias)
+        scope_filter, scope_parameters = _scope_filter(inspection, scope, source_alias)
+        branches.append(
+            sql.SQL(
+                "SELECT {origin_types}, dfe_range.segment_id, dfe_range.ordinal, "
+                "{branch_ordinal}::integer AS branch_ordinal, "
+                "({key_column})::bigint AS key_value, {key_envelope} AS key_envelope, "
+                "{row_envelope} AS row_envelope, "
+                "{invalid_row} AS invalid_row, {oversized_row} AS oversized_row, "
+                "{source_alias}.tableoid IS NOT NULL AS has_data "
+                "FROM dfe_ranges AS dfe_range LEFT JOIN ONLY {relation} AS {source_alias} ON "
+                "({scope_filter}) AND {contributes_rows} "
+                "AND {key_column} IS NOT NULL AND ({key_valid}) "
+                "AND {key_column} >= dfe_range.lower_inclusive "
+                "AND (dfe_range.upper_exclusive IS NULL "
+                "OR {key_column} < dfe_range.upper_exclusive)"
+            ).format(
+                origin_types=_origin_type_branch_projections(
+                    relations,
+                    index,
+                    source_alias,
+                ),
+                branch_ordinal=sql.Literal(index),
+                key_column=key.column,
+                key_envelope=key.envelope,
+                row_envelope=row.envelope,
+                invalid_row=row.invalid_row,
+                oversized_row=row.oversized_row,
+                relation=sql.Identifier(*inspection.relation.components),
+                source_alias=sql.Identifier(source_alias),
+                scope_filter=scope_filter,
+                contributes_rows=_contribution_filter(relation),
+                key_valid=key.is_valid,
+            )
+        )
+        parameters.extend((context.schema_digest_hex, len(context.schema.fields)))
+        parameters.extend(scope_parameters)
     statement = sql.SQL(
         "WITH dfe_ranges(segment_id, lower_inclusive, upper_exclusive, ordinal) AS ("
         "VALUES {ranges_values}"
-        ") SELECT "
-        "CASE WHEN FALSE THEN (dfe_origin.*) ELSE NULL END AS origin_type, "
-        "dfe_range.segment_id, {key_envelope} AS key_envelope, "
-        "{row_envelope} AS row_envelope, {invalid_row} AS invalid_row, "
-        "{oversized_row} AS oversized_row "
-        "FROM dfe_ranges AS dfe_range JOIN ONLY {relation} AS dfe_origin ON "
-        "{scope_filter} AND {key_column} IS NOT NULL AND ({key_valid}) "
-        "AND {key_column} >= dfe_range.lower_inclusive "
-        "AND (dfe_range.upper_exclusive IS NULL "
-        "OR {key_column} < dfe_range.upper_exclusive) "
-        "ORDER BY dfe_range.ordinal, {key_column}"
+        ") SELECT {origin_types}, dfe_provenance.has_data, "
+        "CASE WHEN dfe_provenance.has_data THEN dfe_provenance.segment_id "
+        "ELSE NULL::text END AS segment_id, "
+        "CASE WHEN dfe_provenance.has_data THEN dfe_provenance.key_envelope "
+        "ELSE NULL::text END AS key_envelope, "
+        "CASE WHEN dfe_provenance.has_data THEN dfe_provenance.row_envelope "
+        "ELSE NULL::text END AS row_envelope, "
+        "CASE WHEN dfe_provenance.has_data THEN dfe_provenance.invalid_row "
+        "ELSE NULL::boolean END AS invalid_row, "
+        "CASE WHEN dfe_provenance.has_data THEN dfe_provenance.oversized_row "
+        "ELSE NULL::boolean END AS oversized_row FROM ("
+        "SELECT {window_origin_types}, dfe_source.segment_id, dfe_source.ordinal, "
+        "dfe_source.branch_ordinal, dfe_source.key_value, dfe_source.key_envelope, "
+        "dfe_source.row_envelope, dfe_source.invalid_row, "
+        "dfe_source.oversized_row, dfe_source.has_data, "
+        "count(*) FILTER (WHERE dfe_source.has_data) OVER () AS data_count, "
+        "row_number() OVER (ORDER BY dfe_source.ordinal, "
+        "dfe_source.branch_ordinal) AS witness_ordinal "
+        "FROM ({source_branches}) AS dfe_source"
+        ") AS dfe_provenance WHERE dfe_provenance.has_data "
+        "OR (dfe_provenance.data_count = 0 AND dfe_provenance.witness_ordinal = 1) "
+        "ORDER BY dfe_provenance.ordinal, dfe_provenance.key_value"
     ).format(
+        source_branches=sql.SQL(" UNION ALL ").join(branches),
         ranges_values=_integer_range_values(ranges),
-        key_envelope=key.envelope,
-        row_envelope=row.envelope,
-        invalid_row=row.invalid_row,
-        oversized_row=row.oversized_row,
-        relation=sql.Identifier(*inspection.relation.components),
-        scope_filter=scope_filter,
-        key_column=key.column,
-        key_valid=key.is_valid,
+        origin_types=_origin_type_columns(relations, "dfe_provenance"),
+        window_origin_types=_window_origin_type_projections(relations, "dfe_source"),
     )
     return PostgresQuery(
         statement=statement,
-        parameters=(context.schema_digest_hex, len(context.schema.fields), *scope_parameters),
+        parameters=tuple(parameters),
         context=context,
-        inspected_relation=inspection,
+        relations=relations,
         max_encoded_envelope_bytes=max_encoded_envelope_bytes,
     )
 
@@ -943,15 +1368,6 @@ def _validate_integer_ranges(value: object) -> None:
                     "PostgreSQL integer ranges must be ordered and disjoint"
                 )
         previous_upper = item.upper_exclusive
-
-
-def _row_lowering(
-    schema: CanonicalSchema,
-    bindings: tuple[PostgresFieldBinding, ...],
-    max_encoded_envelope_bytes: int,
-) -> _RowLowering:
-    columns = tuple(sql.Identifier(binding.column_name) for binding in bindings)
-    return _row_lowering_from_columns(schema, columns, max_encoded_envelope_bytes)
 
 
 def _row_lowering_for_alias(
@@ -1437,6 +1853,40 @@ def _require_relation(value: object) -> None:
 def _require_inspected_relation(value: object) -> None:
     if not isinstance(value, PostgresInspectedRelation):
         raise PostgresLoweringError("inspection must be a PostgresInspectedRelation")
+
+
+def _require_query_relations(value: object) -> None:
+    if type(value) is not tuple or not value:
+        raise PostgresLoweringError(
+            "PostgreSQL query relations must be a non-empty immutable tuple"
+        )
+    relations = cast(tuple[object, ...], value)
+    if len(relations) > MAX_COMPILED_RELATION_MEMBERS:
+        raise PostgresLoweringError(
+            "PostgreSQL compiled union exceeds the relation member limit: "
+            f"members={len(relations)}, maximum={MAX_COMPILED_RELATION_MEMBERS}"
+        )
+    context_id: UUID | None = None
+    seen_oids: set[int] = set()
+    for index, relation in enumerate(relations):
+        if not isinstance(relation, PostgresQueryRelation):
+            raise PostgresLoweringError(
+                "PostgreSQL query relations must contain PostgresQueryRelation values: "
+                f"index={index}"
+            )
+        inspection = relation.inspection
+        if context_id is None:
+            context_id = inspection.context_id
+        elif inspection.context_id != context_id:
+            raise PostgresLoweringError(
+                "PostgreSQL query relations must belong to one read context"
+            )
+        if inspection.relation_oid in seen_oids:
+            raise PostgresLoweringError(
+                "PostgreSQL query relations must not contain duplicate relation OIDs: "
+                f"relation_oid={inspection.relation_oid}"
+            )
+        seen_oids.add(inspection.relation_oid)
 
 
 def _require_uuid(value: object, context: str) -> None:

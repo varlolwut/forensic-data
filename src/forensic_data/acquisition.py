@@ -877,9 +877,12 @@ def classify_dataset_acquisition(
     _require_instance(direction, PlanDirection, "dataset acquisition direction")
     _require_instance(dataset, DatasetDefinition, "dataset acquisition definition")
     if isinstance(dataset.locator, RelationLocator):
-        if dataset.locator.relation_scope is not RelationScope.PHYSICAL_ONLY:
+        if dataset.locator.relation_scope not in (
+            RelationScope.PHYSICAL_ONLY,
+            RelationScope.FROZEN_PHYSICAL_UNION,
+        ):
             raise AcquisitionValidationError(
-                "relation dataset acquisition requires physical_only scope"
+                "relation dataset acquisition requires physical_only or frozen_physical_union scope"
             )
         return None
     return _unsupported_capability_outcome(

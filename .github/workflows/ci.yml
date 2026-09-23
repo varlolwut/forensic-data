@@ -123,7 +123,7 @@ jobs:
             --requirements /tmp/forensic-data-runtime.txt
           uv pip install --python .artifact-venv/bin/python --no-deps dist/*.whl
           .artifact-venv/bin/python -c "import forensic_data; print(forensic_data.__version__)"
-          .artifact-venv/bin/python -c "from importlib.resources import files; root = files('forensic_data.persistence'); assert root.joinpath('sql/migrations/0001_initial.sql').read_bytes(); assert root.joinpath('sql/migrations/0002_run_lifecycle.sql').read_bytes(); assert root.joinpath('sql/migrations/0003_completed_comparisons.sql').read_bytes(); assert root.joinpath('sql/migrations/0004_retained_anomalies.sql').read_bytes(); assert root.joinpath('sql/bootstrap.sql').read_bytes()"
+          .artifact-venv/bin/python -c "from importlib.resources import files; root = files('forensic_data.persistence'); assert root.joinpath('sql/migrations/0001_initial.sql').read_bytes(); assert root.joinpath('sql/migrations/0002_run_lifecycle.sql').read_bytes(); assert root.joinpath('sql/migrations/0003_completed_comparisons.sql').read_bytes(); assert root.joinpath('sql/migrations/0004_retained_anomalies.sql').read_bytes(); assert root.joinpath('sql/migrations/0005_frozen_physical_union.sql').read_bytes(); assert root.joinpath('sql/bootstrap.sql').read_bytes()"
           .artifact-venv/bin/forensics --help
           .artifact-venv/bin/forensics plan --config examples/postgres-relation-manifest/contract.yaml --check daily_orders --scope-json '{"business_date":"2026-09-23"}' --output json
       - name: Upload package artifacts

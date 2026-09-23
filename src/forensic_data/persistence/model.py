@@ -212,8 +212,14 @@ class DatasetVersionDefinition:
         _require_nonblank_text(self.profile, "dataset profile")
         _require_enum(self.locator_kind, DatasetLocatorKind, "dataset locator kind")
         if self.locator_kind is DatasetLocatorKind.RELATION:
-            if self.relation_scope is not RelationScope.PHYSICAL_ONLY:
-                raise ValueError("relation dataset requires physical_only relation scope")
+            _require_enum(self.relation_scope, RelationScope, "dataset relation scope")
+            if self.relation_scope not in (
+                RelationScope.PHYSICAL_ONLY,
+                RelationScope.FROZEN_PHYSICAL_UNION,
+            ):
+                raise ValueError(
+                    "relation dataset requires physical_only or frozen_physical_union relation scope"
+                )
         elif self.relation_scope is not None:
             raise ValueError("SQL dataset cannot have a relation scope")
         _require_canonical_object_json(self.semantic_payload_json, "dataset semantic payload")
@@ -833,7 +839,7 @@ def _require_dataset_body_shape(
     locator = _semantic_object(body["locator"], f"{context} locator")
     locator_kind = _semantic_text(locator.get("kind"), f"{context} locator kind")
     if locator_kind == DatasetLocatorKind.RELATION.value:
-        _require_relation_locator(locator, RelationScope.PHYSICAL_ONLY)
+        _require_dataset_relation_locator(locator, f"{context} locator")
     elif locator_kind == DatasetLocatorKind.SQL.value:
         _sql_artifact_identity(locator, f"{context} locator")
     else:
@@ -1047,6 +1053,30 @@ def _require_relation_locator(
         raise ValueError("PostgreSQL relation locator catalog must be null")
     _semantic_nonempty_text(locator["schema"], "relation locator schema")
     _semantic_nonempty_text(locator["name"], "relation locator name")
+
+
+def _require_dataset_relation_locator(
+    locator: dict[str, SemanticValue],
+    context: str,
+) -> None:
+    relation_scope_text = _semantic_text(
+        locator.get("relation_scope"),
+        f"{context} relation scope",
+    )
+    try:
+        relation_scope = RelationScope(relation_scope_text)
+    except ValueError:
+        raise ValueError(
+            f"{context} relation scope is unsupported: relation_scope={relation_scope_text!r}"
+        ) from None
+    if relation_scope not in (
+        RelationScope.PHYSICAL_ONLY,
+        RelationScope.FROZEN_PHYSICAL_UNION,
+    ):
+        raise ValueError(
+            f"{context} relation scope is unsupported: relation_scope={relation_scope_text!r}"
+        )
+    _require_relation_locator(locator, relation_scope)
 
 
 def _contract_direction_bodies(

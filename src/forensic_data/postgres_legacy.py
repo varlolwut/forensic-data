@@ -23,6 +23,7 @@ from psycopg2.extensions import (
 )
 
 from forensic_data.canonical import CanonicalSchema
+from forensic_data.contracts.model import RelationScope
 from forensic_data.postgres import (
     INT64_MAX,
     UINT32_MAX,
@@ -31,10 +32,14 @@ from forensic_data.postgres import (
     PostgresConnectionError,
     PostgresConnectionSettings,
     PostgresDataValidationError,
+    PostgresInheritanceDetachState,
+    PostgresMetadataError,
     PostgresProtectedReadContext,
     PostgresProtectedReadContextEvidence,
+    PostgresProtectedRelationInspection,
     PostgresReadContext,
     PostgresRelationAcquisition,
+    PostgresRelationKind,
     PostgresRelationPersistence,
     PostgresRetryPolicy,
     PostgresServerProfile,
@@ -45,31 +50,34 @@ from forensic_data.postgres import (
     _configure_protected_snapshot_invariants,
     _configure_protected_statement_timeout,
     _database_row_bytes,
-    _discover_relation_candidate,
+    _discover_physical_relation_candidate,
+    _execute_pretransaction_candidate_bounded,
     _execute_setup_bounded,
     _execute_source_command,
-    _inspect_protected_candidate,
+    _frozen_candidate_from_rows,
     _lock_candidate_relation,
     _PostgresRelationCandidate,
+    _PostgresRelationMemberCandidate,
     _profile_and_evidence,
     _protected_acquisition_database_error_message,
     _ProtectedAcquisitionReceipt,
     _require_boolean,
     _require_bounded_integer,
     _require_text,
+    _seal_protected_candidate,
     _unique_lock_candidates,
     _validate_and_order_acquisitions,
     _validate_protected_lock_timeout,
 )
 from forensic_data.postgres_sql import (
-    PostgresInspectedRelation,
     PostgresIntegerRangeRequest,
     PostgresQuery,
+    PostgresQueryRelation,
     PostgresScopePredicate,
-    build_postgres_legacy_fingerprint_query,
-    build_postgres_legacy_integer_key_summary_query,
-    build_postgres_legacy_integer_range_fingerprint_query,
-    build_postgres_legacy_row_envelope_query,
+    build_postgres_legacy_union_fingerprint_query,
+    build_postgres_legacy_union_integer_key_summary_query,
+    build_postgres_legacy_union_integer_range_fingerprint_query,
+    build_postgres_legacy_union_row_envelope_query,
 )
 
 LOGGER = logging.getLogger(__name__)
@@ -293,14 +301,14 @@ class PostgresLegacyProtectedReadContext(PostgresProtectedReadContext):
     def _build_integer_key_summary_query(
         self,
         schema: CanonicalSchema,
-        inspection: PostgresInspectedRelation,
+        relations: tuple[PostgresQueryRelation, ...],
         key_field_index: int,
         scope: PostgresScopePredicate | None,
         max_encoded_envelope_bytes: int,
     ) -> PostgresQuery:
-        return build_postgres_legacy_integer_key_summary_query(
+        return build_postgres_legacy_union_integer_key_summary_query(
             schema,
-            inspection,
+            relations,
             key_field_index,
             scope,
             max_encoded_envelope_bytes,
@@ -309,39 +317,39 @@ class PostgresLegacyProtectedReadContext(PostgresProtectedReadContext):
     def _build_row_envelope_query(
         self,
         schema: CanonicalSchema,
-        inspection: PostgresInspectedRelation,
+        relations: tuple[PostgresQueryRelation, ...],
         max_encoded_envelope_bytes: int,
     ) -> PostgresQuery:
-        return build_postgres_legacy_row_envelope_query(
+        return build_postgres_legacy_union_row_envelope_query(
             schema,
-            inspection,
+            relations,
             max_encoded_envelope_bytes,
         )
 
     def _build_fingerprint_query(
         self,
         schema: CanonicalSchema,
-        inspection: PostgresInspectedRelation,
+        relations: tuple[PostgresQueryRelation, ...],
         max_encoded_envelope_bytes: int,
     ) -> PostgresQuery:
-        return build_postgres_legacy_fingerprint_query(
+        return build_postgres_legacy_union_fingerprint_query(
             schema,
-            inspection,
+            relations,
             max_encoded_envelope_bytes,
         )
 
     def _build_integer_range_fingerprint_query(
         self,
         schema: CanonicalSchema,
-        inspection: PostgresInspectedRelation,
+        relations: tuple[PostgresQueryRelation, ...],
         key_field_index: int,
         scope: PostgresScopePredicate | None,
         ranges: tuple[PostgresIntegerRangeRequest, ...],
         max_encoded_envelope_bytes: int,
     ) -> PostgresQuery:
-        return build_postgres_legacy_integer_range_fingerprint_query(
+        return build_postgres_legacy_union_integer_range_fingerprint_query(
             schema,
-            inspection,
+            relations,
             key_field_index,
             scope,
             ranges,
@@ -473,7 +481,12 @@ def _open_legacy_protected_once(
     succeeded = False
     try:
         candidates = tuple(
-            _discover_relation_candidate(transport, acquisition, source_budget, direction)
+            _discover_legacy_relation_candidate(
+                transport,
+                acquisition,
+                source_budget,
+                direction,
+            )
             for acquisition in acquisitions
         )
         lock_candidates = _unique_lock_candidates(candidates)
@@ -515,7 +528,7 @@ def _open_legacy_protected_once(
             direction,
         )
         protected_relations = tuple(
-            _inspect_protected_candidate(
+            _inspect_legacy_protected_candidate(
                 transport,
                 candidate,
                 profile,
@@ -549,9 +562,126 @@ def _open_legacy_protected_once(
             connection.close()
 
 
+def _discover_legacy_relation_candidate(
+    connection: psycopg.Connection[DatabaseRow],
+    acquisition: PostgresRelationAcquisition,
+    source_budget: PostgresSourceBudgetAttempt,
+    direction: PostgresSourceDirection,
+) -> _PostgresRelationCandidate:
+    if acquisition.relation_scope is RelationScope.PHYSICAL_ONLY:
+        return _discover_physical_relation_candidate(
+            connection,
+            acquisition,
+            source_budget,
+            direction,
+        )
+    if acquisition.relation_scope is not RelationScope.FROZEN_PHYSICAL_UNION:
+        raise ValueError("PostgreSQL 9.6 acquisition has an unsupported relation scope")
+    statement = sql.SQL(
+        "WITH RECURSIVE dfe_root AS ("
+        "SELECT c.oid FROM pg_catalog.pg_class AS c "
+        "JOIN pg_catalog.pg_namespace AS n ON n.oid = c.relnamespace "
+        "WHERE n.nspname = %s AND c.relname = %s"
+        "), dfe_members(relation_oid) AS ("
+        "SELECT dfe_root.oid FROM dfe_root UNION "
+        "SELECT inheritance.inhrelid FROM pg_catalog.pg_inherits AS inheritance "
+        "JOIN dfe_members ON inheritance.inhparent = dfe_members.relation_oid"
+        ") SELECT c.oid::bigint, c.reltype::bigint, n.oid::bigint, n.nspname, c.relname, "
+        "c.relkind::text, c.relpersistence::text, "
+        "pg_catalog.has_table_privilege(c.oid, 'SELECT'), "
+        "c.relrowsecurity, c.relforcerowsecurity, "
+        "pg_catalog.has_schema_privilege(n.oid, 'USAGE'), "
+        "c.oid = dfe_root.oid, inheritance.inhparent::bigint, "
+        "inheritance.inhseqno::integer, "
+        "CASE WHEN inheritance.inhparent IS NULL THEN NULL::boolean ELSE FALSE::boolean END, "
+        "pg_catalog.current_setting('max_identifier_length')::integer "
+        "FROM dfe_members JOIN pg_catalog.pg_class AS c "
+        "ON c.oid = dfe_members.relation_oid "
+        "JOIN pg_catalog.pg_namespace AS n ON n.oid = c.relnamespace "
+        "CROSS JOIN dfe_root LEFT JOIN pg_catalog.pg_inherits AS inheritance "
+        "ON inheritance.inhrelid = c.oid "
+        "AND inheritance.inhparent IN (SELECT relation_oid FROM dfe_members) "
+        "ORDER BY n.nspname, c.relname, c.oid, inheritance.inhseqno, inheritance.inhparent "
+        "LIMIT %s"
+    )
+    max_records = acquisition.max_metadata_total_bytes
+    rows = _execute_pretransaction_candidate_bounded(
+        connection,
+        statement,
+        (*acquisition.relation.components, max_records + 1),
+        max_records,
+        acquisition.max_metadata_record_bytes,
+        acquisition.max_metadata_total_bytes,
+        source_budget,
+        direction,
+    )
+    if not rows:
+        raise PostgresMetadataError(
+            "PostgreSQL 9.6 frozen physical union root is missing or inaccessible during "
+            f"candidate discovery: relation={acquisition.relation.components!r}"
+        )
+    candidate = _frozen_candidate_from_rows(acquisition, rows)
+    unsupported_members = tuple(
+        member
+        for member in candidate.members
+        if member.relation_kind is not PostgresRelationKind.REGULAR
+    )
+    if unsupported_members:
+        raise PostgresMetadataError(
+            "PostgreSQL 9.6 frozen physical union contains a non-regular relation: "
+            f"relation={unsupported_members[0].relation.components!r}, "
+            f"relation_kind={unsupported_members[0].relation_kind.value!r}, required='r'"
+        )
+    return replace(
+        candidate,
+        edges=tuple(
+            replace(
+                edge,
+                detach_state=PostgresInheritanceDetachState.UNSUPPORTED_BY_SERVER,
+            )
+            for edge in candidate.edges
+        ),
+    )
+
+
+def _inspect_legacy_protected_candidate(
+    connection: psycopg.Connection[DatabaseRow],
+    candidate: _PostgresRelationCandidate,
+    profile: PostgresServerProfile,
+    evidence: PostgresProtectedReadContextEvidence,
+    source_budget: PostgresSourceBudgetAttempt,
+    direction: PostgresSourceDirection,
+) -> PostgresProtectedRelationInspection:
+    acquisition = candidate.acquisition
+    try:
+        final_candidate = _discover_legacy_relation_candidate(
+            connection,
+            acquisition,
+            source_budget,
+            direction,
+        )
+    except PostgresAcquisitionRaceError:
+        raise
+    except PostgresMetadataError as error:
+        raise PostgresAcquisitionRaceError(
+            "PostgreSQL 9.6 protected relation graph became invalid between discovery and "
+            f"the protected snapshot: relation={acquisition.relation.components!r}, "
+            f"reason={error}"
+        ) from None
+    return _seal_protected_candidate(
+        connection,
+        candidate,
+        final_candidate,
+        profile,
+        evidence,
+        source_budget,
+        direction,
+    )
+
+
 def _capture_legacy_protected_snapshot(
     connection: psycopg.Connection[DatabaseRow],
-    lock_candidates: tuple[_PostgresRelationCandidate, ...],
+    lock_candidates: tuple[_PostgresRelationMemberCandidate, ...],
     started_at: datetime,
     source_budget: PostgresSourceBudgetAttempt,
     direction: PostgresSourceDirection,
@@ -618,7 +748,7 @@ def _capture_legacy_protected_snapshot(
             raise PostgresAcquisitionRaceError(
                 "PostgreSQL 9.6 protected acquisition cannot prove an AccessShareLock for "
                 "the discovered relation before its snapshot: "
-                f"relation={candidate.acquisition.relation.components!r}, "
+                f"relation={candidate.relation.components!r}, "
                 f"relation_oid={candidate.relation_oid}"
             )
     locked_relation_oids = tuple(candidate.relation_oid for candidate in lock_candidates)
@@ -635,8 +765,8 @@ def _capture_legacy_protected_snapshot(
             *base_evidence.limitations,
             "snapshot locator uses PostgreSQL 9.6 txid_current_snapshot",
             "SHA-256 requires preinstalled pgcrypto 1.3 in schema dfe_ext",
-            "every declared physical relation holds AccessShareLock before the snapshot",
-            "only pre-acquired physical regular tables may contribute evidentiary reads",
+            "every discovered physical relation holds AccessShareLock before the snapshot",
+            "only pre-acquired regular members contribute rows through explicit ONLY scans",
         ),
         locked_relation_oids=locked_relation_oids,
         lock_mode="access_share",

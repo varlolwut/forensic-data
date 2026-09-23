@@ -29,6 +29,7 @@ class FieldEquality(StrEnum):
 
 class RelationScope(StrEnum):
     PHYSICAL_ONLY = "physical_only"
+    FROZEN_PHYSICAL_UNION = "frozen_physical_union"
 
 
 class ScopeOperator(StrEnum):

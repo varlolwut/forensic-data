@@ -41,8 +41,8 @@ def test_lifecycle_schema_enforces_aggregate_closure_and_least_privilege() -> No
     requested = required_metadata_database_settings()
     with disposable_metadata_database(requested) as settings:
         migration_report = migrate_postgres_metadata(settings.migrator, _RETRY_POLICY, 5_000)
-        assert migration_report.applied_versions == (1, 2, 3, 4)
-        assert migration_report.current_version == 4
+        assert migration_report.applied_versions == (1, 2, 3, 4, 5)
+        assert migration_report.current_version == 5
         assert (
             migrate_postgres_metadata(
                 settings.migrator,
@@ -303,14 +303,15 @@ def test_lifecycle_migration_extends_v1_history_and_rolls_back_atomically() -> N
         (2, "0002_run_lifecycle.sql"),
         (3, "0003_completed_comparisons.sql"),
         (4, "0004_retained_anomalies.sql"),
+        (5, "0005_frozen_physical_union.sql"),
     )
 
     upgrade_request = required_metadata_database_settings()
     with disposable_metadata_database(upgrade_request) as settings:
         _install_v1(settings, migrations[0])
         report = migrate_postgres_metadata(settings.migrator, _RETRY_POLICY, 5_000)
-        assert report.applied_versions == (2, 3, 4)
-        assert report.current_version == 4
+        assert report.applied_versions == (2, 3, 4, 5)
+        assert report.current_version == 5
         with connect_writer(settings.reader) as connection:
             connection.execute("SET ROLE dfe_metadata_reader")
             rows = connection.execute(
@@ -321,6 +322,7 @@ def test_lifecycle_migration_extends_v1_history_and_rolls_back_atomically() -> N
                 (2, "0002_run_lifecycle.sql"),
                 (3, "0003_completed_comparisons.sql"),
                 (4, "0004_retained_anomalies.sql"),
+                (5, "0005_frozen_physical_union.sql"),
             ]
 
     rollback_request = required_metadata_database_settings()

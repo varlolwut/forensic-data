@@ -18,7 +18,7 @@ from forensic_data.canonical import (
     TimestampParameters,
     decode_row,
 )
-from forensic_data.contracts.model import ReadinessManifestColumns
+from forensic_data.contracts.model import ReadinessManifestColumns, RelationScope
 from forensic_data.postgres import (
     PostgresConnectionError,
     PostgresConnectionSettings,
@@ -482,6 +482,7 @@ def _acquisition(
     return PostgresRelationAcquisition(
         schema=schema,
         relation=relation,
+        relation_scope=RelationScope.PHYSICAL_ONLY,
         column_names=column_names,
         max_metadata_record_bytes=_METADATA_RECORD_BYTES,
         max_metadata_total_bytes=_METADATA_TOTAL_BYTES,

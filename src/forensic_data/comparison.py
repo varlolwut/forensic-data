@@ -93,6 +93,8 @@ _SUMMARY_RECORD_BYTES = 136
 _SESSION_SETUP_RECORD_BYTES = 128
 _MAX_INT64_KEY_ENVELOPE_BYTES = 136
 _EXACT_STATUS_BYTES = 2
+_MAX_ROW_TYPE_OID_BYTES = 10
+_HAS_DATA_BYTES = 1
 _DEADLINE_CHECK_RECORDS = 64
 _POINTER_BYTES = getsizeof((None,)) - getsizeof(())
 _EMPTY_TUPLE_BYTES = getsizeof(())
@@ -742,6 +744,10 @@ class _ValidatedInputs:
     reference_scope: PostgresScopePredicate | None
     target_scope: PostgresScopePredicate | None
     max_encoded_row_bytes: int
+    reference_member_count: int
+    target_member_count: int
+    reference_physical_scan_count: int
+    target_physical_scan_count: int
 
 
 @final
@@ -824,8 +830,11 @@ class _ComparisonProgress:
 class _ExactSideReservation:
     records: int
     result_bytes: int
+    raw_records: int
+    raw_result_bytes: int
     envelope_bytes: int
     segment_identifier_bytes: int
+    member_count: int
     full_scans: int
 
 
@@ -841,8 +850,12 @@ class _ExactFrontierReservation:
 @dataclass(frozen=True, slots=True)
 class _FingerprintLevelPlan:
     requests: tuple[PostgresIntegerRangeRequest, ...]
-    side_result_bytes: int
-    record_bytes: int
+    payload_result_bytes: int
+    payload_record_bytes: int
+    reference_result_bytes: int
+    target_result_bytes: int
+    reference_full_scans: int
+    target_full_scans: int
     coordinator_peak_bytes: int
 
 
@@ -1010,7 +1023,17 @@ def _execute_postgres_integer_key_comparison(
     )
     usage = progress.usage
     _require_deadline(read_deadline.deadline_nanoseconds)
-    summary_coordinator_peak = _summary_phase_memory_bytes(budgets)
+    reference_summary_bytes = _SUMMARY_RECORD_BYTES + _provenance_bytes(
+        validated.reference_member_count
+    )
+    target_summary_bytes = _SUMMARY_RECORD_BYTES + _provenance_bytes(validated.target_member_count)
+    summary_coordinator_peak = _summary_phase_memory_bytes(
+        budgets,
+        validated.reference_member_count,
+        validated.target_member_count,
+        reference_summary_bytes,
+        target_summary_bytes,
+    )
     progress = replace(
         progress,
         usage=_usage_with_coordinator_peak(usage, summary_coordinator_peak),
@@ -1019,15 +1042,17 @@ def _execute_postgres_integer_key_comparison(
     yield progress
     _require_full_scan_capacity(
         source_budget,
-        reference_full_scans=1,
-        target_full_scans=1,
+        reference_full_scans=validated.reference_physical_scan_count,
+        target_full_scans=validated.target_physical_scan_count,
     )
     _require_budget_capacity(
         source_budget,
         budgets,
         additional_queries=4,
         additional_records=4,
-        additional_result_bytes=(2 * (_SUMMARY_RECORD_BYTES + _SESSION_SETUP_RECORD_BYTES)),
+        additional_result_bytes=(
+            reference_summary_bytes + target_summary_bytes + (2 * _SESSION_SETUP_RECORD_BYTES)
+        ),
         coordinator_bytes=summary_coordinator_peak,
     )
     reference_summary_read = reference_context.read_integer_key_summary(
@@ -1038,7 +1063,7 @@ def _execute_postgres_integer_key_comparison(
         _SUMMARY_RECORD_BYTES,
         _SUMMARY_RECORD_BYTES,
         read_deadline,
-        1,
+        validated.reference_physical_scan_count,
     )
     _require_deadline(read_deadline.deadline_nanoseconds)
     target_summary_read = target_context.read_integer_key_summary(
@@ -1049,7 +1074,7 @@ def _execute_postgres_integer_key_comparison(
         _SUMMARY_RECORD_BYTES,
         _SUMMARY_RECORD_BYTES,
         read_deadline,
-        1,
+        validated.target_physical_scan_count,
     )
     usage = _consume_source_usage(
         usage,
@@ -1118,6 +1143,10 @@ def _execute_postgres_integer_key_comparison(
             pending,
             usage,
             budgets,
+            validated.reference_member_count,
+            validated.target_member_count,
+            validated.reference_physical_scan_count,
+            validated.target_physical_scan_count,
         )
         progress = replace(
             progress,
@@ -1197,6 +1226,10 @@ def _execute_postgres_integer_key_comparison(
             budgets,
             validated.max_encoded_row_bytes,
             len(check.comparison_schema.schema.fields),
+            validated.reference_member_count,
+            validated.target_member_count,
+            validated.reference_physical_scan_count,
+            validated.target_physical_scan_count,
         )
         if _exact_frontier_fits(exact_reservation, usage, budgets, source_budget):
             progress = replace(
@@ -1679,10 +1712,6 @@ def _validate_inputs(
         raise UnsupportedComparisonError(
             "integer-range comparison requires the key to equal both dataset grains"
         )
-    if budgets.max_full_scans_per_side < 1:
-        raise ComparisonBudgetExceededError(
-            "integer-key summary requires one reserved full scan per side"
-        )
     if reference_context.state is not ReadContextState.ACTIVE:
         raise ComparisonProtocolError("reference protected read context must be active")
     if target_context.state is not ReadContextState.ACTIVE:
@@ -1703,6 +1732,20 @@ def _validate_inputs(
         )
     _validate_dataset_relation(check.reference, reference_relation, "reference")
     _validate_dataset_relation(check.target, target_relation, "target")
+    reference_member_count = len(reference_relation.query_relations())
+    target_member_count = len(target_relation.query_relations())
+    reference_physical_scan_count = reference_relation.physical_scan_count()
+    target_physical_scan_count = target_relation.physical_scan_count()
+    required_summary_scans = max(
+        reference_physical_scan_count,
+        target_physical_scan_count,
+    )
+    if budgets.max_full_scans_per_side < required_summary_scans:
+        raise ComparisonBudgetExceededError(
+            "integer-key summary cannot reserve every contributing physical member scan: "
+            f"required_per_side={required_summary_scans}, "
+            f"max_full_scans_per_side={budgets.max_full_scans_per_side}"
+        )
     for direction, consistency in zip(
         ("reference", "target"),
         check.consistency.datasets,
@@ -1737,6 +1780,8 @@ def _validate_inputs(
         - _MAX_INT64_KEY_ENVELOPE_BYTES
         - maximum_segment_id_bytes
         - _EXACT_STATUS_BYTES
+        - _provenance_bytes(max(reference_member_count, target_member_count))
+        - _HAS_DATA_BYTES
     )
     if max_encoded_row_bytes < 1:
         raise ComparisonBudgetExceededError(
@@ -1747,6 +1792,10 @@ def _validate_inputs(
         reference_scope=reference_scope,
         target_scope=target_scope,
         max_encoded_row_bytes=max_encoded_row_bytes,
+        reference_member_count=reference_member_count,
+        target_member_count=target_member_count,
+        reference_physical_scan_count=reference_physical_scan_count,
+        target_physical_scan_count=target_physical_scan_count,
     )
 
 
@@ -1759,9 +1808,30 @@ def _validate_dataset_relation(
         raise UnsupportedComparisonError(
             f"{direction} integer-range comparison does not support opaque SQL datasets"
         )
-    if dataset.locator.relation_scope is not RelationScope.PHYSICAL_ONLY:
+    if dataset.locator.relation_scope not in (
+        RelationScope.PHYSICAL_ONLY,
+        RelationScope.FROZEN_PHYSICAL_UNION,
+    ):
         raise UnsupportedComparisonError(
-            f"{direction} integer-range comparison requires a physical-only relation"
+            f"{direction} integer-range comparison has an unsupported relation scope"
+        )
+    if relation.acquisition.relation_scope is not dataset.locator.relation_scope:
+        raise ComparisonProtocolError(
+            f"{direction} protected acquisition relation scope does not match the dataset"
+        )
+    if (
+        dataset.locator.relation_scope is RelationScope.FROZEN_PHYSICAL_UNION
+        and relation.composition is None
+    ):
+        raise ComparisonProtocolError(
+            f"{direction} frozen physical union lacks a protected composition"
+        )
+    if (
+        dataset.locator.relation_scope is RelationScope.PHYSICAL_ONLY
+        and relation.composition is not None
+    ):
+        raise ComparisonProtocolError(
+            f"{direction} physical-only relation unexpectedly contains a composition"
         )
     expected_relation = (dataset.locator.schema, dataset.locator.name)
     if relation.acquisition.relation.components != expected_relation:
@@ -2001,8 +2071,6 @@ def _validate_structural_artifact(artifact: CompletedStructuralComparisonArtifac
         or artifact.metrics.fingerprint_nodes != 0
     ):
         raise ValueError("completed structural comparison requires both summary-read receipts")
-    if artifact.reference_full_scans != 1 or artifact.target_full_scans != 1:
-        raise ValueError("completed structural comparison requires one summary scan per side")
     if artifact.reference_key_summary.invalid_key_count != 0:
         raise ValueError("reference structural result cannot include invalid mapped keys")
     if artifact.target_key_summary.invalid_key_count != 0:
@@ -2047,24 +2115,39 @@ def _plan_fingerprint_level(
     pending: tuple[_PendingSegment, ...],
     usage: _Usage,
     budgets: ExecutionBudgets,
+    reference_member_count: int,
+    target_member_count: int,
+    reference_physical_scan_count: int,
+    target_physical_scan_count: int,
 ) -> _FingerprintLevelPlan:
     if usage.fingerprint_nodes + len(pending) > budgets.max_fingerprint_nodes:
         raise ComparisonBudgetExceededError(
             "next fingerprint level exceeds execution max_fingerprint_nodes"
         )
     requests = tuple(_range_request(item) for item in pending)
-    side_result_bytes = sum(_fingerprint_record_bytes(item.segment_id) for item in requests)
-    record_bytes = max(_fingerprint_record_bytes(item.segment_id) for item in requests)
+    base_result_bytes = sum(_fingerprint_record_bytes(item.segment_id) for item in requests)
+    base_record_bytes = max(_fingerprint_record_bytes(item.segment_id) for item in requests)
+    reference_provenance_bytes = _provenance_bytes(reference_member_count)
+    target_provenance_bytes = _provenance_bytes(target_member_count)
+    reference_result_bytes = base_result_bytes + (len(requests) * reference_provenance_bytes)
+    target_result_bytes = base_result_bytes + (len(requests) * target_provenance_bytes)
     return _FingerprintLevelPlan(
         requests=requests,
-        side_result_bytes=side_result_bytes,
-        record_bytes=record_bytes,
+        payload_result_bytes=base_result_bytes,
+        payload_record_bytes=base_record_bytes,
+        reference_result_bytes=reference_result_bytes,
+        target_result_bytes=target_result_bytes,
+        reference_full_scans=len(requests) * reference_physical_scan_count,
+        target_full_scans=len(requests) * target_physical_scan_count,
         coordinator_peak_bytes=_fingerprint_phase_memory_bytes(
             usage,
             pending,
             requests,
             budgets,
-            side_result_bytes,
+            reference_member_count,
+            target_member_count,
+            reference_result_bytes,
+            target_result_bytes,
         ),
     )
 
@@ -2087,15 +2170,19 @@ def _read_fingerprint_level(
 ) -> tuple[PostgresRangeFingerprintRead, PostgresRangeFingerprintRead, _Usage]:
     _require_full_scan_capacity(
         source_budget,
-        reference_full_scans=len(plan.requests),
-        target_full_scans=len(plan.requests),
+        reference_full_scans=plan.reference_full_scans,
+        target_full_scans=plan.target_full_scans,
     )
     _require_budget_capacity(
         source_budget,
         budgets,
         additional_queries=4,
         additional_records=(2 * len(plan.requests)) + 2,
-        additional_result_bytes=((2 * plan.side_result_bytes) + (2 * _SESSION_SETUP_RECORD_BYTES)),
+        additional_result_bytes=(
+            plan.reference_result_bytes
+            + plan.target_result_bytes
+            + (2 * _SESSION_SETUP_RECORD_BYTES)
+        ),
         coordinator_bytes=plan.coordinator_peak_bytes,
     )
     _require_deadline(read_deadline.deadline_nanoseconds)
@@ -2105,10 +2192,10 @@ def _read_fingerprint_level(
         reference_scope,
         plan.requests,
         max_encoded_row_bytes,
-        plan.record_bytes,
-        plan.side_result_bytes,
+        plan.payload_record_bytes,
+        plan.payload_result_bytes,
         read_deadline,
-        len(plan.requests),
+        plan.reference_full_scans,
     )
     _require_deadline(read_deadline.deadline_nanoseconds)
     target_read = target_context.read_integer_range_fingerprints(
@@ -2117,10 +2204,10 @@ def _read_fingerprint_level(
         target_scope,
         plan.requests,
         max_encoded_row_bytes,
-        plan.record_bytes,
-        plan.side_result_bytes,
+        plan.payload_record_bytes,
+        plan.payload_result_bytes,
         read_deadline,
-        len(plan.requests),
+        plan.target_full_scans,
     )
     next_usage = _consume_source_usage(
         usage,
@@ -2186,15 +2273,14 @@ def _exact_frontier_fits(
     budgets: ExecutionBudgets,
     source_budget: PostgresSourceBudgetAttempt,
 ) -> bool:
-    reserved_result_bytes = max(1, reservation.reference.result_bytes) + max(
-        1,
-        reservation.target.result_bytes,
+    reserved_result_bytes = (
+        reservation.reference.raw_result_bytes + reservation.target.raw_result_bytes
     )
     remaining = source_budget.remaining()
     return (
         remaining.queries >= 4
         and remaining.fetched_records
-        >= reservation.reference.records + reservation.target.records + 2
+        >= reservation.reference.raw_records + reservation.target.raw_records + 2
         and remaining.result_bytes >= reserved_result_bytes + (2 * _SESSION_SETUP_RECORD_BYTES)
         and reservation.coordinator_peak_bytes <= budgets.max_coordinator_memory_bytes
         and remaining.reference_full_scans >= reservation.reference.full_scans
@@ -2219,8 +2305,8 @@ def _read_exact_frontier(
     source_budget: PostgresSourceBudgetAttempt,
 ) -> tuple[PostgresIntegerExactRowsRead, PostgresIntegerExactRowsRead, _Usage]:
     requests = tuple(_range_request(node.segment) for node in nodes)
-    reference_limit = max(1, reservation.reference.result_bytes)
-    target_limit = max(1, reservation.target.result_bytes)
+    reference_payload_limit = max(1, reservation.reference.result_bytes)
+    target_payload_limit = max(1, reservation.target.result_bytes)
     _require_full_scan_capacity(
         source_budget,
         reference_full_scans=reservation.reference.full_scans,
@@ -2230,13 +2316,15 @@ def _read_exact_frontier(
         source_budget,
         budgets,
         additional_queries=4,
-        additional_records=(reservation.reference.records + reservation.target.records + 2),
+        additional_records=(reservation.reference.raw_records + reservation.target.raw_records + 2),
         additional_result_bytes=(
-            reference_limit + target_limit + (2 * _SESSION_SETUP_RECORD_BYTES)
+            reservation.reference.raw_result_bytes
+            + reservation.target.raw_result_bytes
+            + (2 * _SESSION_SETUP_RECORD_BYTES)
         ),
         coordinator_bytes=reservation.coordinator_peak_bytes,
     )
-    maximum_record_bytes = (
+    maximum_payload_record_bytes = (
         max_encoded_row_bytes
         + _MAX_INT64_KEY_ENVELOPE_BYTES
         + max(len(item.segment_id.encode("ascii")) for item in requests)
@@ -2249,9 +2337,9 @@ def _read_exact_frontier(
         reference_scope,
         requests,
         max_encoded_row_bytes,
-        max(1, reservation.reference.records),
-        min(maximum_record_bytes, reference_limit),
-        reference_limit,
+        reservation.reference.raw_records,
+        min(maximum_payload_record_bytes, reference_payload_limit),
+        reference_payload_limit,
         read_deadline,
         reservation.reference.full_scans,
     )
@@ -2262,9 +2350,9 @@ def _read_exact_frontier(
         target_scope,
         requests,
         max_encoded_row_bytes,
-        max(1, reservation.target.records),
-        min(maximum_record_bytes, target_limit),
-        target_limit,
+        reservation.target.raw_records,
+        min(maximum_payload_record_bytes, target_payload_limit),
+        target_payload_limit,
         read_deadline,
         reservation.target.full_scans,
     )
@@ -2754,6 +2842,11 @@ def _fingerprint_record_bytes(segment_id: str) -> int:
     return len(segment_id.encode("ascii")) + (3 * 19) + (8 * 38) + (2 * 38)
 
 
+def _provenance_bytes(member_count: int) -> int:
+    _require_nonnegative_integer(member_count, "protected relation member count")
+    return member_count * _MAX_ROW_TYPE_OID_BYTES
+
+
 def _slot_object_bytes(value_type: type[object]) -> int:
     return getsizeof(object.__new__(value_type))
 
@@ -2815,30 +2908,53 @@ def _raw_rows_memory_bytes(
     record_count: int,
     field_count: int,
     ascii_value_count: int,
+    integer_value_count: int,
     result_bytes: int,
+    budgets: ExecutionBudgets,
 ) -> int:
     _require_nonnegative_integer(record_count, "raw record count")
     _require_nonnegative_integer(field_count, "raw row field count")
     _require_nonnegative_integer(ascii_value_count, "raw ASCII value count")
+    _require_nonnegative_integer(integer_value_count, "raw integer value count")
     _require_nonnegative_integer(result_bytes, "raw result bytes")
     return (
         _list_storage_bytes(record_count)
         + _tuple_storage_bytes(record_count)
         + (record_count * _tuple_storage_bytes(field_count))
         + (ascii_value_count * _ASCII_TEXT_HEADER_BYTES)
+        + (integer_value_count * _maximum_integer_object_bytes(budgets))
         + result_bytes
     )
 
 
-def _summary_phase_memory_bytes(budgets: ExecutionBudgets) -> int:
+def _summary_phase_memory_bytes(
+    budgets: ExecutionBudgets,
+    reference_member_count: int,
+    target_member_count: int,
+    reference_result_bytes: int,
+    target_result_bytes: int,
+) -> int:
     parsed_side = _summary_parsed_side_memory_bytes(budgets)
+    reference_raw = _raw_rows_memory_bytes(
+        record_count=1,
+        field_count=reference_member_count + 8,
+        ascii_value_count=7,
+        integer_value_count=reference_member_count,
+        result_bytes=reference_result_bytes,
+        budgets=budgets,
+    )
     target_raw = _raw_rows_memory_bytes(
         record_count=1,
-        field_count=9,
+        field_count=target_member_count + 8,
         ascii_value_count=7,
-        result_bytes=_SUMMARY_RECORD_BYTES,
+        integer_value_count=target_member_count,
+        result_bytes=target_result_bytes,
+        budgets=budgets,
     )
-    return (2 * parsed_side) + target_raw
+    return max(
+        parsed_side + reference_raw,
+        (2 * parsed_side) + target_raw,
+    )
 
 
 def _summary_pair_memory_bytes(budgets: ExecutionBudgets) -> int:
@@ -2912,21 +3028,37 @@ def _fingerprint_phase_memory_bytes(
     pending: tuple[_PendingSegment, ...],
     requests: tuple[PostgresIntegerRangeRequest, ...],
     budgets: ExecutionBudgets,
-    side_result_bytes: int,
+    reference_member_count: int,
+    target_member_count: int,
+    reference_result_bytes: int,
+    target_result_bytes: int,
 ) -> int:
     parsed_side = _fingerprint_parsed_side_memory_bytes(requests, budgets)
+    reference_raw = _raw_rows_memory_bytes(
+        record_count=len(requests),
+        field_count=reference_member_count + 14,
+        ascii_value_count=14 * len(requests),
+        integer_value_count=reference_member_count * len(requests),
+        result_bytes=reference_result_bytes,
+        budgets=budgets,
+    )
     target_raw = _raw_rows_memory_bytes(
         record_count=len(requests),
-        field_count=15,
+        field_count=target_member_count + 14,
         ascii_value_count=14 * len(requests),
-        result_bytes=side_result_bytes,
+        integer_value_count=target_member_count * len(requests),
+        result_bytes=target_result_bytes,
+        budgets=budgets,
     )
     retained = (
         _summary_pair_memory_bytes(budgets)
         + _topology_memory_bytes(usage.fingerprint_nodes, budgets)
         + _frontier_structure_memory_bytes(pending, budgets)
     )
-    query_peak = retained + (2 * parsed_side) + target_raw
+    query_peak = max(
+        retained + parsed_side + reference_raw,
+        retained + (2 * parsed_side) + target_raw,
+    )
     projected_topology_peak = (
         _summary_pair_memory_bytes(budgets)
         + _topology_memory_bytes(usage.fingerprint_nodes + len(pending), budgets)
@@ -2957,6 +3089,8 @@ def _target_exact_frontier_bytes(nodes: tuple[_FingerprintNode, ...]) -> int:
 
 def _reference_exact_side_reservation(
     nodes: tuple[_FingerprintNode, ...],
+    member_count: int,
+    physical_scan_count: int,
 ) -> _ExactSideReservation:
     records = sum(node.reference.fingerprint.count for node in nodes)
     envelope_bytes = sum(
@@ -2966,17 +3100,25 @@ def _reference_exact_side_reservation(
         node.reference.fingerprint.count * len(node.reference.segment_id.encode("ascii"))
         for node in nodes
     )
+    result_bytes = _reference_exact_frontier_bytes(nodes)
+    raw_records = max(1, records)
     return _ExactSideReservation(
         records=records,
-        result_bytes=_reference_exact_frontier_bytes(nodes),
+        result_bytes=result_bytes,
+        raw_records=raw_records,
+        raw_result_bytes=result_bytes
+        + (raw_records * (_provenance_bytes(member_count) + _HAS_DATA_BYTES)),
         envelope_bytes=envelope_bytes,
         segment_identifier_bytes=segment_identifier_bytes,
-        full_scans=max(1, len(nodes)),
+        member_count=member_count,
+        full_scans=max(1, len(nodes)) * physical_scan_count,
     )
 
 
 def _target_exact_side_reservation(
     nodes: tuple[_FingerprintNode, ...],
+    member_count: int,
+    physical_scan_count: int,
 ) -> _ExactSideReservation:
     records = sum(node.target.fingerprint.count for node in nodes)
     envelope_bytes = sum(
@@ -2986,12 +3128,18 @@ def _target_exact_side_reservation(
         node.target.fingerprint.count * len(node.target.segment_id.encode("ascii"))
         for node in nodes
     )
+    result_bytes = _target_exact_frontier_bytes(nodes)
+    raw_records = max(1, records)
     return _ExactSideReservation(
         records=records,
-        result_bytes=_target_exact_frontier_bytes(nodes),
+        result_bytes=result_bytes,
+        raw_records=raw_records,
+        raw_result_bytes=result_bytes
+        + (raw_records * (_provenance_bytes(member_count) + _HAS_DATA_BYTES)),
         envelope_bytes=envelope_bytes,
         segment_identifier_bytes=segment_identifier_bytes,
-        full_scans=max(1, len(nodes)),
+        member_count=member_count,
+        full_scans=max(1, len(nodes)) * physical_scan_count,
     )
 
 
@@ -3019,12 +3167,17 @@ def _exact_parsed_side_memory_bytes(
     )
 
 
-def _exact_raw_side_memory_bytes(reservation: _ExactSideReservation) -> int:
+def _exact_raw_side_memory_bytes(
+    reservation: _ExactSideReservation,
+    budgets: ExecutionBudgets,
+) -> int:
     return _raw_rows_memory_bytes(
-        record_count=reservation.records,
-        field_count=6,
+        record_count=reservation.raw_records,
+        field_count=reservation.member_count + 6,
         ascii_value_count=3 * reservation.records,
-        result_bytes=reservation.result_bytes,
+        integer_value_count=reservation.member_count * reservation.raw_records,
+        result_bytes=reservation.raw_result_bytes,
+        budgets=budgets,
     )
 
 
@@ -3061,9 +3214,21 @@ def _exact_frontier_reservation(
     budgets: ExecutionBudgets,
     max_encoded_row_bytes: int,
     schema_field_count: int,
+    reference_member_count: int,
+    target_member_count: int,
+    reference_physical_scan_count: int,
+    target_physical_scan_count: int,
 ) -> _ExactFrontierReservation:
-    reference = _reference_exact_side_reservation(nodes)
-    target = _target_exact_side_reservation(nodes)
+    reference = _reference_exact_side_reservation(
+        nodes,
+        reference_member_count,
+        reference_physical_scan_count,
+    )
+    target = _target_exact_side_reservation(
+        nodes,
+        target_member_count,
+        target_physical_scan_count,
+    )
     reference_parsed = _exact_parsed_side_memory_bytes(
         reference,
         budgets,
@@ -3084,7 +3249,7 @@ def _exact_frontier_reservation(
     )
     reference_query_peak = (
         retained
-        + _exact_raw_side_memory_bytes(reference)
+        + _exact_raw_side_memory_bytes(reference, budgets)
         + reference_parsed
         + _exact_decode_scratch_bytes(
             reference,
@@ -3095,7 +3260,7 @@ def _exact_frontier_reservation(
     target_query_peak = (
         retained
         + reference_parsed
-        + _exact_raw_side_memory_bytes(target)
+        + _exact_raw_side_memory_bytes(target, budgets)
         + target_parsed
         + _exact_decode_scratch_bytes(
             target,

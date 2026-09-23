@@ -228,6 +228,22 @@ def test_postgres_fingerprint_matches_duplicate_bag_and_empty_identity() -> None
             _FINGERPRINT_RECORD_BYTES,
             _FINGERPRINT_RECORD_BYTES,
         ) == fingerprint_rows((envelope, envelope))
+        bag_row_query = build_postgres_row_envelope_query(schema, bag_inspection, 512)
+        with pytest.raises(PostgresResultLimitError, match="logical record budget"):
+            context.read_canonical_rows(bag_row_query, 1, 1_024, 2_048)
+        logical_record_bytes = len(envelope) + 34
+        tight_bag_row_query = build_postgres_row_envelope_query(
+            schema,
+            bag_inspection,
+            len(envelope),
+        )
+        with pytest.raises(PostgresResultLimitError, match="logical total byte budget"):
+            context.read_canonical_rows(
+                tight_bag_row_query,
+                2,
+                logical_record_bytes,
+                (2 * logical_record_bytes) - 1,
+            )
 
         empty_inspection = context.inspect_relation(
             schema,
@@ -242,6 +258,8 @@ def test_postgres_fingerprint_matches_duplicate_bag_and_empty_identity() -> None
             _FINGERPRINT_RECORD_BYTES,
             _FINGERPRINT_RECORD_BYTES,
         ) == Fingerprint(count=0, limb_sums=(0, 0, 0, 0, 0, 0, 0, 0))
+        empty_row_query = build_postgres_row_envelope_query(schema, empty_inspection, 512)
+        assert context.read_canonical_rows(empty_row_query, 1, 546, 546) == ()
     finally:
         context.close()
 

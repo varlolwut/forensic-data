@@ -104,6 +104,10 @@ class _RelationInput(_InputModel):
     name: NonEmptyText
 
 
+class _DatasetRelationInput(_RelationInput):
+    relation_scope: NonEmptyText = "physical_only"
+
+
 class _SqlParameterInput(_InputModel):
     name: NonEmptyText
     type: _LogicalTypeInput
@@ -122,7 +126,7 @@ class _ProjectionInput(_InputModel):
 
 class _DatasetInput(_InputModel):
     connection: NonEmptyText
-    relation: _RelationInput | None = None
+    relation: _DatasetRelationInput | None = None
     sql: _SqlArtifactInput | None = None
     logical_schema: NonEmptyText
     projection: tuple[_ProjectionInput, ...]
@@ -322,6 +326,7 @@ class RelationSource:
     catalog: str | None
     schema: str | None
     name: str
+    relation_scope: str
 
 
 @final
@@ -650,6 +655,7 @@ def _dataset_source(
             catalog=value.relation.catalog,
             schema=value.relation.schema_name,
             name=value.relation.name,
+            relation_scope=value.relation.relation_scope,
         )
     elif value.sql is not None:
         locator = _sql_artifact_source(
@@ -758,6 +764,7 @@ def _readiness_source(
         catalog=value.relation.catalog,
         schema=value.relation.schema_name,
         name=value.relation.name,
+        relation_scope="physical_only",
     )
     columns = value.columns
     return RelationManifestReadinessSource(

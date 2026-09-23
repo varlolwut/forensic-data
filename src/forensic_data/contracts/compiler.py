@@ -329,11 +329,18 @@ def _compile_dataset_locator(
             raise UnsupportedContractError(
                 f"dataset {dataset_id!r} PostgreSQL relation requires an explicit schema"
             )
+        try:
+            relation_scope = RelationScope(source.relation_scope)
+        except ValueError:
+            raise UnsupportedContractError(
+                f"dataset {dataset_id!r} PostgreSQL relation scope is unsupported: "
+                f"relation_scope={source.relation_scope!r}"
+            ) from None
         return RelationLocator(
             catalog=None,
             schema=_physical_name(source.schema, f"dataset {dataset_id!r} relation schema"),
             name=_physical_name(source.name, f"dataset {dataset_id!r} relation name"),
-            relation_scope=RelationScope.PHYSICAL_ONLY,
+            relation_scope=relation_scope,
         )
     return _compile_sql_artifact(
         source,
@@ -571,6 +578,11 @@ def _compile_relation_manifest_readiness(
         )
     if source.relation.schema is None:
         raise UnsupportedContractError(f"{context} PostgreSQL relation requires an explicit schema")
+    if source.relation.relation_scope != RelationScope.PHYSICAL_ONLY.value:
+        raise UnsupportedContractError(
+            f"{context} relation requires physical_only scope: "
+            f"relation_scope={source.relation.relation_scope!r}"
+        )
     relation = RelationLocator(
         catalog=None,
         schema=_physical_name(source.relation.schema, f"{context} relation schema"),

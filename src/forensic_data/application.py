@@ -43,6 +43,7 @@ from forensic_data.contracts.model import (
     LoadedContractConfig,
     RelationLocator,
     RelationManifestReadiness,
+    RelationScope,
     RowCheckDefinition,
 )
 from forensic_data.persistence.definitions import build_metadata_registration_definition
@@ -831,6 +832,7 @@ def _open_side(
         PostgresRelationAcquisition(
             schema=dataset.logical_schema.schema,
             relation=dataset_relation,
+            relation_scope=locator.relation_scope,
             column_names=tuple(field.column_name for field in dataset.projection),
             max_metadata_record_bytes=services.metadata_record_bytes,
             max_metadata_total_bytes=services.metadata_total_bytes,
@@ -838,6 +840,7 @@ def _open_side(
         PostgresRelationAcquisition(
             schema=_manifest_schema(),
             relation=readiness_relation,
+            relation_scope=RelationScope.PHYSICAL_ONLY,
             column_names=readiness.columns.values(),
             max_metadata_record_bytes=services.metadata_record_bytes,
             max_metadata_total_bytes=services.metadata_total_bytes,

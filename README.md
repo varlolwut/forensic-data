@@ -142,19 +142,20 @@ schema `dfe_ext`; the reader needs `USAGE` on that schema and `EXECUTE` on
 it never installs the extension or silently changes drivers. Other PostgreSQL 9.6 patches, other
 PostgreSQL majors, and other database engines are not verified by the current code.
 
-Relations must be given as an exact `(schema, table)` pair. The connector reads one physical
-regular table with `FROM ONLY`:
+Relations must be given as an exact `(schema, table)` pair and select one explicit scope. The
+default `physical_only` scope reads one permanent regular table with `FROM ONLY`: ordinary
+inheritance children are excluded, a partition leaf can be addressed directly, and partitioned
+parents and views are rejected. The opt-in `frozen_physical_union` scope resolves the root's full
+inheritance or partition hierarchy, accepts only permanent regular or partitioned members, and
+reads every discovered regular member through an explicit `ONLY` branch. Partitioned members are
+retained as topology-only evidence and do not contribute their own rows.
 
-- ordinary inheritance children are deliberately excluded;
-- a partition leaf can be addressed directly as a physical table;
-- partitioned parents and views are rejected; and
-- changing the qualified name to a different relation is detected before any result row is used.
-
-Protected acquisition applies the same physical-only rule to both the dataset and its readiness
-manifest: each must be a permanent regular table. On each dataset connection, both relations are
-resolved and held with `ACCESS SHARE` locks before the first snapshot-forming query in the
-read-only Repeatable Read transaction. This keeps the exact relation identities protected for the
-life of that read context, including across empty reads.
+Protected acquisition resolves and holds every selected dataset member plus the physical-only
+readiness manifest with `ACCESS SHARE` locks before the first snapshot-forming query in the
+read-only Repeatable Read transaction. It then proves the hierarchy again inside that snapshot.
+Qualified identities, direct edges, row types, and projected physical bindings are sealed for the
+life of the context, including across empty reads. A relation attached after that frozen closure is
+not added to the query; detaching or replacing a locked member is blocked until the context closes.
 
 The initial logical-to-physical mappings are:
 
@@ -172,12 +173,15 @@ Domains, arrays, blank-padded `character`, lossy decimal/timestamp values, unsup
 kinds, and envelopes above the configured byte budget fail explicitly. Fingerprint mismatch proves
 a content difference; fingerprint match must be treated as probabilistic.
 
-Relation comparison charges one full-scan-equivalent per side for the summary, each fingerprint
-range, and each exact range. The relation-manifest example's corruption path therefore reserves five
-per side: one summary, one root fingerprint range, two child fingerprint ranges, and one exact
-range. A budget of four cannot complete that path. Its reported `coordinator_peak_bytes` is the
-conservative reservation high-water estimate for retained and decoded coordinator data, not a
-measurement of process RSS or allocator peak usage.
+Relation comparison charges by the compiled physical query shape. If a side has `C` row-contributing
+regular members, its summary reserves `C` full-scan-equivalents and a request containing `R`
+fingerprint or exact ranges reserves `R × C`; topology-only partitioned members contribute zero
+scans. The physical-only relation-manifest example still has `C = 1`, so its corruption path
+reserves five per side: one summary, one root fingerprint range, two child fingerprint ranges, and
+one exact range. A budget of four cannot complete that path. Result-byte and coordinator-memory
+reservations also include every member's bounded provenance witness and the empty-result sentinel.
+Reported `coordinator_peak_bytes` is the conservative reservation high-water estimate for retained
+and decoded coordinator data, not a measurement of process RSS or allocator peak usage.
 
 ## Developer setup
 
@@ -329,8 +333,11 @@ every check must provide exactly one inline scope or resolvable scope reference.
 YAML keys fail validation. Connections contain a `secret_ref`; inline credentials and DSNs are not
 part of the contract shape.
 
-Datasets use exactly one relation locator or SQL artifact. Relative SQL artifact paths are resolved
-from the contract directory; absolute and UNC paths are also accepted for operator-managed files.
+Datasets use exactly one relation locator or SQL artifact. A relation locator defaults to
+`relation_scope: physical_only`; `relation_scope: frozen_physical_union` must be selected explicitly
+and is part of the dataset's immutable semantic identity. Readiness relations remain
+`physical_only`. Relative SQL artifact paths are resolved from the contract directory; absolute and
+UNC paths are also accepted for operator-managed files.
 The loader assumes the contract and artifacts remain stable while they are captured, reads each
 distinct artifact once as strict UTF-8, and binds its exact bytes by SHA-256. Contract input is
 bounded to 1 MiB, composed YAML to 10,000 nodes, and nesting to 64 levels; YAML aliases are rejected.
@@ -432,7 +439,10 @@ record without mutating the semantic version. Migration `0002` adds run, attempt
 read-context, and dataset-observation records plus narrow immutable lease-renewal receipts;
 migration `0003` adds completed check results and segment fingerprints; migration `0004` adds
 partial check results, immutable retained anomalies and their full-replay manifest, plus the typed
-numeric-difference inspection view.
+numeric-difference inspection view; migration `0005` admits the immutable
+`frozen_physical_union` dataset scope. Dataset observations keep each side's root and complete
+member/edge composition with per-member binding digests; the composition digest is evidence of the
+observed protected closure, not an equality requirement between source and target physical OIDs.
 
 ## PostgreSQL fixture and checks
 
@@ -486,7 +496,9 @@ server-side cursors, duplicate bags, empty tables, precision rejection, relation
 level security, read-only enforcement, concurrent-writer snapshot stability, protected
 dataset/manifest locking, metadata migration serialization and rollback, role separation, immutable
 registration/readback, lifecycle fencing and identity constraints, million-row retained-difference
-paging after source mutation, typed numeric evidence, and durable partial-result replay.
+paging after source mutation, typed numeric evidence, durable partial-result replay, and frozen
+partition/inheritance compositions with concurrent membership-change behavior and durable
+per-endpoint evidence.
 The legacy endpoint gate additionally proves the exact PostgreSQL 9.6.24 source profile, its
 preinstalled pgcrypto capability, PostgreSQL 17.11 target interoperability, persisted driver/server
 provenance, and an exact retained `1 matched / 1 missing / 1 extra / 1 modified` result.

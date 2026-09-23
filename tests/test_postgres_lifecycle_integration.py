@@ -41,9 +41,15 @@ from forensic_data.contracts.model import (
     MinimumEvidence,
     RelationLocator,
     RelationManifestReadiness,
+    RelationScope,
     RowCheckDefinition,
 )
-from forensic_data.contracts.semantics import canonical_semantic_json
+from forensic_data.contracts.semantics import (
+    SemanticValue,
+    canonical_semantic_json,
+    semantic_digest_hex,
+    semantic_value_from_json,
+)
 from forensic_data.persistence.definitions import build_metadata_registration_definition
 from forensic_data.persistence.errors import (
     ActiveRunAttemptError,
@@ -122,6 +128,92 @@ class _AcquiredSide:
     dataset_relation: PostgresProtectedRelationInspection
     readiness_relation: PostgresProtectedRelationInspection
     evidence: RelationManifestEvidence
+
+
+def test_postgres_lifecycle_persists_frozen_union_composition_evidence() -> None:
+    requested = required_metadata_database_settings()
+    with disposable_metadata_database(requested) as settings:
+        migrate_postgres_metadata(settings.migrator, _NO_RETRY, 5_000)
+        config = load_contract_config(_CONTRACT_PATH)
+        execution = replace(config.execution, max_queries=500)
+        check = _frozen_reference_check(config.checks[0])
+        registration = register_postgres_metadata(
+            settings.writer,
+            _NO_RETRY,
+            build_metadata_registration_definition(config.version, check, config.evidence),
+        )
+        scope = resolve_scope_values(check, {"business_date": "2026-09-23"})
+        _create_reference_inheritance_source_relations(
+            settings,
+            registration,
+            scope.scope_digest,
+        )
+        run = claim_postgres_run(
+            settings.writer,
+            _NO_RETRY,
+            uuid4(),
+            uuid4(),
+            _run_request(uuid4(), registration, check, execution, config.evidence),
+        )
+        attempt = start_postgres_run_attempt(
+            settings.writer,
+            _NO_RETRY,
+            run,
+            uuid4(),
+            uuid4(),
+            uuid4(),
+            datetime.now(UTC) + timedelta(minutes=5),
+            execution,
+        )
+        source_budget = PostgresSourceBudgetLedger(execution).start_attempt(attempt.attempt_id)
+        reference = _acquire_side(
+            settings.writer,
+            check,
+            PlanDirection.REFERENCE,
+            scope.scope_digest,
+            _REFERENCE_BATCH,
+            source_budget,
+        )
+        target = _acquire_side(
+            settings.writer,
+            check,
+            PlanDirection.TARGET,
+            scope.scope_digest,
+            _TARGET_BATCH,
+            source_budget,
+        )
+        try:
+            persist_postgres_read_context(
+                settings.writer,
+                _NO_RETRY,
+                attempt,
+                _context_definition(
+                    registration.reference_dataset,
+                    PlanDirection.REFERENCE,
+                    reference,
+                ),
+            )
+            persist_postgres_read_context(
+                settings.writer,
+                _NO_RETRY,
+                attempt,
+                _context_definition(
+                    registration.target_dataset,
+                    PlanDirection.TARGET,
+                    target,
+                ),
+            )
+            cut = build_input_cut_definition(reference.evidence, target.evidence)
+            persist_postgres_aligned_input_cut(
+                settings.writer,
+                _NO_RETRY,
+                attempt,
+                _cut_persistence(uuid4(), cut, registration, reference, target),
+            )
+            _assert_frozen_union_persistence(settings, attempt.attempt_id, reference)
+        finally:
+            reference.context.close()
+            target.context.close()
 
 
 def test_postgres_lifecycle_reconciles_fences_cuts_and_terminal_publication() -> None:
@@ -1324,8 +1416,14 @@ def _acquire_side(
                 dataset.logical_schema.schema,
                 dataset_relation,
                 tuple(item.column_name for item in dataset.projection),
+                dataset.locator.relation_scope,
             ),
-            _acquisition(_manifest_schema(), readiness_relation, readiness.columns.values()),
+            _acquisition(
+                _manifest_schema(),
+                readiness_relation,
+                readiness.columns.values(),
+                readiness.relation.relation_scope,
+            ),
         ),
         2_000,
         source_budget,
@@ -1370,14 +1468,32 @@ def _acquisition(
     schema: CanonicalSchema,
     relation: PostgresRelation,
     columns: tuple[str, ...],
+    relation_scope: RelationScope,
 ) -> PostgresRelationAcquisition:
     return PostgresRelationAcquisition(
         schema=schema,
         relation=relation,
+        relation_scope=relation_scope,
         column_names=columns,
         max_metadata_record_bytes=4_096,
         max_metadata_total_bytes=32_768,
     )
+
+
+def _frozen_reference_check(check: RowCheckDefinition) -> RowCheckDefinition:
+    if not isinstance(check.reference.locator, RelationLocator) or not isinstance(
+        check.target.locator,
+        RelationLocator,
+    ):
+        raise AssertionError("frozen-union lifecycle fixture requires relation datasets")
+    reference = replace(
+        check.reference,
+        locator=replace(
+            check.reference.locator,
+            relation_scope=RelationScope.FROZEN_PHYSICAL_UNION,
+        ),
+    )
+    return replace(check, reference=reference)
 
 
 def _manifest_schema() -> CanonicalSchema:
@@ -1554,6 +1670,264 @@ def _create_source_relations(
             "GRANT SELECT ON dfe_demo.reference_orders, dfe_demo.target_orders, "
             "dfe_control.batch_manifest TO dfe_metadata_writer"
         )
+
+
+def _create_reference_inheritance_source_relations(
+    settings: MetadataDatabaseSettings,
+    registration: MetadataRegistration,
+    scope_digest: str,
+) -> None:
+    _create_source_relations(settings, registration, scope_digest)
+    with connect_writer(settings.admin) as connection:
+        connection.execute(
+            "CREATE TABLE dfe_demo.reference_orders_child () INHERITS (dfe_demo.reference_orders)"
+        )
+        connection.execute("GRANT SELECT ON dfe_demo.reference_orders_child TO dfe_metadata_writer")
+
+
+def _assert_frozen_union_persistence(
+    settings: MetadataDatabaseSettings,
+    attempt_id: UUID,
+    reference: _AcquiredSide,
+) -> None:
+    with connect_writer(settings.reader) as connection:
+        connection.execute("SET ROLE dfe_metadata_reader")
+        context_row = connection.execute(
+            "SELECT acquisition_evidence::text FROM dfe_metadata.attempt_read_contexts "
+            "WHERE attempt_id = %s AND direction = 'reference'",
+            (attempt_id,),
+        ).fetchone()
+        observation_rows = connection.execute(
+            "SELECT direction, physical_binding::text, physical_binding_digest "
+            "FROM dfe_metadata.dataset_observations WHERE attempt_id = %s",
+            (attempt_id,),
+        ).fetchall()
+    assert context_row is not None
+    assert len(observation_rows) == 2
+    observations = {_test_text(row[0]): row for row in observation_rows}
+    evidence = _test_semantic_object_from_json(
+        _test_text(context_row[0]),
+        "protected acquisition evidence",
+    )
+    acquisition_payload = _test_semantic_object(
+        evidence.get("payload"),
+        "protected acquisition payload",
+    )
+    relations = tuple(
+        _test_semantic_object(item, "protected acquisition relation")
+        for item in _test_semantic_array(
+            acquisition_payload.get("relations"),
+            "protected acquisition relations",
+        )
+    )
+    frozen_relation = next(
+        relation
+        for relation in relations
+        if relation.get("relation_scope") == RelationScope.FROZEN_PHYSICAL_UNION.value
+    )
+    physical_relation = next(
+        relation for relation in relations if relation.get("relation_scope") is None
+    )
+    _assert_physical_only_relation_evidence(physical_relation)
+    _assert_frozen_relation_evidence(frozen_relation, reference)
+
+    composition = reference.dataset_relation.composition
+    assert composition is not None
+    lock_identities = [
+        (member.inspection.relation.components, member.inspection.relation_oid)
+        for member in composition.members
+    ]
+    lock_identities.append(
+        (
+            reference.readiness_relation.inspection.relation.components,
+            reference.readiness_relation.inspection.relation_oid,
+        )
+    )
+    persisted_lock_oids = acquisition_payload.get("locked_relation_oids")
+    assert persisted_lock_oids == list(reference.context.evidence.locked_relation_oids)
+    assert persisted_lock_oids == [
+        relation_oid
+        for _relation, relation_oid in sorted(
+            lock_identities,
+            key=lambda item: (item[0], item[1]),
+        )
+    ]
+
+    reference_observation = observations["reference"]
+    binding = _test_semantic_object_from_json(
+        _test_text(reference_observation[1]),
+        "physical binding",
+    )
+    assert _test_bytes(reference_observation[2]).hex() == semantic_digest_hex(binding)
+    binding_payload = _test_semantic_object(
+        binding.get("payload"),
+        "physical binding payload",
+    )
+    assert binding_payload.get("dataset_relation") == frozen_relation
+    assert binding_payload.get("readiness_relation") == physical_relation
+
+    target_observation = observations["target"]
+    target_binding = _test_semantic_object_from_json(
+        _test_text(target_observation[1]),
+        "target physical binding",
+    )
+    assert _test_bytes(target_observation[2]).hex() == semantic_digest_hex(target_binding)
+    target_payload = _test_semantic_object(
+        target_binding.get("payload"),
+        "target physical binding payload",
+    )
+    _assert_physical_only_relation_evidence(
+        _test_semantic_object(target_payload.get("dataset_relation"), "target dataset relation")
+    )
+    _assert_physical_only_relation_evidence(
+        _test_semantic_object(
+            target_payload.get("readiness_relation"),
+            "target readiness relation",
+        )
+    )
+
+
+def _assert_frozen_relation_evidence(
+    relation: dict[str, SemanticValue],
+    reference: _AcquiredSide,
+) -> None:
+    assert relation.get("relation_scope") == RelationScope.FROZEN_PHYSICAL_UNION.value
+    composition = _test_semantic_object(
+        relation.get("composition"),
+        "protected relation composition",
+    )
+    composition_payload = {
+        key: value for key, value in composition.items() if key != "composition_digest"
+    }
+    assert composition.get("composition_digest") == semantic_digest_hex(composition_payload)
+    assert composition_payload.get("composition_version") == 1
+    protected_composition = reference.dataset_relation.composition
+    assert protected_composition is not None
+    members = {
+        _test_integer(member.get("relation_oid"), "composition member OID"): member
+        for member in (
+            _test_semantic_object(item, "protected composition member")
+            for item in _test_semantic_array(
+                composition_payload.get("members"),
+                "protected composition members",
+            )
+        )
+    }
+    assert len(members) == len(protected_composition.members)
+    for protected_member in protected_composition.members:
+        member = members[protected_member.inspection.relation_oid]
+        assert set(member) == {
+            "columns",
+            "namespace_oid",
+            "physical_binding_digest",
+            "relation_kind",
+            "relation_oid",
+            "relation_persistence",
+            "relation_row_type_oid",
+            "resolved_relation",
+        }
+        binding = {key: value for key, value in member.items() if key != "physical_binding_digest"}
+        assert member.get("physical_binding_digest") == semantic_digest_hex(binding)
+        assert (
+            member.get("namespace_oid"),
+            member.get("relation_kind"),
+            member.get("relation_persistence"),
+            member.get("relation_row_type_oid"),
+            member.get("resolved_relation"),
+            member.get("columns"),
+        ) == (
+            protected_member.namespace_oid,
+            protected_member.relation_kind.value,
+            protected_member.relation_persistence.value,
+            protected_member.inspection.relation_row_type_oid,
+            list(protected_member.inspection.relation.components),
+            relation.get("columns"),
+        )
+    assert composition_payload.get("root_relation_oid") == (protected_composition.root_relation_oid)
+    edges = {
+        (
+            edge.get("parent_relation_oid"),
+            edge.get("child_relation_oid"),
+            edge.get("inhseqno"),
+            edge.get("detach_state"),
+        )
+        for edge in (
+            _test_semantic_object(item, "protected composition edge")
+            for item in _test_semantic_array(
+                composition_payload.get("edges"),
+                "protected composition edges",
+            )
+        )
+    }
+    assert edges == {
+        (
+            edge.parent_relation_oid,
+            edge.child_relation_oid,
+            edge.sequence,
+            edge.detach_state.value,
+        )
+        for edge in protected_composition.edges
+    }
+
+
+def _assert_physical_only_relation_evidence(
+    relation: dict[str, SemanticValue],
+) -> None:
+    assert set(relation) == {
+        "acquired_before_snapshot",
+        "columns",
+        "lock_mode",
+        "max_identifier_utf8_bytes",
+        "namespace_oid",
+        "relation_oid",
+        "relation_persistence",
+        "relation_row_type_oid",
+        "requested_relation",
+        "resolved_relation",
+    }
+
+
+def _test_semantic_object_from_json(
+    value: str,
+    context: str,
+) -> dict[str, SemanticValue]:
+    return _test_semantic_object(semantic_value_from_json(value), context)
+
+
+def _test_semantic_object(
+    value: SemanticValue | None,
+    context: str,
+) -> dict[str, SemanticValue]:
+    if type(value) is not dict:
+        raise AssertionError(f"{context} must be an object")
+    return value
+
+
+def _test_semantic_array(
+    value: SemanticValue | None,
+    context: str,
+) -> list[SemanticValue]:
+    if type(value) is not list:
+        raise AssertionError(f"{context} must be an array")
+    return value
+
+
+def _test_text(value: object) -> str:
+    if type(value) is not str:
+        raise AssertionError("persisted lifecycle value must be text")
+    return value
+
+
+def _test_integer(value: SemanticValue | None, context: str) -> int:
+    if type(value) is not int:
+        raise AssertionError(f"{context} must be an integer")
+    return value
+
+
+def _test_bytes(value: object) -> bytes:
+    if type(value) is not bytes:
+        raise AssertionError("persisted lifecycle value must be bytes")
+    return value
 
 
 def _reason(code: ReasonCode, message: str) -> ResultReason:

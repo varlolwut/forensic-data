@@ -37,6 +37,26 @@ CREATE TABLE dfe_legacy.daily_orders (
   amount numeric(18, 2)
 );
 
+CREATE TABLE dfe_legacy.union_root (
+  id bigint,
+  bucket bigint NOT NULL
+);
+CREATE TABLE dfe_legacy.union_child () INHERITS (dfe_legacy.union_root);
+CREATE TABLE dfe_legacy.union_middle () INHERITS (dfe_legacy.union_root);
+CREATE TABLE dfe_legacy.union_grandchild () INHERITS (dfe_legacy.union_middle);
+CREATE TABLE dfe_legacy.union_empty () INHERITS (dfe_legacy.union_root);
+
+CREATE INDEX union_root_id_idx ON dfe_legacy.union_root (id);
+CREATE INDEX union_child_id_idx ON dfe_legacy.union_child (id);
+CREATE INDEX union_middle_id_idx ON dfe_legacy.union_middle (id);
+CREATE INDEX union_grandchild_id_idx ON dfe_legacy.union_grandchild (id);
+CREATE INDEX union_empty_id_idx ON dfe_legacy.union_empty (id);
+
+INSERT INTO dfe_legacy.union_root (id, bucket) VALUES (1, 0);
+INSERT INTO dfe_legacy.union_child (id, bucket) VALUES (1, 10);
+INSERT INTO dfe_legacy.union_middle (id, bucket) VALUES (NULL, 20);
+INSERT INTO dfe_legacy.union_grandchild (id, bucket) VALUES (2, 30);
+
 CREATE TABLE dfe_control.batch_manifest (
   dataset_id text NOT NULL,
   scope_digest text NOT NULL,
@@ -51,8 +71,14 @@ CREATE TABLE dfe_control.batch_manifest (
 
 \ir /opt/forensic-data/data.sql
 
-REVOKE ALL ON dfe_legacy.daily_orders, dfe_control.batch_manifest FROM PUBLIC;
-GRANT SELECT ON dfe_legacy.daily_orders, dfe_control.batch_manifest
+REVOKE ALL ON dfe_legacy.daily_orders, dfe_legacy.union_root,
+  dfe_legacy.union_child, dfe_legacy.union_middle,
+  dfe_legacy.union_grandchild, dfe_legacy.union_empty,
+  dfe_control.batch_manifest FROM PUBLIC;
+GRANT SELECT ON dfe_legacy.daily_orders, dfe_legacy.union_root,
+  dfe_legacy.union_child, dfe_legacy.union_middle,
+  dfe_legacy.union_grandchild, dfe_legacy.union_empty,
+  dfe_control.batch_manifest
   TO dfe_legacy_reader;
 
 COMMIT;

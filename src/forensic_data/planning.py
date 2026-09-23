@@ -275,11 +275,13 @@ class PlanDataset(_PlanModel):
         ):
             if value.strip() == "":
                 raise ValueError(f"plan {context} must be nonblank")
-        if (
-            self.locator_kind == "relation"
-            and self.relation_scope is not RelationScope.PHYSICAL_ONLY
+        if self.locator_kind == "relation" and self.relation_scope not in (
+            RelationScope.PHYSICAL_ONLY,
+            RelationScope.FROZEN_PHYSICAL_UNION,
         ):
-            raise ValueError("relation plan dataset requires physical_only relation scope")
+            raise ValueError(
+                "relation plan dataset requires physical_only or frozen_physical_union scope"
+            )
         if self.locator_kind == "sql" and self.relation_scope is not None:
             raise ValueError("SQL plan dataset cannot carry a relation scope")
         if self.readiness.connection_id != self.connection_id:
@@ -426,8 +428,7 @@ def compile_static_plan(
     limitations = (
         "static plan does not access endpoints or establish readiness, capability, or data equality",
         "all listed probes and execution stages remain required and not run",
-        "relation datasets use physical_only semantics with ONLY; existence and relkind are not "
-        "statically proven",
+        _relation_scope_limitation(reference, target),
         "estimates are unknown until bounded endpoint preflight and execution",
     )
     return PlanReport(
@@ -450,6 +451,31 @@ def compile_static_plan(
         stages=stages,
         estimates=estimates,
         limitations=limitations,
+    )
+
+
+def _relation_scope_limitation(reference: PlanDataset, target: PlanDataset) -> str:
+    scopes = tuple(
+        dataset.relation_scope
+        for dataset in (reference, target)
+        if dataset.locator_kind == "relation"
+    )
+    if RelationScope.FROZEN_PHYSICAL_UNION not in scopes:
+        return (
+            "relation datasets use physical_only semantics with ONLY; existence and relkind are not "
+            "statically proven"
+        )
+    reference_scope = (
+        reference.relation_scope.value if reference.relation_scope is not None else "not_applicable"
+    )
+    target_scope = (
+        target.relation_scope.value if target.relation_scope is not None else "not_applicable"
+    )
+    return (
+        "relation dataset scopes are explicitly selected: "
+        f"reference={reference_scope}, target={target_scope}; frozen_physical_union resolves a "
+        "locked physical hierarchy while physical_only uses ONLY; existence, topology, and relkind "
+        "are not statically proven"
     )
 
 

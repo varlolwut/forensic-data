@@ -88,8 +88,12 @@ from forensic_data.planning import PlanDirection
 from forensic_data.postgres import (
     DatabaseRow,
     PostgresConnectionSettings,
+    PostgresInheritanceEdge,
     PostgresProtectedReadContext,
     PostgresProtectedRelationInspection,
+    PostgresProtectedRelationMember,
+    PostgresRelationKind,
+    PostgresRelationPersistence,
     PostgresRetryPolicy,
     ReadContextState,
 )
@@ -537,10 +541,8 @@ class ReadContextPersistence:
             "protected read context",
         )
         evidence = self.protected_context.evidence
-        protected_relations = self.protected_context.protected_relations
-        if (
-            tuple(item.inspection.relation_oid for item in protected_relations)
-            != evidence.locked_relation_oids
+        if _protected_context_lock_closure(self.protected_context) != (
+            evidence.locked_relation_oids
         ):
             raise ValueError(
                 "protected context relations must exactly match its locked relation evidence"
@@ -4756,10 +4758,59 @@ def _validate_context_definition(
         raise ValueError("read context dataset is outside the run request direction closure")
 
 
+def _protected_context_lock_closure(
+    context: PostgresProtectedReadContext,
+) -> tuple[int, ...]:
+    identities_by_oid: dict[
+        int,
+        tuple[
+            tuple[str, ...],
+            int,
+            int,
+            PostgresRelationKind,
+            PostgresRelationPersistence,
+        ],
+    ] = {}
+    for protected in context.protected_relations:
+        inspection = protected.inspection
+        if protected.composition is None:
+            members = (
+                PostgresProtectedRelationMember(
+                    inspection=inspection,
+                    namespace_oid=protected.namespace_oid,
+                    relation_kind=PostgresRelationKind.REGULAR,
+                    relation_persistence=protected.relation_persistence,
+                ),
+            )
+        else:
+            members = protected.composition.members
+        for member in members:
+            member_inspection = member.inspection
+            identity = (
+                member_inspection.relation.components,
+                member_inspection.relation_row_type_oid,
+                member.namespace_oid,
+                member.relation_kind,
+                member.relation_persistence,
+            )
+            previous = identities_by_oid.get(member_inspection.relation_oid)
+            if previous is not None and previous != identity:
+                raise ValueError(
+                    "protected context maps one locked relation OID to conflicting identities"
+                )
+            identities_by_oid[member_inspection.relation_oid] = identity
+    return tuple(
+        relation_oid
+        for relation_oid, _identity in sorted(
+            identities_by_oid.items(),
+            key=lambda item: (item[1][0], item[0]),
+        )
+    )
+
+
 def _require_protected_context_active(context: PostgresProtectedReadContext) -> None:
     evidence = context.evidence
-    relations = context.protected_relations
-    if tuple(item.inspection.relation_oid for item in relations) != evidence.locked_relation_oids:
+    if _protected_context_lock_closure(context) != evidence.locked_relation_oids:
         raise RunLifecycleStateError(
             "protected source context relation closure changed before persistence"
         )
@@ -4810,6 +4861,11 @@ def _require_dataset_relation_closure(
     )
     if protected.acquisition.relation.components != expected_relation:
         raise ValueError("protected dataset relation differs from the registered locator")
+    expected_scope = dataset.definition.relation_scope
+    if expected_scope is None or protected.acquisition.relation_scope is not expected_scope:
+        raise ValueError(
+            "protected dataset relation scope differs from the immutable dataset definition"
+        )
     projection = _semantic_array(body.get("projection"), "dataset projection")
     expected_columns = tuple(
         _semantic_text(
@@ -5032,7 +5088,7 @@ def _protected_relation_semantic_value(
     protected: PostgresProtectedRelationInspection,
 ) -> dict[str, SemanticValue]:
     inspection = protected.inspection
-    return {
+    value: dict[str, SemanticValue] = {
         "acquired_before_snapshot": protected.acquired_before_snapshot,
         "columns": [_binding_semantic_value(item) for item in inspection.bindings],
         "lock_mode": protected.lock_mode,
@@ -5043,6 +5099,53 @@ def _protected_relation_semantic_value(
         "relation_row_type_oid": inspection.relation_row_type_oid,
         "requested_relation": list(protected.acquisition.relation.components),
         "resolved_relation": list(inspection.relation.components),
+    }
+    if protected.acquisition.relation_scope is RelationScope.PHYSICAL_ONLY:
+        return value
+    composition = protected.composition
+    if composition is None:
+        raise ValueError("frozen physical union lacks a protected composition")
+    composition_value: dict[str, SemanticValue] = {
+        "composition_version": 1,
+        "edges": [_inheritance_edge_semantic_value(edge) for edge in composition.edges],
+        "members": [_protected_member_semantic_value(member) for member in composition.members],
+        "root_relation_oid": composition.root_relation_oid,
+    }
+    value["composition"] = {
+        "composition_digest": semantic_digest_hex(composition_value),
+        **composition_value,
+    }
+    value["relation_scope"] = protected.acquisition.relation_scope.value
+    return value
+
+
+def _protected_member_semantic_value(
+    member: PostgresProtectedRelationMember,
+) -> dict[str, SemanticValue]:
+    inspection = member.inspection
+    binding: dict[str, SemanticValue] = {
+        "columns": [_binding_semantic_value(item) for item in inspection.bindings],
+        "namespace_oid": member.namespace_oid,
+        "relation_kind": member.relation_kind.value,
+        "relation_oid": inspection.relation_oid,
+        "relation_persistence": member.relation_persistence.value,
+        "relation_row_type_oid": inspection.relation_row_type_oid,
+        "resolved_relation": list(inspection.relation.components),
+    }
+    return {
+        **binding,
+        "physical_binding_digest": semantic_digest_hex(binding),
+    }
+
+
+def _inheritance_edge_semantic_value(
+    edge: PostgresInheritanceEdge,
+) -> dict[str, SemanticValue]:
+    return {
+        "child_relation_oid": edge.child_relation_oid,
+        "detach_state": edge.detach_state.value,
+        "inhseqno": edge.sequence,
+        "parent_relation_oid": edge.parent_relation_oid,
     }
 
 

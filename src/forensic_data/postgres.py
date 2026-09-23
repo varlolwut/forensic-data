@@ -25,22 +25,28 @@ from forensic_data.canonical import (
     envelope_sha256,
     prepare_envelope_context,
 )
-from forensic_data.contracts.model import ExecutionBudgets, ReadinessManifestColumns
+from forensic_data.contracts.model import (
+    ExecutionBudgets,
+    ReadinessManifestColumns,
+    RelationScope,
+)
 from forensic_data.postgres_sql import (
+    MAX_COMPILED_RELATION_MEMBERS,
     PostgresFieldBinding,
     PostgresInspectedRelation,
     PostgresIntegerRangeRequest,
     PostgresParameter,
     PostgresPhysicalField,
     PostgresQuery,
+    PostgresQueryRelation,
     PostgresRelation,
     PostgresScopePredicate,
     PostgresTypeIdentity,
-    build_postgres_fingerprint_query,
-    build_postgres_integer_key_summary_query,
-    build_postgres_integer_range_fingerprint_query,
-    build_postgres_integer_range_rows_query,
-    build_postgres_row_envelope_query,
+    build_postgres_union_fingerprint_query,
+    build_postgres_union_integer_key_summary_query,
+    build_postgres_union_integer_range_fingerprint_query,
+    build_postgres_union_integer_range_rows_query,
+    build_postgres_union_row_envelope_query,
     validate_postgres_inspection,
 )
 
@@ -49,6 +55,8 @@ INT64_MAX = (1 << 63) - 1
 UINT32_MAX = (1 << 32) - 1
 SHA256_BYTES = 32
 _CANONICAL_STATUS_BYTES = 2
+_MAX_UINT32_DECIMAL_BYTES = 10
+_DATA_MARKER_BYTES = 1
 _CURSOR_FETCH_RECORDS = 64
 _DEADLINE_CHECK_RECORDS = 64
 _METADATA_ROW_COLUMNS = 15
@@ -139,6 +147,16 @@ class PostgresRelationPersistence(StrEnum):
     PERMANENT = "permanent"
 
 
+class PostgresRelationKind(StrEnum):
+    REGULAR = "r"
+    PARTITIONED = "p"
+
+
+class PostgresInheritanceDetachState(StrEnum):
+    ATTACHED = "attached"
+    UNSUPPORTED_BY_SERVER = "unsupported_by_server"
+
+
 class PostgresConnectionSettings(BaseModel):
     model_config = ConfigDict(extra="forbid", frozen=True, strict=True)
 
@@ -215,6 +233,7 @@ class PostgresProtectedReadContextEvidence(PostgresReadContextEvidence):
 class PostgresRelationAcquisition:
     schema: CanonicalSchema
     relation: PostgresRelation
+    relation_scope: RelationScope
     column_names: tuple[str, ...]
     max_metadata_record_bytes: int
     max_metadata_total_bytes: int
@@ -222,10 +241,104 @@ class PostgresRelationAcquisition:
     def __post_init__(self) -> None:
         _require_schema(self.schema)
         _require_relation(self.relation)
+        if type(self.relation_scope) is not RelationScope:
+            raise TypeError("PostgreSQL relation_scope must be a RelationScope")
+        if self.relation_scope not in (
+            RelationScope.PHYSICAL_ONLY,
+            RelationScope.FROZEN_PHYSICAL_UNION,
+        ):
+            raise ValueError("PostgreSQL relation acquisition requires a supported relation scope")
         _require_column_names(self.column_names, len(self.schema.fields))
         _validate_metadata_limits(
             self.max_metadata_record_bytes,
             self.max_metadata_total_bytes,
+        )
+
+
+@dataclass(frozen=True, slots=True)
+class PostgresInheritanceEdge:
+    parent_relation_oid: int
+    child_relation_oid: int
+    sequence: int
+    detach_state: PostgresInheritanceDetachState
+
+    def __post_init__(self) -> None:
+        _validate_positive_integer(self.parent_relation_oid, "inheritance parent OID")
+        _validate_positive_integer(self.child_relation_oid, "inheritance child OID")
+        _validate_positive_integer(self.sequence, "inheritance edge sequence")
+        if self.parent_relation_oid == self.child_relation_oid:
+            raise ValueError("PostgreSQL inheritance edge cannot be self-referential")
+        if type(self.detach_state) is not PostgresInheritanceDetachState:
+            raise TypeError("detach_state must be a PostgresInheritanceDetachState")
+
+
+@dataclass(frozen=True, slots=True)
+class PostgresProtectedRelationMember:
+    inspection: PostgresInspectedRelation
+    namespace_oid: int
+    relation_kind: PostgresRelationKind
+    relation_persistence: PostgresRelationPersistence
+
+    def __post_init__(self) -> None:
+        _require_inspected_relation(self.inspection)
+        _validate_positive_integer(self.namespace_oid, "member namespace_oid")
+        if type(self.relation_kind) is not PostgresRelationKind:
+            raise TypeError("relation_kind must be a PostgresRelationKind")
+        if self.relation_persistence is not PostgresRelationPersistence.PERMANENT:
+            raise ValueError("protected union member must be permanent")
+
+
+@dataclass(frozen=True, slots=True)
+class PostgresProtectedRelationComposition:
+    root_relation_oid: int
+    members: tuple[PostgresProtectedRelationMember, ...]
+    edges: tuple[PostgresInheritanceEdge, ...]
+
+    def __post_init__(self) -> None:
+        _validate_positive_integer(self.root_relation_oid, "composition root relation OID")
+        if type(self.members) is not tuple or not self.members:
+            raise ValueError("protected relation composition requires immutable members")
+        if type(self.edges) is not tuple:
+            raise TypeError("protected relation composition edges must be an immutable tuple")
+        member_oids = tuple(member.inspection.relation_oid for member in self.members)
+        if len(set(member_oids)) != len(member_oids):
+            raise ValueError("protected relation composition contains duplicate member OIDs")
+        if self.root_relation_oid not in member_oids:
+            raise ValueError("protected relation composition root is absent from its members")
+        expected_member_order = tuple(
+            sorted(
+                self.members,
+                key=lambda member: (
+                    member.inspection.relation.components,
+                    member.inspection.relation_oid,
+                ),
+            )
+        )
+        if self.members != expected_member_order:
+            raise ValueError("protected relation composition members are not deterministic")
+        member_oid_set = set(member_oids)
+        expected_edge_order = tuple(
+            sorted(
+                self.edges,
+                key=lambda edge: (
+                    edge.parent_relation_oid,
+                    edge.sequence,
+                    edge.child_relation_oid,
+                ),
+            )
+        )
+        if self.edges != expected_edge_order or len(set(self.edges)) != len(self.edges):
+            raise ValueError("protected relation composition edges are not deterministic")
+        for edge in self.edges:
+            if (
+                edge.parent_relation_oid not in member_oid_set
+                or edge.child_relation_oid not in member_oid_set
+            ):
+                raise ValueError("protected relation composition contains a dangling edge")
+        _validate_composition_reachability(
+            self.root_relation_oid,
+            member_oid_set,
+            self.edges,
         )
 
 
@@ -237,6 +350,7 @@ class PostgresProtectedRelationInspection:
     lock_mode: str
     relation_persistence: PostgresRelationPersistence
     acquired_before_snapshot: bool
+    composition: PostgresProtectedRelationComposition | None
 
     def __post_init__(self) -> None:
         _require_relation_acquisition(self.acquisition)
@@ -250,6 +364,93 @@ class PostgresProtectedRelationInspection:
             raise ValueError("protected inspection relation_persistence must be permanent")
         if self.acquired_before_snapshot is not True:
             raise ValueError("protected inspection must be acquired before the snapshot")
+        if self.acquisition.relation_scope is RelationScope.PHYSICAL_ONLY:
+            if self.composition is not None:
+                raise ValueError("physical_only inspection cannot contain a union composition")
+        elif self.acquisition.relation_scope is RelationScope.FROZEN_PHYSICAL_UNION:
+            if not isinstance(self.composition, PostgresProtectedRelationComposition):
+                raise ValueError("frozen physical union inspection requires a composition")
+            if self.composition.root_relation_oid != self.inspection.relation_oid:
+                raise ValueError("protected composition root differs from the root inspection")
+            root_members = tuple(
+                member
+                for member in self.composition.members
+                if member.inspection.relation_oid == self.inspection.relation_oid
+            )
+            if len(root_members) != 1 or root_members[0].inspection is not self.inspection:
+                raise ValueError(
+                    "protected composition must contain the exact sealed root inspection"
+                )
+        else:
+            raise ValueError("protected inspection has an unsupported relation scope")
+
+    def query_relations(self) -> tuple[PostgresQueryRelation, ...]:
+        if self.composition is None:
+            return (
+                PostgresQueryRelation(
+                    inspection=self.inspection,
+                    contributes_rows=True,
+                ),
+            )
+        return tuple(
+            PostgresQueryRelation(
+                inspection=member.inspection,
+                contributes_rows=member.relation_kind is PostgresRelationKind.REGULAR,
+            )
+            for member in self.composition.members
+        )
+
+    def physical_scan_count(self) -> int:
+        if self.composition is None:
+            return 1
+        return sum(
+            member.relation_kind is PostgresRelationKind.REGULAR
+            for member in self.composition.members
+        )
+
+
+def _validate_composition_reachability(
+    root_relation_oid: int,
+    member_oids: set[int],
+    edges: tuple[PostgresInheritanceEdge, ...],
+) -> None:
+    children_by_parent: dict[int, list[int]] = {oid: [] for oid in member_oids}
+    child_sequences: set[tuple[int, int]] = set()
+    for edge in edges:
+        sequence_identity = (edge.child_relation_oid, edge.sequence)
+        if sequence_identity in child_sequences:
+            raise ValueError(
+                "PostgreSQL relation composition repeats an inheritance sequence for one "
+                f"child: child_oid={edge.child_relation_oid}, sequence={edge.sequence}"
+            )
+        child_sequences.add(sequence_identity)
+        children_by_parent.setdefault(edge.parent_relation_oid, []).append(edge.child_relation_oid)
+
+    reachable: set[int] = set()
+    active: set[int] = set()
+    stack: list[tuple[int, bool]] = [(root_relation_oid, False)]
+    while stack:
+        relation_oid, exiting = stack.pop()
+        if exiting:
+            active.remove(relation_oid)
+            reachable.add(relation_oid)
+            continue
+        if relation_oid in reachable:
+            continue
+        if relation_oid in active:
+            raise ValueError(
+                "PostgreSQL relation composition contains an inheritance cycle: "
+                f"relation_oid={relation_oid}"
+            )
+        active.add(relation_oid)
+        stack.append((relation_oid, True))
+        for child_oid in reversed(children_by_parent.get(relation_oid, [])):
+            stack.append((child_oid, False))
+    if reachable != member_oids:
+        raise ValueError(
+            "PostgreSQL relation composition contains members unreachable from its root: "
+            f"unreachable_oids={tuple(sorted(member_oids - reachable))!r}"
+        )
 
 
 @dataclass(frozen=True, slots=True)
@@ -724,12 +925,22 @@ type ExecutableSql = LiteralString | sql.SQL | sql.Composed
 
 
 @dataclass(frozen=True, slots=True)
-class _PostgresRelationCandidate:
+class _PostgresRelationMemberCandidate:
     acquisition: PostgresRelationAcquisition
+    relation: PostgresRelation
     relation_oid: int
     relation_row_type_oid: int
     namespace_oid: int
+    relation_kind: PostgresRelationKind
     relation_persistence: str
+
+
+@dataclass(frozen=True, slots=True)
+class _PostgresRelationCandidate:
+    acquisition: PostgresRelationAcquisition
+    root_relation_oid: int
+    members: tuple[_PostgresRelationMemberCandidate, ...]
+    edges: tuple[PostgresInheritanceEdge, ...]
 
 
 class PostgresReadContext:
@@ -892,14 +1103,39 @@ class PostgresReadContext:
                 "max_record_bytes must reserve the configured envelope and SHA-256 digest: "
                 f"required={minimum_record_budget}, actual={max_record_bytes}"
             )
+        raw_record_overhead = _MAX_UINT32_DECIMAL_BYTES + _DATA_MARKER_BYTES
+        raw_max_records = max_records + len(query.relations)
         rows = self._execute_compiled_query(
             query,
-            max_records,
-            max_record_bytes,
-            max_total_bytes,
-            1,
+            raw_max_records,
+            max_record_bytes + raw_record_overhead,
+            max_total_bytes + (raw_max_records * raw_record_overhead),
+            _query_physical_scan_count(query),
         )
-        return tuple(_canonical_row_from_database(row, query) for row in rows)
+        parsed: list[PostgresCanonicalRow] = []
+        logical_total_bytes = 0
+        for row in rows:
+            canonical_row = _canonical_row_from_database(row, query)
+            if canonical_row is None:
+                continue
+            if len(parsed) >= max_records:
+                raise PostgresResultLimitError(
+                    "PostgreSQL canonical query exceeded the reserved logical record budget: "
+                    f"max_records={max_records}"
+                )
+            logical_record_bytes = (
+                len(canonical_row.envelope) + SHA256_BYTES + _CANONICAL_STATUS_BYTES
+            )
+            observed_logical_total_bytes = logical_total_bytes + logical_record_bytes
+            if observed_logical_total_bytes > max_total_bytes:
+                raise PostgresResultLimitError(
+                    "PostgreSQL canonical query exceeded the reserved logical total byte "
+                    f"budget: observed_bytes={observed_logical_total_bytes}, "
+                    f"max_total_bytes={max_total_bytes}"
+                )
+            parsed.append(canonical_row)
+            logical_total_bytes = observed_logical_total_bytes
+        return tuple(parsed)
 
     def read_fingerprint(
         self,
@@ -909,25 +1145,22 @@ class PostgresReadContext:
     ) -> Fingerprint:
         _validate_postgres_query(query)
         self._require_query_context(query)
+        provenance_bytes = _query_provenance_bytes(query)
         rows = self._execute_compiled_query(
             query,
             1,
-            max_record_bytes,
-            max_total_bytes,
-            1,
+            max_record_bytes + provenance_bytes,
+            max_total_bytes + provenance_bytes,
+            _query_physical_scan_count(query),
         )
-        if len(rows) != 1 or len(rows[0]) != 12:
+        if len(rows) != 1:
             raise PostgresDataValidationError(
-                "PostgreSQL fingerprint query must return one row with origin type, valid "
-                "count, eight limbs, invalid count, and oversized count"
+                "PostgreSQL fingerprint query must return exactly one row"
             )
-        if rows[0][0] is not None:
-            raise PostgresDataValidationError(
-                "PostgreSQL fingerprint origin type marker must be NULL"
-            )
+        payload = _compiled_query_payload(rows[0], query, 11, "fingerprint")
         values = tuple(
             _parse_unsigned_decimal(value, 19 if index in (0, 9, 10) else 38)
-            for index, value in enumerate(rows[0][1:])
+            for index, value in enumerate(payload)
         )
         count = values[0]
         invalid_count = values[9]
@@ -978,20 +1211,27 @@ class PostgresReadContext:
         _validate_postgres_query(query)
         self._require_query_context(query)
         _require_postgres_read_deadline(deadline, "integer-key summary read")
+        expected_full_scans = _query_physical_scan_count(query)
+        _require_compiled_full_scan_reservation(
+            full_scans,
+            expected_full_scans,
+            "integer-key summary",
+        )
+        provenance_bytes = _query_provenance_bytes(query)
         rows = self._execute_compiled_query_before_deadline(
             query,
             1,
-            max_record_bytes,
-            max_total_bytes,
+            max_record_bytes + provenance_bytes,
+            max_total_bytes + provenance_bytes,
             deadline,
-            full_scans,
+            expected_full_scans,
         )
         if len(rows) != 1:
             raise PostgresDataValidationError(
                 "PostgreSQL integer-key summary query must return exactly one row"
             )
         return PostgresIntegerKeySummaryRead(
-            summary=_integer_key_summary_from_database(rows[0]),
+            summary=_integer_key_summary_from_database(rows[0], query),
             metrics=_read_metrics_before_deadline(rows, deadline),
         )
 
@@ -1007,13 +1247,20 @@ class PostgresReadContext:
         _validate_postgres_query(query)
         self._require_query_context(query)
         _require_postgres_read_deadline(deadline, "integer-range fingerprint read")
+        expected_full_scans = len(ranges) * _query_physical_scan_count(query)
+        _require_compiled_full_scan_reservation(
+            full_scans,
+            expected_full_scans,
+            "integer-range fingerprint",
+        )
+        provenance_bytes = _query_provenance_bytes(query)
         rows = self._execute_compiled_query_before_deadline(
             query,
             len(ranges),
-            max_record_bytes,
-            max_total_bytes,
+            max_record_bytes + provenance_bytes,
+            max_total_bytes + (len(ranges) * provenance_bytes),
             deadline,
-            full_scans,
+            expected_full_scans,
         )
         parsed = _range_fingerprints_from_database(rows, ranges, query, deadline)
         return PostgresRangeFingerprintRead(
@@ -1035,13 +1282,20 @@ class PostgresReadContext:
         _validate_postgres_query(query)
         self._require_query_context(query)
         _require_postgres_read_deadline(deadline, "integer-range exact read")
+        expected_full_scans = len(ranges) * _query_physical_scan_count(query)
+        _require_compiled_full_scan_reservation(
+            full_scans,
+            expected_full_scans,
+            "integer-range exact",
+        )
+        raw_record_overhead = _query_provenance_bytes(query) + _DATA_MARKER_BYTES
         rows = self._execute_compiled_query_before_deadline(
             query,
             max_records,
-            max_record_bytes,
-            max_total_bytes,
+            max_record_bytes + raw_record_overhead,
+            max_total_bytes + (max_records * raw_record_overhead),
             deadline,
-            full_scans,
+            expected_full_scans,
         )
         parsed = _integer_exact_rows_from_database(
             rows,
@@ -1052,7 +1306,7 @@ class PostgresReadContext:
         )
         return PostgresIntegerExactRowsRead(
             rows=parsed,
-            metrics=_read_metrics_before_deadline(rows, deadline),
+            metrics=_exact_read_metrics(rows, query, deadline),
         )
 
     def close(self) -> None:
@@ -1220,9 +1474,9 @@ class PostgresReadContext:
                         _executable_statement(query.statement),
                         query.parameters,
                     )
-                    _require_compiled_origin_type(
+                    _require_compiled_origin_types(
                         cursor.description,
-                        query.inspected_relation.relation_row_type_oid,
+                        query.relations,
                     )
                     records = _fetch_bounded_rows(
                         cursor,
@@ -1239,6 +1493,7 @@ class PostgresReadContext:
             raise PostgresQueryError(database_failure)
         if records is None:
             raise AssertionError("PostgreSQL compiled query completed without a result")
+        _require_compiled_query_provenance(records, query)
         return records
 
     def _execute_compiled_query_before_deadline(
@@ -1268,9 +1523,9 @@ class PostgresReadContext:
                         _executable_statement(query.statement),
                         query.parameters,
                     )
-                    _require_compiled_origin_type(
+                    _require_compiled_origin_types(
                         cursor.description,
-                        query.inspected_relation.relation_row_type_oid,
+                        query.relations,
                     )
                     records = self._fetch_bounded_rows_before_deadline(
                         cursor,
@@ -1293,6 +1548,7 @@ class PostgresReadContext:
             raise AssertionError(
                 "PostgreSQL deadline-bounded compiled query completed without a result"
             )
+        _require_compiled_query_provenance(records, query)
         return records
 
     def _fetch_bounded_rows_before_deadline(
@@ -1435,12 +1691,14 @@ class PostgresReadContext:
         return min(self._statement_timeout_milliseconds, remaining_milliseconds)
 
     def _require_query_context(self, query: PostgresQuery) -> None:
-        if query.inspected_relation.context_id != self._evidence.context_id:
-            raise PostgresQueryContextError(
-                "PostgreSQL compiled query belongs to a different read context: "
-                f"query_context_id={query.inspected_relation.context_id}, "
-                f"active_context_id={self._evidence.context_id}"
-            )
+        for index, relation in enumerate(query.relations):
+            query_context_id = relation.inspection.context_id
+            if query_context_id != self._evidence.context_id:
+                raise PostgresQueryContextError(
+                    "PostgreSQL compiled query relation belongs to a different read context: "
+                    f"index={index}, query_context_id={query_context_id}, "
+                    f"active_context_id={self._evidence.context_id}"
+                )
 
     def _require_active(self) -> None:
         if self._state is ReadContextState.CLOSED:
@@ -1507,7 +1765,7 @@ class PostgresProtectedReadContext:
         self._require_protected_relation(protected_relation)
         query = self._build_row_envelope_query(
             protected_relation.acquisition.schema,
-            protected_relation.inspection,
+            protected_relation.query_relations(),
             max_encoded_envelope_bytes,
         )
         return self._read_context.read_canonical_rows(
@@ -1527,7 +1785,7 @@ class PostgresProtectedReadContext:
         self._require_protected_relation(protected_relation)
         query = self._build_fingerprint_query(
             protected_relation.acquisition.schema,
-            protected_relation.inspection,
+            protected_relation.query_relations(),
             max_encoded_envelope_bytes,
         )
         return self._read_context.read_fingerprint(
@@ -1550,7 +1808,7 @@ class PostgresProtectedReadContext:
         self._require_protected_relation(protected_relation)
         query = self._build_integer_key_summary_query(
             protected_relation.acquisition.schema,
-            protected_relation.inspection,
+            protected_relation.query_relations(),
             key_field_index,
             scope,
             max_encoded_envelope_bytes,
@@ -1578,7 +1836,7 @@ class PostgresProtectedReadContext:
         self._require_protected_relation(protected_relation)
         query = self._build_integer_range_fingerprint_query(
             protected_relation.acquisition.schema,
-            protected_relation.inspection,
+            protected_relation.query_relations(),
             key_field_index,
             scope,
             ranges,
@@ -1607,9 +1865,9 @@ class PostgresProtectedReadContext:
         full_scans: int,
     ) -> PostgresIntegerExactRowsRead:
         self._require_protected_relation(protected_relation)
-        query = build_postgres_integer_range_rows_query(
+        query = build_postgres_union_integer_range_rows_query(
             protected_relation.acquisition.schema,
-            protected_relation.inspection,
+            protected_relation.query_relations(),
             key_field_index,
             scope,
             ranges,
@@ -1629,39 +1887,39 @@ class PostgresProtectedReadContext:
     def _build_row_envelope_query(
         self,
         schema: CanonicalSchema,
-        inspection: PostgresInspectedRelation,
+        relations: tuple[PostgresQueryRelation, ...],
         max_encoded_envelope_bytes: int,
     ) -> PostgresQuery:
-        return build_postgres_row_envelope_query(
+        return build_postgres_union_row_envelope_query(
             schema,
-            inspection,
+            relations,
             max_encoded_envelope_bytes,
         )
 
     def _build_fingerprint_query(
         self,
         schema: CanonicalSchema,
-        inspection: PostgresInspectedRelation,
+        relations: tuple[PostgresQueryRelation, ...],
         max_encoded_envelope_bytes: int,
     ) -> PostgresQuery:
-        return build_postgres_fingerprint_query(
+        return build_postgres_union_fingerprint_query(
             schema,
-            inspection,
+            relations,
             max_encoded_envelope_bytes,
         )
 
     def _build_integer_range_fingerprint_query(
         self,
         schema: CanonicalSchema,
-        inspection: PostgresInspectedRelation,
+        relations: tuple[PostgresQueryRelation, ...],
         key_field_index: int,
         scope: PostgresScopePredicate | None,
         ranges: tuple[PostgresIntegerRangeRequest, ...],
         max_encoded_envelope_bytes: int,
     ) -> PostgresQuery:
-        return build_postgres_integer_range_fingerprint_query(
+        return build_postgres_union_integer_range_fingerprint_query(
             schema,
-            inspection,
+            relations,
             key_field_index,
             scope,
             ranges,
@@ -1671,14 +1929,14 @@ class PostgresProtectedReadContext:
     def _build_integer_key_summary_query(
         self,
         schema: CanonicalSchema,
-        inspection: PostgresInspectedRelation,
+        relations: tuple[PostgresQueryRelation, ...],
         key_field_index: int,
         scope: PostgresScopePredicate | None,
         max_encoded_envelope_bytes: int,
     ) -> PostgresQuery:
-        return build_postgres_integer_key_summary_query(
+        return build_postgres_union_integer_key_summary_query(
             schema,
-            inspection,
+            relations,
             key_field_index,
             scope,
             max_encoded_envelope_bytes,
@@ -1813,9 +2071,10 @@ def _validate_protected_context_closure(
         )
 
     typed_relations = cast(tuple[object, ...], protected_relations)
-    expected_locked_oids: list[int] = []
-    seen_locked_oids: set[int] = set()
-    identities_by_oid: dict[int, tuple[PostgresRelation, int, int]] = {}
+    members_by_oid: dict[
+        int,
+        tuple[PostgresRelation, int, int, PostgresRelationKind],
+    ] = {}
     previous_relation: tuple[str, ...] | None = None
     for index, value in enumerate(typed_relations):
         if not isinstance(value, PostgresProtectedRelationInspection):
@@ -1865,23 +2124,54 @@ def _validate_protected_context_closure(
                 f"order: index={index}"
             )
         previous_relation = relation_components
-        relation_identity = (
-            inspection.relation,
-            inspection.relation_row_type_oid,
-            protected.namespace_oid,
-        )
-        previous_identity = identities_by_oid.get(inspection.relation_oid)
-        if previous_identity is not None and previous_identity != relation_identity:
-            raise PostgresQueryContextError(
-                "PostgreSQL protected relation OID maps to conflicting inspected identities: "
-                f"relation_oid={inspection.relation_oid}"
+        if protected.composition is None:
+            member_closure = (
+                PostgresProtectedRelationMember(
+                    inspection=inspection,
+                    namespace_oid=protected.namespace_oid,
+                    relation_kind=PostgresRelationKind.REGULAR,
+                    relation_persistence=protected.relation_persistence,
+                ),
             )
-        identities_by_oid[inspection.relation_oid] = relation_identity
-        if inspection.relation_oid not in seen_locked_oids:
-            expected_locked_oids.append(inspection.relation_oid)
-            seen_locked_oids.add(inspection.relation_oid)
+        else:
+            member_closure = protected.composition.members
+        for member_index, member in enumerate(member_closure):
+            member_inspection = member.inspection
+            if member_inspection.context_id != evidence.context_id:
+                raise PostgresQueryContextError(
+                    "PostgreSQL protected member belongs to a different read context: "
+                    f"relation_index={index}, member_index={member_index}"
+                )
+            member_binding_columns = tuple(
+                binding.column_name for binding in member_inspection.bindings
+            )
+            if member_binding_columns != acquisition.column_names:
+                raise PostgresQueryContextError(
+                    "PostgreSQL protected member columns differ from the acquired column "
+                    f"closure: relation_index={index}, member_index={member_index}"
+                )
+            validate_postgres_inspection(acquisition.schema, member_inspection)
+            identity = (
+                member_inspection.relation,
+                member_inspection.relation_row_type_oid,
+                member.namespace_oid,
+                member.relation_kind,
+            )
+            previous_identity = members_by_oid.get(member_inspection.relation_oid)
+            if previous_identity is not None and previous_identity != identity:
+                raise PostgresQueryContextError(
+                    "PostgreSQL protected member OID maps to conflicting inspected "
+                    f"identities: relation_oid={member_inspection.relation_oid}"
+                )
+            members_by_oid[member_inspection.relation_oid] = identity
 
-    expected_lock_closure = tuple(expected_locked_oids)
+    expected_lock_closure = tuple(
+        relation_oid
+        for relation_oid, _identity in sorted(
+            members_by_oid.items(),
+            key=lambda item: (item[1][0].components, item[0]),
+        )
+    )
     if evidence.locked_relation_oids != expected_lock_closure:
         raise PostgresQueryContextError(
             "PostgreSQL protected evidence does not exactly match the deduplicated relation "
@@ -2231,11 +2521,35 @@ def _discover_relation_candidate(
     source_budget: PostgresSourceBudgetAttempt,
     direction: PostgresSourceDirection,
 ) -> _PostgresRelationCandidate:
+    if acquisition.relation_scope is RelationScope.PHYSICAL_ONLY:
+        return _discover_physical_relation_candidate(
+            connection,
+            acquisition,
+            source_budget,
+            direction,
+        )
+    if acquisition.relation_scope is RelationScope.FROZEN_PHYSICAL_UNION:
+        return _discover_frozen_relation_candidate(
+            connection,
+            acquisition,
+            source_budget,
+            direction,
+        )
+    raise ValueError("PostgreSQL acquisition has an unsupported relation scope")
+
+
+def _discover_physical_relation_candidate(
+    connection: psycopg.Connection[DatabaseRow],
+    acquisition: PostgresRelationAcquisition,
+    source_budget: PostgresSourceBudgetAttempt,
+    direction: PostgresSourceDirection,
+) -> _PostgresRelationCandidate:
     statement = sql.SQL(
         "SELECT c.oid::bigint, c.reltype::bigint, n.oid::bigint, n.nspname, c.relname, "
         "c.relkind::text, c.relpersistence::text, "
         "pg_catalog.has_table_privilege(c.oid, 'SELECT'), "
         "c.relrowsecurity, c.relforcerowsecurity, "
+        "pg_catalog.has_schema_privilege(n.oid, 'USAGE'), "
         "pg_catalog.current_setting('max_identifier_length')::integer "
         "FROM pg_catalog.pg_class AS c "
         "JOIN pg_catalog.pg_namespace AS n ON n.oid = c.relnamespace "
@@ -2245,6 +2559,7 @@ def _discover_relation_candidate(
         connection,
         statement,
         acquisition.relation.components,
+        1,
         acquisition.max_metadata_record_bytes,
         acquisition.max_metadata_total_bytes,
         source_budget,
@@ -2255,49 +2570,14 @@ def _discover_relation_candidate(
             "PostgreSQL protected relation is missing or inaccessible during candidate "
             f"discovery: relation={acquisition.relation.components!r}"
         )
-    if len(rows) != 1:
-        raise PostgresDataValidationError(
-            "PostgreSQL candidate discovery returned multiple rows for one qualified relation: "
-            f"relation={acquisition.relation.components!r}, rows={len(rows)}"
-        )
-    _validate_materialized_row_budget(
-        rows[0],
-        acquisition.max_metadata_record_bytes,
-        acquisition.max_metadata_total_bytes,
-    )
     row = rows[0]
-    if len(row) != 11:
+    if len(row) != 12:
         raise PostgresDataValidationError(
-            "PostgreSQL candidate discovery must return exactly eleven typed fields"
+            "PostgreSQL physical candidate discovery must return exactly twelve typed fields"
         )
-    relation_oid = _require_bounded_integer(row[0], "candidate relation OID", 1, UINT32_MAX)
-    relation_row_type_oid = _require_bounded_integer(
-        row[1],
-        "candidate relation row type OID",
-        1,
-        UINT32_MAX,
-    )
-    namespace_oid = _require_bounded_integer(
-        row[2],
-        "candidate namespace OID",
-        1,
-        UINT32_MAX,
-    )
-    relation_schema = _require_text(row[3], "candidate relation schema")
-    relation_name = _require_text(row[4], "candidate relation name")
-    relation_persistence = _require_text(row[6], "candidate relation persistence")
-    _validate_discovered_relation(
-        acquisition.relation,
-        relation_schema,
-        relation_name,
-        _require_text(row[5], "candidate relation kind"),
-        relation_persistence,
-        _require_boolean(row[7], "candidate relation SELECT privilege"),
-        _require_boolean(row[8], "candidate relation RLS enabled"),
-        _require_boolean(row[9], "candidate relation RLS forced"),
-    )
+    member = _physical_member_candidate_from_row(acquisition, row)
     max_identifier_utf8_bytes = _require_bounded_integer(
-        row[10],
+        row[11],
         "candidate max_identifier_length",
         1,
         INT64_MAX,
@@ -2306,63 +2586,329 @@ def _discover_relation_candidate(
     _validate_column_identifiers(acquisition.column_names, max_identifier_utf8_bytes)
     return _PostgresRelationCandidate(
         acquisition=acquisition,
+        root_relation_oid=member.relation_oid,
+        members=(member,),
+        edges=(),
+    )
+
+
+def _physical_member_candidate_from_row(
+    acquisition: PostgresRelationAcquisition,
+    row: DatabaseRow,
+) -> _PostgresRelationMemberCandidate:
+    member = _member_candidate_from_values(acquisition, row[:11])
+    if member.relation != acquisition.relation:
+        raise PostgresMetadataError(
+            "PostgreSQL relation identity changed during physical acquisition: "
+            f"requested={acquisition.relation.components!r}, "
+            f"actual={member.relation.components!r}"
+        )
+    if member.relation_kind is not PostgresRelationKind.REGULAR:
+        raise PostgresMetadataError(
+            "PostgreSQL physical_only acquisition requires a regular table: "
+            f"relation={member.relation.components!r}, "
+            f"relation_kind={member.relation_kind.value!r}"
+        )
+    return member
+
+
+def _discover_frozen_relation_candidate(
+    connection: psycopg.Connection[DatabaseRow],
+    acquisition: PostgresRelationAcquisition,
+    source_budget: PostgresSourceBudgetAttempt,
+    direction: PostgresSourceDirection,
+) -> _PostgresRelationCandidate:
+    statement = sql.SQL(
+        "WITH RECURSIVE dfe_root AS ("
+        "SELECT c.oid FROM pg_catalog.pg_class AS c "
+        "JOIN pg_catalog.pg_namespace AS n ON n.oid = c.relnamespace "
+        "WHERE n.nspname = %s AND c.relname = %s"
+        "), dfe_members(relation_oid) AS ("
+        "SELECT dfe_root.oid FROM dfe_root UNION "
+        "SELECT inheritance.inhrelid FROM pg_catalog.pg_inherits AS inheritance "
+        "JOIN dfe_members ON inheritance.inhparent = dfe_members.relation_oid"
+        ") SELECT c.oid::bigint, c.reltype::bigint, n.oid::bigint, n.nspname, c.relname, "
+        "c.relkind::text, c.relpersistence::text, "
+        "pg_catalog.has_table_privilege(c.oid, 'SELECT'), "
+        "c.relrowsecurity, c.relforcerowsecurity, "
+        "pg_catalog.has_schema_privilege(n.oid, 'USAGE'), "
+        "c.oid = dfe_root.oid, inheritance.inhparent::bigint, "
+        "inheritance.inhseqno::integer, inheritance.inhdetachpending, "
+        "pg_catalog.current_setting('max_identifier_length')::integer "
+        "FROM dfe_members JOIN pg_catalog.pg_class AS c "
+        "ON c.oid = dfe_members.relation_oid "
+        "JOIN pg_catalog.pg_namespace AS n ON n.oid = c.relnamespace "
+        "CROSS JOIN dfe_root LEFT JOIN pg_catalog.pg_inherits AS inheritance "
+        "ON inheritance.inhrelid = c.oid "
+        "AND inheritance.inhparent IN (SELECT relation_oid FROM dfe_members) "
+        "ORDER BY n.nspname, c.relname, c.oid, inheritance.inhseqno, inheritance.inhparent "
+        "LIMIT %s"
+    )
+    max_records = acquisition.max_metadata_total_bytes
+    rows = _execute_pretransaction_candidate_bounded(
+        connection,
+        statement,
+        (*acquisition.relation.components, max_records + 1),
+        max_records,
+        acquisition.max_metadata_record_bytes,
+        acquisition.max_metadata_total_bytes,
+        source_budget,
+        direction,
+    )
+    if not rows:
+        raise PostgresMetadataError(
+            "PostgreSQL frozen physical union root is missing or inaccessible during "
+            f"candidate discovery: relation={acquisition.relation.components!r}"
+        )
+    return _frozen_candidate_from_rows(acquisition, rows)
+
+
+def _frozen_candidate_from_rows(
+    acquisition: PostgresRelationAcquisition,
+    rows: tuple[DatabaseRow, ...],
+) -> _PostgresRelationCandidate:
+    members_by_oid: dict[int, _PostgresRelationMemberCandidate] = {}
+    oids_by_relation: dict[PostgresRelation, int] = {}
+    edges_by_identity: dict[tuple[int, int], PostgresInheritanceEdge] = {}
+    root_oids: set[int] = set()
+    max_identifier_lengths: set[int] = set()
+    for index, row in enumerate(rows):
+        if len(row) != 16:
+            raise PostgresDataValidationError(
+                "PostgreSQL frozen physical union discovery returned an unexpected field "
+                f"count: row={index}, expected=16, actual={len(row)}"
+            )
+        member = _member_candidate_from_values(acquisition, row[:11])
+        previous_member = members_by_oid.get(member.relation_oid)
+        if previous_member is not None and previous_member != member:
+            raise PostgresMetadataError(
+                "PostgreSQL hierarchy maps one OID to conflicting member identities: "
+                f"relation_oid={member.relation_oid}"
+            )
+        members_by_oid[member.relation_oid] = member
+        previous_oid = oids_by_relation.get(member.relation)
+        if previous_oid is not None and previous_oid != member.relation_oid:
+            raise PostgresMetadataError(
+                "PostgreSQL hierarchy maps one qualified name to conflicting OIDs: "
+                f"relation={member.relation.components!r}"
+            )
+        oids_by_relation[member.relation] = member.relation_oid
+        if _require_boolean(row[11], f"hierarchy root marker at row {index}"):
+            root_oids.add(member.relation_oid)
+        parent_oid = _require_optional_integer(row[12], f"hierarchy parent OID at row {index}")
+        sequence = _require_optional_integer(row[13], f"hierarchy sequence at row {index}")
+        detach_pending = row[14]
+        if parent_oid is None or sequence is None:
+            if parent_oid is not None or sequence is not None or detach_pending is not None:
+                raise PostgresMetadataError(
+                    "PostgreSQL hierarchy returned a malformed partial inheritance edge: "
+                    f"row={index}"
+                )
+        else:
+            if _require_boolean(detach_pending, f"hierarchy detach state at row {index}"):
+                raise PostgresAcquisitionRaceError(
+                    "PostgreSQL hierarchy contains an inheritance edge pending detach: "
+                    f"parent_oid={parent_oid}, child_oid={member.relation_oid}, "
+                    f"inhseqno={sequence}"
+                )
+            edge = PostgresInheritanceEdge(
+                parent_relation_oid=parent_oid,
+                child_relation_oid=member.relation_oid,
+                sequence=sequence,
+                detach_state=PostgresInheritanceDetachState.ATTACHED,
+            )
+            edge_identity = (edge.parent_relation_oid, edge.child_relation_oid)
+            previous_edge = edges_by_identity.get(edge_identity)
+            if previous_edge is not None and previous_edge != edge:
+                raise PostgresMetadataError(
+                    "PostgreSQL hierarchy returned conflicting direct-edge metadata: "
+                    f"parent_oid={parent_oid}, child_oid={member.relation_oid}"
+                )
+            edges_by_identity[edge_identity] = edge
+        max_identifier_lengths.add(
+            _require_bounded_integer(
+                row[15],
+                f"candidate max_identifier_length at row {index}",
+                1,
+                INT64_MAX,
+            )
+        )
+    if len(root_oids) != 1:
+        raise PostgresMetadataError(
+            "PostgreSQL frozen physical union discovery did not identify exactly one root: "
+            f"root_oids={tuple(sorted(root_oids))!r}"
+        )
+    root_relation_oid = next(iter(root_oids))
+    if len(members_by_oid) > MAX_COMPILED_RELATION_MEMBERS:
+        raise PostgresMetadataError(
+            "PostgreSQL frozen physical union exceeds the compiled-query member limit: "
+            f"members={len(members_by_oid)}, maximum={MAX_COMPILED_RELATION_MEMBERS}"
+        )
+    root = members_by_oid[root_relation_oid]
+    if root.relation != acquisition.relation:
+        raise PostgresMetadataError(
+            "PostgreSQL frozen physical union root changed qualified identity: "
+            f"requested={acquisition.relation.components!r}, "
+            f"actual={root.relation.components!r}"
+        )
+    if len(max_identifier_lengths) != 1:
+        raise PostgresDataValidationError(
+            "PostgreSQL hierarchy returned inconsistent max_identifier_length values"
+        )
+    max_identifier_utf8_bytes = next(iter(max_identifier_lengths))
+    for member in members_by_oid.values():
+        _validate_relation_identifiers(member.relation, max_identifier_utf8_bytes)
+    _validate_column_identifiers(acquisition.column_names, max_identifier_utf8_bytes)
+    edges = tuple(
+        sorted(
+            edges_by_identity.values(),
+            key=lambda edge: (
+                edge.parent_relation_oid,
+                edge.sequence,
+                edge.child_relation_oid,
+            ),
+        )
+    )
+    try:
+        _validate_composition_reachability(root_relation_oid, set(members_by_oid), edges)
+    except ValueError as error:
+        raise PostgresMetadataError(
+            "PostgreSQL hierarchy graph is malformed: "
+            f"root_relation_oid={root_relation_oid}, reason={error}"
+        ) from None
+    members = tuple(
+        sorted(
+            members_by_oid.values(),
+            key=lambda member: (member.relation.components, member.relation_oid),
+        )
+    )
+    return _PostgresRelationCandidate(
+        acquisition=acquisition,
+        root_relation_oid=root_relation_oid,
+        members=members,
+        edges=edges,
+    )
+
+
+def _member_candidate_from_values(
+    acquisition: PostgresRelationAcquisition,
+    values: DatabaseRow,
+) -> _PostgresRelationMemberCandidate:
+    if len(values) != 11:
+        raise PostgresDataValidationError(
+            "PostgreSQL relation member metadata must contain exactly eleven fields"
+        )
+    relation_oid = _require_bounded_integer(values[0], "candidate relation OID", 1, UINT32_MAX)
+    relation_row_type_oid = _require_bounded_integer(
+        values[1],
+        "candidate relation row type OID",
+        1,
+        UINT32_MAX,
+    )
+    namespace_oid = _require_bounded_integer(
+        values[2],
+        "candidate namespace OID",
+        1,
+        UINT32_MAX,
+    )
+    relation = PostgresRelation(
+        components=(
+            _require_text(values[3], "candidate relation schema"),
+            _require_text(values[4], "candidate relation name"),
+        )
+    )
+    relation_kind_text = _require_text(values[5], "candidate relation kind")
+    try:
+        relation_kind = PostgresRelationKind(relation_kind_text)
+    except ValueError:
+        raise PostgresMetadataError(
+            "PostgreSQL frozen physical union contains an unsupported relation kind: "
+            f"relation={relation.components!r}, relation_kind={relation_kind_text!r}, "
+            "allowed=('p', 'r')"
+        ) from None
+    relation_persistence = _require_text(values[6], "candidate relation persistence")
+    _validate_discovered_relation(
+        acquisition.relation,
+        relation,
+        relation_kind,
+        relation_persistence,
+        _require_boolean(values[7], "candidate relation SELECT privilege"),
+        _require_boolean(values[8], "candidate relation RLS enabled"),
+        _require_boolean(values[9], "candidate relation RLS forced"),
+        _require_boolean(values[10], "candidate schema USAGE privilege"),
+    )
+    return _PostgresRelationMemberCandidate(
+        acquisition=acquisition,
+        relation=relation,
         relation_oid=relation_oid,
         relation_row_type_oid=relation_row_type_oid,
         namespace_oid=namespace_oid,
+        relation_kind=relation_kind,
         relation_persistence=relation_persistence,
     )
 
 
 def _validate_discovered_relation(
     requested_relation: PostgresRelation,
-    relation_schema: str,
-    relation_name: str,
-    relation_kind: str,
+    relation: PostgresRelation,
+    relation_kind: PostgresRelationKind,
     relation_persistence: str,
     has_select: bool,
     row_security: bool,
     force_row_security: bool,
+    has_schema_usage: bool,
 ) -> None:
-    actual_relation = (relation_schema, relation_name)
-    if actual_relation != requested_relation.components:
-        raise PostgresMetadataError(
-            "PostgreSQL relation identity changed during protected acquisition: "
-            f"requested={requested_relation.components!r}, actual={actual_relation!r}"
-        )
-    if relation_kind != "r":
-        raise PostgresMetadataError(
-            "PostgreSQL relation kind is unsupported by the protected physical-table profile: "
-            f"relation={actual_relation!r}, relation_kind={relation_kind!r}, allowed=('r',)"
-        )
     if relation_persistence != "p":
         raise PostgresMetadataError(
-            "PostgreSQL protected relation must be a permanent regular table: "
-            f"relation={actual_relation!r}, relpersistence={relation_persistence!r}, "
+            "PostgreSQL protected relation must be permanent: "
+            f"root={requested_relation.components!r}, relation={relation.components!r}, "
+            f"relation_kind={relation_kind.value!r}, relpersistence={relation_persistence!r}, "
             "required='p'"
+        )
+    if not has_schema_usage:
+        raise PostgresMetadataError(
+            "PostgreSQL protected relation lacks direct schema USAGE privilege for the read "
+            f"role: relation={relation.components!r}"
         )
     if not has_select:
         raise PostgresMetadataError(
             "PostgreSQL protected relation lacks direct SELECT privilege for the read role: "
-            f"relation={actual_relation!r}"
+            f"relation={relation.components!r}"
         )
     if row_security or force_row_security:
         raise PostgresMetadataError(
             "PostgreSQL protected relation enables row-level security, which is unsupported: "
-            f"relation={actual_relation!r}, row_security={row_security}, "
+            f"relation={relation.components!r}, row_security={row_security}, "
             f"force_row_security={force_row_security}"
         )
 
 
 def _unique_lock_candidates(
     candidates: tuple[_PostgresRelationCandidate, ...],
-) -> tuple[_PostgresRelationCandidate, ...]:
-    unique: list[_PostgresRelationCandidate] = []
-    seen_oids: set[int] = set()
+) -> tuple[_PostgresRelationMemberCandidate, ...]:
+    unique_by_oid: dict[int, _PostgresRelationMemberCandidate] = {}
     for candidate in candidates:
-        if candidate.relation_oid not in seen_oids:
-            unique.append(candidate)
-            seen_oids.add(candidate.relation_oid)
-    return tuple(unique)
+        for member in candidate.members:
+            previous = unique_by_oid.get(member.relation_oid)
+            if previous is not None and (
+                previous.relation != member.relation
+                or previous.relation_row_type_oid != member.relation_row_type_oid
+                or previous.namespace_oid != member.namespace_oid
+                or previous.relation_kind is not member.relation_kind
+                or previous.relation_persistence != member.relation_persistence
+            ):
+                raise PostgresMetadataError(
+                    "PostgreSQL protected acquisition maps one lock OID to conflicting "
+                    f"identities: relation_oid={member.relation_oid}"
+                )
+            if previous is None:
+                unique_by_oid[member.relation_oid] = member
+    return tuple(
+        sorted(
+            unique_by_oid.values(),
+            key=lambda member: (member.relation.components, member.relation_oid),
+        )
+    )
 
 
 def _configure_protected_lock_timeouts(
@@ -2429,12 +2975,12 @@ def _configure_protected_snapshot_invariants(
 
 def _lock_candidate_relation(
     connection: psycopg.Connection[DatabaseRow],
-    candidate: _PostgresRelationCandidate,
+    candidate: _PostgresRelationMemberCandidate,
     source_budget: PostgresSourceBudgetAttempt,
     direction: PostgresSourceDirection,
 ) -> None:
     statement = sql.SQL("LOCK TABLE ONLY {} IN ACCESS SHARE MODE").format(
-        sql.Identifier(*candidate.acquisition.relation.components)
+        sql.Identifier(*candidate.relation.components)
     )
     try:
         _execute_source_command(connection, statement, (), source_budget, direction)
@@ -2446,7 +2992,7 @@ def _lock_candidate_relation(
         raise PostgresAcquisitionRaceError(
             "PostgreSQL protected relation disappeared or was rebound after candidate "
             "discovery and before lock acquisition: "
-            f"relation={candidate.acquisition.relation.components!r}, "
+            f"relation={candidate.relation.components!r}, "
             f"candidate_oid={candidate.relation_oid}, "
             f"error_type={type(error).__name__}, sqlstate={error.sqlstate!r}"
         ) from None
@@ -2454,7 +3000,7 @@ def _lock_candidate_relation(
 
 def _capture_protected_snapshot(
     connection: psycopg.Connection[DatabaseRow],
-    lock_candidates: tuple[_PostgresRelationCandidate, ...],
+    lock_candidates: tuple[_PostgresRelationMemberCandidate, ...],
     started_at: datetime,
     source_budget: PostgresSourceBudgetAttempt,
     direction: PostgresSourceDirection,
@@ -2519,7 +3065,7 @@ def _capture_protected_snapshot(
             raise PostgresAcquisitionRaceError(
                 "PostgreSQL protected acquisition cannot prove an AccessShareLock for the "
                 "discovered relation before its snapshot: "
-                f"relation={candidate.acquisition.relation.components!r}, "
+                f"relation={candidate.relation.components!r}, "
                 f"relation_oid={candidate.relation_oid}"
             )
     locked_relation_oids = tuple(candidate.relation_oid for candidate in lock_candidates)
@@ -2534,8 +3080,8 @@ def _capture_protected_snapshot(
         allowed_concurrency=base_evidence.allowed_concurrency,
         limitations=(
             *base_evidence.limitations,
-            "every declared physical relation holds AccessShareLock before the snapshot",
-            "only pre-acquired physical regular tables may contribute evidentiary reads",
+            "every discovered physical relation holds AccessShareLock before the snapshot",
+            "only pre-acquired regular members contribute rows through explicit ONLY scans",
         ),
         locked_relation_oids=locked_relation_oids,
         lock_mode="access_share",
@@ -2554,95 +3100,107 @@ def _inspect_protected_candidate(
     direction: PostgresSourceDirection,
 ) -> PostgresProtectedRelationInspection:
     acquisition = candidate.acquisition
-    statement = sql.SQL(
-        "SELECT c.oid::bigint, c.reltype::bigint, n.oid::bigint, n.nspname, c.relname, "
-        "c.relkind::text, c.relpersistence::text, "
-        "pg_catalog.has_table_privilege(c.oid, 'SELECT'), "
-        "c.relrowsecurity, c.relforcerowsecurity "
-        "FROM pg_catalog.pg_class AS c "
-        "JOIN pg_catalog.pg_namespace AS n ON n.oid = c.relnamespace "
-        "WHERE c.oid = %s::oid"
-    )
-    identity_rows = _execute_setup_bounded(
+    try:
+        final_candidate = _discover_relation_candidate(
+            connection,
+            acquisition,
+            source_budget,
+            direction,
+        )
+    except PostgresAcquisitionRaceError:
+        raise
+    except PostgresMetadataError as error:
+        raise PostgresAcquisitionRaceError(
+            "PostgreSQL protected relation graph became invalid between discovery and the "
+            f"protected snapshot: relation={acquisition.relation.components!r}, "
+            f"reason={error}"
+        ) from None
+    return _seal_protected_candidate(
         connection,
-        statement,
-        (candidate.relation_oid,),
-        1,
-        acquisition.max_metadata_record_bytes,
-        acquisition.max_metadata_total_bytes,
+        candidate,
+        final_candidate,
+        profile,
+        evidence,
         source_budget,
         direction,
     )
-    if not identity_rows:
+
+
+def _seal_protected_candidate(
+    connection: psycopg.Connection[DatabaseRow],
+    candidate: _PostgresRelationCandidate,
+    final_candidate: _PostgresRelationCandidate,
+    profile: PostgresServerProfile,
+    evidence: PostgresProtectedReadContextEvidence,
+    source_budget: PostgresSourceBudgetAttempt,
+    direction: PostgresSourceDirection,
+) -> PostgresProtectedRelationInspection:
+    acquisition = candidate.acquisition
+    if final_candidate != candidate:
         raise PostgresAcquisitionRaceError(
-            "PostgreSQL protected relation disappeared from the final snapshot: "
+            "PostgreSQL protected relation graph changed between candidate discovery and "
+            "the protected snapshot: "
             f"relation={acquisition.relation.components!r}, "
-            f"candidate_oid={candidate.relation_oid}"
+            f"expected_root_oid={candidate.root_relation_oid}, "
+            f"actual_root_oid={final_candidate.root_relation_oid}"
         )
-    row = identity_rows[0]
-    if len(row) != 10:
+    protected_members = tuple(
+        _inspect_protected_member(
+            connection,
+            member,
+            profile,
+            evidence,
+            source_budget,
+            direction,
+        )
+        for member in final_candidate.members
+    )
+    root_members = tuple(
+        member
+        for member in protected_members
+        if member.inspection.relation_oid == candidate.root_relation_oid
+    )
+    if len(root_members) != 1:
         raise PostgresDataValidationError(
-            "PostgreSQL protected identity probe must return exactly ten typed fields"
+            "PostgreSQL protected relation graph did not produce exactly one inspected root"
         )
-    relation_oid = _require_bounded_integer(row[0], "protected relation OID", 1, UINT32_MAX)
-    relation_row_type_oid = _require_bounded_integer(
-        row[1],
-        "protected relation row type OID",
-        1,
-        UINT32_MAX,
-    )
-    namespace_oid = _require_bounded_integer(
-        row[2],
-        "protected namespace OID",
-        1,
-        UINT32_MAX,
-    )
-    relation_schema = _require_text(row[3], "protected relation schema")
-    relation_name = _require_text(row[4], "protected relation name")
-    relation_persistence = _require_text(row[6], "protected relation persistence")
-    final_relation = (relation_schema, relation_name)
-    if final_relation != acquisition.relation.components:
-        raise PostgresAcquisitionRaceError(
-            "PostgreSQL protected relation name or namespace changed between candidate "
-            "discovery and the protected snapshot: "
-            f"requested={acquisition.relation.components!r}, actual={final_relation!r}, "
-            f"candidate_oid={candidate.relation_oid}"
+    root_member = root_members[0]
+    composition = (
+        None
+        if acquisition.relation_scope is RelationScope.PHYSICAL_ONLY
+        else PostgresProtectedRelationComposition(
+            root_relation_oid=candidate.root_relation_oid,
+            members=protected_members,
+            edges=candidate.edges,
         )
-    if relation_persistence != candidate.relation_persistence:
-        raise PostgresAcquisitionRaceError(
-            "PostgreSQL protected relation persistence changed between candidate discovery "
-            "and the protected snapshot: "
-            f"relation={final_relation!r}, candidate={candidate.relation_persistence!r}, "
-            f"actual={relation_persistence!r}"
-        )
-    _validate_discovered_relation(
-        acquisition.relation,
-        relation_schema,
-        relation_name,
-        _require_text(row[5], "protected relation kind"),
-        relation_persistence,
-        _require_boolean(row[7], "protected relation SELECT privilege"),
-        _require_boolean(row[8], "protected relation RLS enabled"),
-        _require_boolean(row[9], "protected relation RLS forced"),
     )
-    expected_identity = (
-        candidate.relation_oid,
-        candidate.relation_row_type_oid,
-        candidate.namespace_oid,
+    return PostgresProtectedRelationInspection(
+        acquisition=acquisition,
+        inspection=root_member.inspection,
+        namespace_oid=root_member.namespace_oid,
+        lock_mode="access_share",
+        relation_persistence=PostgresRelationPersistence.PERMANENT,
+        acquired_before_snapshot=True,
+        composition=composition,
     )
-    actual_identity = (relation_oid, relation_row_type_oid, namespace_oid)
-    if actual_identity != expected_identity:
-        raise PostgresAcquisitionRaceError(
-            "PostgreSQL protected relation changed identity between candidate discovery and "
-            f"the protected snapshot: expected={expected_identity!r}, actual={actual_identity!r}"
-        )
+
+
+def _inspect_protected_member(
+    connection: psycopg.Connection[DatabaseRow],
+    candidate: _PostgresRelationMemberCandidate,
+    profile: PostgresServerProfile,
+    evidence: PostgresProtectedReadContextEvidence,
+    source_budget: PostgresSourceBudgetAttempt,
+    direction: PostgresSourceDirection,
+) -> PostgresProtectedRelationMember:
+    acquisition = candidate.acquisition
     if not acquisition.column_names:
         bindings: tuple[PostgresFieldBinding, ...] = ()
     else:
         metadata_statement, metadata_parameters = _metadata_query(
-            relation_oid,
-            relation_schema,
-            relation_name,
+            candidate.relation_oid,
+            candidate.relation.components[0],
+            candidate.relation.components[1],
             acquisition.column_names,
         )
         metadata_rows = _execute_setup_bounded(
@@ -2673,20 +3231,18 @@ def _inspect_protected_candidate(
         )
     inspection = PostgresInspectedRelation(
         context_id=evidence.context_id,
-        relation_oid=relation_oid,
-        relation_row_type_oid=relation_row_type_oid,
-        relation=PostgresRelation(components=(relation_schema, relation_name)),
+        relation_oid=candidate.relation_oid,
+        relation_row_type_oid=candidate.relation_row_type_oid,
+        relation=candidate.relation,
         bindings=bindings,
         max_identifier_utf8_bytes=profile.max_identifier_utf8_bytes,
     )
     validate_postgres_inspection(acquisition.schema, inspection)
-    return PostgresProtectedRelationInspection(
-        acquisition=acquisition,
+    return PostgresProtectedRelationMember(
         inspection=inspection,
-        namespace_oid=namespace_oid,
-        lock_mode="access_share",
+        namespace_oid=candidate.namespace_oid,
+        relation_kind=candidate.relation_kind,
         relation_persistence=PostgresRelationPersistence.PERMANENT,
-        acquired_before_snapshot=True,
     )
 
 
@@ -2719,40 +3275,53 @@ def _execute_pretransaction_candidate_bounded(
     connection: psycopg.Connection[DatabaseRow],
     statement: ExecutableSql,
     parameters: tuple[PostgresParameter, ...],
+    max_records: int,
     max_record_bytes: int,
     max_total_bytes: int,
     source_budget: PostgresSourceBudgetAttempt,
     direction: PostgresSourceDirection,
 ) -> tuple[DatabaseRow, ...]:
-    _validate_result_limits(1, max_record_bytes, max_total_bytes)
+    _validate_result_limits(max_records, max_record_bytes, max_total_bytes)
     _set_source_statement_timeout(connection, source_budget, direction)
     charge = source_budget.dispatch_query(direction, 0)
+    records: list[DatabaseRow] = []
+    observed_bytes = 0
     with connection.cursor() as cursor:
         cursor.execute(statement, parameters)
-        charge.require_fetch_deadline()
-        rows = tuple(cursor.fetchall())
-    row_bytes = tuple(_database_row_bytes(row) for row in rows)
-    charge.consume_records(row_bytes)
-    if len(rows) > 1:
-        raise PostgresResultLimitError(
-            "PostgreSQL pretransaction candidate query exceeded max_records=1"
-        )
-    oversized_record = next(
-        (value for value in row_bytes if value > max_record_bytes),
-        None,
-    )
-    if oversized_record is not None:
-        raise PostgresResultLimitError(
-            "PostgreSQL pretransaction candidate query returned a record above the byte budget: "
-            f"record_bytes={oversized_record}, max_record_bytes={max_record_bytes}"
-        )
-    observed_bytes = sum(row_bytes)
-    if observed_bytes > max_total_bytes:
-        raise PostgresResultLimitError(
-            "PostgreSQL pretransaction candidate query exceeded the total byte budget: "
-            f"observed_bytes={observed_bytes}, max_total_bytes={max_total_bytes}"
-        )
-    return rows
+        while True:
+            charge.require_fetch_deadline()
+            remaining = max_records + 1 - len(records)
+            batch = tuple(cursor.fetchmany(min(_CURSOR_FETCH_RECORDS, remaining)))
+            if not batch:
+                break
+            batch_bytes = tuple(_database_row_bytes(row) for row in batch)
+            charge.consume_records(batch_bytes)
+            if len(records) + len(batch) > max_records:
+                raise PostgresResultLimitError(
+                    "PostgreSQL pretransaction candidate query exceeded its record budget: "
+                    f"max_records={max_records}"
+                )
+            oversized_record = next(
+                (value for value in batch_bytes if value > max_record_bytes),
+                None,
+            )
+            if oversized_record is not None:
+                raise PostgresResultLimitError(
+                    "PostgreSQL pretransaction candidate query returned a record above the "
+                    f"byte budget: record_bytes={oversized_record}, "
+                    f"max_record_bytes={max_record_bytes}"
+                )
+            observed_bytes += sum(batch_bytes)
+            if observed_bytes > max_total_bytes:
+                raise PostgresResultLimitError(
+                    "PostgreSQL pretransaction candidate query exceeded the total byte "
+                    f"budget: observed_bytes={observed_bytes}, "
+                    f"max_total_bytes={max_total_bytes}"
+                )
+            records.extend(batch)
+            if len(batch) < min(_CURSOR_FETCH_RECORDS, remaining):
+                break
+    return tuple(records)
 
 
 def _execute_source_command(
@@ -2785,24 +3354,6 @@ def _set_source_statement_timeout(
         source_budget,
         direction,
     )
-
-
-def _validate_materialized_row_budget(
-    row: DatabaseRow,
-    max_record_bytes: int,
-    max_total_bytes: int,
-) -> None:
-    record_bytes = _database_row_bytes(row)
-    if record_bytes > max_record_bytes:
-        raise PostgresResultLimitError(
-            "PostgreSQL candidate metadata exceeded the record byte budget: "
-            f"record_bytes={record_bytes}, max_record_bytes={max_record_bytes}"
-        )
-    if record_bytes > max_total_bytes:
-        raise PostgresResultLimitError(
-            "PostgreSQL candidate metadata exceeded the total byte budget: "
-            f"observed_bytes={record_bytes}, max_total_bytes={max_total_bytes}"
-        )
 
 
 def _profile_and_evidence(
@@ -3133,27 +3684,58 @@ def _relation_manifest_record_from_database(
     )
 
 
+def _compiled_query_payload(
+    row: DatabaseRow,
+    query: PostgresQuery,
+    expected_payload_fields: int,
+    operation: str,
+) -> DatabaseRow:
+    provenance_fields = len(query.relations)
+    expected_fields = provenance_fields + expected_payload_fields
+    if len(row) != expected_fields:
+        raise PostgresDataValidationError(
+            f"PostgreSQL {operation} query returned an unexpected field count: "
+            f"expected={expected_fields}, actual={len(row)}, "
+            f"provenance_fields={provenance_fields}"
+        )
+    for index, (value, relation) in enumerate(
+        zip(row[:provenance_fields], query.relations, strict=True)
+    ):
+        if value is None:
+            continue
+        observed_row_type_oid = _require_bounded_integer(
+            value,
+            f"{operation} provenance row type OID at index {index}",
+            1,
+            UINT32_MAX,
+        )
+        expected_row_type_oid = relation.inspection.relation_row_type_oid
+        if observed_row_type_oid != expected_row_type_oid:
+            raise PostgresMetadataError(
+                f"PostgreSQL {operation} query resolved a member to a different relation "
+                "identity through its actual RTE: "
+                f"index={index}, expected_row_type_oid={expected_row_type_oid}, "
+                f"observed_row_type_oid={observed_row_type_oid}"
+            )
+    return row[provenance_fields:]
+
+
 def _canonical_row_from_database(
     row: DatabaseRow,
     query: PostgresQuery,
-) -> PostgresCanonicalRow:
-    if len(row) != 5:
-        raise PostgresDataValidationError(
-            "PostgreSQL canonical row query must return origin type, envelope, SHA-256, "
-            "invalid, and oversized fields"
-        )
-    if row[0] is not None:
-        raise PostgresDataValidationError(
-            "PostgreSQL canonical row origin type marker must be NULL"
-        )
-    invalid_row = _require_boolean(row[3], "canonical invalid-row status")
-    oversized_row = _require_boolean(row[4], "canonical oversized-row status")
+) -> PostgresCanonicalRow | None:
+    payload = _compiled_query_payload(row, query, 5, "canonical row")
+    has_data = _require_boolean(payload[0], "canonical row data marker")
+    if not has_data:
+        return None
+    invalid_row = _require_boolean(payload[3], "canonical invalid-row status")
+    oversized_row = _require_boolean(payload[4], "canonical oversized-row status")
     if invalid_row and oversized_row:
         raise PostgresDataValidationError(
             "PostgreSQL canonical row statuses must be mutually exclusive"
         )
     if invalid_row or oversized_row:
-        if row[1] is not None or row[2] is not None:
+        if payload[1] is not None or payload[2] is not None:
             raise PostgresDataValidationError(
                 "PostgreSQL rejected canonical rows must not expose an envelope or digest"
             )
@@ -3165,7 +3747,7 @@ def _canonical_row_from_database(
             "PostgreSQL canonical envelope exceeds the configured SQL-side limit: "
             f"max_encoded_envelope_bytes={query.max_encoded_envelope_bytes}"
         )
-    envelope_text = _require_text(row[1], "canonical envelope")
+    envelope_text = _require_text(payload[1], "canonical envelope")
     try:
         envelope = envelope_text.encode("ascii", errors="strict")
     except UnicodeEncodeError:
@@ -3177,7 +3759,7 @@ def _canonical_row_from_database(
             "PostgreSQL canonical envelope exceeds its declared SQL-side limit: "
             f"observed={len(envelope)}, limit={query.max_encoded_envelope_bytes}"
         )
-    digest = row[2]
+    digest = payload[2]
     if type(digest) is memoryview:
         if digest.nbytes != SHA256_BYTES:
             raise PostgresDataValidationError(
@@ -3205,19 +3787,14 @@ def _canonical_row_from_database(
     return PostgresCanonicalRow(envelope=envelope, sha256=digest_bytes)
 
 
-def _integer_key_summary_from_database(row: DatabaseRow) -> PostgresIntegerKeySummary:
-    if len(row) != 9:
-        raise PostgresDataValidationError(
-            "PostgreSQL integer-key summary must return origin type, five counts, two "
-            "bounds, and access-path status"
-        )
-    if row[0] is not None:
-        raise PostgresDataValidationError(
-            "PostgreSQL integer-key summary origin type marker must be NULL"
-        )
-    counts = tuple(_parse_unsigned_decimal(value, 19) for value in row[1:6])
-    minimum = _parse_optional_int64(row[6], "integer-key minimum")
-    maximum = _parse_optional_int64(row[7], "integer-key maximum")
+def _integer_key_summary_from_database(
+    row: DatabaseRow,
+    query: PostgresQuery,
+) -> PostgresIntegerKeySummary:
+    payload = _compiled_query_payload(row, query, 8, "integer-key summary")
+    counts = tuple(_parse_unsigned_decimal(value, 19) for value in payload[:5])
+    minimum = _parse_optional_int64(payload[5], "integer-key minimum")
+    maximum = _parse_optional_int64(payload[6], "integer-key maximum")
     return PostgresIntegerKeySummary(
         row_count=counts[0],
         null_key_count=counts[1],
@@ -3226,7 +3803,10 @@ def _integer_key_summary_from_database(row: DatabaseRow) -> PostgresIntegerKeySu
         distinct_key_count=counts[4],
         minimum_key=minimum,
         maximum_key=maximum,
-        usable_access_path=_require_boolean(row[8], "integer-key usable access path"),
+        usable_access_path=_require_boolean(
+            payload[7],
+            "integer-key usable access path",
+        ),
     )
 
 
@@ -3245,22 +3825,15 @@ def _range_fingerprints_from_database(
     for index, (range_request, row) in enumerate(zip(ranges, rows, strict=True)):
         if index % _DEADLINE_CHECK_RECORDS == 0:
             _require_postgres_read_deadline(deadline, "range fingerprint decoding")
-        if len(row) != 15:
-            raise PostgresDataValidationError(
-                "PostgreSQL range fingerprint row must contain exactly fifteen fields"
-            )
-        if row[0] is not None:
-            raise PostgresDataValidationError(
-                "PostgreSQL range fingerprint origin type marker must be NULL"
-            )
-        segment_id = _require_text(row[1], "range fingerprint segment_id")
+        payload = _compiled_query_payload(row, query, 14, "range fingerprint")
+        segment_id = _require_text(payload[0], "range fingerprint segment_id")
         if segment_id != range_request.segment_id:
             raise PostgresDataValidationError(
                 "PostgreSQL range fingerprint rows do not follow requested segment order"
             )
         values = tuple(
             _parse_unsigned_decimal(value, 19 if index in (0, 9, 10) else 38)
-            for index, value in enumerate(row[2:])
+            for index, value in enumerate(payload[1:])
         )
         count = values[0]
         invalid_count = values[9]
@@ -3338,15 +3911,11 @@ def _integer_exact_rows_from_database(
     for index, row in enumerate(rows):
         if index % _DEADLINE_CHECK_RECORDS == 0:
             _require_postgres_read_deadline(deadline, "exact-row decoding")
-        if len(row) != 6:
-            raise PostgresDataValidationError(
-                "PostgreSQL exact comparison row must contain exactly six fields"
-            )
-        if row[0] is not None:
-            raise PostgresDataValidationError(
-                "PostgreSQL exact comparison origin type marker must be NULL"
-            )
-        segment_id = _require_text(row[1], "exact comparison segment_id")
+        payload = _compiled_query_payload(row, query, 6, "exact comparison")
+        has_data = _require_boolean(payload[0], "exact comparison data marker")
+        if not has_data:
+            continue
+        segment_id = _require_text(payload[1], "exact comparison segment_id")
         ordinal = ordinals.get(segment_id)
         if ordinal is None:
             raise PostgresDataValidationError(
@@ -3356,8 +3925,8 @@ def _integer_exact_rows_from_database(
             raise PostgresDataValidationError(
                 "PostgreSQL exact comparison rows do not follow requested segment order"
             )
-        invalid_row = _require_boolean(row[4], "exact invalid-row status")
-        oversized_row = _require_boolean(row[5], "exact oversized-row status")
+        invalid_row = _require_boolean(payload[4], "exact invalid-row status")
+        oversized_row = _require_boolean(payload[5], "exact oversized-row status")
         if invalid_row and oversized_row:
             raise PostgresDataValidationError(
                 "PostgreSQL exact comparison row statuses must be mutually exclusive"
@@ -3372,8 +3941,8 @@ def _integer_exact_rows_from_database(
                 f"configured limit: max_encoded_envelope_bytes="
                 f"{query.max_encoded_envelope_bytes}"
             )
-        key_envelope = _ascii_envelope(row[2], "exact canonical key envelope")
-        row_envelope = _ascii_envelope(row[3], "exact canonical row envelope")
+        key_envelope = _ascii_envelope(payload[2], "exact canonical key envelope")
+        row_envelope = _ascii_envelope(payload[3], "exact canonical row envelope")
         if len(row_envelope) > query.max_encoded_envelope_bytes:
             raise PostgresResultLimitError(
                 "PostgreSQL exact comparison row envelope exceeds the configured limit: "
@@ -3450,6 +4019,27 @@ def _read_metrics_before_deadline(
     _require_postgres_read_deadline(deadline, "comparison read metric calculation")
     return PostgresReadMetrics(
         fetched_records=len(rows),
+        result_bytes=result_bytes,
+    )
+
+
+def _exact_read_metrics(
+    rows: tuple[DatabaseRow, ...],
+    query: PostgresQuery,
+    deadline: PostgresReadDeadline,
+) -> PostgresReadMetrics:
+    fetched_records = 0
+    result_bytes = 0
+    for index, row in enumerate(rows):
+        if index % _DEADLINE_CHECK_RECORDS == 0:
+            _require_postgres_read_deadline(deadline, "exact read metric calculation")
+        payload = _compiled_query_payload(row, query, 6, "exact comparison metric")
+        if _require_boolean(payload[0], "exact comparison metric data marker"):
+            fetched_records += 1
+            result_bytes += _database_row_bytes((None, *payload[1:]))
+    _require_postgres_read_deadline(deadline, "exact read metric calculation")
+    return PostgresReadMetrics(
+        fetched_records=fetched_records,
         result_bytes=result_bytes,
     )
 
@@ -3531,6 +4121,101 @@ def _require_compiled_origin_type(
             "PostgreSQL compiled query resolved to a different relation identity: "
             f"expected_row_type_oid={expected_row_type_oid}, "
             f"observed_row_type_oid={observed_row_type_oid}"
+        )
+
+
+def _require_compiled_origin_types(
+    description: Sequence[Column] | None,
+    relations: tuple[PostgresQueryRelation, ...],
+) -> None:
+    if description is None or len(description) < len(relations):
+        actual_fields = 0 if description is None else len(description)
+        raise PostgresDataValidationError(
+            "PostgreSQL compiled union query did not expose every relation provenance "
+            f"column: expected_at_least={len(relations)}, actual={actual_fields}"
+        )
+    for index, _relation in enumerate(relations):
+        column = description[index]
+        expected_name = "origin_type" if index == 0 else f"origin_type_{index}"
+        if column.name != expected_name:
+            raise PostgresDataValidationError(
+                "PostgreSQL compiled union query returned an unexpected provenance column: "
+                f"index={index}, expected={expected_name!r}, actual={column.name!r}"
+            )
+        observed_row_type_oid = _require_bounded_integer(
+            column.type_code,
+            f"compiled union provenance descriptor type OID at index {index}",
+            1,
+            UINT32_MAX,
+        )
+        if observed_row_type_oid != 20:
+            raise PostgresDataValidationError(
+                "PostgreSQL compiled union query returned a non-bigint provenance witness: "
+                f"index={index}, descriptor_type_oid={observed_row_type_oid}"
+            )
+
+
+def _require_compiled_query_provenance(
+    rows: tuple[DatabaseRow, ...],
+    query: PostgresQuery,
+) -> None:
+    provenance_fields = len(query.relations)
+    observed_members: set[int] = set()
+    for row_index, row in enumerate(rows):
+        if len(row) < provenance_fields:
+            raise PostgresDataValidationError(
+                "PostgreSQL compiled union query returned fewer fields than its provenance "
+                f"closure: row={row_index}, expected_at_least={provenance_fields}, "
+                f"actual={len(row)}"
+            )
+        for index, (value, relation) in enumerate(
+            zip(row[:provenance_fields], query.relations, strict=True)
+        ):
+            if value is None:
+                continue
+            observed_row_type_oid = _require_bounded_integer(
+                value,
+                f"compiled union provenance row type OID at row {row_index}, index {index}",
+                1,
+                UINT32_MAX,
+            )
+            expected_row_type_oid = relation.inspection.relation_row_type_oid
+            if observed_row_type_oid != expected_row_type_oid:
+                raise PostgresMetadataError(
+                    "PostgreSQL compiled union query resolved a member to a different relation "
+                    f"identity through its actual RTE: row={row_index}, index={index}, "
+                    f"expected_row_type_oid={expected_row_type_oid}, "
+                    f"observed_row_type_oid={observed_row_type_oid}"
+                )
+            observed_members.add(index)
+    expected_members = set(range(provenance_fields))
+    if observed_members != expected_members:
+        raise PostgresMetadataError(
+            "PostgreSQL compiled union query did not prove every acquired member's actual "
+            "RTE identity: "
+            f"missing_member_indexes={tuple(sorted(expected_members - observed_members))!r}"
+        )
+
+
+def _query_provenance_bytes(query: PostgresQuery) -> int:
+    return len(query.relations) * _MAX_UINT32_DECIMAL_BYTES
+
+
+def _query_physical_scan_count(query: PostgresQuery) -> int:
+    return sum(1 for relation in query.relations if relation.contributes_rows)
+
+
+def _require_compiled_full_scan_reservation(
+    reserved_full_scans: int,
+    expected_full_scans: int,
+    operation: str,
+) -> None:
+    _validate_nonnegative_integer(reserved_full_scans, "reserved full scans")
+    if reserved_full_scans != expected_full_scans:
+        raise ValueError(
+            f"PostgreSQL {operation} full-scan reservation does not match the compiled "
+            f"physical query shape: reserved={reserved_full_scans}, "
+            f"expected={expected_full_scans}"
         )
 
 
