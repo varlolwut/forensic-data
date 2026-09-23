@@ -64,6 +64,7 @@ from forensic_data.persistence.lifecycle import (
     persist_postgres_aligned_input_cut,
     persist_postgres_read_context,
     publish_postgres_terminal_error_attempt,
+    read_postgres_history,
     record_postgres_retryable_incomplete_attempt,
     renew_postgres_run_attempt,
     start_postgres_run_attempt,
@@ -84,6 +85,7 @@ from forensic_data.postgres import (
     open_postgres_protected_read_context,
 )
 from forensic_data.postgres_sql import PostgresRelation
+from forensic_data.reporting import HistoryAttemptStatus, StoredResultAvailability
 from forensic_data.result import ReasonCode, ResultReason
 from tests.metadata_postgres_support import (
     MetadataDatabaseSettings,
@@ -411,6 +413,25 @@ def test_postgres_lifecycle_reconciles_fences_cuts_and_terminal_publication() ->
             second_expiry,
             config.execution,
         )
+        active_history = read_postgres_history(
+            settings.reader,
+            _NO_RETRY,
+            check.check_id,
+            scope.scope_digest,
+            100,
+            None,
+        )
+        active_by_attempt = {item.attempt_id: item for item in active_history.items}
+        assert active_by_attempt[first.attempt_id].status is HistoryAttemptStatus.INCOMPLETE
+        assert active_by_attempt[second.attempt_id].status is HistoryAttemptStatus.RUNNING
+        assert active_by_attempt[second.attempt_id].end_operation_id is None
+        assert active_by_attempt[second.attempt_id].ended_at is None
+        assert active_by_attempt[second.attempt_id].terminal_reason is None
+        assert (
+            active_by_attempt[second.attempt_id].stored_result_availability
+            is StoredResultAvailability.NOT_CREATED
+        )
+        assert active_by_attempt[second.attempt_id].stored_result is None
         second_reference = _acquire_side(
             settings.writer,
             check,
@@ -554,6 +575,20 @@ def test_postgres_lifecycle_reconciles_fences_cuts_and_terminal_publication() ->
         assert final_replay.status is AttemptStatus.ERROR
         assert final_replay.run.selected_terminal_attempt_id == second.attempt_id
         _assert_terminal_failure(settings, run.run_id, second.attempt_id)
+        terminal_history = read_postgres_history(
+            settings.reader,
+            _NO_RETRY,
+            check.check_id,
+            scope.scope_digest,
+            100,
+            None,
+        )
+        terminal_by_attempt = {item.attempt_id: item for item in terminal_history.items}
+        assert terminal_by_attempt[first.attempt_id].status is HistoryAttemptStatus.INCOMPLETE
+        assert terminal_by_attempt[second.attempt_id].status is HistoryAttemptStatus.ERROR
+        assert terminal_by_attempt[second.attempt_id].is_run_terminal
+        assert terminal_by_attempt[second.attempt_id].terminal_reason == terminal_reason
+        assert terminal_by_attempt[second.attempt_id].stored_result is None
 
 
 def test_postgres_lifecycle_fences_waits_and_reconciles_store_loss() -> None:

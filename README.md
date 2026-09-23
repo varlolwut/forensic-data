@@ -4,8 +4,8 @@ Forensic Data Engine is a typed, read-only foundation for detecting data differe
 explicit evidence of agreement across database systems without silently rounding, normalizing, or
 dropping values.
 
-The current `0.1.0.dev0` package is a development library, not yet an end-to-end reconciliation
-application. It provides:
+The current `0.1.0.dev0` package is a development release with a typed application API and a
+`forensics` CLI for the PostgreSQL relation-manifest workflow. It provides:
 
 - strict comparison-result models with distinct completed, incomplete, and error outcomes;
 - the versioned `dfe_canon_v1` row/key envelope, schema digest, SHA-256 fingerprint, and segment
@@ -14,13 +14,15 @@ application. It provides:
   static plan report;
 - a bounded PostgreSQL read connector, protected relation-manifest readiness acquisition, and SQL
   lowering for the initial common type profile;
-- versioned PostgreSQL metadata migrations, typed immutable contract registration, and durable
-  run/acquisition lifecycle records; and
+- versioned PostgreSQL metadata migrations, typed immutable contract registration, durable
+  run/acquisition lifecycle records, and completed comparison results;
+- bounded PostgreSQL check execution, idempotent request IDs, attempt history, and stored-result
+  summaries; and
 - reproducible Python package, PostgreSQL fixture, container, and CI builds.
 
-There is no end-user CLI, scheduler integration, or multi-engine execution workflow yet. Static
-planning does not connect to a database or prove readiness, capability, schema presence, or data
-equality. Import the Python APIs directly for development and protocol experiments.
+There is no scheduler integration, background service, or multi-engine execution workflow yet.
+Static planning does not connect to a database or prove readiness, capability, schema presence, or
+data equality.
 
 ## Verified scope
 
@@ -78,6 +80,57 @@ Install the locked development environment:
 uv sync --frozen --all-groups
 uv run python -c "import forensic_data; print(forensic_data.__version__)"
 ```
+
+## CLI and application workflow
+
+The installed `forensics` command exposes four bounded operations. The relation-manifest example
+uses the check and scope names shown below:
+
+```console
+uv run forensics plan --config examples/postgres-relation-manifest/contract.yaml --check daily_orders --scope-json '{"business_date":"2026-09-23"}' --output json
+
+uv run forensics check --config examples/postgres-relation-manifest/contract.yaml --check daily_orders --scope-json '{"business_date":"2026-09-23"}' --reference-batch reference-batch-42 --target-batch target-batch-42 --request-id 7fa700c4-7c5d-42eb-8f55-50e372ed0e25 --output json
+
+uv run forensics history --config examples/postgres-relation-manifest/contract.yaml --check daily_orders --scope-json '{"business_date":"2026-09-23"}' --limit 20 --output json
+
+uv run forensics diff --config examples/postgres-relation-manifest/contract.yaml --run-id 04be2d56-6c2f-4f66-8c84-4cfdb33a79ea --attempt-id 2d4d807a-a079-424a-8a67-a48b27777386 --limit 20 --output json
+```
+
+Scope input is an exact JSON object whose values are booleans, integers, or strings. `check`
+requires both expected batch IDs and a canonical request UUID; repeating that request reads the
+same durable outcome instead of silently creating a different run. History pagination uses
+`--cursor-json` with the exact `next_cursor` object returned by the previous page.
+
+For every connection a command resolves, the CLI accepts endpoint secrets only through contract
+references of the form `env:NAME`. The referenced variable must contain a complete PostgreSQL DSN
+with `host`, `port`, `dbname`, `user`, `password`, `sslmode`, and `connect_timeout`; there is no
+raw-DSN command-line flag or fallback. `plan` neither resolves secret references nor opens a
+connection. `history` and `diff` resolve only the metadata connection and never query a source or
+target endpoint.
+
+The metadata login used by `check` or `execute_check` must be a member of both
+`dfe_metadata_writer` and `dfe_metadata_reader`. The login used by `history`, `diff`,
+`read_history`, or `read_diff` needs only `dfe_metadata_reader`. Keep those capability roles
+separate and grant both memberships to the runtime writer login; metadata migrator and database
+administrator credentials are only for setup and bootstrap.
+
+Human output is the default. `--output json` emits the exact schema-version 1 typed model returned
+by the corresponding application API: `PlanReport`, `RunResult`, `HistoryPage`, or `DiffPage`.
+In `forensic_data.application`, `plan_check` accepts a compiled contract and typed request,
+`execute_check` adds explicit PostgreSQL execution services, and `read_history`/`read_diff` accept
+typed requests with metadata-only services. A `PlanReport` is informational and cannot be supplied
+to `execute_check`; execution resolves and validates the compiled contract again.
+
+| Exit code | Meaning |
+|---:|---|
+| `0` | Command succeeded; for `check`, the completed result is a match. |
+| `1` | The check completed with a mismatch. |
+| `2` | The check ended in error, or command/configuration input failed. |
+| `3` | The check is incomplete, such as when readiness or a required execution budget was not established. |
+
+History returns bounded durable attempt metadata and an optional stored result. Diff is also a
+metadata-only view: this release reports `detail_availability` as `not_retained`, returns no row
+details, and does not revisit the compared endpoints.
 
 ## Canonical API example
 
@@ -179,11 +232,12 @@ ready, issue a new `dataset_version` whenever the published dataset cut changes,
 the protected snapshot under that publication protocol, not that the provider independently proved
 the manifest's truthfulness.
 
-Metadata persistence records immutable run requests, leased attempts, protected read contexts, and
-per-dataset readiness observations. The first aligned input cut is bound once to the run; retries
-may use a new snapshot but cannot silently change that cut. Attempt outcomes are currently limited
-to incomplete, error, or abandoned. No completed comparison result can be published until the
-comparison stages exist.
+Metadata persistence records immutable run requests, leased attempts, protected read contexts,
+per-dataset readiness observations, and completed comparison results. The first aligned input cut
+is bound once to the run; retries may use a new snapshot but cannot silently change that cut.
+Attempts may be completed, incomplete, error, or abandoned. A completed result is published only
+after its observations, closed protected contexts, comparison output, and terminal attempt state
+pass durable closure validation.
 
 ## PostgreSQL metadata bootstrap
 
@@ -210,9 +264,10 @@ and writer roles can validate the journal version but cannot change it or perfor
 validated row check. `register_postgres_metadata(...)` then stores immutable dataset and contract
 versions and append-only SQL capture records. Secret references, artifact paths, budgets, and SQL
 bytes disabled by the evidence policy are never stored. A later enabled capture creates a separate
-record without mutating the semantic version. The lifecycle migration adds run, attempt, protected
-read-context, and dataset-observation records plus narrow immutable lease-renewal receipts; it does
-not pre-create result, check, segment, or anomaly records.
+record without mutating the semantic version. Migration `0002` adds run, attempt, protected
+read-context, and dataset-observation records plus narrow immutable lease-renewal receipts;
+migration `0003` adds completed check results and segment fingerprints. Individual row anomalies
+are not retained in this release.
 
 ## PostgreSQL fixture and checks
 
@@ -274,5 +329,6 @@ docker build --platform linux/amd64 --tag forensic-data:dev .
 docker run --rm forensic-data:dev
 ```
 
-The current container verifies the installed package and prints its version. It is not yet a
-long-running service or CLI.
+The current container is a build smoke image whose default command prints the installed package
+version. The installed package includes the `forensics` CLI, but the image is not configured as a
+long-running service.

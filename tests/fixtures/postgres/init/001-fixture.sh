@@ -69,6 +69,7 @@ CREATE ROLE dfe_metadata_reader_login
 
 GRANT dfe_metadata_migrator TO dfe_metadata_migrator_login;
 GRANT dfe_metadata_writer TO dfe_metadata_writer_login;
+GRANT dfe_metadata_reader TO dfe_metadata_writer_login;
 GRANT dfe_metadata_reader TO dfe_metadata_reader_login;
 
 ALTER ROLE dfe_fixture_reader SET default_transaction_read_only = on;

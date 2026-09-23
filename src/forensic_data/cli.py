@@ -1,0 +1,731 @@
+import argparse
+import contextlib
+import json
+import os
+import re
+import sys
+from collections.abc import Mapping, Sequence
+from pathlib import Path
+from typing import Final, NoReturn, TextIO, cast
+from uuid import UUID
+
+import psycopg
+from psycopg.conninfo import conninfo_to_dict
+from pydantic import BaseModel, SecretStr, ValidationError
+
+from forensic_data.application import (
+    ApplicationError,
+    DiffRequest,
+    ExecuteCheckRequest,
+    HistoryRequest,
+    PlanCheckRequest,
+    PostgresExecutionServices,
+    PostgresMetadataServices,
+    ScopeValue,
+    execute_check,
+    plan_check,
+    read_diff,
+    read_history,
+)
+from forensic_data.contracts.compiler import load_contract_config
+from forensic_data.contracts.errors import ContractError
+from forensic_data.contracts.model import (
+    ConnectionDefinition,
+    LoadedContractConfig,
+    RowCheckDefinition,
+)
+from forensic_data.persistence.errors import MetadataError
+from forensic_data.planning import PlanReport
+from forensic_data.postgres import (
+    PostgresConnectionSettings,
+    PostgresConnectorError,
+    PostgresRetryPolicy,
+    PostgresSslMode,
+)
+from forensic_data.reporting import DiffPage, HistoryCursor, HistoryPage
+from forensic_data.result import (
+    Guarantee,
+    ReasonCode,
+    RunResult,
+    Total,
+    UnavailableTotal,
+    exit_code_for_result,
+)
+
+_ENV_SECRET_REF_PATTERN: Final[re.Pattern[str]] = re.compile(r"^env:([A-Za-z_][A-Za-z0-9_]*)$")
+_REQUIRED_DSN_FIELDS: Final[frozenset[str]] = frozenset(
+    {
+        "host",
+        "port",
+        "dbname",
+        "user",
+        "password",
+        "sslmode",
+        "connect_timeout",
+    }
+)
+_CONNECTION_RETRY_DELAY_SECONDS: Final[float] = 1.0
+_CONNECTION_RETRY_ATTEMPTS: Final[int] = 3
+_MAX_PROTECTED_LOCK_TIMEOUT_MILLISECONDS: Final[int] = 5_000
+_CLI_ORIGIN: Final[str] = "cli"
+_TRUSTED_ARGUMENT_NAMES: Final[frozenset[str]] = frozenset(
+    {
+        "command",
+        "--attempt-id",
+        "--check",
+        "--config",
+        "--limit",
+        "--reference-batch",
+        "--request-id",
+        "--run-id",
+        "--scope-json",
+        "--target-batch",
+    }
+)
+_STRUCTURAL_SUMMARY_PARAMETER_NAMES: Final[tuple[str, ...]] = (
+    "reference_row_count",
+    "reference_null_key_count",
+    "reference_invalid_key_count",
+    "reference_valid_key_count",
+    "reference_distinct_key_count",
+    "target_row_count",
+    "target_null_key_count",
+    "target_invalid_key_count",
+    "target_valid_key_count",
+    "target_distinct_key_count",
+)
+
+type _ScopeInput = bool | int | str
+type _JsonObject = dict[str, object]
+
+
+class CliInputError(ValueError):
+    """A command-line value is invalid without exposing its raw contents."""
+
+
+class _SafeArgumentParser(argparse.ArgumentParser):
+    def error(self, message: str) -> NoReturn:
+        required_prefix = "the following arguments are required: "
+        if message.startswith(required_prefix):
+            names = tuple(message.removeprefix(required_prefix).split(", "))
+            if names and all(name in _TRUSTED_ARGUMENT_NAMES for name in names):
+                raise CliInputError("missing required command arguments: " + ", ".join(names))
+        raise CliInputError("invalid command arguments; run 'forensics --help' for usage")
+
+
+class _Arguments(argparse.Namespace):
+    command: str
+    config: Path
+    check: str
+    scope_json: str
+    output: str
+    reference_batch: str
+    target_batch: str
+    request_id: str
+    limit: int
+    cursor_json: str | None
+    run_id: str
+    attempt_id: str
+
+
+def main() -> int:
+    return run_cli(tuple(sys.argv[1:]), os.environ, sys.stdout, sys.stderr)
+
+
+def run_cli(
+    arguments: Sequence[str],
+    environment: Mapping[str, str],
+    stdout: TextIO,
+    stderr: TextIO,
+) -> int:
+    output_json = _requests_json_output(arguments)
+    parser = _build_parser()
+    try:
+        with contextlib.redirect_stdout(stdout), contextlib.redirect_stderr(stderr):
+            parsed = parser.parse_args(list(arguments), namespace=_Arguments())
+        return _dispatch(parsed, environment, stdout)
+    except SystemExit as error:
+        return _system_exit_code(error)
+    except ContractError as error:
+        return _write_error(stderr, output_json, "invalid_contract", str(error))
+    except ApplicationError as error:
+        return _write_error(stderr, output_json, "application_error", str(error))
+    except MetadataError as error:
+        return _write_error(stderr, output_json, "metadata_error", str(error))
+    except PostgresConnectorError as error:
+        return _write_error(stderr, output_json, "postgres_error", str(error))
+    except ValidationError:
+        return _write_error(
+            stderr,
+            output_json,
+            "invalid_input",
+            "input does not satisfy the version-1 typed API contract",
+        )
+    except CliInputError as error:
+        return _write_error(stderr, output_json, "invalid_input", str(error))
+    except ValueError as error:
+        return _write_error(stderr, output_json, "invalid_value", str(error))
+
+
+def _build_parser() -> _SafeArgumentParser:
+    parser = _SafeArgumentParser(
+        prog="forensics",
+        description="Plan, run, and inspect bounded data-forensics checks.",
+    )
+    commands = parser.add_subparsers(dest="command", required=True)
+
+    plan_parser = commands.add_parser(
+        "plan",
+        help="compile a static plan without resolving secrets or connecting to endpoints",
+    )
+    _add_check_scope_arguments(plan_parser)
+    _add_output_argument(plan_parser)
+
+    check_parser = commands.add_parser(
+        "check",
+        help="execute and durably record one check",
+    )
+    _add_check_scope_arguments(check_parser)
+    check_parser.add_argument(
+        "--reference-batch", required=True, help="expected reference batch ID"
+    )
+    check_parser.add_argument("--target-batch", required=True, help="expected target batch ID")
+    check_parser.add_argument("--request-id", required=True, help="idempotency request UUID")
+    _add_output_argument(check_parser)
+
+    history_parser = commands.add_parser(
+        "history",
+        help="read a bounded attempt history page from metadata only",
+    )
+    _add_check_scope_arguments(history_parser)
+    history_parser.add_argument("--limit", required=True, type=int, help="page size, from 1 to 100")
+    history_parser.add_argument(
+        "--cursor-json",
+        help="HistoryCursor JSON returned by the previous page",
+    )
+    _add_output_argument(history_parser)
+
+    diff_parser = commands.add_parser(
+        "diff",
+        help="read stored result metadata; row details are not retained in this release",
+    )
+    diff_parser.add_argument("--config", required=True, type=Path, help="contract YAML path")
+    diff_parser.add_argument("--run-id", required=True, help="full run UUID")
+    diff_parser.add_argument("--attempt-id", required=True, help="full attempt UUID")
+    diff_parser.add_argument("--limit", required=True, type=int, help="page size, from 1 to 100")
+    _add_output_argument(diff_parser)
+    return parser
+
+
+def _add_check_scope_arguments(parser: argparse.ArgumentParser) -> None:
+    parser.add_argument("--config", required=True, type=Path, help="contract YAML path")
+    parser.add_argument("--check", required=True, help="check ID from the contract")
+    parser.add_argument(
+        "--scope-json",
+        required=True,
+        help='exact JSON object of typed scope values, for example {"business_date":"2026-09-23"}',
+    )
+
+
+def _add_output_argument(parser: argparse.ArgumentParser) -> None:
+    parser.add_argument(
+        "--output",
+        choices=("human", "json"),
+        default="human",
+        help="render a readable summary or the exact JSON v1 API model (default: human)",
+    )
+
+
+def _dispatch(
+    arguments: _Arguments,
+    environment: Mapping[str, str],
+    stdout: TextIO,
+) -> int:
+    if arguments.command == "plan":
+        return _run_plan(arguments, stdout)
+    if arguments.command == "check":
+        return _run_check(arguments, environment, stdout)
+    if arguments.command == "history":
+        return _run_history(arguments, environment, stdout)
+    if arguments.command == "diff":
+        return _run_diff(arguments, environment, stdout)
+    raise CliInputError("unknown command; run 'forensics --help' for usage")
+
+
+def _run_plan(arguments: _Arguments, stdout: TextIO) -> int:
+    config = load_contract_config(arguments.config)
+    report = plan_check(config, _plan_request(arguments.check, arguments.scope_json))
+    _write_plan(report, _output_format(arguments.output), stdout)
+    return 0
+
+
+def _run_check(
+    arguments: _Arguments,
+    environment: Mapping[str, str],
+    stdout: TextIO,
+) -> int:
+    config = load_contract_config(arguments.config)
+    request = ExecuteCheckRequest(
+        request_id=_parse_uuid(arguments.request_id, "request ID"),
+        check_id=arguments.check,
+        scope_values=_scope_values(arguments.scope_json),
+        reference_expected_batch_id=arguments.reference_batch,
+        target_expected_batch_id=arguments.target_batch,
+        origin=_CLI_ORIGIN,
+    )
+    check = _find_check(config, request.check_id)
+    services = _execution_services(
+        config, check.reference.connection, check.target.connection, environment
+    )
+    result = execute_check(config, request, services)
+    _write_run_result(result, _output_format(arguments.output), stdout)
+    return int(exit_code_for_result(result))
+
+
+def _run_history(
+    arguments: _Arguments,
+    environment: Mapping[str, str],
+    stdout: TextIO,
+) -> int:
+    config = load_contract_config(arguments.config)
+    request = _plan_request(arguments.check, arguments.scope_json)
+    plan = plan_check(config, request)
+    page = read_history(
+        HistoryRequest(
+            check_id=plan.check_id,
+            scope_digest=plan.scope_digest,
+            limit=arguments.limit,
+            cursor=_history_cursor(arguments.cursor_json),
+        ),
+        _metadata_services(config, environment, "dfe-cli-history"),
+    )
+    _write_history(page, _output_format(arguments.output), stdout)
+    return 0
+
+
+def _run_diff(
+    arguments: _Arguments,
+    environment: Mapping[str, str],
+    stdout: TextIO,
+) -> int:
+    config = load_contract_config(arguments.config)
+    page = read_diff(
+        DiffRequest(
+            run_id=_parse_uuid(arguments.run_id, "run ID"),
+            attempt_id=_parse_uuid(arguments.attempt_id, "attempt ID"),
+            limit=arguments.limit,
+        ),
+        _metadata_services(config, environment, "dfe-cli-diff"),
+    )
+    _write_diff(page, _output_format(arguments.output), stdout)
+    return 0
+
+
+def _plan_request(check_id: str, scope_json: str) -> PlanCheckRequest:
+    return PlanCheckRequest(check_id=check_id, scope_values=_scope_values(scope_json))
+
+
+def _scope_values(value: str) -> tuple[ScopeValue, ...]:
+    decoded = _decode_json(value, "scope")
+    if type(decoded) is not dict:
+        raise CliInputError("scope JSON must be an object")
+    raw_scope = cast(dict[object, object], decoded)
+    values: list[ScopeValue] = []
+    for raw_name in sorted(raw_scope, key=_scope_name_sort_key):
+        if type(raw_name) is not str:
+            raise CliInputError("scope JSON property names must be strings")
+        raw_value = raw_scope[raw_name]
+        if type(raw_value) not in (bool, int, str):
+            raise CliInputError("scope JSON values must be exact booleans, integers, or strings")
+        values.append(ScopeValue(name=raw_name, value=cast(_ScopeInput, raw_value)))
+    return tuple(values)
+
+
+def _scope_name_sort_key(value: object) -> str:
+    if type(value) is not str:
+        raise CliInputError("scope JSON property names must be strings")
+    return value
+
+
+def _history_cursor(value: str | None) -> HistoryCursor | None:
+    if value is None:
+        return None
+    decoded = _decode_json(value, "history cursor")
+    if type(decoded) is not dict:
+        raise CliInputError("history cursor JSON must be an object")
+    return HistoryCursor.model_validate_json(
+        json.dumps(decoded, ensure_ascii=False, separators=(",", ":"))
+    )
+
+
+def _decode_json(value: str, context: str) -> object:
+    try:
+        return cast(
+            object,
+            json.loads(
+                value,
+                object_pairs_hook=_unique_json_object,
+                parse_constant=_reject_json_constant,
+            ),
+        )
+    except json.JSONDecodeError:
+        raise CliInputError(f"{context} must be valid strict JSON") from None
+
+
+def _unique_json_object(pairs: list[tuple[str, object]]) -> _JsonObject:
+    result: _JsonObject = {}
+    for name, value in pairs:
+        if name in result:
+            raise CliInputError("JSON objects must not contain duplicate property names")
+        result[name] = value
+    return result
+
+
+def _reject_json_constant(value: str) -> object:
+    del value
+    raise CliInputError("JSON must not contain non-finite numeric constants")
+
+
+def _parse_uuid(value: str, context: str) -> UUID:
+    try:
+        parsed = UUID(value)
+    except (ValueError, AttributeError):
+        raise CliInputError(f"{context} must be a UUID") from None
+    if str(parsed) != value.lower():
+        raise CliInputError(f"{context} must use canonical UUID text")
+    return parsed
+
+
+def _find_check(config: LoadedContractConfig, check_id: str) -> RowCheckDefinition:
+    matches = tuple(check for check in config.checks if check.check_id == check_id)
+    if len(matches) != 1:
+        raise CliInputError("check ID does not identify exactly one configured check")
+    return matches[0]
+
+
+def _execution_services(
+    config: LoadedContractConfig,
+    reference: ConnectionDefinition,
+    target: ConnectionDefinition,
+    environment: Mapping[str, str],
+) -> PostgresExecutionServices:
+    statement_timeout = config.execution.statement_timeout_milliseconds
+    if statement_timeout < 2:
+        raise CliInputError(
+            "execution statement_timeout_milliseconds must be at least 2 for protected reads"
+        )
+    metadata_record_bytes = min(
+        config.execution.max_application_result_bytes,
+        config.execution.max_coordinator_memory_bytes,
+    )
+    return PostgresExecutionServices(
+        reference_connection_id=reference.connection_id,
+        reference_settings=_connection_settings(
+            reference,
+            environment,
+            statement_timeout,
+            "dfe-cli-check-reference",
+        ),
+        target_connection_id=target.connection_id,
+        target_settings=_connection_settings(
+            target,
+            environment,
+            statement_timeout,
+            "dfe-cli-check-target",
+        ),
+        metadata_connection_id=config.metadata.connection.connection_id,
+        metadata_settings=_connection_settings(
+            config.metadata.connection,
+            environment,
+            statement_timeout,
+            "dfe-cli-check-metadata",
+        ),
+        source_retry_policy=_retry_policy(),
+        metadata_retry_policy=_retry_policy(),
+        protected_lock_timeout_milliseconds=min(
+            _MAX_PROTECTED_LOCK_TIMEOUT_MILLISECONDS,
+            statement_timeout - 1,
+        ),
+        metadata_record_bytes=metadata_record_bytes,
+        metadata_total_bytes=config.execution.max_coordinator_memory_bytes,
+    )
+
+
+def _retry_policy() -> PostgresRetryPolicy:
+    return PostgresRetryPolicy(
+        max_attempts=_CONNECTION_RETRY_ATTEMPTS,
+        delay_seconds=_CONNECTION_RETRY_DELAY_SECONDS,
+    )
+
+
+def _metadata_services(
+    config: LoadedContractConfig,
+    environment: Mapping[str, str],
+    application_name: str,
+) -> PostgresMetadataServices:
+    connection = config.metadata.connection
+    return PostgresMetadataServices(
+        connection_id=connection.connection_id,
+        settings=_connection_settings(
+            connection,
+            environment,
+            config.execution.statement_timeout_milliseconds,
+            application_name,
+        ),
+        retry_policy=_retry_policy(),
+    )
+
+
+def _connection_settings(
+    connection: ConnectionDefinition,
+    environment: Mapping[str, str],
+    statement_timeout_milliseconds: int,
+    application_name: str,
+) -> PostgresConnectionSettings:
+    match = _ENV_SECRET_REF_PATTERN.fullmatch(connection.secret_ref)
+    if match is None:
+        raise CliInputError(
+            f"connection {connection.connection_id!r} must use an env:NAME secret reference"
+        )
+    variable_name = match.group(1)
+    dsn = environment.get(variable_name)
+    if dsn is None or dsn == "":
+        raise CliInputError(
+            f"connection {connection.connection_id!r} requires environment variable "
+            f"{variable_name!r}"
+        )
+    try:
+        values = conninfo_to_dict(dsn)
+    except psycopg.ProgrammingError:
+        raise CliInputError(
+            f"environment variable {variable_name!r} must contain a valid PostgreSQL DSN"
+        ) from None
+    fields = frozenset(values)
+    missing = tuple(sorted(_REQUIRED_DSN_FIELDS - fields))
+    unsupported = tuple(sorted(fields - _REQUIRED_DSN_FIELDS))
+    if missing:
+        raise CliInputError(
+            f"PostgreSQL DSN in {variable_name!r} is missing required fields: {', '.join(missing)}"
+        )
+    if unsupported:
+        raise CliInputError(
+            f"PostgreSQL DSN in {variable_name!r} contains unsupported fields: "
+            f"{', '.join(unsupported)}"
+        )
+    required_values = cast(dict[str, str], values)
+    if any(required_values[name] == "" for name in _REQUIRED_DSN_FIELDS):
+        raise CliInputError(
+            f"PostgreSQL DSN in {variable_name!r} must not contain empty required fields"
+        )
+    return PostgresConnectionSettings(
+        host=required_values["host"],
+        port=_positive_integer(required_values["port"], "PostgreSQL DSN port"),
+        dbname=required_values["dbname"],
+        user=required_values["user"],
+        password=SecretStr(required_values["password"]),
+        sslmode=_sslmode(required_values["sslmode"]),
+        connect_timeout_seconds=_positive_integer(
+            required_values["connect_timeout"],
+            "PostgreSQL DSN connect_timeout",
+        ),
+        statement_timeout_milliseconds=statement_timeout_milliseconds,
+        application_name=application_name,
+    )
+
+
+def _positive_integer(value: str, context: str) -> int:
+    if not value.isascii() or not value.isdecimal():
+        raise CliInputError(f"{context} must be a positive decimal integer")
+    parsed = int(value)
+    if parsed < 1:
+        raise CliInputError(f"{context} must be a positive decimal integer")
+    return parsed
+
+
+def _sslmode(value: str) -> PostgresSslMode:
+    try:
+        return PostgresSslMode(value)
+    except ValueError:
+        supported = ", ".join(mode.value for mode in PostgresSslMode)
+        raise CliInputError(f"PostgreSQL DSN sslmode must be one of: {supported}") from None
+
+
+def _output_format(value: str) -> str:
+    if value not in {"human", "json"}:
+        raise CliInputError("output must be 'human' or 'json'")
+    return value
+
+
+def _write_plan(report: PlanReport, output: str, stdout: TextIO) -> None:
+    if output == "json":
+        _write_json_model(report, stdout)
+        return
+    lines = (
+        f"Check: {report.check_id} (revision {report.revision})",
+        f"Scope: {report.scope_digest}",
+        f"Requested assurance: {report.assurance_policy.value}",
+        f"Reference: {report.reference.dataset_id} via {report.reference.connection_id}",
+        f"Target: {report.target.dataset_id} via {report.target.connection_id}",
+        "Stages: " + ", ".join(f"{stage.name}={stage.status.value}" for stage in report.stages),
+        "No endpoints were contacted; readiness and equality remain unestablished.",
+    )
+    _write_lines(stdout, lines)
+
+
+def _write_run_result(result: RunResult, output: str, stdout: TextIO) -> None:
+    if output == "json":
+        _write_json_model(result, stdout)
+        return
+    coverage = result.comparison_coverage
+    lines = [
+        f"Run: {result.run_id}",
+        f"Attempt: {result.attempt_id}",
+        f"Check: {result.check_id}",
+        f"Status: {result.execution_status.value}",
+        f"Verdict: {result.verdict.value}",
+        f"Guarantee: {result.guarantee.value}",
+        f"Coverage: {coverage.covered_partitions}/{coverage.total_partitions} partitions; "
+        f"{coverage.resolved_segments} resolved, {coverage.unresolved_segments} unresolved segments",
+        "Totals: "
+        f"matched={_total_text(result.totals.matched)}, "
+        f"missing={_total_text(result.totals.missing)}, "
+        f"extra={_total_text(result.totals.extra)}, "
+        f"modified={_total_text(result.totals.modified)}",
+        f"Persistence: {result.persistence.state.value}",
+    ]
+    lines.extend(f"Reason: {reason.code.value} — {reason.message}" for reason in result.reasons)
+    lines.extend(_structural_summary_lines(result))
+    _write_lines(stdout, tuple(lines))
+
+
+def _write_history(page: HistoryPage, output: str, stdout: TextIO) -> None:
+    if output == "json":
+        _write_json_model(page, stdout)
+        return
+    lines = [
+        f"History for check {page.check_id}",
+        f"Scope: {page.scope_digest}",
+        f"Attempts returned: {len(page.items)} (limit {page.requested_limit})",
+    ]
+    for item in page.items:
+        outcome = (
+            f"verdict={item.stored_result.verdict.value}"
+            if item.stored_result is not None
+            else "reason="
+            f"{item.terminal_reason.code.value if item.terminal_reason is not None else 'pending'}"
+        )
+        lines.append(
+            f"{item.started_at.isoformat()}  {item.status.value}  "
+            f"run={item.run_id} attempt={item.attempt_id} {outcome}"
+        )
+    if page.next_cursor is None:
+        lines.append("Next cursor: none")
+    else:
+        lines.append(f"Next cursor: {page.next_cursor.model_dump_json()}")
+    _write_lines(stdout, tuple(lines))
+
+
+def _write_diff(page: DiffPage, output: str, stdout: TextIO) -> None:
+    if output == "json":
+        _write_json_model(page, stdout)
+        return
+    result = page.stored_result
+    lines = [
+        f"Run: {page.run_id}",
+        f"Attempt: {page.attempt_id}",
+        f"Stored verdict: {result.verdict.value} ({result.guarantee.value})",
+        f"Row details: {page.detail_availability.value}",
+        f"Difference records found: {page.found_records}",
+        "Retained row details: 0; source endpoints were not queried.",
+    ]
+    lines.extend(f"Reason: {reason.code.value} — {reason.message}" for reason in result.reasons)
+    lines.extend(_structural_summary_lines(result))
+    _write_lines(stdout, tuple(lines))
+
+
+def _structural_summary_lines(result: RunResult) -> tuple[str, ...]:
+    if result.guarantee is not Guarantee.STRUCTURAL:
+        return ()
+    reasons = tuple(
+        reason for reason in result.reasons if reason.code is ReasonCode.CONTRACT_VIOLATION
+    )
+    if len(reasons) != 1:
+        raise ApplicationError("structural result requires one contract-violation summary")
+    reason = reasons[0]
+    names = tuple(parameter.name for parameter in reason.safe_parameters)
+    if names != _STRUCTURAL_SUMMARY_PARAMETER_NAMES:
+        raise ApplicationError("structural result has an unsupported key-summary shape")
+    values = {
+        parameter.name: _canonical_summary_count(parameter.value, parameter.name)
+        for parameter in reason.safe_parameters
+    }
+    lines: list[str] = []
+    for label, prefix in (("Reference", "reference"), ("Target", "target")):
+        valid = values[f"{prefix}_valid_key_count"]
+        distinct = values[f"{prefix}_distinct_key_count"]
+        if distinct > valid:
+            raise ApplicationError("structural result has invalid distinct-key counts")
+        lines.append(
+            f"{label} key summary: rows={values[f'{prefix}_row_count']}, "
+            f"null_keys={values[f'{prefix}_null_key_count']}, "
+            f"duplicate_excess={valid - distinct}, valid_keys={valid}, "
+            f"distinct_keys={distinct}"
+        )
+    return tuple(lines)
+
+
+def _canonical_summary_count(value: str, name: str) -> int:
+    if not value.isascii() or not value.isdecimal() or (len(value) > 1 and value[0] == "0"):
+        raise ApplicationError(f"structural result parameter {name!r} is not canonical decimal")
+    return int(value)
+
+
+def _total_text(total: Total) -> str:
+    if isinstance(total, UnavailableTotal):
+        return f"unavailable ({total.reason.value})"
+    return f"{total.value} ({total.precision})"
+
+
+def _write_json_model(model: BaseModel, stdout: TextIO) -> None:
+    stdout.write(model.model_dump_json())
+    stdout.write("\n")
+
+
+def _write_lines(stdout: TextIO, lines: tuple[str, ...]) -> None:
+    stdout.write("\n".join(lines))
+    stdout.write("\n")
+
+
+def _requests_json_output(arguments: Sequence[str]) -> bool:
+    for index, value in enumerate(arguments):
+        if value == "--output" and index + 1 < len(arguments):
+            return arguments[index + 1] == "json"
+        if value == "--output=json":
+            return True
+    return False
+
+
+def _write_error(stderr: TextIO, output_json: bool, code: str, message: str) -> int:
+    if output_json:
+        payload = {
+            "schema_version": 1,
+            "error": {
+                "code": code,
+                "message": message,
+            },
+        }
+        stderr.write(json.dumps(payload, ensure_ascii=False, separators=(",", ":")))
+        stderr.write("\n")
+    else:
+        stderr.write(f"Error [{code}]: {message}\n")
+    return 2
+
+
+def _system_exit_code(error: SystemExit) -> int:
+    if type(error.code) is int:
+        return error.code
+    return 2
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

@@ -1,72 +1,46 @@
 import re
 from collections.abc import Generator
 from contextlib import contextmanager
-from dataclasses import dataclass, replace
-from datetime import UTC, date, datetime, timedelta
+from dataclasses import dataclass
+from datetime import UTC, date, datetime
+from io import StringIO
 from pathlib import Path
 from typing import Literal
-from uuid import uuid4
+from uuid import UUID, uuid4
 
 import pytest
 from psycopg import sql
+from psycopg.conninfo import make_conninfo
 
-from forensic_data.acquisition import (
-    InputCutDefinition,
-    RelationManifestEvidence,
-    RunRequestDefinition,
-    build_input_cut_definition,
-    build_run_request_definition,
-    validate_relation_manifest_readiness,
+from forensic_data.application import (
+    DiffRequest,
+    ExecuteCheckRequest,
+    HistoryRequest,
+    PlanCheckRequest,
+    PostgresExecutionServices,
+    PostgresMetadataServices,
+    ScopeValue,
+    execute_check,
+    plan_check,
+    read_diff,
+    read_history,
 )
-from forensic_data.canonical import (
-    PROTOCOL,
-    CanonicalSchema,
-    FieldSchema,
-    LogicalType,
-    NoParameters,
-    Normalization,
-    TimestampParameters,
-)
-from forensic_data.comparison import execute_postgres_integer_key_comparison
+from forensic_data.cli import run_cli
 from forensic_data.contracts import load_contract_config
-from forensic_data.contracts.model import (
-    EvidenceDefinition,
-    ExecutionBudgets,
-    RelationLocator,
-    RelationManifestReadiness,
-    RowCheckDefinition,
-)
+from forensic_data.contracts.model import ExecutionBudgets, RowCheckDefinition
 from forensic_data.persistence.definitions import build_metadata_registration_definition
-from forensic_data.persistence.lifecycle import (
-    AlignedInputCutPersistence,
-    ClaimedRun,
-    ReadContextPersistence,
-    RelationManifestObservationPersistence,
-    RunAttemptRecord,
-    claim_postgres_run,
-    close_postgres_read_context,
-    completed_comparison_persistence_from_artifact,
-    persist_postgres_aligned_input_cut,
-    persist_postgres_read_context,
-    publish_postgres_completed_comparison,
-    read_postgres_completed_comparison,
-    start_postgres_run_attempt,
+from forensic_data.persistence.errors import CompletedComparisonNotFoundError
+from forensic_data.persistence.lifecycle import read_postgres_completed_comparison
+from forensic_data.persistence.postgres import migrate_postgres_metadata, register_postgres_metadata
+from forensic_data.planning import PlanReport, ResolvedScope, resolve_scope_values
+from forensic_data.postgres import PostgresConnectionSettings, PostgresRetryPolicy
+from forensic_data.reporting import (
+    DetailAvailability,
+    DiffPage,
+    HistoryAttemptStatus,
+    HistoryPage,
+    StoredResultAvailability,
 )
-from forensic_data.persistence.model import DatasetVersionRecord, MetadataRegistration
-from forensic_data.persistence.postgres import (
-    migrate_postgres_metadata,
-    register_postgres_metadata,
-)
-from forensic_data.planning import PlanDirection, ResolvedScope, resolve_scope_values
-from forensic_data.postgres import (
-    PostgresConnectionSettings,
-    PostgresProtectedReadContext,
-    PostgresProtectedRelationInspection,
-    PostgresRelationAcquisition,
-    PostgresRetryPolicy,
-    open_postgres_protected_read_context,
-)
-from forensic_data.postgres_sql import PostgresRelation
 from forensic_data.result import (
     ComparisonTotals,
     ConsistencyLevel,
@@ -77,6 +51,7 @@ from forensic_data.result import (
     PersistenceState,
     ReasonCode,
     RunResult,
+    UnavailableTotal,
     Verdict,
     exit_code_for_result,
 )
@@ -85,10 +60,7 @@ from tests.metadata_postgres_support import (
     disposable_metadata_database,
     required_metadata_database_settings,
 )
-from tests.postgres_support import (
-    connect_writer,
-    required_connection_settings,
-)
+from tests.postgres_support import connect_writer, required_connection_settings
 
 pytestmark = [pytest.mark.integration, pytest.mark.postgres]
 
@@ -98,14 +70,24 @@ _BUSINESS_DATE = date(2026, 9, 23)
 _OUT_OF_SCOPE_DATE = date(2026, 9, 22)
 _BASELINE_COMPLETED_AT = datetime(2026, 9, 23, 12, 30, 45, 123456, tzinfo=UTC)
 _CORRUPT_COMPLETED_AT = datetime(2026, 9, 23, 13, 30, 45, 123456, tzinfo=UTC)
+_STRUCTURAL_COMPLETED_AT = datetime(2026, 9, 23, 14, 30, 45, 123456, tzinfo=UTC)
+_LOSSY_COMPLETED_AT = datetime(2026, 9, 23, 15, 30, 45, 123456, tzinfo=UTC)
 _BASELINE_SOURCE_CUT = "orders-cut-baseline"
 _CORRUPT_SOURCE_CUT = "orders-cut-corrupt"
+_STRUCTURAL_SOURCE_CUT = "orders-cut-structural"
+_LOSSY_SOURCE_CUT = "orders-cut-lossy"
 _REFERENCE_BASELINE_BATCH = "reference-orders-baseline"
 _TARGET_BASELINE_BATCH = "target-orders-baseline"
 _REFERENCE_CORRUPT_BATCH = "reference-orders-corrupt"
 _TARGET_CORRUPT_BATCH = "target-orders-corrupt"
+_REFERENCE_STRUCTURAL_BATCH = "reference-orders-structural"
+_TARGET_STRUCTURAL_BATCH = "target-orders-structural"
+_REFERENCE_LOSSY_BATCH = "reference-orders-lossy"
+_TARGET_LOSSY_BATCH = "target-orders-lossy"
 _NO_RETRY = PostgresRetryPolicy(max_attempts=1, delay_seconds=0.0)
 _SOURCE_RETRY = PostgresRetryPolicy(max_attempts=2, delay_seconds=0.0)
+_SCOPE_VALUES = (ScopeValue(name="business_date", value="2026-09-23"),)
+_SCOPE_JSON = '{"business_date":"2026-09-23"}'
 
 
 @dataclass(frozen=True, slots=True)
@@ -116,15 +98,7 @@ class _SourceDatabaseSettings:
     reader: PostgresConnectionSettings
 
 
-@dataclass(frozen=True, slots=True)
-class _AcquiredSide:
-    context: PostgresProtectedReadContext
-    dataset_relation: PostgresProtectedRelationInspection
-    readiness_relation: PostgresProtectedRelationInspection
-    evidence: RelationManifestEvidence
-
-
-def test_postgres_integer_range_comparison_persists_baseline_and_corruption() -> None:
+def test_postgres_application_cli_history_diff_and_structural_mismatch() -> None:
     metadata_request = required_metadata_database_settings()
     reference_request = _new_source_database_settings("reference")
     target_request = _new_source_database_settings("target")
@@ -136,12 +110,12 @@ def test_postgres_integer_range_comparison_persists_baseline_and_corruption() ->
         migrate_postgres_metadata(metadata.migrator, _NO_RETRY, 5_000)
         config = load_contract_config(_CONTRACT_PATH)
         check = config.checks[0]
+        scope = resolve_scope_values(check, {"business_date": "2026-09-23"})
         registration = register_postgres_metadata(
             metadata.writer,
             _NO_RETRY,
             build_metadata_registration_definition(config.version, check, config.evidence),
         )
-        scope = resolve_scope_values(check, {"business_date": "2026-09-23"})
         _seed_source_database(
             reference,
             "reference_orders",
@@ -162,20 +136,54 @@ def test_postgres_integer_range_comparison_persists_baseline_and_corruption() ->
             "target-orders-v1",
             "901.00",
         )
-
-        baseline, baseline_readback = _execute_completed_comparison(
-            metadata,
-            reference.reader,
-            target.reader,
-            registration,
-            check,
-            scope,
-            config.execution,
-            config.evidence,
-            _REFERENCE_BASELINE_BATCH,
-            _TARGET_BASELINE_BATCH,
+        services = _execution_services(metadata, reference, target, check)
+        metadata_services = PostgresMetadataServices(
+            connection_id=config.metadata.connection.connection_id,
+            settings=metadata.reader,
+            retry_policy=_NO_RETRY,
         )
-        assert baseline_readback == baseline
+
+        api_plan = plan_check(
+            config,
+            PlanCheckRequest(check_id=check.check_id, scope_values=_SCOPE_VALUES),
+        )
+        plan_exit, plan_stdout, plan_stderr = _invoke_cli(
+            (
+                "plan",
+                "--config",
+                str(_CONTRACT_PATH),
+                "--check",
+                check.check_id,
+                "--scope-json",
+                _SCOPE_JSON,
+                "--output",
+                "json",
+            ),
+            {},
+        )
+        assert plan_exit == 0
+        assert plan_stderr == ""
+        assert PlanReport.model_validate_json(plan_stdout) == api_plan
+
+        baseline_request = ExecuteCheckRequest(
+            request_id=uuid4(),
+            check_id=check.check_id,
+            scope_values=_SCOPE_VALUES,
+            reference_expected_batch_id=_REFERENCE_BASELINE_BATCH,
+            target_expected_batch_id=_TARGET_BASELINE_BATCH,
+            origin="api-integration",
+        )
+        baseline = execute_check(config, baseline_request, services)
+        assert execute_check(config, baseline_request, services) == baseline
+        assert (
+            read_postgres_completed_comparison(
+                metadata.reader,
+                _NO_RETRY,
+                baseline.run_id,
+                baseline.attempt_id,
+            )
+            == baseline
+        )
         _assert_baseline_result(baseline, check, scope, config.execution)
 
         _advance_reference_manifest(
@@ -188,22 +196,308 @@ def test_postgres_integer_range_comparison_persists_baseline_and_corruption() ->
             registration.target_dataset.definition.dataset_id,
             scope.scope_digest,
         )
-        corrupt, corrupt_readback = _execute_completed_comparison(
-            metadata,
-            reference.reader,
-            target.reader,
-            registration,
-            check,
-            scope,
-            config.execution,
-            config.evidence,
-            _REFERENCE_CORRUPT_BATCH,
-            _TARGET_CORRUPT_BATCH,
+        corrupt_request_id = uuid4()
+        corrupt_exit, corrupt_stdout, corrupt_stderr = _invoke_cli(
+            (
+                "check",
+                "--config",
+                str(_CONTRACT_PATH),
+                "--check",
+                check.check_id,
+                "--scope-json",
+                _SCOPE_JSON,
+                "--reference-batch",
+                _REFERENCE_CORRUPT_BATCH,
+                "--target-batch",
+                _TARGET_CORRUPT_BATCH,
+                "--request-id",
+                str(corrupt_request_id),
+                "--output",
+                "json",
+            ),
+            _cli_environment(reference, target, metadata.writer),
         )
-        assert corrupt_readback == corrupt
+        assert corrupt_exit == int(ExitCode.MISMATCH)
+        assert corrupt_stderr == ""
+        corrupt = RunResult.model_validate_json(corrupt_stdout)
+        corrupt_request = ExecuteCheckRequest(
+            request_id=corrupt_request_id,
+            check_id=check.check_id,
+            scope_values=_SCOPE_VALUES,
+            reference_expected_batch_id=_REFERENCE_CORRUPT_BATCH,
+            target_expected_batch_id=_TARGET_CORRUPT_BATCH,
+            origin="cli",
+        )
+        assert execute_check(config, corrupt_request, services) == corrupt
+        assert (
+            read_postgres_completed_comparison(
+                metadata.reader,
+                _NO_RETRY,
+                corrupt.run_id,
+                corrupt.attempt_id,
+            )
+            == corrupt
+        )
         assert corrupt.run_id != baseline.run_id
         assert corrupt.attempt_id != baseline.attempt_id
         _assert_corrupt_result(corrupt, check, scope, config.execution)
+
+        _revoke_source_reader_connect(reference)
+        _revoke_source_reader_connect(target)
+        metadata_environment = {"DFE_METADATA_DSN": _connection_dsn(metadata.reader)}
+        first_history = read_history(
+            HistoryRequest(
+                check_id=check.check_id,
+                scope_digest=scope.scope_digest,
+                limit=1,
+                cursor=None,
+            ),
+            metadata_services,
+        )
+        assert len(first_history.items) == 1
+        assert first_history.items[0].run_id == corrupt.run_id
+        assert first_history.items[0].status is HistoryAttemptStatus.COMPLETED
+        assert (
+            first_history.items[0].stored_result_availability is StoredResultAvailability.AVAILABLE
+        )
+        assert first_history.items[0].stored_result == corrupt
+        assert first_history.next_cursor is not None
+        history_exit, history_stdout, history_stderr = _invoke_cli(
+            (
+                "history",
+                "--config",
+                str(_CONTRACT_PATH),
+                "--check",
+                check.check_id,
+                "--scope-json",
+                _SCOPE_JSON,
+                "--limit",
+                "1",
+                "--output",
+                "json",
+            ),
+            metadata_environment,
+        )
+        assert history_exit == 0
+        assert history_stderr == ""
+        assert HistoryPage.model_validate_json(history_stdout) == first_history
+
+        second_history = read_history(
+            HistoryRequest(
+                check_id=check.check_id,
+                scope_digest=scope.scope_digest,
+                limit=1,
+                cursor=first_history.next_cursor,
+            ),
+            metadata_services,
+        )
+        assert len(second_history.items) == 1
+        assert second_history.items[0].run_id == baseline.run_id
+        assert second_history.items[0].stored_result == baseline
+        assert second_history.next_cursor is None
+        assert first_history.next_cursor is not None
+        second_exit, second_stdout, second_stderr = _invoke_cli(
+            (
+                "history",
+                "--config",
+                str(_CONTRACT_PATH),
+                "--check",
+                check.check_id,
+                "--scope-json",
+                _SCOPE_JSON,
+                "--limit",
+                "1",
+                "--cursor-json",
+                first_history.next_cursor.model_dump_json(),
+                "--output",
+                "json",
+            ),
+            metadata_environment,
+        )
+        assert second_exit == 0
+        assert second_stderr == ""
+        assert HistoryPage.model_validate_json(second_stdout) == second_history
+
+        diff_page = read_diff(
+            DiffRequest(run_id=corrupt.run_id, attempt_id=corrupt.attempt_id, limit=25),
+            metadata_services,
+        )
+        assert diff_page.detail_availability is DetailAvailability.NOT_RETAINED
+        assert diff_page.stored_result == corrupt
+        assert diff_page.found_records == 37
+        assert diff_page.retained_records == 0
+        assert diff_page.details == ()
+        assert diff_page.next_cursor is None
+        diff_exit, diff_stdout, diff_stderr = _invoke_cli(
+            (
+                "diff",
+                "--config",
+                str(_CONTRACT_PATH),
+                "--run-id",
+                str(corrupt.run_id),
+                "--attempt-id",
+                str(corrupt.attempt_id),
+                "--limit",
+                "25",
+                "--output",
+                "json",
+            ),
+            metadata_environment,
+        )
+        assert diff_exit == 0
+        assert diff_stderr == ""
+        assert DiffPage.model_validate_json(diff_stdout) == diff_page
+
+        _grant_source_reader_connect(reference)
+        _grant_source_reader_connect(target)
+        _replace_with_structural_key_violation(
+            reference,
+            target,
+            registration.reference_dataset.definition.dataset_id,
+            registration.target_dataset.definition.dataset_id,
+            scope.scope_digest,
+        )
+        structural_request = ExecuteCheckRequest(
+            request_id=uuid4(),
+            check_id=check.check_id,
+            scope_values=_SCOPE_VALUES,
+            reference_expected_batch_id=_REFERENCE_STRUCTURAL_BATCH,
+            target_expected_batch_id=_TARGET_STRUCTURAL_BATCH,
+            origin="api-integration",
+        )
+        structural = execute_check(config, structural_request, services)
+        assert (
+            read_postgres_completed_comparison(
+                metadata.reader,
+                _NO_RETRY,
+                structural.run_id,
+                structural.attempt_id,
+            )
+            == structural
+        )
+        _assert_structural_result(structural, check, scope, config.execution)
+        _assert_attempt_has_no_segments(metadata.reader, structural.run_id, structural.attempt_id)
+
+        _introduce_lossy_key_mapping(
+            reference,
+            target,
+            registration.reference_dataset.definition.dataset_id,
+            registration.target_dataset.definition.dataset_id,
+            scope.scope_digest,
+        )
+        lossy_request_id = uuid4()
+        lossy_exit, lossy_stdout, lossy_stderr = _invoke_cli(
+            (
+                "check",
+                "--config",
+                str(_CONTRACT_PATH),
+                "--check",
+                check.check_id,
+                "--scope-json",
+                _SCOPE_JSON,
+                "--reference-batch",
+                _REFERENCE_LOSSY_BATCH,
+                "--target-batch",
+                _TARGET_LOSSY_BATCH,
+                "--request-id",
+                str(lossy_request_id),
+                "--output",
+                "json",
+            ),
+            _cli_environment(reference, target, metadata.writer),
+        )
+        assert lossy_exit == int(ExitCode.ERROR)
+        assert lossy_stderr == ""
+        lossy = RunResult.model_validate_json(lossy_stdout)
+        lossy_request = ExecuteCheckRequest(
+            request_id=lossy_request_id,
+            check_id=check.check_id,
+            scope_values=_SCOPE_VALUES,
+            reference_expected_batch_id=_REFERENCE_LOSSY_BATCH,
+            target_expected_batch_id=_TARGET_LOSSY_BATCH,
+            origin="cli",
+        )
+        assert execute_check(config, lossy_request, services) == lossy
+        _assert_lossy_result(lossy, check, scope, config.execution)
+        with pytest.raises(CompletedComparisonNotFoundError):
+            read_postgres_completed_comparison(
+                metadata.reader,
+                _NO_RETRY,
+                lossy.run_id,
+                lossy.attempt_id,
+            )
+        lossy_history = read_history(
+            HistoryRequest(
+                check_id=check.check_id,
+                scope_digest=scope.scope_digest,
+                limit=1,
+                cursor=None,
+            ),
+            metadata_services,
+        )
+        assert len(lossy_history.items) == 1
+        assert lossy_history.items[0].attempt_id == lossy.attempt_id
+        assert lossy_history.items[0].status is HistoryAttemptStatus.ERROR
+        assert (
+            lossy_history.items[0].stored_result_availability
+            is StoredResultAvailability.NOT_CREATED
+        )
+        assert lossy_history.items[0].stored_result is None
+
+
+def _invoke_cli(
+    arguments: tuple[str, ...],
+    environment: dict[str, str],
+) -> tuple[int, str, str]:
+    stdout = StringIO()
+    stderr = StringIO()
+    exit_code = run_cli(arguments, environment, stdout, stderr)
+    return exit_code, stdout.getvalue(), stderr.getvalue()
+
+
+def _execution_services(
+    metadata: MetadataDatabaseSettings,
+    reference: _SourceDatabaseSettings,
+    target: _SourceDatabaseSettings,
+    check: RowCheckDefinition,
+) -> PostgresExecutionServices:
+    return PostgresExecutionServices(
+        reference_connection_id=check.reference.connection.connection_id,
+        reference_settings=reference.reader,
+        target_connection_id=check.target.connection.connection_id,
+        target_settings=target.reader,
+        metadata_connection_id="metadata_pg",
+        metadata_settings=metadata.writer,
+        source_retry_policy=_SOURCE_RETRY,
+        metadata_retry_policy=_NO_RETRY,
+        protected_lock_timeout_milliseconds=2_000,
+        metadata_record_bytes=4_096,
+        metadata_total_bytes=32_768,
+    )
+
+
+def _cli_environment(
+    reference: _SourceDatabaseSettings,
+    target: _SourceDatabaseSettings,
+    metadata: PostgresConnectionSettings,
+) -> dict[str, str]:
+    return {
+        "DFE_REFERENCE_DSN": _connection_dsn(reference.reader),
+        "DFE_TARGET_DSN": _connection_dsn(target.reader),
+        "DFE_METADATA_DSN": _connection_dsn(metadata),
+    }
+
+
+def _connection_dsn(settings: PostgresConnectionSettings) -> str:
+    return make_conninfo(
+        host=settings.host,
+        port=str(settings.port),
+        dbname=settings.dbname,
+        user=settings.user,
+        password=settings.password.get_secret_value(),
+        sslmode=settings.sslmode.value,
+        connect_timeout=str(settings.connect_timeout_seconds),
+    )
 
 
 def _new_source_database_settings(
@@ -444,383 +738,147 @@ def _corrupt_target_and_advance_manifest(
             )
 
 
-def _run_request(
-    registration: MetadataRegistration,
-    check: RowCheckDefinition,
-    scope: ResolvedScope,
-    execution_policy: ExecutionBudgets,
-    evidence_policy: EvidenceDefinition,
-    reference_batch_id: str,
-    target_batch_id: str,
-) -> RunRequestDefinition:
-    return build_run_request_definition(
-        request_id=uuid4(),
-        contract_version_id=registration.contract.contract_version_id,
-        origin="pytest",
-        check=check,
-        scope=scope,
-        reference_expected_batch_id=reference_batch_id,
-        target_expected_batch_id=target_batch_id,
-        execution_policy=execution_policy,
-        evidence_policy=evidence_policy,
+def _revoke_source_reader_connect(settings: _SourceDatabaseSettings) -> None:
+    cluster_admin = required_connection_settings(
+        "DFE_TEST_POSTGRES_ADMIN_DSN",
+        "forensic-data-comparison-revoke-source-reader",
     )
-
-
-def _claim_and_start_attempt(
-    settings: MetadataDatabaseSettings,
-    registration: MetadataRegistration,
-    check: RowCheckDefinition,
-    scope: ResolvedScope,
-    execution_policy: ExecutionBudgets,
-    evidence_policy: EvidenceDefinition,
-    reference_batch_id: str,
-    target_batch_id: str,
-) -> tuple[ClaimedRun, RunAttemptRecord]:
-    request = _run_request(
-        registration,
-        check,
-        scope,
-        execution_policy,
-        evidence_policy,
-        reference_batch_id,
-        target_batch_id,
-    )
-    run = claim_postgres_run(
-        settings.writer,
-        _NO_RETRY,
-        uuid4(),
-        uuid4(),
-        request,
-    )
-    attempt = start_postgres_run_attempt(
-        settings.writer,
-        _NO_RETRY,
-        run,
-        uuid4(),
-        uuid4(),
-        uuid4(),
-        datetime.now(UTC) + timedelta(minutes=10),
-        execution_policy,
-    )
-    return run, attempt
-
-
-def _execute_completed_comparison(
-    metadata: MetadataDatabaseSettings,
-    reference_settings: PostgresConnectionSettings,
-    target_settings: PostgresConnectionSettings,
-    registration: MetadataRegistration,
-    check: RowCheckDefinition,
-    scope: ResolvedScope,
-    execution_policy: ExecutionBudgets,
-    evidence_policy: EvidenceDefinition,
-    reference_batch_id: str,
-    target_batch_id: str,
-) -> tuple[RunResult, RunResult]:
-    run, attempt = _claim_and_start_attempt(
-        metadata,
-        registration,
-        check,
-        scope,
-        execution_policy,
-        evidence_policy,
-        reference_batch_id,
-        target_batch_id,
-    )
-    reference = _acquire_side(
-        reference_settings,
-        check,
-        PlanDirection.REFERENCE,
-        scope.scope_digest,
-        reference_batch_id,
-    )
-    try:
-        target = _acquire_side(
-            target_settings,
-            check,
-            PlanDirection.TARGET,
-            scope.scope_digest,
-            target_batch_id,
+    with connect_writer(cluster_admin) as connection:
+        connection.execute(
+            sql.SQL("REVOKE CONNECT ON DATABASE {} FROM dfe_fixture_reader").format(
+                sql.Identifier(settings.database_name)
+            )
         )
-        try:
-            persisted_reference = persist_postgres_read_context(
-                metadata.writer,
-                _NO_RETRY,
-                attempt,
-                _context_definition(
-                    registration.reference_dataset,
-                    PlanDirection.REFERENCE,
-                    reference,
-                ),
-            )
-            persisted_target = persist_postgres_read_context(
-                metadata.writer,
-                _NO_RETRY,
-                attempt,
-                _context_definition(
-                    registration.target_dataset,
-                    PlanDirection.TARGET,
-                    target,
-                ),
-            )
-            input_cut = build_input_cut_definition(reference.evidence, target.evidence)
-            persisted_cut = persist_postgres_aligned_input_cut(
-                metadata.writer,
-                _NO_RETRY,
-                attempt,
-                _cut_persistence(
-                    input_cut,
-                    registration,
-                    reference,
-                    target,
-                ),
-            )
-            artifact = execute_postgres_integer_key_comparison(
-                reference.context,
-                reference.dataset_relation,
-                target.context,
-                target.dataset_relation,
-                check,
-                scope,
-                input_cut,
-                execution_policy,
-            )
-            assert artifact.reference_full_scans <= execution_policy.max_full_scans_per_side
-            assert artifact.target_full_scans <= execution_policy.max_full_scans_per_side
-        finally:
-            target.context.close()
-    finally:
-        reference.context.close()
-
-    contexts_closed_at = datetime.now(UTC)
-    close_postgres_read_context(
-        metadata.writer,
-        _NO_RETRY,
-        attempt,
-        persisted_reference.read_context_id,
-        uuid4(),
-        contexts_closed_at,
-    )
-    close_postgres_read_context(
-        metadata.writer,
-        _NO_RETRY,
-        attempt,
-        persisted_target.read_context_id,
-        uuid4(),
-        contexts_closed_at,
-    )
-    comparison, segments = completed_comparison_persistence_from_artifact(
-        attempt,
-        persisted_cut,
-        artifact,
-    )
-    published = publish_postgres_completed_comparison(
-        metadata.writer,
-        _NO_RETRY,
-        attempt,
-        uuid4(),
-        comparison,
-        segments,
-        datetime.now(UTC),
-    )
-    readback = read_postgres_completed_comparison(
-        metadata.reader,
-        _NO_RETRY,
-        run.run_id,
-        attempt.attempt_id,
-    )
-    return published, readback
 
 
-def _acquire_side(
-    settings: PostgresConnectionSettings,
-    check: RowCheckDefinition,
-    direction: PlanDirection,
+def _grant_source_reader_connect(settings: _SourceDatabaseSettings) -> None:
+    cluster_admin = required_connection_settings(
+        "DFE_TEST_POSTGRES_ADMIN_DSN",
+        "forensic-data-comparison-grant-source-reader",
+    )
+    with connect_writer(cluster_admin) as connection:
+        connection.execute(
+            sql.SQL("GRANT CONNECT ON DATABASE {} TO dfe_fixture_reader").format(
+                sql.Identifier(settings.database_name)
+            )
+        )
+
+
+def _replace_with_structural_key_violation(
+    reference: _SourceDatabaseSettings,
+    target: _SourceDatabaseSettings,
+    reference_dataset_id: str,
+    target_dataset_id: str,
     scope_digest: str,
-    batch_id: str,
-) -> _AcquiredSide:
-    dataset = check.reference if direction is PlanDirection.REFERENCE else check.target
-    consistency = check.consistency.datasets[0 if direction is PlanDirection.REFERENCE else 1]
-    readiness = consistency.readiness
-    assert isinstance(dataset.locator, RelationLocator)
-    assert isinstance(readiness, RelationManifestReadiness)
-    dataset_relation = PostgresRelation(components=(dataset.locator.schema, dataset.locator.name))
-    readiness_relation = PostgresRelation(
-        components=(readiness.relation.schema, readiness.relation.name)
-    )
-    context = open_postgres_protected_read_context(
-        settings,
-        _SOURCE_RETRY,
-        (
-            _acquisition(
-                dataset.logical_schema.schema,
-                dataset_relation,
-                tuple(item.column_name for item in dataset.projection),
+) -> None:
+    with connect_writer(reference.writer) as connection:
+        with connection.transaction():
+            connection.execute("TRUNCATE TABLE dfe_demo.reference_orders")
+            connection.execute(
+                "INSERT INTO dfe_demo.reference_orders "
+                "(order_id, business_date, amount) VALUES "
+                "(1, %s, 10.00), (2, %s, 20.00), (3, %s, 30.00)",
+                (_BUSINESS_DATE, _BUSINESS_DATE, _BUSINESS_DATE),
+            )
+            connection.execute("ANALYZE dfe_demo.reference_orders")
+            connection.execute(
+                "UPDATE dfe_control.batch_manifest "
+                "SET batch_id = %s, source_cut = %s, dataset_version = %s, completed_at = %s "
+                "WHERE dataset_id = %s AND scope_digest = %s",
+                (
+                    _REFERENCE_STRUCTURAL_BATCH,
+                    _STRUCTURAL_SOURCE_CUT,
+                    "reference-orders-v3",
+                    _STRUCTURAL_COMPLETED_AT,
+                    reference_dataset_id,
+                    scope_digest,
+                ),
+            )
+    with connect_writer(target.writer) as connection:
+        with connection.transaction():
+            connection.execute(
+                "ALTER TABLE dfe_demo.target_orders DROP CONSTRAINT target_orders_pkey"
+            )
+            connection.execute(
+                "ALTER TABLE dfe_demo.target_orders ALTER COLUMN order_id DROP NOT NULL"
+            )
+            connection.execute("TRUNCATE TABLE dfe_demo.target_orders")
+            connection.execute(
+                "INSERT INTO dfe_demo.target_orders "
+                "(order_id, business_date, amount) VALUES "
+                "(1, %s, 10.00), (2, %s, 20.00), (2, %s, 20.00), (NULL, %s, 40.00)",
+                (_BUSINESS_DATE, _BUSINESS_DATE, _BUSINESS_DATE, _BUSINESS_DATE),
+            )
+            connection.execute("ANALYZE dfe_demo.target_orders")
+            connection.execute(
+                "UPDATE dfe_control.batch_manifest "
+                "SET batch_id = %s, source_cut = %s, dataset_version = %s, completed_at = %s "
+                "WHERE dataset_id = %s AND scope_digest = %s",
+                (
+                    _TARGET_STRUCTURAL_BATCH,
+                    _STRUCTURAL_SOURCE_CUT,
+                    "target-orders-v3",
+                    _STRUCTURAL_COMPLETED_AT,
+                    target_dataset_id,
+                    scope_digest,
+                ),
+            )
+
+
+def _introduce_lossy_key_mapping(
+    reference: _SourceDatabaseSettings,
+    target: _SourceDatabaseSettings,
+    reference_dataset_id: str,
+    target_dataset_id: str,
+    scope_digest: str,
+) -> None:
+    with connect_writer(reference.writer) as connection:
+        with connection.transaction():
+            connection.execute(
+                "UPDATE dfe_demo.reference_orders SET order_id = 1.50 WHERE order_id = 1.00"
+            )
+            connection.execute("ANALYZE dfe_demo.reference_orders")
+            connection.execute(
+                "UPDATE dfe_control.batch_manifest "
+                "SET batch_id = %s, source_cut = %s, dataset_version = %s, completed_at = %s "
+                "WHERE dataset_id = %s AND scope_digest = %s",
+                (
+                    _REFERENCE_LOSSY_BATCH,
+                    _LOSSY_SOURCE_CUT,
+                    "reference-orders-v4",
+                    _LOSSY_COMPLETED_AT,
+                    reference_dataset_id,
+                    scope_digest,
+                ),
+            )
+    with connect_writer(target.writer) as connection:
+        connection.execute(
+            "UPDATE dfe_control.batch_manifest "
+            "SET batch_id = %s, source_cut = %s, dataset_version = %s, completed_at = %s "
+            "WHERE dataset_id = %s AND scope_digest = %s",
+            (
+                _TARGET_LOSSY_BATCH,
+                _LOSSY_SOURCE_CUT,
+                "target-orders-v4",
+                _LOSSY_COMPLETED_AT,
+                target_dataset_id,
+                scope_digest,
             ),
-            _acquisition(_manifest_schema(), readiness_relation, readiness.columns.values()),
-        ),
-        2_000,
-    )
-    dataset_protected = _protected_relation(context.protected_relations, dataset_relation)
-    readiness_protected = _protected_relation(context.protected_relations, readiness_relation)
-    rows = context.read_relation_manifest(
-        readiness_protected,
-        readiness.columns,
-        dataset.dataset_id,
-        scope_digest,
-        4_096,
-        32_768,
-    )
-    evidence = validate_relation_manifest_readiness(
-        direction=direction,
-        rows=rows,
-        expected_dataset_id=dataset.dataset_id,
-        expected_scope_digest=scope_digest,
-        expected_batch_id=batch_id,
-        alignment_fields=check.consistency.alignment_fields,
-        minimum_evidence=check.consistency.minimum_evidence,
-        late_arrivals=check.consistency.late_arrivals,
-    )
-    assert isinstance(evidence, RelationManifestEvidence)
-    return _AcquiredSide(context, dataset_protected, readiness_protected, evidence)
+        )
 
 
-def _protected_relation(
-    protected: tuple[PostgresProtectedRelationInspection, ...],
-    relation: PostgresRelation,
-) -> PostgresProtectedRelationInspection:
-    for item in protected:
-        if item.inspection.relation == relation:
-            return item
-    raise AssertionError(f"protected relation is missing: {relation.components!r}")
-
-
-def _acquisition(
-    schema: CanonicalSchema,
-    relation: PostgresRelation,
-    columns: tuple[str, ...],
-) -> PostgresRelationAcquisition:
-    return PostgresRelationAcquisition(
-        schema=schema,
-        relation=relation,
-        column_names=columns,
-        max_metadata_record_bytes=4_096,
-        max_metadata_total_bytes=32_768,
-    )
-
-
-def _manifest_schema() -> CanonicalSchema:
-    return CanonicalSchema(
-        protocol=PROTOCOL,
-        fields=(
-            _string_field("dataset_id", False),
-            _string_field("scope_digest", False),
-            _string_field("batch_id", False),
-            _string_field("state", False),
-            FieldSchema(
-                name="business_date",
-                logical_type=LogicalType.DATE,
-                nullable=False,
-                parameters=NoParameters(),
-                normalization=Normalization.NONE,
-            ),
-            _string_field("source_cut", True),
-            _string_field("dataset_version", True),
-            FieldSchema(
-                name="completed_at",
-                logical_type=LogicalType.TIMESTAMP_INSTANT,
-                nullable=True,
-                parameters=TimestampParameters(precision=6),
-                normalization=Normalization.NONE,
-            ),
-        ),
-    )
-
-
-def _string_field(name: str, nullable: bool) -> FieldSchema:
-    return FieldSchema(
-        name=name,
-        logical_type=LogicalType.STRING,
-        nullable=nullable,
-        parameters=NoParameters(),
-        normalization=Normalization.NONE,
-    )
-
-
-def _context_definition(
-    dataset: DatasetVersionRecord,
-    direction: PlanDirection,
-    acquired: _AcquiredSide,
-) -> ReadContextPersistence:
-    return ReadContextPersistence(
-        acquisition_operation_id=uuid4(),
-        dataset=dataset,
-        direction=direction,
-        protected_context=acquired.context,
-    )
-
-
-def _cut_persistence(
-    cut: InputCutDefinition,
-    registration: MetadataRegistration,
-    reference: _AcquiredSide,
-    target: _AcquiredSide,
-) -> AlignedInputCutPersistence:
-    recorded_at = datetime.now(UTC)
-    reference_for_cut = replace(
-        reference,
-        evidence=replace(
-            reference.evidence,
-            late_arrivals=cut.late_arrivals,
-            cut=cut.reference,
-        ),
-    )
-    target_for_cut = replace(
-        target,
-        evidence=replace(
-            target.evidence,
-            late_arrivals=cut.late_arrivals,
-            cut=cut.target,
-        ),
-    )
-    return AlignedInputCutPersistence(
-        cut_binding_operation_id=uuid4(),
-        attempt_cut_operation_id=uuid4(),
-        input_cut=cut,
-        reference=_observation(
-            registration.reference_dataset,
-            PlanDirection.REFERENCE,
-            reference_for_cut,
-            recorded_at,
-        ),
-        target=_observation(
-            registration.target_dataset,
-            PlanDirection.TARGET,
-            target_for_cut,
-            recorded_at,
-        ),
-        recorded_at=recorded_at,
-    )
-
-
-def _observation(
-    dataset: DatasetVersionRecord,
-    direction: PlanDirection,
-    acquired: _AcquiredSide,
-    observed_at: datetime,
-) -> RelationManifestObservationPersistence:
-    return RelationManifestObservationPersistence(
-        observation_id=uuid4(),
-        observation_operation_id=uuid4(),
-        dataset=dataset,
-        direction=direction,
-        readiness=acquired.evidence,
-        protected_context=acquired.context,
-        dataset_relation=acquired.dataset_relation,
-        readiness_relation=acquired.readiness_relation,
-        projection_code_artifact=None,
-        observed_at=observed_at,
-    )
+def _assert_attempt_has_no_segments(
+    settings: PostgresConnectionSettings,
+    run_id: UUID,
+    attempt_id: UUID,
+) -> None:
+    with connect_writer(settings) as connection:
+        row = connection.execute(
+            "SELECT pg_catalog.count(*) FROM dfe_metadata.segment_fingerprints "
+            "WHERE run_id = %s AND attempt_id = %s",
+            (run_id, attempt_id),
+        ).fetchone()
+    assert row == (0,)
 
 
 def _assert_common_completed_result(
@@ -833,13 +891,11 @@ def _assert_common_completed_result(
     assert result.contract_digest == check.contract_digest
     assert result.scope_digest == scope.scope_digest
     assert result.execution_status is ExecutionStatus.COMPLETED
-    assert result.guarantee is Guarantee.FINGERPRINT
     assert result.consistency.stable_reads is ConsistencyLevel.VERIFIED
     assert result.consistency.cut_alignment is ConsistencyLevel.VERIFIED
     assert len(result.consistency.read_context_ids) == 2
     assert result.comparison_coverage.total_partitions == 1
     assert result.comparison_coverage.covered_partitions == 1
-    assert result.comparison_coverage.pruned_segments > 0
     assert result.comparison_coverage.unresolved_segments == 0
     assert result.comparison_coverage.unresolved_reasons == ()
     assert result.evidence_coverage.retained_records == 0
@@ -863,7 +919,9 @@ def _assert_baseline_result(
 ) -> None:
     _assert_common_completed_result(result, check, scope, execution_policy)
     assert result.verdict is Verdict.MATCH
+    assert result.guarantee is Guarantee.FINGERPRINT
     assert exit_code_for_result(result) is ExitCode.MATCH
+    assert result.comparison_coverage.pruned_segments > 0
     assert result.comparison_coverage.exact_segments == 0
     assert result.totals == ComparisonTotals(
         matched=InferredTotal(precision="inferred_under_fingerprint", value="1000000"),
@@ -884,7 +942,9 @@ def _assert_corrupt_result(
 ) -> None:
     _assert_common_completed_result(result, check, scope, execution_policy)
     assert result.verdict is Verdict.MISMATCH
+    assert result.guarantee is Guarantee.FINGERPRINT
     assert exit_code_for_result(result) is ExitCode.MISMATCH
+    assert result.comparison_coverage.pruned_segments > 0
     assert result.comparison_coverage.exact_segments > 0
     assert result.totals == ComparisonTotals(
         matched=InferredTotal(precision="inferred_under_fingerprint", value="999967"),
@@ -895,3 +955,99 @@ def _assert_corrupt_result(
     assert result.evidence_coverage.found_records == 37
     assert result.evidence_coverage.found_bytes == 0
     assert tuple(reason.code for reason in result.reasons) == (ReasonCode.DATA_MISMATCH,)
+
+
+def _assert_structural_result(
+    result: RunResult,
+    check: RowCheckDefinition,
+    scope: ResolvedScope,
+    execution_policy: ExecutionBudgets,
+) -> None:
+    _assert_common_completed_result(result, check, scope, execution_policy)
+    assert result.verdict is Verdict.MISMATCH
+    assert result.guarantee is Guarantee.STRUCTURAL
+    assert exit_code_for_result(result) is ExitCode.MISMATCH
+    assert result.comparison_coverage.resolved_segments == 1
+    assert result.comparison_coverage.pruned_segments == 0
+    assert result.comparison_coverage.exact_segments == 1
+    unavailable = UnavailableTotal(
+        precision="unavailable",
+        value=None,
+        reason=ReasonCode.CONTRACT_VIOLATION,
+    )
+    assert result.totals == ComparisonTotals(
+        matched=unavailable,
+        missing=unavailable,
+        extra=unavailable,
+        modified=unavailable,
+    )
+    assert result.evidence_coverage.found_records == 0
+    assert result.evidence_coverage.found_bytes == 0
+    assert result.metrics.queries == 2
+    assert result.metrics.fetched_records == 2
+    assert result.metrics.fingerprint_nodes == 0
+    assert tuple(reason.code for reason in result.reasons) == (ReasonCode.CONTRACT_VIOLATION,)
+    assert tuple(
+        (parameter.name, parameter.value) for parameter in result.reasons[0].safe_parameters
+    ) == (
+        ("reference_row_count", "3"),
+        ("reference_null_key_count", "0"),
+        ("reference_invalid_key_count", "0"),
+        ("reference_valid_key_count", "3"),
+        ("reference_distinct_key_count", "3"),
+        ("target_row_count", "4"),
+        ("target_null_key_count", "1"),
+        ("target_invalid_key_count", "0"),
+        ("target_valid_key_count", "3"),
+        ("target_distinct_key_count", "2"),
+    )
+
+
+def _assert_lossy_result(
+    result: RunResult,
+    check: RowCheckDefinition,
+    scope: ResolvedScope,
+    execution_policy: ExecutionBudgets,
+) -> None:
+    assert result.check_id == check.check_id
+    assert result.contract_digest == check.contract_digest
+    assert result.scope_digest == scope.scope_digest
+    assert result.execution_status is ExecutionStatus.ERROR
+    assert result.verdict is Verdict.MISMATCH
+    assert result.guarantee is Guarantee.NOT_ESTABLISHED
+    assert exit_code_for_result(result) is ExitCode.ERROR
+    assert result.consistency.stable_reads is ConsistencyLevel.VERIFIED
+    assert result.consistency.cut_alignment is ConsistencyLevel.VERIFIED
+    assert len(result.consistency.read_context_ids) == 2
+    assert result.comparison_coverage.total_partitions == 1
+    assert result.comparison_coverage.covered_partitions == 0
+    assert result.comparison_coverage.unresolved_segments == 1
+    assert result.comparison_coverage.unresolved_reasons == (ReasonCode.LOSSY_TRANSPORT,)
+    assert all(
+        isinstance(total, UnavailableTotal) and total.reason is ReasonCode.LOSSY_TRANSPORT
+        for total in result.totals.values()
+    )
+    assert result.evidence_coverage.found_records == 0
+    assert result.metrics.queries == 2
+    assert result.metrics.fetched_records == 2
+    assert result.metrics.fingerprint_nodes == 0
+    assert result.metrics.result_bytes <= execution_policy.max_application_result_bytes
+    assert result.persistence.state is PersistenceState.CONFIRMED
+    assert tuple(reason.code for reason in result.reasons) == (
+        ReasonCode.LOSSY_TRANSPORT,
+        ReasonCode.CONTRACT_VIOLATION,
+    )
+    assert tuple(
+        (parameter.name, parameter.value) for parameter in result.reasons[1].safe_parameters
+    ) == (
+        ("reference_row_count", "3"),
+        ("reference_null_key_count", "0"),
+        ("reference_invalid_key_count", "1"),
+        ("reference_valid_key_count", "2"),
+        ("reference_distinct_key_count", "2"),
+        ("target_row_count", "4"),
+        ("target_null_key_count", "1"),
+        ("target_invalid_key_count", "0"),
+        ("target_valid_key_count", "3"),
+        ("target_distinct_key_count", "2"),
+    )

@@ -46,6 +46,7 @@ from forensic_data.result import (
     ResultMetrics,
     ResultReason,
     SafeParameter,
+    UnavailableTotal,
     Verdict,
 )
 
@@ -84,26 +85,29 @@ class ComparisonProtocolError(ComparisonExecutionError):
     """Connector output violated the integer-key comparison protocol."""
 
 
-class ComparisonKeyContractError(ComparisonExecutionError):
-    """Both key summaries completed and at least one side violates the key contract."""
+class ComparisonKeyMappingError(ComparisonExecutionError):
+    """A completed key summary found values that cannot map losslessly to INT64."""
 
     def __init__(
         self,
         reference_summary: PostgresIntegerKeySummary,
         target_summary: PostgresIntegerKeySummary,
+        metrics: ResultMetrics,
+        reference_full_scans: int,
+        target_full_scans: int,
+        contract_violation_reason: ResultReason | None,
     ) -> None:
         self.reference_summary = reference_summary
         self.target_summary = target_summary
+        self.metrics = metrics
+        self.reference_full_scans = reference_full_scans
+        self.target_full_scans = target_full_scans
+        self.contract_violation_reason = contract_violation_reason
         super().__init__(
-            "scoped integer-key validation found null, unrepresentable, or duplicate keys: "
-            f"reference_null={reference_summary.null_key_count}, "
+            "scoped integer-key validation found physical values that cannot map "
+            "losslessly to logical INT64: "
             f"reference_invalid={reference_summary.invalid_key_count}, "
-            f"reference_duplicate="
-            f"{reference_summary.valid_key_count - reference_summary.distinct_key_count}, "
-            f"target_null={target_summary.null_key_count}, "
-            f"target_invalid={target_summary.invalid_key_count}, "
-            f"target_duplicate="
-            f"{target_summary.valid_key_count - target_summary.distinct_key_count}"
+            f"target_invalid={target_summary.invalid_key_count}"
         )
 
 
@@ -228,6 +232,67 @@ class CompletedComparisonArtifact:
 
 @final
 @dataclass(frozen=True, slots=True)
+class CompletedStructuralComparisonArtifact:
+    check_id: str
+    contract_digest: str
+    scope_digest: str
+    input_cut_digest: str
+    verdict: Verdict
+    consistency: ConsistencyStatus
+    guarantee: Guarantee
+    comparison_coverage: ComparisonCoverage
+    totals: ComparisonTotals
+    evidence_coverage: EvidenceCoverage
+    metrics: ResultMetrics
+    reasons: tuple[ResultReason, ...]
+    reference_key_summary: PostgresIntegerKeySummary
+    target_key_summary: PostgresIntegerKeySummary
+    reference_full_scans: int
+    target_full_scans: int
+
+    def __post_init__(self) -> None:
+        if type(self.check_id) is not str or self.check_id.strip() == "":
+            raise ValueError("completed structural comparison check_id must be nonblank")
+        _require_sha256(self.contract_digest, "completed structural contract digest")
+        _require_sha256(self.scope_digest, "completed structural scope digest")
+        _require_sha256(self.input_cut_digest, "completed structural input-cut digest")
+        if self.verdict is not Verdict.MISMATCH:
+            raise ValueError("completed structural key-contract result must be mismatch")
+        _require_instance(self.consistency, ConsistencyStatus, "completed consistency")
+        if self.guarantee is not Guarantee.STRUCTURAL:
+            raise ValueError("completed key-contract result requires structural guarantee")
+        _require_instance(
+            self.comparison_coverage,
+            ComparisonCoverage,
+            "completed structural comparison coverage",
+        )
+        _require_instance(self.totals, ComparisonTotals, "completed structural totals")
+        _require_instance(
+            self.evidence_coverage,
+            EvidenceCoverage,
+            "completed structural evidence coverage",
+        )
+        _require_instance(self.metrics, ResultMetrics, "completed structural metrics")
+        if type(self.reasons) is not tuple or len(self.reasons) != 1:
+            raise ValueError("completed structural comparison requires one immutable reason")
+        _require_instance(self.reasons[0], ResultReason, "completed structural reason")
+        _require_instance(
+            self.reference_key_summary,
+            PostgresIntegerKeySummary,
+            "reference key summary",
+        )
+        _require_instance(
+            self.target_key_summary,
+            PostgresIntegerKeySummary,
+            "target key summary",
+        )
+        _require_nonnegative_integer(self.reference_full_scans, "reference_full_scans")
+        _require_nonnegative_integer(self.target_full_scans, "target_full_scans")
+        _validate_structural_artifact(self)
+
+
+@final
+@dataclass(frozen=True, slots=True)
 class _ValidatedInputs:
     key_field_index: int
     reference_scope: PostgresScopePredicate | None
@@ -307,7 +372,7 @@ def execute_postgres_integer_key_comparison(
     scope: ResolvedScope,
     input_cut: InputCutDefinition,
     budgets: ExecutionBudgets,
-) -> CompletedComparisonArtifact:
+) -> CompletedComparisonArtifact | CompletedStructuralComparisonArtifact:
     reference_context = _require_instance(
         reference_context,
         PostgresProtectedReadContext,
@@ -403,8 +468,36 @@ def execute_postgres_integer_key_comparison(
     )
     reference_summary = reference_summary_read.summary
     target_summary = target_summary_read.summary
-    if _violates_key_contract(reference_summary) or _violates_key_contract(target_summary):
-        raise ComparisonKeyContractError(reference_summary, target_summary)
+    contract_violation_reason = _structural_contract_violation_reason(
+        reference_summary,
+        target_summary,
+    )
+    if reference_summary.invalid_key_count > 0 or target_summary.invalid_key_count > 0:
+        raise ComparisonKeyMappingError(
+            reference_summary,
+            target_summary,
+            _result_metrics(usage, started_nanoseconds),
+            usage.reference_full_scans,
+            usage.target_full_scans,
+            contract_violation_reason,
+        )
+    if contract_violation_reason is not None:
+        return _completed_structural_artifact(
+            check,
+            scope,
+            input_cut,
+            reference_context,
+            target_context,
+            reference_summary,
+            target_summary,
+            usage,
+            started_nanoseconds,
+            contract_violation_reason,
+        )
+    if check.assurance_policy is AssurancePolicy.EXACT_REQUIRED:
+        raise UnsupportedComparisonError(
+            "integer-range fingerprint comparison does not implement exact_required assurance"
+        )
     if not reference_summary.usable_access_path or not target_summary.usable_access_path:
         raise UnsupportedComparisonError(
             "integer-range comparison requires a confirmed leading, non-partial, built-in "
@@ -580,14 +673,7 @@ def execute_postgres_integer_key_comparison(
             found_bytes=0,
             retained_bytes=0,
         ),
-        metrics=ResultMetrics(
-            queries=usage.queries,
-            fetched_records=usage.fetched_records,
-            result_bytes=usage.result_bytes,
-            fingerprint_nodes=usage.fingerprint_nodes,
-            coordinator_peak_bytes=usage.coordinator_peak_bytes,
-            elapsed_milliseconds=elapsed_milliseconds,
-        ),
+        metrics=_result_metrics_with_elapsed(usage, elapsed_milliseconds),
         reasons=reasons,
         segments=ordered_topology,
         reference_key_summary=reference_summary,
@@ -607,10 +693,6 @@ def _validate_inputs(
     input_cut: InputCutDefinition,
     budgets: ExecutionBudgets,
 ) -> _ValidatedInputs:
-    if check.assurance_policy is not AssurancePolicy.FINGERPRINT_ALLOWED:
-        raise UnsupportedComparisonError(
-            "integer-range fingerprint comparison does not implement exact_required assurance"
-        )
     if len(check.key) != 1:
         raise UnsupportedComparisonError(
             "integer-range comparison requires exactly one logical key field"
@@ -803,12 +885,177 @@ def _validate_input_cut(
         raise ComparisonProtocolError("reference and target input cuts are not aligned")
 
 
-def _violates_key_contract(summary: PostgresIntegerKeySummary) -> bool:
-    return (
-        summary.null_key_count > 0
-        or summary.invalid_key_count > 0
-        or summary.valid_key_count != summary.distinct_key_count
+def _completed_structural_artifact(
+    check: RowCheckDefinition,
+    scope: ResolvedScope,
+    input_cut: InputCutDefinition,
+    reference_context: PostgresProtectedReadContext,
+    target_context: PostgresProtectedReadContext,
+    reference_summary: PostgresIntegerKeySummary,
+    target_summary: PostgresIntegerKeySummary,
+    usage: _Usage,
+    started_nanoseconds: int,
+    reason: ResultReason,
+) -> CompletedStructuralComparisonArtifact:
+    return CompletedStructuralComparisonArtifact(
+        check_id=check.check_id,
+        contract_digest=check.contract_digest,
+        scope_digest=scope.scope_digest,
+        input_cut_digest=input_cut.input_cut_digest,
+        verdict=Verdict.MISMATCH,
+        consistency=ConsistencyStatus(
+            stable_reads=ConsistencyLevel.VERIFIED,
+            cut_alignment=ConsistencyLevel.VERIFIED,
+            read_context_ids=(
+                reference_context.evidence.context_id,
+                target_context.evidence.context_id,
+            ),
+        ),
+        guarantee=Guarantee.STRUCTURAL,
+        comparison_coverage=ComparisonCoverage(
+            total_partitions=1,
+            covered_partitions=1,
+            resolved_segments=1,
+            pruned_segments=0,
+            exact_segments=1,
+            unresolved_segments=0,
+            unresolved_reasons=(),
+        ),
+        totals=_unavailable_contract_totals(),
+        evidence_coverage=EvidenceCoverage(
+            found_records=0,
+            retained_records=0,
+            found_bytes=0,
+            retained_bytes=0,
+        ),
+        metrics=_result_metrics(usage, started_nanoseconds),
+        reasons=(reason,),
+        reference_key_summary=reference_summary,
+        target_key_summary=target_summary,
+        reference_full_scans=usage.reference_full_scans,
+        target_full_scans=usage.target_full_scans,
     )
+
+
+def _structural_contract_violation_reason(
+    reference: PostgresIntegerKeySummary,
+    target: PostgresIntegerKeySummary,
+) -> ResultReason | None:
+    if (
+        reference.null_key_count == 0
+        and reference.valid_key_count == reference.distinct_key_count
+        and target.null_key_count == 0
+        and target.valid_key_count == target.distinct_key_count
+    ):
+        return None
+    return ResultReason(
+        code=ReasonCode.CONTRACT_VIOLATION,
+        operation="validate_integer_key_contract",
+        message="scoped integer-key validation found null or duplicate keys",
+        safe_parameters=_key_summary_safe_parameters(reference, target),
+        native_error_code=None,
+        query_id=None,
+        redacted_response=None,
+    )
+
+
+def _key_summary_safe_parameters(
+    reference: PostgresIntegerKeySummary,
+    target: PostgresIntegerKeySummary,
+) -> tuple[SafeParameter, ...]:
+    return tuple(
+        SafeParameter(name=name, value=str(value))
+        for name, value in (
+            ("reference_row_count", reference.row_count),
+            ("reference_null_key_count", reference.null_key_count),
+            ("reference_invalid_key_count", reference.invalid_key_count),
+            ("reference_valid_key_count", reference.valid_key_count),
+            ("reference_distinct_key_count", reference.distinct_key_count),
+            ("target_row_count", target.row_count),
+            ("target_null_key_count", target.null_key_count),
+            ("target_invalid_key_count", target.invalid_key_count),
+            ("target_valid_key_count", target.valid_key_count),
+            ("target_distinct_key_count", target.distinct_key_count),
+        )
+    )
+
+
+def _unavailable_contract_totals() -> ComparisonTotals:
+    return ComparisonTotals(
+        matched=UnavailableTotal(
+            precision="unavailable",
+            value=None,
+            reason=ReasonCode.CONTRACT_VIOLATION,
+        ),
+        missing=UnavailableTotal(
+            precision="unavailable",
+            value=None,
+            reason=ReasonCode.CONTRACT_VIOLATION,
+        ),
+        extra=UnavailableTotal(
+            precision="unavailable",
+            value=None,
+            reason=ReasonCode.CONTRACT_VIOLATION,
+        ),
+        modified=UnavailableTotal(
+            precision="unavailable",
+            value=None,
+            reason=ReasonCode.CONTRACT_VIOLATION,
+        ),
+    )
+
+
+def _validate_structural_artifact(artifact: CompletedStructuralComparisonArtifact) -> None:
+    if artifact.consistency.stable_reads is not ConsistencyLevel.VERIFIED:
+        raise ValueError("completed structural comparison requires verified stable reads")
+    if artifact.consistency.cut_alignment is not ConsistencyLevel.VERIFIED:
+        raise ValueError("completed structural comparison requires verified cut alignment")
+    if len(artifact.consistency.read_context_ids) != 2:
+        raise ValueError("completed structural comparison requires two read contexts")
+    expected_coverage = ComparisonCoverage(
+        total_partitions=1,
+        covered_partitions=1,
+        resolved_segments=1,
+        pruned_segments=0,
+        exact_segments=1,
+        unresolved_segments=0,
+        unresolved_reasons=(),
+    )
+    if artifact.comparison_coverage != expected_coverage:
+        raise ValueError(
+            "completed structural comparison requires one resolved exact logical partition"
+        )
+    if artifact.totals != _unavailable_contract_totals():
+        raise ValueError("completed structural comparison requires unavailable contract totals")
+    if artifact.evidence_coverage != EvidenceCoverage(
+        found_records=0,
+        retained_records=0,
+        found_bytes=0,
+        retained_bytes=0,
+    ):
+        raise ValueError("completed structural comparison cannot claim retained row evidence")
+    if (
+        artifact.metrics.queries != 2
+        or artifact.metrics.fetched_records != 2
+        or artifact.metrics.fingerprint_nodes != 0
+    ):
+        raise ValueError(
+            "completed structural comparison requires exactly two summary-read receipts"
+        )
+    if artifact.reference_full_scans != 1 or artifact.target_full_scans != 1:
+        raise ValueError("completed structural comparison requires one summary scan per side")
+    if artifact.reference_key_summary.invalid_key_count != 0:
+        raise ValueError("reference structural result cannot include invalid mapped keys")
+    if artifact.target_key_summary.invalid_key_count != 0:
+        raise ValueError("target structural result cannot include invalid mapped keys")
+    expected_reason = _structural_contract_violation_reason(
+        artifact.reference_key_summary,
+        artifact.target_key_summary,
+    )
+    if expected_reason is None or artifact.reasons != (expected_reason,):
+        raise ValueError(
+            "completed structural comparison reason must exactly encode its key summaries"
+        )
 
 
 def _root_segment(
@@ -1744,6 +1991,21 @@ def _require_deadline(deadline_nanoseconds: int) -> None:
 def _elapsed_milliseconds(started_nanoseconds: int) -> int:
     elapsed_nanoseconds = time.monotonic_ns() - started_nanoseconds
     return max(0, elapsed_nanoseconds // 1_000_000)
+
+
+def _result_metrics(usage: _Usage, started_nanoseconds: int) -> ResultMetrics:
+    return _result_metrics_with_elapsed(usage, _elapsed_milliseconds(started_nanoseconds))
+
+
+def _result_metrics_with_elapsed(usage: _Usage, elapsed_milliseconds: int) -> ResultMetrics:
+    return ResultMetrics(
+        queries=usage.queries,
+        fetched_records=usage.fetched_records,
+        result_bytes=usage.result_bytes,
+        fingerprint_nodes=usage.fingerprint_nodes,
+        coordinator_peak_bytes=usage.coordinator_peak_bytes,
+        elapsed_milliseconds=elapsed_milliseconds,
+    )
 
 
 def _require_instance[ValueT](

@@ -21,7 +21,10 @@ from forensic_data.acquisition import (
     run_request_semantic_value,
 )
 from forensic_data.canonical import Fingerprint, combine_fingerprints, schema_digest_hex
-from forensic_data.comparison import CompletedComparisonArtifact
+from forensic_data.comparison import (
+    CompletedComparisonArtifact,
+    CompletedStructuralComparisonArtifact,
+)
 from forensic_data.contracts.model import ExecutionBudgets
 from forensic_data.contracts.semantics import (
     SemanticValue,
@@ -33,6 +36,7 @@ from forensic_data.contracts.semantics import (
 from forensic_data.persistence.errors import (
     ActiveRunAttemptError,
     AttemptFenceError,
+    CompletedComparisonNotFoundError,
     InputCutMismatchError,
     LifecycleCommitUnknownError,
     LifecycleOperationConflictError,
@@ -65,6 +69,17 @@ from forensic_data.postgres_sql import (
     PostgresPhysicalField,
     PostgresTypeIdentity,
 )
+from forensic_data.reporting import (
+    DIFF_PAGE_LIMIT_MAX,
+    HISTORY_PAGE_LIMIT_MAX,
+    DetailAvailability,
+    DiffPage,
+    HistoryAttemptStatus,
+    HistoryCursor,
+    HistoryEntry,
+    HistoryPage,
+    StoredResultAvailability,
+)
 from forensic_data.result import (
     ComparisonCoverage,
     ComparisonTotals,
@@ -80,6 +95,7 @@ from forensic_data.result import (
     ResultReason,
     RunResult,
     Total,
+    UnavailableTotal,
     Verdict,
 )
 
@@ -90,6 +106,7 @@ __all__ = (
     "ClaimedRun",
     "ComparisonSegmentState",
     "CompletedComparisonDefinition",
+    "CompletedStructuralComparisonDefinition",
     "IntegerRangeFingerprintPersistence",
     "PersistedInputCut",
     "PersistedReadContext",
@@ -101,13 +118,18 @@ __all__ = (
     "claim_postgres_run",
     "close_postgres_read_context",
     "completed_comparison_persistence_from_artifact",
+    "completed_structural_comparison_persistence_from_artifact",
     "mark_postgres_read_context_lost",
     "persist_postgres_aligned_input_cut",
     "persist_postgres_read_context",
     "publish_postgres_completed_comparison",
+    "publish_postgres_completed_structural_comparison",
     "publish_postgres_terminal_error_attempt",
     "publish_postgres_terminal_incomplete_attempt",
     "read_postgres_completed_comparison",
+    "read_postgres_diff",
+    "read_postgres_history",
+    "read_postgres_terminal_attempt",
     "record_postgres_retryable_error_attempt",
     "record_postgres_retryable_incomplete_attempt",
     "renew_postgres_run_attempt",
@@ -121,6 +143,18 @@ _WRITER_ROLE: Final[str] = "dfe_metadata_writer"
 _READER_ROLE: Final[str] = "dfe_metadata_reader"
 _CANONICAL_PROTOCOL: Final[str] = "dfe_canon_v1"
 _FINGERPRINT_PROTOCOL: Final[str] = "sha256_sum32_v1"
+_STRUCTURAL_SUMMARY_PARAMETER_NAMES: Final[tuple[str, ...]] = (
+    "reference_row_count",
+    "reference_null_key_count",
+    "reference_invalid_key_count",
+    "reference_valid_key_count",
+    "reference_distinct_key_count",
+    "target_row_count",
+    "target_null_key_count",
+    "target_invalid_key_count",
+    "target_valid_key_count",
+    "target_distinct_key_count",
+)
 
 
 class AttemptStatus(StrEnum):
@@ -241,6 +275,55 @@ class CompletedComparisonDefinition:
             raise TypeError("completed comparison reasons must be an immutable tuple")
         for reason in self.reasons:
             _require_instance(reason, ResultReason, "completed comparison reason")
+
+
+@final
+@dataclass(frozen=True, slots=True)
+class CompletedStructuralComparisonDefinition:
+    check_id: str
+    contract_digest: str
+    scope_digest: str
+    verdict: Verdict
+    consistency: ConsistencyStatus
+    guarantee: Guarantee
+    comparison_coverage: ComparisonCoverage
+    totals: ComparisonTotals
+    evidence_coverage: EvidenceCoverage
+    metrics: ResultMetrics
+    reasons: tuple[ResultReason, ...]
+
+    def __post_init__(self) -> None:
+        if type(self.check_id) is not str or self.check_id.strip() == "":
+            raise ValueError("completed structural comparison check id must be nonblank")
+        _require_sha256(self.contract_digest, "completed structural contract digest")
+        _require_sha256(self.scope_digest, "completed structural scope digest")
+        _require_instance(
+            self.consistency,
+            ConsistencyStatus,
+            "completed structural consistency",
+        )
+        _require_instance(
+            self.comparison_coverage,
+            ComparisonCoverage,
+            "completed structural coverage",
+        )
+        _require_instance(self.totals, ComparisonTotals, "completed structural totals")
+        _require_instance(
+            self.evidence_coverage,
+            EvidenceCoverage,
+            "completed structural evidence coverage",
+        )
+        _require_instance(self.metrics, ResultMetrics, "completed structural metrics")
+        if type(self.reasons) is not tuple:
+            raise TypeError("completed structural reasons must be an immutable tuple")
+        for reason in self.reasons:
+            _require_instance(reason, ResultReason, "completed structural reason")
+        _validate_completed_structural_definition(self)
+
+
+type _CompletedResultDefinition = (
+    CompletedComparisonDefinition | CompletedStructuralComparisonDefinition
+)
 
 
 @final
@@ -612,7 +695,7 @@ class _OutcomeExpectation:
 class _CompletedComparisonExpectation:
     attempt: RunAttemptRecord
     operation_id: UUID
-    comparison: CompletedComparisonDefinition
+    comparison: _CompletedResultDefinition
     segments: tuple[IntegerRangeFingerprintPersistence, ...]
     ended_at: datetime
     result: RunResult
@@ -879,6 +962,54 @@ def completed_comparison_persistence_from_artifact(
     return definition, segments
 
 
+def completed_structural_comparison_persistence_from_artifact(
+    attempt: RunAttemptRecord,
+    persisted_cut: PersistedInputCut,
+    artifact: CompletedStructuralComparisonArtifact,
+) -> CompletedStructuralComparisonDefinition:
+    _require_instance(attempt, RunAttemptRecord, "run attempt")
+    _require_instance(persisted_cut, PersistedInputCut, "persisted input cut")
+    _require_instance(
+        artifact,
+        CompletedStructuralComparisonArtifact,
+        "completed structural comparison artifact",
+    )
+    if persisted_cut.run_id != attempt.run.run_id or persisted_cut.attempt_id != attempt.attempt_id:
+        raise ValueError("persisted input cut must belong to the structural comparison attempt")
+    input_cut_digest = persisted_cut.input_cut.input_cut_digest
+    if artifact.input_cut_digest != input_cut_digest:
+        raise ValueError("structural comparison artifact differs from the persisted attempt cut")
+    for bound_digest in (
+        attempt.run.bound_input_cut_digest,
+        attempt.input_cut_digest,
+    ):
+        if bound_digest is not None and bound_digest != input_cut_digest:
+            raise ValueError("structural comparison attempt is bound to a different input cut")
+    if artifact.scope_digest != persisted_cut.input_cut.reference.scope_digest:
+        raise ValueError("structural comparison artifact scope differs from its persisted cut")
+    if artifact.reference_full_scans > attempt.execution_budgets.max_full_scans_per_side:
+        raise ValueError("reference full scans exceed the immutable attempt budget")
+    if artifact.target_full_scans > attempt.execution_budgets.max_full_scans_per_side:
+        raise ValueError("target full scans exceed the immutable attempt budget")
+    definition = CompletedStructuralComparisonDefinition(
+        check_id=artifact.check_id,
+        contract_digest=artifact.contract_digest,
+        scope_digest=artifact.scope_digest,
+        verdict=artifact.verdict,
+        consistency=artifact.consistency,
+        guarantee=artifact.guarantee,
+        comparison_coverage=artifact.comparison_coverage,
+        totals=artifact.totals,
+        evidence_coverage=artifact.evidence_coverage,
+        metrics=artifact.metrics,
+        reasons=artifact.reasons,
+    )
+    _validate_completed_segments(definition, ())
+    _validate_completed_budget_use(attempt.execution_budgets, definition, ())
+    _validate_structural_artifact_summary_closure(artifact)
+    return definition
+
+
 def publish_postgres_completed_comparison(
     settings: PostgresConnectionSettings,
     retry_policy: PostgresRetryPolicy,
@@ -915,6 +1046,41 @@ def publish_postgres_completed_comparison(
     )
 
 
+def publish_postgres_completed_structural_comparison(
+    settings: PostgresConnectionSettings,
+    retry_policy: PostgresRetryPolicy,
+    attempt: RunAttemptRecord,
+    terminal_operation_id: UUID,
+    comparison: CompletedStructuralComparisonDefinition,
+    ended_at: datetime,
+) -> RunResult:
+    _require_instance(settings, PostgresConnectionSettings, "metadata connection settings")
+    _require_instance(retry_policy, PostgresRetryPolicy, "metadata retry policy")
+    _require_instance(attempt, RunAttemptRecord, "run attempt")
+    _require_uuid(terminal_operation_id, "completed structural operation id")
+    _require_instance(
+        comparison,
+        CompletedStructuralComparisonDefinition,
+        "completed structural comparison definition",
+    )
+    _require_utc_datetime(ended_at, "completed structural comparison ended_at")
+    expected = _completed_comparison_expectation(
+        attempt,
+        terminal_operation_id,
+        comparison,
+        (),
+        ended_at,
+    )
+    return _run_with_reconciliation(
+        settings,
+        retry_policy,
+        "publish_completed_structural_comparison",
+        (expected.operation_id,),
+        lambda connection: _publish_completed_comparison_once(connection, settings, expected),
+        lambda connection: _lookup_completed_comparison(connection, settings, expected),
+    )
+
+
 def read_postgres_completed_comparison(
     settings: PostgresConnectionSettings,
     retry_policy: PostgresRetryPolicy,
@@ -930,6 +1096,93 @@ def read_postgres_completed_comparison(
         retry_policy,
         "read_completed_comparison",
         lambda connection: _read_completed_comparison_once(
+            connection,
+            settings,
+            run_id,
+            attempt_id,
+        ),
+    )
+
+
+def read_postgres_diff(
+    settings: PostgresConnectionSettings,
+    retry_policy: PostgresRetryPolicy,
+    run_id: UUID,
+    attempt_id: UUID,
+    limit: int,
+) -> DiffPage:
+    _require_positive_integer(limit, "diff page limit")
+    if limit > DIFF_PAGE_LIMIT_MAX:
+        raise ValueError(f"diff page limit cannot exceed {DIFF_PAGE_LIMIT_MAX}")
+    result = read_postgres_completed_comparison(
+        settings,
+        retry_policy,
+        run_id,
+        attempt_id,
+    )
+    return DiffPage(
+        schema_version=1,
+        run_id=run_id,
+        attempt_id=attempt_id,
+        requested_limit=limit,
+        stored_result=result,
+        detail_availability=DetailAvailability.NOT_RETAINED,
+        found_records=result.evidence_coverage.found_records,
+        retained_records=0,
+        details=(),
+        next_cursor=None,
+    )
+
+
+def read_postgres_history(
+    settings: PostgresConnectionSettings,
+    retry_policy: PostgresRetryPolicy,
+    check_id: str,
+    scope_digest: str,
+    limit: int,
+    cursor: HistoryCursor | None,
+) -> HistoryPage:
+    _require_instance(settings, PostgresConnectionSettings, "metadata connection settings")
+    _require_instance(retry_policy, PostgresRetryPolicy, "metadata retry policy")
+    _require_nonblank_text(check_id, "history check id")
+    _require_sha256(scope_digest, "history scope digest")
+    _require_positive_integer(limit, "history page limit")
+    if limit > HISTORY_PAGE_LIMIT_MAX:
+        raise ValueError(f"history page limit cannot exceed {HISTORY_PAGE_LIMIT_MAX}")
+    if cursor is not None:
+        _require_instance(cursor, HistoryCursor, "history cursor")
+        if cursor.check_id != check_id or cursor.scope_digest != scope_digest:
+            raise ValueError("history cursor belongs to a different check or scope")
+    return _run_read_with_retries(
+        settings,
+        retry_policy,
+        "read_history",
+        lambda connection: _read_postgres_history_once(
+            connection,
+            settings,
+            check_id,
+            scope_digest,
+            limit,
+            cursor,
+        ),
+    )
+
+
+def read_postgres_terminal_attempt(
+    settings: PostgresConnectionSettings,
+    retry_policy: PostgresRetryPolicy,
+    run_id: UUID,
+    attempt_id: UUID,
+) -> AttemptOutcomeRecord:
+    _require_instance(settings, PostgresConnectionSettings, "metadata connection settings")
+    _require_instance(retry_policy, PostgresRetryPolicy, "metadata retry policy")
+    _require_uuid(run_id, "terminal attempt run id")
+    _require_uuid(attempt_id, "terminal attempt id")
+    return _run_read_with_retries(
+        settings,
+        retry_policy,
+        "read_terminal_attempt",
+        lambda connection: _read_postgres_terminal_attempt_once(
             connection,
             settings,
             run_id,
@@ -2438,7 +2691,7 @@ def _read_completed_comparison_once(
     _require_current_schema(connection)
     rows = _select_results_by_attempt(connection, run_id, attempt_id)
     if not rows:
-        raise RunLifecycleStateError(
+        raise CompletedComparisonNotFoundError(
             "completed comparison does not exist for the requested run and attempt"
         )
     if len(rows) != 1:
@@ -2460,6 +2713,87 @@ def _read_completed_comparison_once(
     )
     _require_completed_terminal_receipt(connection, result, completed_at)
     return _commit_result(connection, result)
+
+
+def _read_postgres_history_once(
+    connection: psycopg.Connection[DatabaseRow],
+    settings: PostgresConnectionSettings,
+    check_id: str,
+    scope_digest: str,
+    limit: int,
+    cursor: HistoryCursor | None,
+) -> HistoryPage:
+    _begin_reader_transaction(connection, settings.statement_timeout_milliseconds)
+    _require_current_schema(connection)
+    rows = _select_history_rows(
+        connection,
+        check_id,
+        scope_digest,
+        limit + 1,
+        cursor,
+    )
+    page_rows = rows[:limit]
+    items = tuple(_history_entry_from_row(connection, row) for row in page_rows)
+    next_cursor = None
+    if len(rows) > limit:
+        last = items[-1]
+        next_cursor = HistoryCursor(
+            check_id=check_id,
+            scope_digest=scope_digest,
+            started_at=last.started_at,
+            run_id=last.run_id,
+            attempt_id=last.attempt_id,
+        )
+    try:
+        page = HistoryPage(
+            schema_version=1,
+            check_id=check_id,
+            scope_digest=scope_digest,
+            requested_limit=limit,
+            items=items,
+            next_cursor=next_cursor,
+        )
+    except ValueError as error:
+        raise StoredLifecycleIntegrityError(
+            f"stored history violates the public reporting protocol: reason={error}"
+        ) from None
+    return _commit_result(connection, page)
+
+
+def _read_postgres_terminal_attempt_once(
+    connection: psycopg.Connection[DatabaseRow],
+    settings: PostgresConnectionSettings,
+    run_id: UUID,
+    attempt_id: UUID,
+) -> AttemptOutcomeRecord:
+    _begin_reader_transaction(connection, settings.statement_timeout_milliseconds)
+    _require_current_schema(connection)
+    row = connection.execute(
+        _ATTEMPT_SELECT + " WHERE run_id = %s AND attempt_id = %s",
+        (run_id, attempt_id),
+    ).fetchone()
+    if row is None:
+        raise RunLifecycleStateError("terminal attempt does not exist for the requested identity")
+    outcome = _attempt_outcome_from_stored_row(row, run_id, attempt_id)
+    _require_stored_attempt_closure(connection, run_id, attempt_id)
+    result_count_row = connection.execute(
+        "SELECT pg_catalog.count(*) FROM dfe_metadata.check_results "
+        "WHERE run_id = %s AND attempt_id = %s",
+        (run_id, attempt_id),
+    ).fetchone()
+    if (
+        result_count_row is None
+        or _row_integer(
+            result_count_row[0],
+            "terminal attempt result count",
+        )
+        != 0
+    ):
+        raise StoredLifecycleIntegrityError(
+            "noncompleted terminal attempt cannot contain a completed result"
+        )
+    _require_terminal_attempt_run_binding(connection, outcome)
+    return _commit_result(connection, outcome)
 
 
 def _lookup_retryable_attempt_outcome(
@@ -2662,7 +2996,7 @@ def _abandoned_outcome_expectation(
 def _completed_comparison_expectation(
     attempt: RunAttemptRecord,
     operation_id: UUID,
-    comparison: CompletedComparisonDefinition,
+    comparison: _CompletedResultDefinition,
     segments: tuple[IntegerRangeFingerprintPersistence, ...],
     ended_at: datetime,
 ) -> _CompletedComparisonExpectation:
@@ -2713,11 +3047,126 @@ def _completed_comparison_expectation(
     )
 
 
+def _validate_completed_structural_definition(
+    comparison: CompletedStructuralComparisonDefinition,
+) -> None:
+    if comparison.verdict is not Verdict.MISMATCH:
+        raise ValueError("completed structural comparison must have mismatch verdict")
+    if comparison.guarantee is not Guarantee.STRUCTURAL:
+        raise ValueError("completed structural comparison requires structural guarantee")
+    if (
+        comparison.consistency.stable_reads is not ConsistencyLevel.VERIFIED
+        or comparison.consistency.cut_alignment is not ConsistencyLevel.VERIFIED
+        or len(comparison.consistency.read_context_ids) != 2
+    ):
+        raise ValueError(
+            "completed structural comparison requires two verified aligned read contexts"
+        )
+    coverage = comparison.comparison_coverage
+    if (
+        coverage.total_partitions != 1
+        or coverage.covered_partitions != 1
+        or coverage.resolved_segments != 1
+        or coverage.pruned_segments != 0
+        or coverage.exact_segments != 1
+        or coverage.unresolved_segments != 0
+        or coverage.unresolved_reasons
+    ):
+        raise ValueError(
+            "completed structural comparison requires one resolved exact logical partition"
+        )
+    if any(
+        not isinstance(total, UnavailableTotal) or total.reason is not ReasonCode.CONTRACT_VIOLATION
+        for total in comparison.totals.values()
+    ):
+        raise ValueError(
+            "completed structural comparison requires unavailable contract-violation totals"
+        )
+    evidence = comparison.evidence_coverage
+    if (
+        evidence.found_records != 0
+        or evidence.retained_records != 0
+        or evidence.found_bytes != 0
+        or evidence.retained_bytes != 0
+    ):
+        raise ValueError("completed structural comparison cannot claim row evidence")
+    if (
+        comparison.metrics.queries != 2
+        or comparison.metrics.fetched_records != 2
+        or comparison.metrics.fingerprint_nodes != 0
+    ):
+        raise ValueError(
+            "completed structural comparison requires exactly two summary-read receipts"
+        )
+    if len(comparison.reasons) != 1:
+        raise ValueError("completed structural comparison requires one contract reason")
+    _validate_structural_summary_reason(comparison.reasons[0])
+
+
+def _validate_structural_summary_reason(reason: ResultReason) -> None:
+    if (
+        reason.code is not ReasonCode.CONTRACT_VIOLATION
+        or reason.operation != "validate_integer_key_contract"
+        or reason.message != "scoped integer-key validation found null or duplicate keys"
+        or reason.native_error_code is not None
+        or reason.query_id is not None
+        or reason.redacted_response is not None
+    ):
+        raise ValueError("completed structural reason must use the canonical contract summary")
+    parameter_names = tuple(parameter.name for parameter in reason.safe_parameters)
+    if parameter_names != _STRUCTURAL_SUMMARY_PARAMETER_NAMES:
+        raise ValueError(
+            "completed structural reason must contain the fixed ordered key-summary parameters"
+        )
+    values = tuple(
+        _canonical_nonnegative_parameter(parameter.value, parameter.name)
+        for parameter in reason.safe_parameters
+    )
+    reference = values[:5]
+    target = values[5:]
+    for direction, summary in (("reference", reference), ("target", target)):
+        row_count, null_count, invalid_count, valid_count, distinct_count = summary
+        if row_count != null_count + invalid_count + valid_count:
+            raise ValueError(
+                f"completed structural {direction} summary counts do not partition its rows"
+            )
+        if distinct_count > valid_count:
+            raise ValueError(f"completed structural {direction} distinct keys exceed valid keys")
+        if invalid_count != 0:
+            raise ValueError(
+                f"completed structural {direction} summary contains invalid mapped keys"
+            )
+    reference_violation = reference[1] > 0 or reference[3] != reference[4]
+    target_violation = target[1] > 0 or target[3] != target[4]
+    if not reference_violation and not target_violation:
+        raise ValueError("completed structural summary contains no null or duplicate key")
+
+
+def _canonical_nonnegative_parameter(value: str, name: str) -> int:
+    if value == "0":
+        return 0
+    if (
+        type(value) is not str
+        or not value
+        or value[0] not in "123456789"
+        or any(character not in "0123456789" for character in value[1:])
+    ):
+        raise ValueError(f"completed structural parameter {name} must be canonical decimal")
+    return int(value)
+
+
 def _validate_completed_segments(
-    comparison: CompletedComparisonDefinition,
+    comparison: _CompletedResultDefinition,
     segments: tuple[IntegerRangeFingerprintPersistence, ...],
 ) -> None:
-    if type(segments) is not tuple or not segments:
+    if type(segments) is not tuple:
+        raise TypeError("completed comparison segments must be an immutable tuple")
+    if isinstance(comparison, CompletedStructuralComparisonDefinition):
+        if segments:
+            raise ValueError("completed structural comparison cannot contain fingerprint rows")
+        _validate_completed_structural_definition(comparison)
+        return
+    if not segments:
         raise ValueError("completed comparison requires a nonempty immutable segment topology")
     for segment in segments:
         _require_instance(
@@ -2860,7 +3309,7 @@ def _available_total_integer(total: Total, context: str) -> int:
 
 def _validate_completed_budget_use(
     budgets: ExecutionBudgets,
-    comparison: CompletedComparisonDefinition,
+    comparison: _CompletedResultDefinition,
     segments: tuple[IntegerRangeFingerprintPersistence, ...],
 ) -> None:
     metrics = comparison.metrics
@@ -2896,7 +3345,7 @@ def _validate_completed_budget_use(
     ):
         if actual > maximum:
             raise ValueError(f"completed comparison {name} exceeds its immutable attempt budget")
-    if max(segment.depth for segment in segments) > budgets.max_depth:
+    if segments and max(segment.depth for segment in segments) > budgets.max_depth:
         raise ValueError("completed comparison segment depth exceeds its attempt budget")
 
 
@@ -2921,6 +3370,29 @@ def _validate_artifact_summary_closure(
         raise ValueError("reference key summary does not close to the root fingerprint")
     if artifact.target_key_summary.row_count != root.target_fingerprint.count:
         raise ValueError("target key summary does not close to the root fingerprint")
+
+
+def _validate_structural_artifact_summary_closure(
+    artifact: CompletedStructuralComparisonArtifact,
+) -> None:
+    if artifact.reference_full_scans != 1 or artifact.target_full_scans != 1:
+        raise ValueError("completed structural artifact requires one summary scan per side")
+    if artifact.metrics.queries != 2 or artifact.metrics.fingerprint_nodes != 0:
+        raise ValueError("completed structural artifact must contain summary-read metrics only")
+    definition = CompletedStructuralComparisonDefinition(
+        check_id=artifact.check_id,
+        contract_digest=artifact.contract_digest,
+        scope_digest=artifact.scope_digest,
+        verdict=artifact.verdict,
+        consistency=artifact.consistency,
+        guarantee=artifact.guarantee,
+        comparison_coverage=artifact.comparison_coverage,
+        totals=artifact.totals,
+        evidence_coverage=artifact.evidence_coverage,
+        metrics=artifact.metrics,
+        reasons=artifact.reasons,
+    )
+    _validate_completed_structural_definition(definition)
 
 
 def _validate_context_definition(
@@ -3405,6 +3877,38 @@ _RESULT_SELECT: Final[LiteralString] = (
     "result_payload::text, completed_at FROM dfe_metadata.check_results"
 )
 
+_HISTORY_SELECT: Final[LiteralString] = (
+    "SELECT dfe_attempt.run_id, dfe_attempt.attempt_id, dfe_attempt.ordinal, "
+    "dfe_attempt.status, dfe_attempt.end_operation_id, dfe_attempt.terminal_reason_code, "
+    "dfe_attempt.terminal_reason::text, dfe_attempt.started_at, dfe_attempt.ended_at, "
+    "dfe_run.selected_terminal_attempt_id, dfe_contract.check_id, "
+    "dfe_contract.semantic_digest, dfe_run.scope_digest, "
+    "dfe_result.run_id, dfe_result.attempt_id, dfe_result.check_id, "
+    "dfe_result.result_operation_id, dfe_result.contract_digest, dfe_result.scope_digest, "
+    "dfe_result.execution_status, dfe_result.verdict, dfe_result.guarantee, "
+    "dfe_result.result_digest, dfe_result.result_payload::text, dfe_result.completed_at "
+    "FROM dfe_metadata.run_attempts AS dfe_attempt "
+    "JOIN dfe_metadata.runs AS dfe_run ON dfe_run.run_id = dfe_attempt.run_id "
+    "JOIN dfe_metadata.contract_versions AS dfe_contract "
+    "ON dfe_contract.contract_version_id = dfe_run.contract_version_id "
+    "LEFT JOIN dfe_metadata.check_results AS dfe_result "
+    "ON dfe_result.run_id = dfe_attempt.run_id "
+    "AND dfe_result.attempt_id = dfe_attempt.attempt_id "
+    "AND dfe_result.check_id = dfe_contract.check_id "
+    "WHERE dfe_contract.check_id = %s AND dfe_run.scope_digest = %s"
+)
+
+_HISTORY_ORDER_LIMIT: Final[LiteralString] = (
+    " ORDER BY dfe_attempt.started_at DESC, dfe_attempt.run_id DESC, "
+    "dfe_attempt.attempt_id DESC LIMIT %s"
+)
+
+_HISTORY_CURSOR_ORDER_LIMIT: Final[LiteralString] = (
+    " AND (dfe_attempt.started_at, dfe_attempt.run_id, dfe_attempt.attempt_id) "
+    "< (%s, %s, %s) ORDER BY dfe_attempt.started_at DESC, dfe_attempt.run_id DESC, "
+    "dfe_attempt.attempt_id DESC LIMIT %s"
+)
+
 _SEGMENT_SELECT: Final[LiteralString] = (
     "SELECT observation_id, run_id, attempt_id, direction, segment_sequence, "
     "parent_segment_sequence, depth, boundary_kind, lower_inclusive, upper_exclusive, "
@@ -3599,6 +4103,32 @@ def _select_results_by_attempt(
     return connection.execute(
         _RESULT_SELECT + " WHERE run_id = %s AND attempt_id = %s ORDER BY check_id",
         (run_id, attempt_id),
+    ).fetchall()
+
+
+def _select_history_rows(
+    connection: psycopg.Connection[DatabaseRow],
+    check_id: str,
+    scope_digest: str,
+    limit: int,
+    cursor: HistoryCursor | None,
+) -> list[DatabaseRow]:
+    scope_digest_bytes = bytes.fromhex(scope_digest)
+    if cursor is None:
+        return connection.execute(
+            _HISTORY_SELECT + _HISTORY_ORDER_LIMIT,
+            (check_id, scope_digest_bytes, limit),
+        ).fetchall()
+    return connection.execute(
+        _HISTORY_SELECT + _HISTORY_CURSOR_ORDER_LIMIT,
+        (
+            check_id,
+            scope_digest_bytes,
+            cursor.started_at,
+            cursor.run_id,
+            cursor.attempt_id,
+            limit,
+        ),
     ).fetchall()
 
 
@@ -4092,8 +4622,289 @@ def _completed_result_from_row(row: DatabaseRow) -> tuple[RunResult, datetime]:
     return result, _row_datetime(row[11], "completed result completed_at")
 
 
-def _comparison_definition_from_result(result: RunResult) -> CompletedComparisonDefinition:
-    return CompletedComparisonDefinition(
+def _history_entry_from_row(
+    connection: psycopg.Connection[DatabaseRow],
+    row: DatabaseRow,
+) -> HistoryEntry:
+    if len(row) != 25:
+        raise StoredLifecycleIntegrityError(
+            f"PostgreSQL history row has an invalid column count: actual={len(row)}, expected=25"
+        )
+    run_id = _row_uuid(row[0], "history run id")
+    attempt_id = _row_uuid(row[1], "history attempt id")
+    try:
+        status = HistoryAttemptStatus(_row_text(row[3], "history attempt status"))
+    except ValueError:
+        raise StoredLifecycleIntegrityError(
+            "stored history attempt status is unsupported"
+        ) from None
+    end_operation_id = _row_optional_uuid(row[4], "history attempt end operation id")
+    started_at = _row_datetime(row[7], "history attempt started_at")
+    ended_at = _row_optional_datetime(row[8], "history attempt ended_at")
+    selected_attempt_id = _row_optional_uuid(row[9], "history selected terminal attempt id")
+    check_id = _row_text(row[10], "history check id")
+    contract_digest = _row_bytes(row[11], "history contract digest").hex()
+    scope_digest = _row_bytes(row[12], "history scope digest").hex()
+    result_row = row[13:]
+    result: RunResult | None = None
+    terminal_reason: ResultReason | None = None
+    availability = StoredResultAvailability.NOT_CREATED
+    if status is HistoryAttemptStatus.RUNNING:
+        if (
+            end_operation_id is not None
+            or row[5] is not None
+            or row[6] is not None
+            or ended_at is not None
+        ):
+            raise StoredLifecycleIntegrityError(
+                "stored running history attempt unexpectedly has terminal fields"
+            )
+        if selected_attempt_id is not None:
+            raise StoredLifecycleIntegrityError(
+                "stored running history attempt belongs to an already terminal run"
+            )
+        if any(value is not None for value in result_row):
+            raise StoredLifecycleIntegrityError(
+                "stored running history attempt unexpectedly has a check result"
+            )
+    elif status is HistoryAttemptStatus.COMPLETED:
+        if end_operation_id is None or ended_at is None:
+            raise StoredLifecycleIntegrityError(
+                "stored completed history attempt lacks terminal fields"
+            )
+        if row[5] is not None or row[6] is not None:
+            raise StoredLifecycleIntegrityError(
+                "stored completed history attempt unexpectedly has a terminal reason"
+            )
+        if any(value is None for value in result_row):
+            raise StoredLifecycleIntegrityError(
+                "stored completed history attempt lacks its immutable result"
+            )
+        result, completed_at = _completed_result_from_row(result_row)
+        segments = _completed_segments_from_database(connection, run_id, attempt_id)
+        _require_valid_stored_segments(result, segments)
+        _require_completed_database_closure(
+            connection,
+            result,
+            segments,
+            completed_at,
+        )
+        _require_completed_terminal_receipt(connection, result, completed_at)
+        availability = StoredResultAvailability.AVAILABLE
+    else:
+        if end_operation_id is None or ended_at is None:
+            raise StoredLifecycleIntegrityError(
+                "stored noncompleted history attempt lacks terminal fields"
+            )
+        if any(value is not None for value in result_row):
+            raise StoredLifecycleIntegrityError(
+                "stored noncompleted history attempt unexpectedly has a check result"
+            )
+        terminal_reason = _terminal_reason_from_database(row[5], row[6])
+    try:
+        entry = HistoryEntry(
+            run_id=run_id,
+            attempt_id=attempt_id,
+            check_id=check_id,
+            contract_digest=contract_digest,
+            scope_digest=scope_digest,
+            ordinal=_row_integer(row[2], "history attempt ordinal"),
+            status=status,
+            end_operation_id=end_operation_id,
+            started_at=started_at,
+            ended_at=ended_at,
+            is_run_terminal=selected_attempt_id == attempt_id,
+            terminal_reason=terminal_reason,
+            stored_result_availability=availability,
+            stored_result=result,
+        )
+    except ValueError as error:
+        raise StoredLifecycleIntegrityError(
+            f"stored history entry violates the public reporting protocol: reason={error}"
+        ) from None
+    if entry.status not in (
+        HistoryAttemptStatus.RUNNING,
+        HistoryAttemptStatus.COMPLETED,
+    ):
+        if (
+            entry.end_operation_id is None
+            or entry.ended_at is None
+            or entry.terminal_reason is None
+        ):
+            raise AssertionError("validated noncompleted history entry has no reason")
+        outcome = AttemptOutcomeRecord(
+            run_id=entry.run_id,
+            attempt_id=entry.attempt_id,
+            status=AttemptStatus(entry.status.value),
+            operation_id=entry.end_operation_id,
+            reason=entry.terminal_reason,
+            ended_at=entry.ended_at,
+        )
+        _require_stored_attempt_closure(connection, entry.run_id, entry.attempt_id)
+        _require_terminal_attempt_run_binding(connection, outcome)
+    return entry
+
+
+def _terminal_reason_from_database(
+    reason_code_value: object,
+    reason_payload_value: object,
+) -> ResultReason:
+    reason_code_text = _row_optional_text(reason_code_value, "terminal reason code")
+    reason_json = _row_optional_canonical_json(reason_payload_value, "terminal reason payload")
+    if reason_code_text is None or reason_json is None:
+        raise StoredLifecycleIntegrityError(
+            "stored noncompleted attempt lacks its terminal reason code or payload"
+        )
+    try:
+        reason_code = ReasonCode(reason_code_text)
+        stored_value = _semantic_object(
+            semantic_value_from_json(reason_json),
+            "terminal reason payload",
+        )
+        if _semantic_integer(stored_value.get("reason_version"), "terminal reason version") != 1:
+            raise StoredLifecycleIntegrityError("terminal reason version must be exactly 1")
+        public_value: dict[str, SemanticValue] = {
+            key: value for key, value in stored_value.items() if key != "reason_version"
+        }
+        public_value["code"] = reason_code.value
+        reason = ResultReason.model_validate_json(canonical_semantic_json(public_value))
+    except (ValueError, StoredLifecycleIntegrityError) as error:
+        raise StoredLifecycleIntegrityError(
+            f"stored terminal reason violates the public result protocol: reason={error}"
+        ) from None
+    if canonical_semantic_json(_reason_semantic_value(reason)) != reason_json:
+        raise StoredLifecycleIntegrityError(
+            "stored terminal reason contains unsupported or non-round-trippable fields"
+        )
+    return reason
+
+
+def _attempt_outcome_from_stored_row(
+    row: DatabaseRow,
+    run_id: UUID,
+    attempt_id: UUID,
+) -> AttemptOutcomeRecord:
+    if len(row) != 19:
+        raise StoredLifecycleIntegrityError(
+            f"PostgreSQL attempt row has an invalid column count: actual={len(row)}, expected=19"
+        )
+    if (
+        _row_uuid(row[0], "terminal attempt id") != attempt_id
+        or _row_uuid(row[1], "terminal attempt run id") != run_id
+    ):
+        raise StoredLifecycleIntegrityError(
+            "stored terminal attempt identity differs from its lookup key"
+        )
+    try:
+        status = AttemptStatus(_row_text(row[4], "terminal attempt status"))
+    except ValueError:
+        raise StoredLifecycleIntegrityError(
+            "stored terminal attempt status is unsupported"
+        ) from None
+    if status not in (
+        AttemptStatus.INCOMPLETE,
+        AttemptStatus.ERROR,
+        AttemptStatus.ABANDONED,
+    ):
+        raise RunLifecycleStateError(
+            "requested attempt has no durable incomplete, error, or abandoned outcome"
+        )
+    operation_id = _row_optional_uuid(row[13], "terminal attempt operation id")
+    ended_at = _row_optional_datetime(row[17], "terminal attempt ended_at")
+    if operation_id is None or ended_at is None:
+        raise StoredLifecycleIntegrityError(
+            "stored terminal attempt lacks an operation id or end timestamp"
+        )
+    started_at = _row_datetime(row[16], "terminal attempt started_at")
+    if ended_at < started_at:
+        raise StoredLifecycleIntegrityError("stored terminal attempt ended before it started")
+    reason = _terminal_reason_from_database(row[14], row[15])
+    try:
+        if status is AttemptStatus.INCOMPLETE:
+            _validate_incomplete_reason(reason)
+        elif status is AttemptStatus.ERROR:
+            _validate_error_reason(reason)
+        elif reason.code is not ReasonCode.SNAPSHOT_LOST:
+            raise ValueError("abandoned attempt requires snapshot_lost reason")
+        return AttemptOutcomeRecord(
+            run_id=run_id,
+            attempt_id=attempt_id,
+            status=status,
+            operation_id=operation_id,
+            reason=reason,
+            ended_at=ended_at,
+        )
+    except (TypeError, ValueError) as error:
+        raise StoredLifecycleIntegrityError(
+            f"stored terminal attempt violates the outcome protocol: reason={error}"
+        ) from None
+
+
+def _require_terminal_attempt_run_binding(
+    connection: psycopg.Connection[DatabaseRow],
+    outcome: AttemptOutcomeRecord,
+) -> None:
+    run_row = connection.execute(
+        "SELECT selected_terminal_attempt_id, terminal_operation_id, terminal_at "
+        "FROM dfe_metadata.runs WHERE run_id = %s",
+        (outcome.run_id,),
+    ).fetchone()
+    if run_row is None:
+        raise StoredLifecycleIntegrityError("terminal attempt run is missing")
+    selected_attempt_id = _row_optional_uuid(run_row[0], "selected terminal attempt id")
+    terminal_operation_id = _row_optional_uuid(run_row[1], "run terminal operation id")
+    terminal_at = _row_optional_datetime(run_row[2], "run terminal_at")
+    if selected_attempt_id is None:
+        if terminal_operation_id is not None or terminal_at is not None:
+            raise StoredLifecycleIntegrityError(
+                "unterminated run contains a partial terminal publication identity"
+            )
+        return
+    if terminal_operation_id is None or terminal_at is None:
+        raise StoredLifecycleIntegrityError(
+            "terminated run lacks its operation id or terminal timestamp"
+        )
+    if selected_attempt_id == outcome.attempt_id:
+        if (
+            terminal_operation_id != outcome.operation_id
+            or terminal_at != outcome.ended_at
+            or outcome.status is AttemptStatus.ABANDONED
+        ):
+            raise StoredLifecycleIntegrityError(
+                "terminal attempt differs from its selected run publication"
+            )
+        return
+    selected_row = connection.execute(
+        "SELECT status, end_operation_id, ended_at FROM dfe_metadata.run_attempts "
+        "WHERE run_id = %s AND attempt_id = %s",
+        (outcome.run_id, selected_attempt_id),
+    ).fetchone()
+    if selected_row is None:
+        raise StoredLifecycleIntegrityError("selected terminal run attempt is missing")
+    selected_status = _row_text(selected_row[0], "selected terminal attempt status")
+    if (
+        selected_status
+        not in (
+            AttemptStatus.COMPLETED.value,
+            AttemptStatus.INCOMPLETE.value,
+            AttemptStatus.ERROR.value,
+        )
+        or _row_optional_uuid(selected_row[1], "selected terminal operation id")
+        != terminal_operation_id
+        or _row_optional_datetime(selected_row[2], "selected terminal ended_at") != terminal_at
+    ):
+        raise StoredLifecycleIntegrityError(
+            "selected terminal attempt differs from its run publication"
+        )
+
+
+def _comparison_definition_from_result(result: RunResult) -> _CompletedResultDefinition:
+    definition_type = (
+        CompletedStructuralComparisonDefinition
+        if result.guarantee is Guarantee.STRUCTURAL
+        else CompletedComparisonDefinition
+    )
+    return definition_type(
         check_id=result.check_id,
         contract_digest=result.contract_digest,
         scope_digest=result.scope_digest,
@@ -4127,7 +4938,7 @@ def _completed_segments_from_database(
     attempt_id: UUID,
 ) -> tuple[IntegerRangeFingerprintPersistence, ...]:
     rows = _select_segment_rows_by_attempt(connection, run_id, attempt_id)
-    if not rows or len(rows) % 2 != 0:
+    if len(rows) % 2 != 0:
         raise StoredLifecycleIntegrityError(
             "completed comparison requires paired reference and target segment evidence"
         )
@@ -4406,8 +5217,6 @@ def _require_completed_closure_rows(
             completed_at,
         ),
     )
-    if not segments:
-        raise StoredLifecycleIntegrityError("completed comparison closure has no segment evidence")
     if len(observation_rows) != 2:
         raise RunLifecycleStateError(
             "completed comparison requires exactly two bound-cut observations"
@@ -4472,15 +5281,28 @@ def _require_completed_closure_rows(
         raise StoredLifecycleIntegrityError(
             "completed comparison contract assurance policy is unsupported"
         )
-    if assurance_policy == "exact_required" and result.guarantee is not Guarantee.EXACT:
+    if assurance_policy == "exact_required" and result.guarantee not in (
+        Guarantee.EXACT,
+        Guarantee.STRUCTURAL,
+    ):
         raise RunLifecycleStateError(
             "exact_required contract cannot publish a weaker completed guarantee"
         )
     reference_observation, target_observation = observation_rows
-    expected_observation_ids = (
-        segments[0].reference_observation_id,
-        segments[0].target_observation_id,
-    )
+    if segments:
+        expected_observation_ids = (
+            segments[0].reference_observation_id,
+            segments[0].target_observation_id,
+        )
+    elif result.guarantee is Guarantee.STRUCTURAL:
+        expected_observation_ids = (
+            _row_uuid(reference_observation[0], "reference structural observation id"),
+            _row_uuid(target_observation[0], "target structural observation id"),
+        )
+    else:
+        raise StoredLifecycleIntegrityError(
+            "completed row comparison closure has no segment evidence"
+        )
     _require_completed_observation(
         reference_observation,
         result,
@@ -4616,10 +5438,22 @@ def _require_attempt_closure_for_end(
     connection: psycopg.Connection[DatabaseRow],
     attempt: RunAttemptRecord,
 ) -> None:
+    _require_stored_attempt_closure(
+        connection,
+        attempt.run.run_id,
+        attempt.attempt_id,
+    )
+
+
+def _require_stored_attempt_closure(
+    connection: psycopg.Connection[DatabaseRow],
+    run_id: UUID,
+    attempt_id: UUID,
+) -> None:
     active_count_row = connection.execute(
         "SELECT pg_catalog.count(*) FROM dfe_metadata.attempt_read_contexts "
         "WHERE run_id = %s AND attempt_id = %s AND state = 'active'",
-        (attempt.run.run_id, attempt.attempt_id),
+        (run_id, attempt_id),
     ).fetchone()
     if active_count_row is None or _row_integer(active_count_row[0], "active context count") != 0:
         raise RunLifecycleStateError(
@@ -4628,7 +5462,7 @@ def _require_attempt_closure_for_end(
     row = connection.execute(
         "SELECT input_cut_digest FROM dfe_metadata.run_attempts "
         "WHERE run_id = %s AND attempt_id = %s",
-        (attempt.run.run_id, attempt.attempt_id),
+        (run_id, attempt_id),
     ).fetchone()
     if row is None:
         raise StoredLifecycleIntegrityError("attempt closure row is missing")
@@ -4636,7 +5470,7 @@ def _require_attempt_closure_for_end(
     observation_count_row = connection.execute(
         "SELECT pg_catalog.count(*) FROM dfe_metadata.dataset_observations "
         "WHERE run_id = %s AND attempt_id = %s",
-        (attempt.run.run_id, attempt.attempt_id),
+        (run_id, attempt_id),
     ).fetchone()
     if observation_count_row is None:
         raise StoredLifecycleIntegrityError("attempt observation count is missing")
@@ -4653,7 +5487,7 @@ def _require_attempt_closure_for_end(
         )
     run_row = connection.execute(
         "SELECT bound_input_cut_digest FROM dfe_metadata.runs WHERE run_id = %s",
-        (attempt.run.run_id,),
+        (run_id,),
     ).fetchone()
     if run_row is None or _row_optional_bytes(run_row[0], "run bound cut digest") != cut_digest:
         raise StoredLifecycleIntegrityError(
@@ -5268,6 +6102,11 @@ def _require_optional_uuid(value: object, context: str) -> None:
 def _require_positive_integer(value: object, context: str) -> None:
     if type(value) is not int or value < 1:
         raise ValueError(f"{context} must be a positive exact integer")
+
+
+def _require_nonblank_text(value: object, context: str) -> None:
+    if type(value) is not str or value.strip() == "":
+        raise ValueError(f"{context} must be nonblank text")
 
 
 def _require_nonnegative_integer(value: object, context: str) -> None:

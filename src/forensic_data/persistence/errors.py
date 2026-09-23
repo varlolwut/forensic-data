@@ -62,6 +62,10 @@ class RunLifecycleStateError(LifecyclePersistenceError):
     """A run or attempt is not in the required lifecycle state."""
 
 
+class CompletedComparisonNotFoundError(RunLifecycleStateError):
+    """A requested run attempt has no completed comparison result."""
+
+
 class ActiveRunAttemptError(RunLifecycleStateError):
     """A run already has a running attempt, including an expired fenced attempt."""
 
