@@ -408,7 +408,7 @@ def test_invalid_status_verdict_combinations_are_rejected(
 def test_completed_result_requires_resolved_coverage_and_persistence() -> None:
     unresolved_coverage = ComparisonCoverage(
         total_partitions=1,
-        covered_partitions=1,
+        covered_partitions=0,
         resolved_segments=0,
         pruned_segments=0,
         exact_segments=0,
@@ -474,6 +474,39 @@ def test_guarantee_represents_achieved_full_scope() -> None:
     )
     assert fully_enumerated_unestablished.guarantee is Guarantee.NOT_ESTABLISHED
 
+    with pytest.raises(ValidationError, match="incomplete execution requires not_established"):
+        _result(
+            ExecutionStatus.INCOMPLETE,
+            Verdict.INCONCLUSIVE,
+            (_reason(ReasonCode.BUDGET_EXHAUSTED),),
+            NO_PERSISTENCE,
+            VERIFIED_CONSISTENCY,
+            Guarantee.EXACT,
+            RESOLVED_COVERAGE,
+            EXACT_TOTALS,
+        )
+
+    empty_frontier = ComparisonCoverage(
+        total_partitions=0,
+        covered_partitions=0,
+        resolved_segments=0,
+        pruned_segments=0,
+        exact_segments=0,
+        unresolved_segments=0,
+        unresolved_reasons=(),
+    )
+    with pytest.raises(ValidationError, match="verified root partition"):
+        _result(
+            ExecutionStatus.ERROR,
+            Verdict.INCONCLUSIVE,
+            (_reason(ReasonCode.QUERY_ERROR),),
+            NO_PERSISTENCE,
+            VERIFIED_CONSISTENCY,
+            Guarantee.EXACT,
+            empty_frontier,
+            EXACT_TOTALS,
+        )
+
     omitted_partition_coverage = ComparisonCoverage(
         total_partitions=2,
         covered_partitions=1,
@@ -516,6 +549,24 @@ def test_coverage_rejects_over_retention_and_inconsistent_segments() -> None:
         lambda: ComparisonCoverage(
             total_partitions=1,
             covered_partitions=1,
+            resolved_segments=0,
+            pruned_segments=0,
+            exact_segments=0,
+            unresolved_segments=0,
+            unresolved_reasons=(),
+        ),
+        lambda: ComparisonCoverage(
+            total_partitions=1,
+            covered_partitions=1,
+            resolved_segments=1,
+            pruned_segments=0,
+            exact_segments=1,
+            unresolved_segments=1,
+            unresolved_reasons=(ReasonCode.BUDGET_EXHAUSTED,),
+        ),
+        lambda: ComparisonCoverage(
+            total_partitions=1,
+            covered_partitions=1,
             resolved_segments=2,
             pruned_segments=0,
             exact_segments=1,
@@ -536,15 +587,20 @@ def test_coverage_rejects_over_retention_and_inconsistent_segments() -> None:
 
 
 @pytest.mark.parametrize(
-    ("execution_status", "higher_reason"),
+    ("execution_status", "guarantee", "higher_reason"),
     [
-        (ExecutionStatus.COMPLETED, ReasonCode.BUDGET_EXHAUSTED),
-        (ExecutionStatus.COMPLETED, ReasonCode.QUERY_ERROR),
-        (ExecutionStatus.INCOMPLETE, ReasonCode.QUERY_ERROR),
+        (ExecutionStatus.COMPLETED, Guarantee.EXACT, ReasonCode.BUDGET_EXHAUSTED),
+        (ExecutionStatus.COMPLETED, Guarantee.EXACT, ReasonCode.QUERY_ERROR),
+        (
+            ExecutionStatus.INCOMPLETE,
+            Guarantee.NOT_ESTABLISHED,
+            ReasonCode.QUERY_ERROR,
+        ),
     ],
 )
 def test_higher_severity_reason_requires_higher_precedence_status(
     execution_status: ExecutionStatus,
+    guarantee: Guarantee,
     higher_reason: ReasonCode,
 ) -> None:
     reasons = (_reason(ReasonCode.DATA_MISMATCH), _reason(higher_reason))
@@ -556,13 +612,13 @@ def test_higher_severity_reason_requires_higher_precedence_status(
             reasons,
             CONFIRMED_PERSISTENCE,
             VERIFIED_CONSISTENCY,
-            Guarantee.EXACT,
+            guarantee,
             RESOLVED_COVERAGE,
             EXACT_MISMATCH_TOTALS,
         )
 
 
-def test_nested_technical_reason_requires_error_status() -> None:
+def test_nested_reason_requires_governing_status_and_detailed_reason() -> None:
     with pytest.raises(ValidationError, match="reason severity requires error"):
         _result(
             ExecutionStatus.INCOMPLETE,
@@ -573,6 +629,30 @@ def test_nested_technical_reason_requires_error_status() -> None:
             Guarantee.NOT_ESTABLISHED,
             QUERY_ERROR_COVERAGE,
             _unavailable_totals(ReasonCode.QUERY_ERROR),
+        )
+
+    with pytest.raises(ValidationError, match="requires a detailed top-level reason"):
+        _result(
+            ExecutionStatus.ERROR,
+            Verdict.INCONCLUSIVE,
+            (_reason(ReasonCode.BUDGET_EXHAUSTED),),
+            NO_PERSISTENCE,
+            UNKNOWN_CONSISTENCY,
+            Guarantee.NOT_ESTABLISHED,
+            QUERY_ERROR_COVERAGE,
+            _unavailable_totals(ReasonCode.QUERY_ERROR),
+        )
+
+    with pytest.raises(ValidationError, match="requires a detailed top-level reason"):
+        _result(
+            ExecutionStatus.INCOMPLETE,
+            Verdict.INCONCLUSIVE,
+            (),
+            NO_PERSISTENCE,
+            UNKNOWN_CONSISTENCY,
+            Guarantee.NOT_ESTABLISHED,
+            NOT_READY_COVERAGE,
+            _unavailable_totals(ReasonCode.NOT_READY),
         )
 
 
@@ -599,6 +679,28 @@ def test_match_rejects_positive_difference_totals(field_name: str) -> None:
             metrics=EMPTY_METRICS,
             reasons=(),
             persistence=CONFIRMED_PERSISTENCE,
+        )
+
+
+@pytest.mark.parametrize("guarantee", [Guarantee.AGGREGATE, Guarantee.STRUCTURAL])
+def test_non_fingerprint_match_requires_exact_absence_totals(guarantee: Guarantee) -> None:
+    lower_bound_zero_totals = ComparisonTotals(
+        matched=ExactTotal(precision="exact", value="4"),
+        missing=LowerBoundTotal(precision="lower_bound", value="0"),
+        extra=LowerBoundTotal(precision="lower_bound", value="0"),
+        modified=LowerBoundTotal(precision="lower_bound", value="0"),
+    )
+
+    with pytest.raises(ValidationError, match="requires exact zero difference totals"):
+        _result(
+            ExecutionStatus.COMPLETED,
+            Verdict.MATCH,
+            (),
+            CONFIRMED_PERSISTENCE,
+            VERIFIED_CONSISTENCY,
+            guarantee,
+            RESOLVED_COVERAGE,
+            lower_bound_zero_totals,
         )
 
 
@@ -765,6 +867,39 @@ def test_completed_fingerprint_evidence_survives_persistence_error_json_round_tr
     assert exit_code_for_result(result) is ExitCode.ERROR
     assert RunResult.model_validate_json(result.model_dump_json()) == result
 
+    with pytest.raises(ValidationError, match="fingerprint data_mismatch requires"):
+        _result(
+            ExecutionStatus.ERROR,
+            Verdict.MISMATCH,
+            (_reason(ReasonCode.DATA_MISMATCH),),
+            failed_persistence,
+            VERIFIED_CONSISTENCY,
+            Guarantee.FINGERPRINT,
+            coverage,
+            totals,
+        )
+
+    erased_totals = totals.model_copy(
+        update={
+            "modified": UnavailableTotal(
+                precision="unavailable",
+                value=None,
+                reason=ReasonCode.PERSISTENCE_ERROR,
+            )
+        }
+    )
+    with pytest.raises(ValidationError, match="requires preserved inferred totals"):
+        _result(
+            ExecutionStatus.ERROR,
+            Verdict.INCONCLUSIVE,
+            (),
+            failed_persistence,
+            VERIFIED_CONSISTENCY,
+            Guarantee.FINGERPRINT,
+            coverage,
+            erased_totals,
+        )
+
 
 def test_verdict_requires_and_preserves_proven_mismatch() -> None:
     with pytest.raises(ValidationError, match="requires mismatch verdict"):
@@ -801,6 +936,36 @@ def test_verdict_requires_and_preserves_proven_mismatch() -> None:
             Guarantee.EXACT,
             RESOLVED_COVERAGE,
             EXACT_TOTALS,
+        )
+
+
+@pytest.mark.parametrize(
+    "consistency",
+    [
+        UNKNOWN_CONSISTENCY,
+        ConsistencyStatus(
+            stable_reads=ConsistencyLevel.VERIFIED,
+            cut_alignment=ConsistencyLevel.VERIFIED,
+            read_context_ids=(),
+        ),
+    ],
+)
+def test_partial_data_mismatch_requires_comparable_contexts(
+    consistency: ConsistencyStatus,
+) -> None:
+    with pytest.raises(ValidationError, match="proven data mismatch requires known consistency"):
+        _result(
+            ExecutionStatus.INCOMPLETE,
+            Verdict.MISMATCH,
+            (
+                _reason(ReasonCode.DATA_MISMATCH),
+                _reason(ReasonCode.BUDGET_EXHAUSTED),
+            ),
+            NO_PERSISTENCE,
+            consistency,
+            Guarantee.NOT_ESTABLISHED,
+            PARTIAL_MISMATCH_COVERAGE,
+            PARTIAL_MISMATCH_TOTALS,
         )
 
 
@@ -844,6 +1009,37 @@ def test_contract_violation_requires_unavailable_row_totals() -> None:
             metrics=EMPTY_METRICS,
             reasons=(_reason(ReasonCode.CONTRACT_VIOLATION),),
             persistence=CONFIRMED_PERSISTENCE,
+        )
+
+
+def test_persistence_reason_codes_match_state_across_typed_locations() -> None:
+    with pytest.raises(ValidationError, match=r"persistence_error.*must appear together"):
+        _result(
+            ExecutionStatus.ERROR,
+            Verdict.INCONCLUSIVE,
+            (_reason(ReasonCode.QUERY_ERROR),),
+            NO_PERSISTENCE,
+            UNKNOWN_CONSISTENCY,
+            Guarantee.NOT_ESTABLISHED,
+            QUERY_ERROR_COVERAGE,
+            _unavailable_totals(ReasonCode.PERSISTENCE_ERROR),
+        )
+
+    failed_persistence = PersistenceStatus(
+        state=PersistenceState.FAILED,
+        operation_id=PERSISTENCE_OPERATION_ID,
+        reason=_reason(ReasonCode.PERSISTENCE_ERROR),
+    )
+    with pytest.raises(ValidationError, match=r"commit_unknown.*must appear together"):
+        _result(
+            ExecutionStatus.ERROR,
+            Verdict.INCONCLUSIVE,
+            (_reason(ReasonCode.COMMIT_UNKNOWN),),
+            failed_persistence,
+            UNKNOWN_CONSISTENCY,
+            Guarantee.NOT_ESTABLISHED,
+            NOT_READY_COVERAGE,
+            _unavailable_totals(ReasonCode.PERSISTENCE_ERROR),
         )
 
 
