@@ -20,14 +20,14 @@ _ROW_EQUIVALENCE = "row_equivalence"
 
 
 def dataset_digest_hex(dataset: DatasetDefinition) -> str:
-    return semantic_digest_hex(_dataset_semantics(dataset))
+    return semantic_digest_hex(dataset_semantic_value(dataset))
 
 
 def contract_digest_hex(config_version: int, check: RowCheckDefinition) -> str:
-    return semantic_digest_hex(_contract_semantics(config_version, check))
+    return semantic_digest_hex(contract_semantic_value(config_version, check))
 
 
-def _dataset_semantics(dataset: DatasetDefinition) -> SemanticValue:
+def dataset_semantic_value(dataset: DatasetDefinition) -> SemanticValue:
     return {
         "canonical_protocol": PROTOCOL,
         "dataset": _dataset_body_semantics(dataset),
@@ -48,7 +48,7 @@ def _dataset_body_semantics(dataset: DatasetDefinition) -> dict[str, SemanticVal
     }
 
 
-def _contract_semantics(config_version: int, check: RowCheckDefinition) -> SemanticValue:
+def contract_semantic_value(config_version: int, check: RowCheckDefinition) -> SemanticValue:
     return {
         "assurance_policy": check.assurance_policy.value,
         "canonical_protocol": PROTOCOL,
@@ -64,6 +64,18 @@ def _contract_semantics(config_version: int, check: RowCheckDefinition) -> Seman
         "scope": _scope_semantics(check.scope),
         "semantic_protocol": SEMANTIC_DIGEST_PROTOCOL,
     }
+
+
+def sql_artifact_parameters_semantic_value(
+    artifact: SqlArtifactDefinition,
+) -> list[SemanticValue]:
+    return sql_parameters_semantic_value(artifact.parameters)
+
+
+def sql_parameters_semantic_value(
+    parameters: tuple[SqlParameterDefinition, ...],
+) -> list[SemanticValue]:
+    return [_sql_parameter_semantics(value) for value in parameters]
 
 
 def _connection_semantics(connection: ConnectionDefinition) -> SemanticValue:
@@ -95,7 +107,7 @@ def _locator_semantics(locator: RelationLocator | SqlArtifactDefinition) -> Sema
         "content_sha256": locator.content_sha256,
         "dialect": locator.dialect.value,
         "kind": "sql",
-        "parameters": [_sql_parameter_semantics(value) for value in locator.parameters],
+        "parameters": sql_artifact_parameters_semantic_value(locator),
     }
 
 

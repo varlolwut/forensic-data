@@ -12,12 +12,13 @@ application. It provides:
   identity primitives;
 - a strict version-1 YAML contract loader, pure reference/schema resolver, semantic digests, and
   static plan report;
-- a bounded PostgreSQL read connector and SQL lowering for the initial common type profile; and
+- a bounded PostgreSQL read connector and SQL lowering for the initial common type profile;
+- versioned PostgreSQL metadata migrations and typed immutable contract registration; and
 - reproducible Python package, PostgreSQL fixture, container, and CI builds.
 
-There is no end-user CLI, metadata store, scheduler integration, or multi-engine execution workflow
-yet. Static planning does not connect to a database or prove readiness, capability, schema presence,
-or data equality. Import the Python APIs directly for development and protocol experiments.
+There is no end-user CLI, scheduler integration, or multi-engine execution workflow yet. Static
+planning does not connect to a database or prove readiness, capability, schema presence, or data
+equality. Import the Python APIs directly for development and protocol experiments.
 
 ## Verified scope
 
@@ -140,14 +141,41 @@ stages remain explicitly `required_not_run` or `planned_not_run`, and its estima
 fields in a deserialized report are sender claims. Execution must load and compile the source
 contract again rather than trusting a supplied report.
 
+## PostgreSQL metadata bootstrap
+
+Metadata installation is an explicit administrator operation. The packaged bootstrap creates and
+validates three fixed `NOLOGIN` capability roles and the `dfe_metadata` schema; it never creates
+login accounts, stores passwords, or takes over an incompatible existing role, schema, or ACL. An
+operator grants the appropriate capability role to separately managed login accounts.
+
+Render and review the exact packaged bootstrap before applying it to the dedicated metadata
+database:
+
+```console
+python -c "from pathlib import Path; from forensic_data.persistence import load_postgres_metadata_bootstrap_sql as load; Path('dfe-metadata-bootstrap.sql').write_bytes(load().encode('utf-8'))"
+psql "$DFE_METADATA_ADMIN_DSN" --set=ON_ERROR_STOP=1 --file dfe-metadata-bootstrap.sql
+```
+
+After bootstrap, `migrate_postgres_metadata(settings, retry_policy,
+lock_timeout_milliseconds)` applies the packaged numbered SQL with an advisory transaction lock.
+The journal must be an exact checksum-matching prefix of the package; unknown, missing, renamed, or
+changed migrations fail explicitly. Repeating an up-to-date migration is a no-op. Runtime reader
+and writer roles can validate the journal version but cannot change it or perform schema DDL.
+
+`build_metadata_registration_definition(...)` creates the safe persistence boundary from a
+validated row check. `register_postgres_metadata(...)` then stores immutable dataset and contract
+versions and append-only SQL capture records. Secret references, artifact paths, budgets, and SQL
+bytes disabled by the evidence policy are never stored. A later enabled capture creates a separate
+record without mutating the semantic version.
+
 ## PostgreSQL fixture and checks
 
 Copy the disposable local fixture environment. The checked-in values are development-only
 credentials bound to `127.0.0.1` with `sslmode=disable`; replace the security profile if the
 fixture is used anywhere else.
 
-If you change `DFE_PG_PORT`, update the port in both test DSNs in the same environment file. If you
-change the reader or writer password, update the matching password in its DSN too.
+If you change `DFE_PG_PORT`, update the port in every test DSN in the same environment file. If you
+change a fixture password, update the matching password in its DSN too.
 
 ```console
 # POSIX
@@ -173,7 +201,7 @@ previously started with different values, run the cleanup command below before s
 The protocol/result tests can run without Docker, but this does not verify PostgreSQL support:
 
 ```console
-uv run pytest --ignore=tests/test_postgres_integration.py
+uv run pytest --ignore=tests/test_postgres_integration.py --ignore=tests/test_postgres_metadata_integration.py
 ```
 
 Stop and remove only this disposable fixture and its data volume:
@@ -184,7 +212,8 @@ docker compose --env-file tests/fixtures/postgres/.env --file tests/fixtures/pos
 
 The integration suite exercises real catalog inspection, canonical row/hash equivalence, bounded
 server-side cursors, duplicate bags, empty tables, precision rejection, relation replacement, row
-level security, read-only enforcement, and concurrent-writer snapshot stability.
+level security, read-only enforcement, concurrent-writer snapshot stability, metadata migration
+serialization and rollback, role separation, and immutable registration/readback.
 
 ## Build artifacts
 

@@ -1,6 +1,6 @@
 import hashlib
 import json
-from typing import Final, Literal
+from typing import Final, Literal, Never, cast
 
 from forensic_data.contracts.errors import ContractValidationError
 
@@ -31,6 +31,38 @@ def semantic_digest_hex(value: SemanticValue) -> str:
     return hashlib.sha256(metadata).hexdigest()
 
 
+def semantic_value_from_json(metadata_json: str) -> SemanticValue:
+    if type(metadata_json) is not str:
+        raise ContractValidationError("semantic metadata JSON must be a string")
+    try:
+        parsed = cast(
+            object,
+            json.loads(
+                metadata_json,
+                object_pairs_hook=_object_without_duplicate_keys,
+                parse_float=_reject_json_float,
+                parse_int=_parse_json_integer,
+                parse_constant=_reject_json_constant,
+            ),
+        )
+    except json.JSONDecodeError as error:
+        raise ContractValidationError(
+            "semantic metadata is not valid JSON: "
+            f"line={error.lineno}, column={error.colno}, reason={error.msg}"
+        ) from None
+    except RecursionError:
+        raise ContractValidationError(
+            "semantic metadata JSON nesting exceeds the parser limit"
+        ) from None
+    value = cast(SemanticValue, parsed)
+    _validate_semantic_value(value, "semantic metadata")
+    return value
+
+
+def canonicalize_semantic_json(metadata_json: str) -> str:
+    return canonical_semantic_json(semantic_value_from_json(metadata_json))
+
+
 def _validate_semantic_value(value: SemanticValue, context: str) -> None:
     if value is None or type(value) in (bool, int):
         return
@@ -55,6 +87,40 @@ def _validate_semantic_value(value: SemanticValue, context: str) -> None:
     raise ContractValidationError(
         f"{context} contains unsupported value type {type(value).__name__}; "
         "only null, booleans, exact integers, strings, arrays, and objects are permitted"
+    )
+
+
+def _object_without_duplicate_keys(
+    pairs: list[tuple[str, object]],
+) -> dict[str, object]:
+    result: dict[str, object] = {}
+    for key, value in pairs:
+        if key in result:
+            raise ContractValidationError(
+                f"semantic metadata JSON contains duplicate object key {key!r}"
+            )
+        result[key] = value
+    return result
+
+
+def _reject_json_float(token: str) -> Never:
+    raise ContractValidationError(
+        f"semantic metadata JSON numbers must be exact integers, got {token!r}"
+    )
+
+
+def _parse_json_integer(token: str) -> int:
+    try:
+        return int(token)
+    except ValueError:
+        raise ContractValidationError(
+            f"semantic metadata JSON integer is too large to validate: digits={len(token)}"
+        ) from None
+
+
+def _reject_json_constant(token: str) -> Never:
+    raise ContractValidationError(
+        f"semantic metadata JSON does not permit non-finite number {token!r}"
     )
 
 

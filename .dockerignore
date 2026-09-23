@@ -6,6 +6,17 @@
 !uv.lock
 !src/
 !src/**
+**/.agents
+**/.codex
+**/.cursor
+**/.env
+**/.env.*
+**/.gitignore
+**/.local
+**/AGENTS.md
+**/CLAUDE.md
+**/data-forensics-brief.md
+**/docs
 src/**/__pycache__/
 src/**/*.py[cod]
 src/**/*.egg-info/

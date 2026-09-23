@@ -3,11 +3,23 @@ set -euo pipefail
 
 : "${DFE_PG_READER_PASSWORD:?DFE_PG_READER_PASSWORD is required}"
 : "${DFE_PG_WRITER_PASSWORD:?DFE_PG_WRITER_PASSWORD is required}"
+: "${DFE_PG_METADATA_MIGRATOR_PASSWORD:?DFE_PG_METADATA_MIGRATOR_PASSWORD is required}"
+: "${DFE_PG_METADATA_WRITER_PASSWORD:?DFE_PG_METADATA_WRITER_PASSWORD is required}"
+: "${DFE_PG_METADATA_READER_PASSWORD:?DFE_PG_METADATA_READER_PASSWORD is required}"
+
+psql \
+  --set=ON_ERROR_STOP=1 \
+  --username "${POSTGRES_USER}" \
+  --dbname "${POSTGRES_DB}" \
+  --file /opt/forensic-data/bootstrap.sql
 
 psql \
   --set=ON_ERROR_STOP=1 \
   --set=reader_password="${DFE_PG_READER_PASSWORD}" \
   --set=writer_password="${DFE_PG_WRITER_PASSWORD}" \
+  --set=metadata_migrator_password="${DFE_PG_METADATA_MIGRATOR_PASSWORD}" \
+  --set=metadata_writer_password="${DFE_PG_METADATA_WRITER_PASSWORD}" \
+  --set=metadata_reader_password="${DFE_PG_METADATA_READER_PASSWORD}" \
   --username "${POSTGRES_USER}" \
   --dbname "${POSTGRES_DB}" <<'SQL'
 REVOKE CREATE ON SCHEMA public FROM PUBLIC;
@@ -28,7 +40,39 @@ CREATE ROLE dfe_fixture_reader
   NOCREATEROLE
   NOREPLICATION;
 
+CREATE ROLE dfe_metadata_migrator_login
+  LOGIN
+  PASSWORD :'metadata_migrator_password'
+  NOSUPERUSER
+  NOCREATEDB
+  NOCREATEROLE
+  NOREPLICATION
+  NOBYPASSRLS;
+
+CREATE ROLE dfe_metadata_writer_login
+  LOGIN
+  PASSWORD :'metadata_writer_password'
+  NOSUPERUSER
+  NOCREATEDB
+  NOCREATEROLE
+  NOREPLICATION
+  NOBYPASSRLS;
+
+CREATE ROLE dfe_metadata_reader_login
+  LOGIN
+  PASSWORD :'metadata_reader_password'
+  NOSUPERUSER
+  NOCREATEDB
+  NOCREATEROLE
+  NOREPLICATION
+  NOBYPASSRLS;
+
+GRANT dfe_metadata_migrator TO dfe_metadata_migrator_login;
+GRANT dfe_metadata_writer TO dfe_metadata_writer_login;
+GRANT dfe_metadata_reader TO dfe_metadata_reader_login;
+
 ALTER ROLE dfe_fixture_reader SET default_transaction_read_only = on;
+ALTER ROLE dfe_metadata_reader_login SET default_transaction_read_only = on;
 GRANT CREATE ON DATABASE dfe_fixture TO dfe_fixture_writer;
 
 CREATE SCHEMA dfe_fixture AUTHORIZATION dfe_fixture_writer;

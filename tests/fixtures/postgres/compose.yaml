@@ -10,10 +10,14 @@ services:
       POSTGRES_PASSWORD: ${DFE_PG_ADMIN_PASSWORD:?set DFE_PG_ADMIN_PASSWORD}
       DFE_PG_READER_PASSWORD: ${DFE_PG_READER_PASSWORD:?set DFE_PG_READER_PASSWORD}
       DFE_PG_WRITER_PASSWORD: ${DFE_PG_WRITER_PASSWORD:?set DFE_PG_WRITER_PASSWORD}
+      DFE_PG_METADATA_MIGRATOR_PASSWORD: ${DFE_PG_METADATA_MIGRATOR_PASSWORD:?set DFE_PG_METADATA_MIGRATOR_PASSWORD}
+      DFE_PG_METADATA_WRITER_PASSWORD: ${DFE_PG_METADATA_WRITER_PASSWORD:?set DFE_PG_METADATA_WRITER_PASSWORD}
+      DFE_PG_METADATA_READER_PASSWORD: ${DFE_PG_METADATA_READER_PASSWORD:?set DFE_PG_METADATA_READER_PASSWORD}
     ports:
       - 127.0.0.1:${DFE_PG_PORT:?set DFE_PG_PORT}:5432
     volumes:
       - postgres-data:/var/lib/postgresql/data
+      - ../../../src/forensic_data/persistence/sql/bootstrap.sql:/opt/forensic-data/bootstrap.sql:ro
       - ./init:/docker-entrypoint-initdb.d:ro
     healthcheck:
       test:

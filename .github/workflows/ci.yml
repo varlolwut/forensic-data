@@ -19,9 +19,16 @@ jobs:
       DFE_PG_ADMIN_PASSWORD: phase01-admin
       DFE_PG_READER_PASSWORD: phase01-reader
       DFE_PG_WRITER_PASSWORD: phase01-writer
+      DFE_PG_METADATA_MIGRATOR_PASSWORD: phase02-metadata-migrator
+      DFE_PG_METADATA_WRITER_PASSWORD: phase02-metadata-writer
+      DFE_PG_METADATA_READER_PASSWORD: phase02-metadata-reader
       DFE_PG_PORT: "55432"
+      DFE_TEST_POSTGRES_ADMIN_DSN: postgresql://postgres:phase01-admin@127.0.0.1:55432/postgres
       DFE_TEST_POSTGRES_READER_DSN: postgresql://dfe_fixture_reader:phase01-reader@127.0.0.1:55432/dfe_fixture
       DFE_TEST_POSTGRES_WRITER_DSN: postgresql://dfe_fixture_writer:phase01-writer@127.0.0.1:55432/dfe_fixture
+      DFE_TEST_POSTGRES_METADATA_MIGRATOR_DSN: postgresql://dfe_metadata_migrator_login:phase02-metadata-migrator@127.0.0.1:55432/dfe_fixture
+      DFE_TEST_POSTGRES_METADATA_WRITER_DSN: postgresql://dfe_metadata_writer_login:phase02-metadata-writer@127.0.0.1:55432/dfe_fixture
+      DFE_TEST_POSTGRES_METADATA_READER_DSN: postgresql://dfe_metadata_reader_login:phase02-metadata-reader@127.0.0.1:55432/dfe_fixture
     steps:
       - name: Check out source
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
@@ -84,6 +91,7 @@ jobs:
             --requirements /tmp/forensic-data-runtime.txt
           uv pip install --python .artifact-venv/bin/python --no-deps dist/*.whl
           .artifact-venv/bin/python -c "import forensic_data; print(forensic_data.__version__)"
+          .artifact-venv/bin/python -c "from importlib.resources import files; assert files('forensic_data.persistence').joinpath('sql/migrations/0001_initial.sql').read_bytes(); assert files('forensic_data.persistence').joinpath('sql/bootstrap.sql').read_bytes()"
       - name: Upload package artifacts
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:

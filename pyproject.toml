@@ -56,15 +56,15 @@ module-name = "forensic_data"
 module-root = "src"
 source-include = ["examples/**", "uv.lock"]
 source-exclude = [
-    "/.agents",
-    "/.codex",
-    "/.cursor",
-    "/.env",
-    "/.env.*",
-    "/.gitignore",
-    "/.local",
-    "/AGENTS.md",
-    "/CLAUDE.md",
-    "/data-forensics-brief.md",
-    "/docs",
+    ".agents",
+    ".codex",
+    ".cursor",
+    ".env",
+    ".env.*",
+    ".gitignore",
+    ".local",
+    "AGENTS.md",
+    "CLAUDE.md",
+    "data-forensics-brief.md",
+    "docs",
 ]
