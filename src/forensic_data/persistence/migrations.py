@@ -5,7 +5,10 @@ from typing import Final
 from forensic_data.persistence.model import Migration
 
 _BOOTSTRAP_RESOURCE: Final[str] = "sql/bootstrap.sql"
-_MIGRATION_RESOURCES: Final[tuple[tuple[int, str], ...]] = ((1, "0001_initial.sql"),)
+_MIGRATION_RESOURCES: Final[tuple[tuple[int, str], ...]] = (
+    (1, "0001_initial.sql"),
+    (2, "0002_run_lifecycle.sql"),
+)
 
 
 def load_postgres_metadata_bootstrap_sql() -> str:

@@ -82,6 +82,7 @@ class ReasonCode(StrEnum):
     DATA_MISMATCH = "data_mismatch"
     CONTRACT_VIOLATION = "contract_violation"
     NOT_READY = "not_ready"
+    CUT_MISMATCH = "cut_mismatch"
     SNAPSHOT_LOST = "snapshot_lost"
     BUDGET_EXHAUSTED = "budget_exhausted"
     CANCELLED = "cancelled"
@@ -105,6 +106,7 @@ _COMPLETED_REASON_CODES: Final[frozenset[ReasonCode]] = frozenset(
 _INCOMPLETE_REASON_CODES: Final[frozenset[ReasonCode]] = frozenset(
     {
         ReasonCode.NOT_READY,
+        ReasonCode.CUT_MISMATCH,
         ReasonCode.SNAPSHOT_LOST,
         ReasonCode.BUDGET_EXHAUSTED,
         ReasonCode.CANCELLED,

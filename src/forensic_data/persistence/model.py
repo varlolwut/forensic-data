@@ -461,22 +461,27 @@ def _require_artifact_closure(registration: MetadataRegistrationDefinition) -> N
                 )
             )
     reference_readiness, target_readiness = _contract_readiness_identities(registration.contract)
-    expected.extend(
+    for direction, dataset, identity in (
         (
-            _ArtifactExpectation(
-                ArtifactDirection.REFERENCE,
-                ArtifactPurpose.READINESS,
-                registration.reference_dataset.dataset_id,
-                reference_readiness,
-            ),
-            _ArtifactExpectation(
-                ArtifactDirection.TARGET,
-                ArtifactPurpose.READINESS,
-                registration.target_dataset.dataset_id,
-                target_readiness,
-            ),
-        )
-    )
+            ArtifactDirection.REFERENCE,
+            registration.reference_dataset,
+            reference_readiness,
+        ),
+        (
+            ArtifactDirection.TARGET,
+            registration.target_dataset,
+            target_readiness,
+        ),
+    ):
+        if identity is not None:
+            expected.append(
+                _ArtifactExpectation(
+                    direction,
+                    ArtifactPurpose.READINESS,
+                    dataset.dataset_id,
+                    identity,
+                )
+            )
     actual_uses = tuple(
         (artifact.direction, artifact.purpose, artifact.dataset_id)
         for artifact in registration.code_artifacts
@@ -1087,7 +1092,7 @@ def _dataset_projection_identity(
 
 def _contract_readiness_identities(
     contract: ContractVersionDefinition,
-) -> tuple[_SqlArtifactIdentity, _SqlArtifactIdentity]:
+) -> tuple[_SqlArtifactIdentity | None, _SqlArtifactIdentity | None]:
     payload = _semantic_object_from_json(
         contract.semantic_payload_json,
         "contract semantic payload",
@@ -1121,11 +1126,26 @@ def _contract_readiness_identities(
     )
     if len(datasets) != 2:
         raise ValueError("contract consistency must contain reference and target datasets")
-    identities: list[_SqlArtifactIdentity] = []
-    for index, (value, expected_dataset_id) in enumerate(
+    direction_bodies = _contract_direction_bodies(contract)
+    expected_connections = tuple(
+        _semantic_text(
+            _semantic_object(body["connection"], f"contract {direction} connection")[
+                "connection_id"
+            ],
+            f"contract {direction} connection id",
+        )
+        for direction, body in zip(
+            ("reference", "target"),
+            direction_bodies,
+            strict=True,
+        )
+    )
+    identities: list[_SqlArtifactIdentity | None] = []
+    for index, (value, expected_dataset_id, expected_connection_id) in enumerate(
         zip(
             datasets,
             (contract.reference_dataset_id, contract.target_dataset_id),
+            expected_connections,
             strict=True,
         )
     ):
@@ -1147,8 +1167,57 @@ def _contract_readiness_identities(
             f"{context} stable read",
         )
         readiness = _semantic_object(dataset["readiness"], f"{context} readiness")
-        identities.append(_sql_artifact_identity(readiness, f"{context} readiness"))
+        identities.append(
+            _readiness_artifact_identity(
+                readiness,
+                expected_connection_id,
+                f"{context} readiness",
+            )
+        )
     return identities[0], identities[1]
+
+
+def _readiness_artifact_identity(
+    readiness: dict[str, SemanticValue],
+    expected_connection_id: str,
+    context: str,
+) -> _SqlArtifactIdentity | None:
+    kind = _semantic_text(readiness.get("kind"), f"{context} kind")
+    if kind == _SQL_ARTIFACT_KIND:
+        return _sql_artifact_identity(readiness, context)
+    if kind != "relation_manifest":
+        raise ValueError(f"{context} kind is unsupported")
+    _require_exact_semantic_keys(
+        readiness,
+        ("columns", "connection_id", "kind", "relation"),
+        context,
+    )
+    _require_semantic_match(
+        readiness["connection_id"],
+        expected_connection_id,
+        f"{context} connection and dataset connection",
+    )
+    relation = _semantic_object(readiness["relation"], f"{context} relation")
+    _require_relation_locator(relation, RelationScope.PHYSICAL_ONLY)
+    columns = _semantic_object(readiness["columns"], f"{context} columns")
+    expected_columns = (
+        "batch_id",
+        "business_date",
+        "completed_at",
+        "dataset_id",
+        "dataset_version",
+        "scope_digest",
+        "source_cut",
+        "state",
+    )
+    _require_exact_semantic_keys(columns, expected_columns, f"{context} columns")
+    resolved_columns = tuple(
+        _semantic_nonempty_text(columns[name], f"{context} {name} column")
+        for name in expected_columns
+    )
+    if len(set(resolved_columns)) != len(resolved_columns):
+        raise ValueError(f"{context} columns must reference distinct physical columns")
+    return None
 
 
 def _sql_artifact_identity(

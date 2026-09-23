@@ -1,6 +1,7 @@
 from collections.abc import Mapping
+from dataclasses import dataclass
 from enum import StrEnum
-from typing import Literal, Self, cast
+from typing import Annotated, Literal, Self, cast, final
 
 from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
 
@@ -19,10 +20,10 @@ from forensic_data.contracts.model import (
     AssurancePolicy,
     DatasetDefinition,
     LoadedContractConfig,
+    ReadinessDefinition,
     RelationLocator,
     RelationScope,
     RowCheckDefinition,
-    ScopeParameterDefinition,
     SqlArtifactDefinition,
     SqlDialect,
     SqlParameterDefinition,
@@ -36,6 +37,72 @@ from forensic_data.contracts.semantics import (
 type ScopeInputValue = int | bool | str
 type DigestHex = str
 type PositiveInt = int
+
+
+@final
+@dataclass(frozen=True, slots=True)
+class ResolvedScopeParameter:
+    name: str
+    field: FieldSchema
+    value: ScopeInputValue
+    canonical_payload: bytes
+
+    def __post_init__(self) -> None:
+        if type(self.name) is not str or self.name.strip() == "":
+            raise ScopeValueError("resolved scope parameter name must be nonblank text")
+        _require_planning_instance(
+            self.field,
+            FieldSchema,
+            "resolved scope parameter field",
+        )
+        if self.field.name != self.name:
+            raise ScopeValueError("resolved scope parameter name must equal its FieldSchema name")
+        if self.field.nullable:
+            raise ScopeValueError("resolved scope parameters must be non-nullable")
+        if type(self.value) not in (bool, int, str):
+            raise ScopeValueError(
+                f"resolved scope parameter {self.name!r} requires an exact integer, "
+                "boolean, or string"
+            )
+        if type(self.canonical_payload) is not bytes:
+            raise ScopeValueError("resolved scope canonical payload must be bytes")
+        try:
+            expected_payload = encode_payload(self.field, self.value)
+        except PayloadValidationError as error:
+            raise ScopeValueError(
+                f"resolved scope parameter {self.name!r} is invalid for logical type "
+                f"{self.field.logical_type.value!r}: {error}"
+            ) from None
+        if self.canonical_payload != expected_payload:
+            raise ScopeValueError(
+                f"resolved scope parameter {self.name!r} canonical payload does not "
+                "match its typed value"
+            )
+
+
+@final
+@dataclass(frozen=True, slots=True)
+class ResolvedScope:
+    parameters: tuple[ResolvedScopeParameter, ...]
+    scope_digest: str
+
+    def __post_init__(self) -> None:
+        if type(self.parameters) is not tuple:
+            raise ScopeValueError("resolved scope parameters must be an immutable tuple")
+        names: list[str] = []
+        for index, parameter in enumerate(self.parameters):
+            _require_planning_instance(
+                parameter,
+                ResolvedScopeParameter,
+                f"resolved scope parameter at index {index}",
+            )
+            names.append(parameter.name)
+        if len(set(names)) != len(names):
+            raise ScopeValueError("resolved scope parameters must have unique names")
+        if self.scope_digest != _resolved_scope_digest(self.parameters):
+            raise ScopeValueError(
+                "resolved scope digest does not match its canonical parameter values"
+            )
 
 
 class PlanProbeStatus(StrEnum):
@@ -110,6 +177,82 @@ class PlanParameter(_PlanModel):
     type: PlanLogicalType
 
 
+class PlanSqlReadiness(_PlanModel):
+    kind: Literal["sql"]
+    connection_id: str
+
+    @model_validator(mode="after")
+    def validate_connection(self) -> Self:
+        if self.connection_id.strip() == "":
+            raise ValueError("SQL readiness connection id must be nonblank")
+        return self
+
+
+class PlanReadinessManifestColumns(_PlanModel):
+    dataset_id: str
+    scope_digest: str
+    batch_id: str
+    state: str
+    business_date: str
+    source_cut: str
+    dataset_version: str
+    completed_at: str
+
+    @model_validator(mode="after")
+    def validate_columns(self) -> Self:
+        values = (
+            self.dataset_id,
+            self.scope_digest,
+            self.batch_id,
+            self.state,
+            self.business_date,
+            self.source_cut,
+            self.dataset_version,
+            self.completed_at,
+        )
+        if any(value == "" for value in values) or len(set(values)) != len(values):
+            raise ValueError(
+                "relation manifest plan requires eight distinct nonempty column mappings"
+            )
+        return self
+
+
+class PlanReadinessRelation(_PlanModel):
+    catalog: str | None
+    schema_name: str
+    relation_name: str
+    relation_scope: RelationScope
+
+    @model_validator(mode="after")
+    def validate_relation(self) -> Self:
+        if self.catalog is not None:
+            raise ValueError("PostgreSQL readiness plan relation catalog must be null")
+        if self.schema_name == "" or self.relation_name == "":
+            raise ValueError("readiness plan relation requires nonempty schema and name")
+        if self.relation_scope is not RelationScope.PHYSICAL_ONLY:
+            raise ValueError("readiness plan relation requires physical_only scope")
+        return self
+
+
+class PlanRelationManifestReadiness(_PlanModel):
+    kind: Literal["relation_manifest"]
+    connection_id: str
+    relation: PlanReadinessRelation
+    columns: PlanReadinessManifestColumns
+
+    @model_validator(mode="after")
+    def validate_connection(self) -> Self:
+        if self.connection_id.strip() == "":
+            raise ValueError("relation manifest readiness connection id must be nonblank")
+        return self
+
+
+type PlanReadiness = Annotated[
+    PlanSqlReadiness | PlanRelationManifestReadiness,
+    Field(discriminator="kind"),
+]
+
+
 class PlanDataset(_PlanModel):
     direction: PlanDirection
     dataset_id: str
@@ -120,6 +263,7 @@ class PlanDataset(_PlanModel):
     profile: str
     locator_kind: Literal["relation", "sql"]
     relation_scope: RelationScope | None
+    readiness: PlanReadiness
 
     @model_validator(mode="after")
     def validate_locator_scope(self) -> Self:
@@ -138,6 +282,8 @@ class PlanDataset(_PlanModel):
             raise ValueError("relation plan dataset requires physical_only relation scope")
         if self.locator_kind == "sql" and self.relation_scope is not None:
             raise ValueError("SQL plan dataset cannot carry a relation scope")
+        if self.readiness.connection_id != self.connection_id:
+            raise ValueError("plan readiness must inherit its dataset connection")
         return self
 
 
@@ -247,9 +393,23 @@ def compile_static_plan(
     scope_values: Mapping[str, ScopeInputValue],
 ) -> PlanReport:
     check = _find_check(config, check_id)
-    scope_digest = _scope_digest(check, scope_values)
-    reference = _plan_dataset(check.reference, PlanDirection.REFERENCE)
-    target = _plan_dataset(check.target, PlanDirection.TARGET)
+    resolved_scope = resolve_scope_values(check, scope_values)
+    reference_consistency, target_consistency = check.consistency.datasets
+    if (
+        reference_consistency.dataset_id != check.reference.dataset_id
+        or target_consistency.dataset_id != check.target.dataset_id
+    ):
+        raise ValueError("check consistency readiness is outside the dataset direction closure")
+    reference = _plan_dataset(
+        check.reference,
+        reference_consistency.readiness,
+        PlanDirection.REFERENCE,
+    )
+    target = _plan_dataset(
+        check.target,
+        target_consistency.readiness,
+        PlanDirection.TARGET,
+    )
     artifacts = _plan_artifacts(check)
     probes = _plan_probes(check)
     stages = _plan_stages(check)
@@ -281,7 +441,7 @@ def compile_static_plan(
         assurance_policy=check.assurance_policy,
         logical_schema_digest=check.comparison_schema.logical_schema_digest,
         contract_digest=check.contract_digest,
-        scope_digest=scope_digest,
+        scope_digest=resolved_scope.scope_digest,
         reference=reference,
         target=target,
         ordered_key=check.key,
@@ -302,12 +462,12 @@ def _find_check(config: LoadedContractConfig, check_id: str) -> RowCheckDefiniti
     return matches[0]
 
 
-def _scope_digest(
+def resolve_scope_values(
     check: RowCheckDefinition,
-    scope_values: object,
-) -> str:
-    if not isinstance(scope_values, Mapping):
-        raise ScopeValueError("scope values must be a mapping")
+    scope_values: Mapping[str, ScopeInputValue],
+) -> ResolvedScope:
+    _require_planning_instance(check, RowCheckDefinition, "scope check")
+    _require_scope_mapping(scope_values)
     untyped_scope = cast(Mapping[object, object], scope_values)
     if any(type(name) is not str for name in untyped_scope):
         raise ScopeValueError("scope value keys must be strings")
@@ -319,7 +479,7 @@ def _scope_digest(
             f"scope values must match declared parameters exactly: "
             f"expected={sorted(expected_names)!r}, actual={list(actual_names)!r}"
         )
-    parameters: list[SemanticValue] = []
+    parameters: list[ResolvedScopeParameter] = []
     for parameter in check.scope.parameters:
         value = typed_scope[parameter.name]
         if type(value) not in (bool, int, str):
@@ -335,22 +495,47 @@ def _scope_digest(
                 f"{parameter.field.logical_type.value!r}: {error}"
             ) from None
         parameters.append(
+            ResolvedScopeParameter(
+                name=parameter.name,
+                field=parameter.field,
+                value=typed_value,
+                canonical_payload=payload,
+            )
+        )
+    resolved_parameters = tuple(parameters)
+    return ResolvedScope(
+        parameters=resolved_parameters,
+        scope_digest=_resolved_scope_digest(resolved_parameters),
+    )
+
+
+def resolved_scope_semantic_value(scope: ResolvedScope) -> dict[str, SemanticValue]:
+    _require_planning_instance(scope, ResolvedScope, "resolved scope")
+    return _resolved_scope_semantics(scope.parameters)
+
+
+def _resolved_scope_digest(parameters: tuple[ResolvedScopeParameter, ...]) -> str:
+    return semantic_digest_hex(_resolved_scope_semantics(parameters))
+
+
+def _resolved_scope_semantics(
+    parameters: tuple[ResolvedScopeParameter, ...],
+) -> dict[str, SemanticValue]:
+    return {
+        "canonical_protocol": PROTOCOL,
+        "parameters": [
             {
                 "name": parameter.name,
-                "payload_hex": payload.hex(),
-                "type": _scope_type_semantics(parameter),
+                "payload_hex": parameter.canonical_payload.hex(),
+                "type": _scope_type_semantics(parameter.field),
             }
-        )
-    metadata: dict[str, SemanticValue] = {
-        "canonical_protocol": PROTOCOL,
-        "parameters": parameters,
+            for parameter in parameters
+        ],
         "semantic_protocol": SEMANTIC_DIGEST_PROTOCOL,
     }
-    return semantic_digest_hex(metadata)
 
 
-def _scope_type_semantics(parameter: ScopeParameterDefinition) -> dict[str, SemanticValue]:
-    field = parameter.field
+def _scope_type_semantics(field: FieldSchema) -> dict[str, SemanticValue]:
     values: dict[str, SemanticValue] = {
         "kind": field.logical_type.value,
         "normalization": field.normalization.value,
@@ -363,7 +548,11 @@ def _scope_type_semantics(parameter: ScopeParameterDefinition) -> dict[str, Sema
     return values
 
 
-def _plan_dataset(dataset: DatasetDefinition, direction: PlanDirection) -> PlanDataset:
+def _plan_dataset(
+    dataset: DatasetDefinition,
+    readiness: ReadinessDefinition,
+    direction: PlanDirection,
+) -> PlanDataset:
     if isinstance(dataset.locator, RelationLocator):
         locator_kind: Literal["relation", "sql"] = "relation"
         relation_scope: RelationScope | None = dataset.locator.relation_scope
@@ -380,6 +569,42 @@ def _plan_dataset(dataset: DatasetDefinition, direction: PlanDirection) -> PlanD
         profile=dataset.connection.profile,
         locator_kind=locator_kind,
         relation_scope=relation_scope,
+        readiness=_plan_readiness(dataset, readiness),
+    )
+
+
+def _plan_readiness(
+    dataset: DatasetDefinition,
+    readiness: ReadinessDefinition,
+) -> PlanReadiness:
+    if isinstance(readiness, SqlArtifactDefinition):
+        return PlanSqlReadiness(
+            kind="sql",
+            connection_id=dataset.connection.connection_id,
+        )
+    if readiness.connection_id != dataset.connection.connection_id:
+        raise ValueError("relation manifest readiness must inherit its dataset connection")
+    columns = readiness.columns
+    relation = readiness.relation
+    return PlanRelationManifestReadiness(
+        kind="relation_manifest",
+        connection_id=readiness.connection_id,
+        relation=PlanReadinessRelation(
+            catalog=relation.catalog,
+            schema_name=relation.schema,
+            relation_name=relation.name,
+            relation_scope=relation.relation_scope,
+        ),
+        columns=PlanReadinessManifestColumns(
+            dataset_id=columns.dataset_id,
+            scope_digest=columns.scope_digest,
+            batch_id=columns.batch_id,
+            state=columns.state,
+            business_date=columns.business_date,
+            source_cut=columns.source_cut,
+            dataset_version=columns.dataset_version,
+            completed_at=columns.completed_at,
+        ),
     )
 
 
@@ -403,14 +628,15 @@ def _plan_artifacts(check: RowCheckDefinition) -> tuple[PlanArtifact, ...]:
         check.consistency.datasets,
         strict=True,
     ):
-        artifacts.append(
-            _plan_artifact(
-                ArtifactPurpose.READINESS,
-                direction,
-                item.dataset_id,
-                item.readiness,
+        if isinstance(item.readiness, SqlArtifactDefinition):
+            artifacts.append(
+                _plan_artifact(
+                    ArtifactPurpose.READINESS,
+                    direction,
+                    item.dataset_id,
+                    item.readiness,
+                )
             )
-        )
     return tuple(artifacts)
 
 
@@ -509,13 +735,12 @@ def _validate_plan_artifacts(plan: PlanReport) -> None:
         if identity in seen:
             raise ValueError("plan artifacts contain a duplicate direction/purpose")
         seen.add(identity)
-    expected = {
-        (PlanDirection.REFERENCE, ArtifactPurpose.READINESS),
-        (PlanDirection.TARGET, ArtifactPurpose.READINESS),
-    }
+    expected: set[tuple[PlanDirection, ArtifactPurpose]] = set()
     for direction, dataset in datasets.items():
         if dataset.locator_kind == "sql":
             expected.add((direction, ArtifactPurpose.PROJECTION))
+        if dataset.readiness.kind == "sql":
+            expected.add((direction, ArtifactPurpose.READINESS))
     if seen != expected:
         raise ValueError("plan artifacts do not match dataset locators and readiness requirements")
 
@@ -561,3 +786,18 @@ def _require_unicode_scalar_values(value: object) -> None:
     if isinstance(value, (list, tuple)):
         for item in cast(list[object] | tuple[object, ...], value):
             _require_unicode_scalar_values(item)
+
+
+def _require_planning_instance[T](
+    value: object,
+    expected_type: type[T],
+    context: str,
+) -> T:
+    if not isinstance(value, expected_type):
+        raise ScopeValueError(f"{context} must be a {expected_type.__name__}")
+    return value
+
+
+def _require_scope_mapping(value: object) -> None:
+    if not isinstance(value, Mapping):
+        raise ScopeValueError("scope values must be a mapping")

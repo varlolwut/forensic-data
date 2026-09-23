@@ -44,3 +44,47 @@ class CodeArtifactIntegrityError(MetadataPersistenceError):
 
 class StoredMetadataIntegrityError(MetadataPersistenceError):
     """Stored metadata violates the typed persistence protocol."""
+
+
+class LifecyclePersistenceError(MetadataPersistenceError):
+    """A run-lifecycle persistence operation failed."""
+
+
+class RunRequestConflictError(LifecyclePersistenceError):
+    """A request UUID is already bound to a different immutable run request."""
+
+
+class LifecycleOperationConflictError(LifecyclePersistenceError):
+    """An operation UUID is already bound to a different lifecycle mutation."""
+
+
+class RunLifecycleStateError(LifecyclePersistenceError):
+    """A run or attempt is not in the required lifecycle state."""
+
+
+class ActiveRunAttemptError(RunLifecycleStateError):
+    """A run already has a running attempt, including an expired fenced attempt."""
+
+
+class RunAttemptLimitError(RunLifecycleStateError):
+    """A run has exhausted the request's immutable attempt budget."""
+
+
+class AttemptFenceError(RunLifecycleStateError):
+    """An attempt mutation failed its owner, running-state, or lease fence."""
+
+
+class InputCutMismatchError(RunLifecycleStateError):
+    """An observed cut differs from the run's immutable first aligned cut."""
+
+
+class StoredLifecycleIntegrityError(StoredMetadataIntegrityError):
+    """Stored lifecycle rows violate their typed aggregate closure."""
+
+
+class LifecycleCommitUnknownError(LifecyclePersistenceError):
+    """A lifecycle COMMIT could not be confirmed by its durable operation receipt."""
+
+
+class LifecycleTransactionError(LifecyclePersistenceError):
+    """A lifecycle transaction definitively failed without a durable receipt."""

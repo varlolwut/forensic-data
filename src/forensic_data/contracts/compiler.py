@@ -38,7 +38,9 @@ from forensic_data.contracts.model import (
     MinimumEvidence,
     NullPartitionPolicy,
     ProjectedField,
+    ReadinessManifestColumns,
     RelationLocator,
+    RelationManifestReadiness,
     RelationScope,
     RowCheckDefinition,
     ScopeBinding,
@@ -59,6 +61,7 @@ from forensic_data.contracts.source import (
     EvidenceSource,
     LoadedContractSource,
     LogicalTypeSource,
+    RelationManifestReadinessSource,
     RelationSource,
     SchemaSource,
     ScopeSource,
@@ -499,11 +502,19 @@ def _compile_consistency(
                 f"{context} stable-read strategy is unsupported for dataset "
                 f"{dataset.dataset_id!r}: kind={item.stable_read!r}"
             ) from None
-        readiness = _compile_sql_artifact(
-            item.readiness,
-            dataset.connection.adapter,
-            f"{context} readiness artifact for dataset {dataset.dataset_id!r}",
-        )
+        readiness_context = f"{context} readiness for dataset {dataset.dataset_id!r}"
+        if isinstance(item.readiness, SqlArtifactSource):
+            readiness = _compile_sql_artifact(
+                item.readiness,
+                dataset.connection.adapter,
+                f"{readiness_context} artifact",
+            )
+        else:
+            readiness = _compile_relation_manifest_readiness(
+                item.readiness,
+                dataset,
+                readiness_context,
+            )
         compiled_datasets.append(
             ConsistencyDatasetDefinition(
                 dataset_id=dataset.dataset_id,
@@ -518,6 +529,56 @@ def _compile_consistency(
         alignment_fields=alignment_fields,
         late_arrivals=late_arrivals,
         datasets=tuple(compiled_datasets),
+    )
+
+
+def _compile_relation_manifest_readiness(
+    source: RelationManifestReadinessSource,
+    dataset: DatasetDefinition,
+    context: str,
+) -> RelationManifestReadiness:
+    if dataset.connection.adapter is not Adapter.POSTGRESQL:
+        raise UnsupportedContractError(
+            f"{context} relation manifest requires the PostgreSQL adapter"
+        )
+    if source.relation.catalog is not None:
+        raise UnsupportedContractError(
+            f"{context} PostgreSQL relation catalog is unsupported; use null"
+        )
+    if source.relation.schema is None:
+        raise UnsupportedContractError(f"{context} PostgreSQL relation requires an explicit schema")
+    relation = RelationLocator(
+        catalog=None,
+        schema=_physical_name(source.relation.schema, f"{context} relation schema"),
+        name=_physical_name(source.relation.name, f"{context} relation name"),
+        relation_scope=RelationScope.PHYSICAL_ONLY,
+    )
+    columns = source.columns
+    return RelationManifestReadiness(
+        connection_id=dataset.connection.connection_id,
+        relation=relation,
+        columns=ReadinessManifestColumns(
+            dataset_id=_physical_name(columns.dataset_id, f"{context} dataset_id column"),
+            scope_digest=_physical_name(
+                columns.scope_digest,
+                f"{context} scope_digest column",
+            ),
+            batch_id=_physical_name(columns.batch_id, f"{context} batch_id column"),
+            state=_physical_name(columns.state, f"{context} state column"),
+            business_date=_physical_name(
+                columns.business_date,
+                f"{context} business_date column",
+            ),
+            source_cut=_physical_name(columns.source_cut, f"{context} source_cut column"),
+            dataset_version=_physical_name(
+                columns.dataset_version,
+                f"{context} dataset_version column",
+            ),
+            completed_at=_physical_name(
+                columns.completed_at,
+                f"{context} completed_at column",
+            ),
+        ),
     )
 
 
@@ -673,14 +734,21 @@ def _select_consistency(
                 f"{context} consistency policy does not define {direction} dataset "
                 f"{dataset.dataset_id!r}"
             )
-        actual_parameters = tuple(parameter.field for parameter in item.readiness.parameters)
-        if not _parameter_definitions_are_ordered_subset(
-            expected_parameters,
-            actual_parameters,
-        ):
+        if isinstance(item.readiness, SqlArtifactDefinition):
+            actual_parameters = tuple(parameter.field for parameter in item.readiness.parameters)
+            if not _parameter_definitions_are_ordered_subset(
+                expected_parameters,
+                actual_parameters,
+            ):
+                raise ContractValidationError(
+                    f"{context} readiness parameters for {direction} dataset "
+                    f"{dataset.dataset_id!r} must be an ordered typed subset of the scope "
+                    "parameters"
+                )
+        elif item.readiness.connection_id != dataset.connection.connection_id:
             raise ContractValidationError(
-                f"{context} readiness parameters for {direction} dataset {dataset.dataset_id!r} "
-                "must be an ordered typed subset of the scope parameters"
+                f"{context} readiness relation for {direction} dataset "
+                f"{dataset.dataset_id!r} must use the dataset connection"
             )
         selected.append(item)
     return ConsistencyDefinition(

@@ -12,8 +12,10 @@ application. It provides:
   identity primitives;
 - a strict version-1 YAML contract loader, pure reference/schema resolver, semantic digests, and
   static plan report;
-- a bounded PostgreSQL read connector and SQL lowering for the initial common type profile;
-- versioned PostgreSQL metadata migrations and typed immutable contract registration; and
+- a bounded PostgreSQL read connector, protected relation-manifest readiness acquisition, and SQL
+  lowering for the initial common type profile;
+- versioned PostgreSQL metadata migrations, typed immutable contract registration, and durable
+  run/acquisition lifecycle records; and
 - reproducible Python package, PostgreSQL fixture, container, and CI builds.
 
 There is no end-user CLI, scheduler integration, or multi-engine execution workflow yet. Static
@@ -34,6 +36,12 @@ regular table with `FROM ONLY`:
 - a partition leaf can be addressed directly as a physical table;
 - partitioned parents and views are rejected; and
 - changing the qualified name to a different relation is detected before any result row is used.
+
+Protected acquisition applies the same physical-only rule to both the dataset and its readiness
+manifest: each must be a permanent regular table. On each dataset connection, both relations are
+resolved and held with `ACCESS SHARE` locks before the first snapshot-forming query in the
+read-only Repeatable Read transaction. This keeps the exact relation identities protected for the
+life of that read context, including across empty reads.
 
 The initial logical-to-physical mappings are:
 
@@ -129,9 +137,14 @@ plan = compile_static_plan(
 print(plan.model_dump_json(indent=2))
 ```
 
-The checked-in example is complete and loadable, but planning it remains static. Its readiness SQL
-describes operator-managed batch-manifest evidence; capturing that SQL does not execute it or prove
-the sources ready.
+The checked-in [SQL-backed example](examples/postgres-row/contract.yaml) is complete and loadable,
+but planning it remains static. Its readiness SQL describes operator-managed batch-manifest
+evidence; capturing that SQL does not execute it or prove the sources ready. SQL dataset locators
+and opaque SQL readiness artifacts are not supported by the current runtime acquisition path.
+
+The [native relation-manifest example](examples/postgres-relation-manifest/contract.yaml) shows the
+runtime-supported readiness form. Static planning is still informational for this example and does
+not itself acquire a snapshot or compare data.
 
 `contract_digest` identifies the resolved comparison semantics but excludes runtime scope values,
 secrets, paths, budgets, evidence settings, and metadata settings. `scope_digest` binds the typed
@@ -140,6 +153,30 @@ stages remain explicitly `required_not_run` or `planned_not_run`, and its estima
 `unknown`. It is unsigned informational output, not an authenticated executable contract; digest
 fields in a deserialized report are sender claims. Execution must load and compile the source
 contract again rather than trusting a supplied report.
+
+## Native readiness and durable acquisition
+
+The native `relation_manifest` provider runs on the same connection as its dataset and requires an
+explicit mapping for exactly eight facts: `dataset_id`, `scope_digest`, `batch_id`, `state`,
+`business_date`, `source_cut`, `dataset_version`, and `completed_at`. It reads the current manifest
+head for the requested dataset and scope, then checks the expected batch in application code. Zero
+rows, more than one row, a `building` row, or a different batch produces a typed `NOT_READY`
+outcome. Unknown state values, malformed identities, invalid physical types, and malformed
+completion facts are errors.
+
+The runtime request supplies expected batch IDs separately for the reference and target; they may
+differ, and the provider never chooses a latest batch automatically. The loader must publish the
+dataset and its current manifest head consistently, mark a row `complete` only after the data is
+ready, issue a new `dataset_version` whenever the published dataset cut changes, and keep
+`source_cut` consistent with the upstream cut. `VERIFIED` means that these facts were observed in
+the protected snapshot under that publication protocol, not that the provider independently proved
+the manifest's truthfulness.
+
+Metadata persistence records immutable run requests, leased attempts, protected read contexts, and
+per-dataset readiness observations. The first aligned input cut is bound once to the run; retries
+may use a new snapshot but cannot silently change that cut. Attempt outcomes are currently limited
+to incomplete, error, or abandoned. No completed comparison result can be published until the
+comparison stages exist.
 
 ## PostgreSQL metadata bootstrap
 
@@ -166,7 +203,9 @@ and writer roles can validate the journal version but cannot change it or perfor
 validated row check. `register_postgres_metadata(...)` then stores immutable dataset and contract
 versions and append-only SQL capture records. Secret references, artifact paths, budgets, and SQL
 bytes disabled by the evidence policy are never stored. A later enabled capture creates a separate
-record without mutating the semantic version.
+record without mutating the semantic version. The lifecycle migration adds run, attempt, protected
+read-context, and dataset-observation records plus narrow immutable lease-renewal receipts; it does
+not pre-create result, check, segment, or anomaly records.
 
 ## PostgreSQL fixture and checks
 
@@ -201,7 +240,7 @@ previously started with different values, run the cleanup command below before s
 The protocol/result tests can run without Docker, but this does not verify PostgreSQL support:
 
 ```console
-uv run pytest --ignore=tests/test_postgres_integration.py --ignore=tests/test_postgres_metadata_integration.py
+uv run pytest --ignore=tests/test_postgres_integration.py --ignore=tests/test_postgres_metadata_integration.py --ignore=tests/test_postgres_protected_integration.py --ignore=tests/test_postgres_lifecycle_schema_integration.py --ignore=tests/test_postgres_lifecycle_integration.py
 ```
 
 Stop and remove only this disposable fixture and its data volume:
@@ -212,8 +251,9 @@ docker compose --env-file tests/fixtures/postgres/.env --file tests/fixtures/pos
 
 The integration suite exercises real catalog inspection, canonical row/hash equivalence, bounded
 server-side cursors, duplicate bags, empty tables, precision rejection, relation replacement, row
-level security, read-only enforcement, concurrent-writer snapshot stability, metadata migration
-serialization and rollback, role separation, and immutable registration/readback.
+level security, read-only enforcement, concurrent-writer snapshot stability, protected
+dataset/manifest locking, metadata migration serialization and rollback, role separation, immutable
+registration/readback, and lifecycle fencing and identity constraints.
 
 ## Build artifacts
 

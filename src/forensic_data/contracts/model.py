@@ -180,6 +180,77 @@ type DatasetLocator = RelationLocator | SqlArtifactDefinition
 
 @final
 @dataclass(frozen=True, slots=True)
+class ReadinessManifestColumns:
+    dataset_id: str
+    scope_digest: str
+    batch_id: str
+    state: str
+    business_date: str
+    source_cut: str
+    dataset_version: str
+    completed_at: str
+
+    def __post_init__(self) -> None:
+        values = self.values()
+        for name, value in zip(
+            (
+                "dataset_id",
+                "scope_digest",
+                "batch_id",
+                "state",
+                "business_date",
+                "source_cut",
+                "dataset_version",
+                "completed_at",
+            ),
+            values,
+            strict=True,
+        ):
+            _require_physical_text(value, f"readiness manifest {name} column")
+        if len(set(values)) != len(values):
+            raise ContractValidationError(
+                "readiness manifest column mappings must reference distinct columns"
+            )
+
+    def values(self) -> tuple[str, ...]:
+        return (
+            self.dataset_id,
+            self.scope_digest,
+            self.batch_id,
+            self.state,
+            self.business_date,
+            self.source_cut,
+            self.dataset_version,
+            self.completed_at,
+        )
+
+
+@final
+@dataclass(frozen=True, slots=True)
+class RelationManifestReadiness:
+    connection_id: str
+    relation: RelationLocator
+    columns: ReadinessManifestColumns
+
+    def __post_init__(self) -> None:
+        _require_logical_text(self.connection_id, "readiness manifest connection id")
+        _require_instance(self.relation, RelationLocator, "readiness manifest relation")
+        if self.relation.catalog is not None:
+            raise ContractValidationError(
+                "PostgreSQL readiness manifest relation catalog must be null"
+            )
+        if self.relation.relation_scope is not RelationScope.PHYSICAL_ONLY:
+            raise ContractValidationError(
+                "readiness manifest relation requires physical_only relation scope"
+            )
+        _require_instance(self.columns, ReadinessManifestColumns, "readiness manifest columns")
+
+
+type ReadinessDefinition = SqlArtifactDefinition | RelationManifestReadiness
+
+
+@final
+@dataclass(frozen=True, slots=True)
 class ProjectedField:
     field_name: str
     column_name: str
@@ -289,16 +360,12 @@ class ScopeDefinition:
 @dataclass(frozen=True, slots=True)
 class ConsistencyDatasetDefinition:
     dataset_id: str
-    readiness: SqlArtifactDefinition
+    readiness: ReadinessDefinition
     stable_read: StableReadKind
 
     def __post_init__(self) -> None:
         _require_logical_text(self.dataset_id, "consistency dataset id")
-        _require_instance(
-            self.readiness,
-            SqlArtifactDefinition,
-            "consistency readiness",
-        )
+        _require_readiness(self.readiness)
         _require_enum(self.stable_read, StableReadKind, "stable-read strategy")
 
 
@@ -489,16 +556,22 @@ class RowCheckDefinition:
             raise ContractValidationError(
                 "check consistency datasets must be ordered reference then target"
             )
-        for direction, item in zip(
+        for direction, item, dataset in zip(
             ("reference", "target"),
             self.consistency.datasets,
+            (self.reference, self.target),
             strict=True,
         ):
-            _require_parameter_subset(
-                expected_parameters,
-                tuple(parameter.field for parameter in item.readiness.parameters),
-                f"check {direction} readiness parameters",
-            )
+            if isinstance(item.readiness, SqlArtifactDefinition):
+                _require_parameter_subset(
+                    expected_parameters,
+                    tuple(parameter.field for parameter in item.readiness.parameters),
+                    f"check {direction} readiness parameters",
+                )
+            elif item.readiness.connection_id != dataset.connection.connection_id:
+                raise ContractValidationError(
+                    f"check {direction} readiness manifest must use the dataset connection"
+                )
         _require_enum(self.assurance_policy, AssurancePolicy, "check assurance policy")
         from forensic_data.contracts.identity import contract_digest_hex
 
@@ -743,6 +816,13 @@ def _require_instance[ObjectT](
 def _require_locator(value: object) -> None:
     if not isinstance(value, (RelationLocator, SqlArtifactDefinition)):
         raise ContractValidationError("dataset locator must be a relation or SQL artifact")
+
+
+def _require_readiness(value: object) -> None:
+    if not isinstance(value, (SqlArtifactDefinition, RelationManifestReadiness)):
+        raise ContractValidationError(
+            "consistency readiness must be a SQL artifact or relation manifest"
+        )
 
 
 def _require_check_scope_bindings(

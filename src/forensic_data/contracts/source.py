@@ -157,12 +157,32 @@ class _ReadinessSqlInput(_InputModel):
     parameters: tuple[_SqlParameterInput, ...]
 
 
+class _ReadinessManifestColumnsInput(_InputModel):
+    dataset_id: NonEmptyText
+    scope_digest: NonEmptyText
+    batch_id: NonEmptyText
+    state: NonEmptyText
+    business_date: NonEmptyText
+    source_cut: NonEmptyText
+    dataset_version: NonEmptyText
+    completed_at: NonEmptyText
+
+
+class _ReadinessRelationManifestInput(_InputModel):
+    kind: Literal["relation_manifest"]
+    relation: _RelationInput
+    columns: _ReadinessManifestColumnsInput
+
+
+type _ReadinessInput = _ReadinessSqlInput | _ReadinessRelationManifestInput
+
+
 class _StableReadInput(_InputModel):
     kind: NonEmptyText
 
 
 class _ConsistencyDatasetInput(_InputModel):
-    readiness: _ReadinessSqlInput
+    readiness: _ReadinessInput
     stable_read: _StableReadInput
 
 
@@ -326,6 +346,29 @@ type DatasetLocatorSource = RelationSource | SqlArtifactSource
 
 @final
 @dataclass(frozen=True, slots=True)
+class ReadinessManifestColumnsSource:
+    dataset_id: str
+    scope_digest: str
+    batch_id: str
+    state: str
+    business_date: str
+    source_cut: str
+    dataset_version: str
+    completed_at: str
+
+
+@final
+@dataclass(frozen=True, slots=True)
+class RelationManifestReadinessSource:
+    relation: RelationSource
+    columns: ReadinessManifestColumnsSource
+
+
+type ReadinessSource = SqlArtifactSource | RelationManifestReadinessSource
+
+
+@final
+@dataclass(frozen=True, slots=True)
 class ProjectionSource:
     field: str
     column: str
@@ -370,7 +413,7 @@ class ScopeSource:
 @dataclass(frozen=True, slots=True)
 class ConsistencyDatasetSource:
     dataset_ref: str
-    readiness: SqlArtifactSource
+    readiness: ReadinessSource
     stable_read: str
 
 
@@ -680,10 +723,8 @@ def _consistency_source(
     datasets = tuple(
         ConsistencyDatasetSource(
             dataset_ref=dataset_ref,
-            readiness=_sql_artifact_source(
-                dataset.readiness.path,
-                dataset.readiness.dialect,
-                _sql_parameters(dataset.readiness.parameters),
+            readiness=_readiness_source(
+                dataset.readiness,
                 base_directory,
                 captured_artifacts,
             ),
@@ -697,6 +738,40 @@ def _consistency_source(
         alignment_fields=value.alignment_fields,
         late_arrivals=value.late_arrivals,
         datasets=datasets,
+    )
+
+
+def _readiness_source(
+    value: _ReadinessInput,
+    base_directory: Path,
+    captured_artifacts: Mapping[Path, _CapturedSqlArtifact],
+) -> ReadinessSource:
+    if isinstance(value, _ReadinessSqlInput):
+        return _sql_artifact_source(
+            value.path,
+            value.dialect,
+            _sql_parameters(value.parameters),
+            base_directory,
+            captured_artifacts,
+        )
+    relation = RelationSource(
+        catalog=value.relation.catalog,
+        schema=value.relation.schema_name,
+        name=value.relation.name,
+    )
+    columns = value.columns
+    return RelationManifestReadinessSource(
+        relation=relation,
+        columns=ReadinessManifestColumnsSource(
+            dataset_id=columns.dataset_id,
+            scope_digest=columns.scope_digest,
+            batch_id=columns.batch_id,
+            state=columns.state,
+            business_date=columns.business_date,
+            source_cut=columns.source_cut,
+            dataset_version=columns.dataset_version,
+            completed_at=columns.completed_at,
+        ),
     )
 
 
@@ -727,7 +802,8 @@ def _configured_sql_artifact_paths(value: _ConfigInput) -> tuple[str, ...]:
             paths.append(dataset.sql.path)
     for _, consistency in sorted(value.consistency.items()):
         for _, dataset in sorted(consistency.datasets.items()):
-            paths.append(dataset.readiness.path)
+            if isinstance(dataset.readiness, _ReadinessSqlInput):
+                paths.append(dataset.readiness.path)
     return tuple(paths)
 
 

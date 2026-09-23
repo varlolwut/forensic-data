@@ -4,6 +4,7 @@ from forensic_data.contracts.model import (
     ConsistencyDefinition,
     DatasetDefinition,
     LogicalSchemaDefinition,
+    ReadinessDefinition,
     RelationLocator,
     RowCheckDefinition,
     ScopeDefinition,
@@ -111,6 +112,27 @@ def _locator_semantics(locator: RelationLocator | SqlArtifactDefinition) -> Sema
     }
 
 
+def _readiness_semantics(readiness: ReadinessDefinition) -> SemanticValue:
+    if isinstance(readiness, SqlArtifactDefinition):
+        return _locator_semantics(readiness)
+    columns = readiness.columns
+    return {
+        "columns": {
+            "batch_id": columns.batch_id,
+            "business_date": columns.business_date,
+            "completed_at": columns.completed_at,
+            "dataset_id": columns.dataset_id,
+            "dataset_version": columns.dataset_version,
+            "scope_digest": columns.scope_digest,
+            "source_cut": columns.source_cut,
+            "state": columns.state,
+        },
+        "connection_id": readiness.connection_id,
+        "kind": "relation_manifest",
+        "relation": _locator_semantics(readiness.relation),
+    }
+
+
 def _sql_parameter_semantics(parameter: SqlParameterDefinition) -> SemanticValue:
     return {"name": parameter.name, "type": _field_type_semantics(parameter.field)}
 
@@ -158,7 +180,7 @@ def _consistency_semantics(consistency: ConsistencyDefinition) -> SemanticValue:
         "datasets": [
             {
                 "dataset_id": item.dataset_id,
-                "readiness": _locator_semantics(item.readiness),
+                "readiness": _readiness_semantics(item.readiness),
                 "stable_read": item.stable_read.value,
             }
             for item in consistency.datasets

@@ -128,14 +128,15 @@ def code_artifact_capture_definitions(
         check.consistency.datasets,
         strict=True,
     ):
-        definitions.append(
-            _readiness_capture_definition(
-                direction,
-                consistency_dataset,
-                check,
-                evidence.sql_capture,
+        if isinstance(consistency_dataset.readiness, SqlArtifactDefinition):
+            definitions.append(
+                _readiness_capture_definition(
+                    direction,
+                    consistency_dataset,
+                    check,
+                    evidence.sql_capture,
+                )
             )
-        )
     return tuple(definitions)
 
 
@@ -169,6 +170,8 @@ def _readiness_capture_definition(
     check: RowCheckDefinition,
     capture_policy: CapturePolicy,
 ) -> CodeArtifactCaptureDefinition:
+    if not isinstance(consistency_dataset.readiness, SqlArtifactDefinition):
+        raise ValueError("relation manifest readiness does not have a SQL code artifact")
     return _code_artifact_capture_definition(
         direction,
         ArtifactPurpose.READINESS,
