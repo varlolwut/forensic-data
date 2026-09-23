@@ -1,0 +1,27 @@
+name: forensic-data-phase01-pg17
+
+services:
+  postgres:
+    image: postgres:17.11-bookworm@sha256:91eb910c44c7ed13f7f1a4ccadaa9ca72ef14cddc04cacb6e070e48eb44731a3
+    platform: linux/amd64
+    environment:
+      POSTGRES_DB: dfe_fixture
+      POSTGRES_USER: postgres
+      POSTGRES_PASSWORD: ${DFE_PG_ADMIN_PASSWORD:?set DFE_PG_ADMIN_PASSWORD}
+      DFE_PG_READER_PASSWORD: ${DFE_PG_READER_PASSWORD:?set DFE_PG_READER_PASSWORD}
+      DFE_PG_WRITER_PASSWORD: ${DFE_PG_WRITER_PASSWORD:?set DFE_PG_WRITER_PASSWORD}
+    ports:
+      - 127.0.0.1:${DFE_PG_PORT:?set DFE_PG_PORT}:5432
+    volumes:
+      - postgres-data:/var/lib/postgresql/data
+      - ./init:/docker-entrypoint-initdb.d:ro
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready --username postgres --dbname dfe_fixture"]
+      interval: 2s
+      timeout: 2s
+      retries: 30
+      start_period: 5s
+    restart: "no"
+
+volumes:
+  postgres-data:
