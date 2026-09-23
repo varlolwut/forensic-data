@@ -22,12 +22,15 @@ from forensic_data.canonical import (
     schema_from_metadata_json,
 )
 from forensic_data.postgres import (
+    PostgresContextClosedError,
+    PostgresContextLostError,
     PostgresDataValidationError,
     PostgresMetadataError,
     PostgresQueryContextError,
     PostgresQueryError,
     PostgresResultLimitError,
     PostgresSslMode,
+    ReadContextState,
 )
 from forensic_data.postgres_sql import (
     PostgresLoweringError,
@@ -719,6 +722,111 @@ def test_postgres_compiled_queries_reject_schema_replacement_before_fetch() -> N
             writer.execute(
                 sql.SQL("DROP SCHEMA IF EXISTS {} CASCADE").format(sql.Identifier(schema_name))
             )
+        writer.close()
+
+
+def test_postgres_repeatable_read_snapshot_ignores_concurrent_writer() -> None:
+    context = open_reader_context(_READER_SETTINGS)
+    writer = connect_writer(_WRITER_SETTINGS)
+    try:
+        evidence = context.evidence
+        assert evidence.engine == "postgresql"
+        assert evidence.strategy == "read_only_repeatable_read"
+        assert evidence.snapshot_locator
+        assert evidence.backend_process_id > 0
+        assert evidence.allowed_concurrency == 1
+        assert (
+            context.read_scalar_integer(
+                sql.SQL(
+                    "SELECT observed_value FROM ONLY dfe_fixture.snapshot_values "
+                    "WHERE record_id = 1"
+                ),
+                (),
+                128,
+                128,
+            )
+            == 100
+        )
+
+        update = writer.execute(
+            "UPDATE dfe_fixture.snapshot_values SET observed_value = %s WHERE record_id = 1",
+            (200,),
+        )
+        assert update.rowcount == 1
+        assert (
+            context.read_scalar_integer(
+                sql.SQL(
+                    "SELECT observed_value FROM ONLY dfe_fixture.snapshot_values "
+                    "WHERE record_id = 1"
+                ),
+                (),
+                128,
+                128,
+            )
+            == 100
+        )
+
+        refreshed_context = open_reader_context(_READER_SETTINGS)
+        try:
+            assert (
+                refreshed_context.read_scalar_integer(
+                    sql.SQL(
+                        "SELECT observed_value FROM ONLY dfe_fixture.snapshot_values "
+                        "WHERE record_id = 1"
+                    ),
+                    (),
+                    128,
+                    128,
+                )
+                == 200
+            )
+        finally:
+            refreshed_context.close()
+
+        context.close()
+        assert context.state is ReadContextState.CLOSED
+        with pytest.raises(PostgresContextClosedError, match="already closed"):
+            context.read_scalar_integer(sql.SQL("SELECT 1"), (), 128, 128)
+    finally:
+        reset = writer.execute(
+            "UPDATE dfe_fixture.snapshot_values SET observed_value = %s WHERE record_id = 1",
+            (100,),
+        )
+        assert reset.rowcount == 1
+        writer.close()
+        context.close()
+
+
+def test_postgres_read_only_failure_loses_context_and_close_is_terminal() -> None:
+    context = open_reader_context(_WRITER_SETTINGS)
+    try:
+        with pytest.raises(PostgresQueryError, match="sqlstate='25006'"):
+            context.read_scalar_integer(
+                sql.SQL(
+                    "SELECT pg_catalog.nextval("
+                    "'dfe_fixture.read_only_probe_sequence'::pg_catalog.regclass)"
+                ),
+                (),
+                128,
+                128,
+            )
+        assert context.state is ReadContextState.LOST
+        with pytest.raises(PostgresContextLostError, match="cannot be reused"):
+            context.read_scalar_integer(sql.SQL("SELECT 1"), (), 128, 128)
+    finally:
+        context.close()
+
+    assert context.state is ReadContextState.CLOSED
+    with pytest.raises(PostgresContextClosedError, match="already closed"):
+        context.read_scalar_integer(sql.SQL("SELECT 1"), (), 128, 128)
+
+    writer = connect_writer(_WRITER_SETTINGS)
+    try:
+        row = writer.execute(
+            "SELECT last_value, is_called FROM dfe_fixture.read_only_probe_sequence"
+        ).fetchone()
+        assert row == (1, False)
+    finally:
         writer.close()
 
 

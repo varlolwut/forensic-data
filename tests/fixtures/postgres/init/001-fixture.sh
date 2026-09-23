@@ -101,6 +101,8 @@ CREATE TABLE dfe_fixture.inheritance_parent_values (
 CREATE TABLE dfe_fixture.inheritance_child_values ()
 INHERITS (dfe_fixture.inheritance_parent_values);
 
+CREATE SEQUENCE dfe_fixture.read_only_probe_sequence;
+
 CREATE VIEW dfe_fixture.volatile_values AS
 SELECT clock_timestamp() AS observed_value;
 
