@@ -1,6 +1,8 @@
 import hashlib
 import json
-from typing import Never, cast
+from dataclasses import dataclass
+from dataclasses import field as dataclass_field
+from typing import Never, cast, final
 
 from forensic_data.canonical.model import (
     CanonicalSchema,
@@ -17,6 +19,35 @@ _SCHEMA_KEYS = frozenset(("protocol", "fields"))
 _FIELD_KEYS = frozenset(("name", "type", "nullable", "parameters", "normalization"))
 _DECIMAL_PARAMETER_KEYS = frozenset(("precision", "scale"))
 _TIMESTAMP_PARAMETER_KEYS = frozenset(("precision",))
+_ROW_PREFIX = "DFE1R"
+_KEY_PREFIX = "DFE1K"
+
+
+@final
+@dataclass(frozen=True, slots=True)
+class CanonicalEnvelopeContext:
+    schema: CanonicalSchema
+    metadata_json: str = dataclass_field(init=False)
+    schema_digest: bytes = dataclass_field(init=False)
+    schema_digest_hex: str = dataclass_field(init=False)
+    row_header: str = dataclass_field(init=False)
+    key_header: str = dataclass_field(init=False)
+
+    def __post_init__(self) -> None:
+        validated_schema = _require_schema(self.schema)
+        metadata_json = canonical_schema_json(validated_schema)
+        digest = _metadata_digest(metadata_json)
+        digest_hex = digest.hex()
+        header_suffix = f"{digest_hex}{len(validated_schema.fields):08x}"
+        object.__setattr__(self, "metadata_json", metadata_json)
+        object.__setattr__(self, "schema_digest", digest)
+        object.__setattr__(self, "schema_digest_hex", digest_hex)
+        object.__setattr__(self, "row_header", f"{_ROW_PREFIX}{header_suffix}")
+        object.__setattr__(self, "key_header", f"{_KEY_PREFIX}{header_suffix}")
+
+
+def prepare_envelope_context(schema: CanonicalSchema) -> CanonicalEnvelopeContext:
+    return CanonicalEnvelopeContext(schema=schema)
 
 
 def schema_from_metadata_json(metadata_json: str) -> CanonicalSchema:
@@ -82,11 +113,15 @@ def canonical_schema_json(schema: CanonicalSchema) -> str:
 
 
 def schema_digest(schema: CanonicalSchema) -> bytes:
-    return hashlib.sha256(canonical_schema_json(schema).encode("utf-8")).digest()
+    return _metadata_digest(canonical_schema_json(schema))
 
 
 def schema_digest_hex(schema: CanonicalSchema) -> str:
     return schema_digest(schema).hex()
+
+
+def _metadata_digest(metadata_json: str) -> bytes:
+    return hashlib.sha256(metadata_json.encode("utf-8")).digest()
 
 
 def _object_without_duplicate_keys(

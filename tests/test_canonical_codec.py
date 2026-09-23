@@ -18,11 +18,16 @@ from forensic_data.canonical import (
     PayloadValidationError,
     TimestampParameters,
     decode_key,
+    decode_key_with_context,
     decode_payload,
     decode_row,
+    decode_row_with_context,
     encode_key,
+    encode_key_with_context,
     encode_payload,
     encode_row,
+    encode_row_with_context,
+    prepare_envelope_context,
     schema_digest_hex,
     schema_from_metadata_json,
 )
@@ -41,8 +46,9 @@ def test_all_common_types_row_matches_independent_golden_vector() -> None:
         "2024-02-29T23:59:58.123456",
         "2024-02-29T21:29:58.123456Z",
     )
+    context = prepare_envelope_context(schema)
 
-    envelope = encode_row(schema, values)
+    envelope = encode_row_with_context(context, values)
 
     assert vector.values == (
         "-9223372036854775808",
@@ -55,7 +61,11 @@ def test_all_common_types_row_matches_independent_golden_vector() -> None:
     )
     assert envelope == vector.envelope_ascii.encode("ascii")
     assert envelope.hex() == vector.envelope_hex
-    assert decode_row(schema, envelope) == (
+    assert context.metadata_json == vector.metadata_json
+    assert context.schema_digest_hex == vector.schema_digest_hex
+    assert context.schema_digest == bytes.fromhex(vector.schema_digest_hex)
+    assert context.row_header == vector.envelope_ascii[:77]
+    assert decode_row_with_context(context, envelope) == (
         -9223372036854775808,
         Decimal("-1780.000"),
         True,
@@ -69,12 +79,14 @@ def test_all_common_types_row_matches_independent_golden_vector() -> None:
 def test_composite_key_matches_independent_golden_vector() -> None:
     vector = vector_named("composite_key")
     schema = schema_from_metadata_json(vector.metadata_json)
+    context = prepare_envelope_context(schema)
 
-    envelope = encode_key(schema, (42, "A|Б😀e\u0301  "))
+    envelope = encode_key_with_context(context, (42, "A|Б😀e\u0301  "))
 
     assert envelope == vector.envelope_ascii.encode("ascii")
     assert envelope.hex() == vector.envelope_hex
-    assert decode_key(schema, envelope) == (42, "A|Б😀e\u0301  ")
+    assert context.key_header == vector.envelope_ascii[:77]
+    assert decode_key_with_context(context, envelope) == (42, "A|Б😀e\u0301  ")
 
 
 @pytest.mark.parametrize(
@@ -130,11 +142,14 @@ def test_decimal_precision_boundary_and_loss_are_enforced() -> None:
     scale_equals_precision = _field("value", LogicalType.DECIMAL, False, DecimalParameters(3, 3))
 
     assert encode_payload(maximum, "9" * 38) == ("9" * 38).encode("ascii")
+    assert encode_payload(maximum, (10**38) - 1) == ("9" * 38).encode("ascii")
     assert encode_payload(scale_equals_precision, "0.999") == b"999"
     with pytest.raises(PayloadValidationError, match="precision"):
         encode_payload(maximum, "1" + ("0" * 38))
     with pytest.raises(PayloadValidationError, match="precision"):
         encode_payload(scale_equals_precision, "1.000")
+    with pytest.raises(PayloadValidationError, match="precision"):
+        encode_payload(maximum, 1 << 1_000_000)
     with pytest.raises(PayloadValidationError, match="rounding"):
         encode_payload(scale_two, Decimal("120.001"))
     with pytest.raises(PayloadValidationError):

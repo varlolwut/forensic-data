@@ -20,10 +20,8 @@ from forensic_data.canonical.model import (
     SchemaValidationError,
     TimestampParameters,
 )
-from forensic_data.canonical.schema import schema_digest_hex
+from forensic_data.canonical.schema import CanonicalEnvelopeContext, prepare_envelope_context
 
-_ROW_PREFIX = "DFE1R"
-_KEY_PREFIX = "DFE1K"
 _ENVELOPE_HEADER_LENGTH = 5 + 64 + 8
 _FIELD_HEADER_LENGTH = 2 + 1 + 16
 _CANONICAL_INTEGER = re.compile(r"(?:0|-?[1-9][0-9]*)\Z", re.ASCII)
@@ -113,32 +111,56 @@ def decode_payload(field: FieldSchema, payload: bytes) -> DecodedValue:
 
 
 def encode_row(schema: CanonicalSchema, values: Sequence[CanonicalInput | None]) -> bytes:
-    _require_values(schema, values)
+    return encode_row_with_context(prepare_envelope_context(schema), values)
+
+
+def encode_row_with_context(
+    context: CanonicalEnvelopeContext,
+    values: Sequence[CanonicalInput | None],
+) -> bytes:
+    context = _require_context(context)
+    _require_values(context.schema, values)
     frames: list[str] = []
-    for field, value in zip(schema.fields, values, strict=True):
+    for field, value in zip(context.schema.fields, values, strict=True):
         if value is None:
             if not field.nullable:
                 raise PayloadValidationError(f"nonnull row field {field.name!r} cannot encode NULL")
             frames.append(_null_frame(field))
         else:
             frames.append(_present_frame(field, encode_payload(field, value)))
-    return (_envelope_header(_ROW_PREFIX, schema) + "".join(frames)).encode("ascii")
+    return (context.row_header + "".join(frames)).encode("ascii")
 
 
 def encode_key(schema: CanonicalSchema, values: Sequence[CanonicalInput | None]) -> bytes:
-    _require_values(schema, values)
+    return encode_key_with_context(prepare_envelope_context(schema), values)
+
+
+def encode_key_with_context(
+    context: CanonicalEnvelopeContext,
+    values: Sequence[CanonicalInput | None],
+) -> bytes:
+    context = _require_context(context)
+    _require_values(context.schema, values)
     frames: list[str] = []
-    for field, value in zip(schema.fields, values, strict=True):
+    for field, value in zip(context.schema.fields, values, strict=True):
         if value is None:
             raise NullKeyError(f"key field {field.name!r} cannot be NULL")
         frames.append(_present_frame(field, encode_payload(field, value)))
-    return (_envelope_header(_KEY_PREFIX, schema) + "".join(frames)).encode("ascii")
+    return (context.key_header + "".join(frames)).encode("ascii")
 
 
 def decode_row(schema: CanonicalSchema, envelope: bytes) -> tuple[DecodedValue | None, ...]:
-    parsed_fields = _parse_envelope(schema, envelope, _ROW_PREFIX)
+    return decode_row_with_context(prepare_envelope_context(schema), envelope)
+
+
+def decode_row_with_context(
+    context: CanonicalEnvelopeContext,
+    envelope: bytes,
+) -> tuple[DecodedValue | None, ...]:
+    context = _require_context(context)
+    parsed_fields = _parse_envelope(context, envelope, context.row_header)
     values: list[DecodedValue | None] = []
-    for field, parsed in zip(schema.fields, parsed_fields, strict=True):
+    for field, parsed in zip(context.schema.fields, parsed_fields, strict=True):
         if parsed.payload is None:
             if not field.nullable:
                 raise FrameValidationError(f"nonnull row field {field.name!r} has a NULL frame")
@@ -149,9 +171,17 @@ def decode_row(schema: CanonicalSchema, envelope: bytes) -> tuple[DecodedValue |
 
 
 def decode_key(schema: CanonicalSchema, envelope: bytes) -> tuple[DecodedValue, ...]:
-    parsed_fields = _parse_envelope(schema, envelope, _KEY_PREFIX)
+    return decode_key_with_context(prepare_envelope_context(schema), envelope)
+
+
+def decode_key_with_context(
+    context: CanonicalEnvelopeContext,
+    envelope: bytes,
+) -> tuple[DecodedValue, ...]:
+    context = _require_context(context)
+    parsed_fields = _parse_envelope(context, envelope, context.key_header)
     values: list[DecodedValue] = []
-    for field, parsed in zip(schema.fields, parsed_fields, strict=True):
+    for field, parsed in zip(context.schema.fields, parsed_fields, strict=True):
         if parsed.payload is None:
             raise NullKeyError(f"key field {field.name!r} has a NULL frame")
         values.append(decode_payload(field, parsed.payload))
@@ -187,6 +217,12 @@ def _decode_int64(payload: bytes) -> int:
 
 
 def _encode_decimal(value: CanonicalInput, parameters: DecimalParameters) -> bytes:
+    if type(value) is int:
+        unscaled_bound = 10 ** (parameters.precision - parameters.scale)
+        if not -unscaled_bound < value < unscaled_bound:
+            raise PayloadValidationError(
+                f"decimal scaled integer exceeds declared precision {parameters.precision}"
+            )
     decimal_value = _decimal_from_input(value)
     if not decimal_value.is_finite():
         raise PayloadValidationError("decimal value must be finite")
@@ -346,11 +382,11 @@ def _encode_timestamp_local(value: CanonicalInput, precision: int) -> bytes:
                 "timestamp_local datetime must not carry timezone information"
             )
         fraction = _fit_fraction(f"{value.microsecond:06d}", precision, "timestamp_local")
-        return _format_timestamp(value, fraction, precision, False).encode("ascii")
+        return _format_timestamp(value, fraction, precision).encode("ascii")
     if type(value) is str:
         parsed, input_fraction = _parse_local_timestamp(value, "timestamp_local")
         fraction = _fit_fraction(input_fraction, precision, "timestamp_local")
-        return _format_timestamp(parsed, fraction, precision, False).encode("ascii")
+        return _format_timestamp(parsed, fraction, precision).encode("ascii")
     raise PayloadValidationError(
         "timestamp_local requires a naive datetime or exact timestamp text, "
         f"got {type(value).__name__}"
@@ -391,7 +427,7 @@ def _encode_timestamp_instant(value: CanonicalInput, precision: int) -> bytes:
                 "timestamp_instant UTC conversion failed or is outside the supported calendar range"
             ) from error
         fraction = _fit_fraction(f"{utc_value.microsecond:06d}", precision, "timestamp_instant")
-        return _format_timestamp(utc_value, fraction, precision, True).encode("ascii")
+        return f"{_format_timestamp(utc_value, fraction, precision)}Z".encode("ascii")
     if type(value) is str:
         local_value, input_fraction, offset = _parse_instant_timestamp(value, "timestamp_instant")
         try:
@@ -401,7 +437,7 @@ def _encode_timestamp_instant(value: CanonicalInput, precision: int) -> bytes:
                 "timestamp_instant UTC conversion is outside the supported calendar range"
             ) from error
         fraction = _fit_fraction(input_fraction, precision, "timestamp_instant")
-        return _format_timestamp(utc_value, fraction, precision, True).encode("ascii")
+        return f"{_format_timestamp(utc_value, fraction, precision)}Z".encode("ascii")
     raise PayloadValidationError(
         "timestamp_instant requires an aware datetime or offset-bearing timestamp text, "
         f"got {type(value).__name__}"
@@ -501,15 +537,13 @@ def _format_date(value: date) -> str:
     return f"{value.year:04d}-{value.month:02d}-{value.day:02d}"
 
 
-def _format_timestamp(value: datetime, fraction: str, precision: int, append_utc: bool) -> str:
+def _format_timestamp(value: datetime, fraction: str, precision: int) -> str:
     result = (
         f"{value.year:04d}-{value.month:02d}-{value.day:02d}"
         f"T{value.hour:02d}:{value.minute:02d}:{value.second:02d}"
     )
     if precision > 0:
         result += f".{fraction}"
-    if append_utc:
-        result += "Z"
     return result
 
 
@@ -524,14 +558,12 @@ def _present_frame(field: FieldSchema, payload: bytes) -> str:
     return f"{_type_tag(field.logical_type)}1{payload_length:016x}{payload.hex()}"
 
 
-def _envelope_header(prefix: str, schema: CanonicalSchema) -> str:
-    return f"{prefix}{schema_digest_hex(schema)}{len(schema.fields):08x}"
-
-
 def _parse_envelope(
-    schema: CanonicalSchema, envelope: bytes, expected_prefix: str
+    context: CanonicalEnvelopeContext,
+    envelope: bytes,
+    expected_header: str,
 ) -> tuple[_ParsedField, ...]:
-    _require_schema(schema)
+    schema = context.schema
     if type(envelope) is not bytes:
         raise FrameValidationError("canonical envelope must be bytes")
     try:
@@ -543,6 +575,7 @@ def _parse_envelope(
         ) from error
     if len(text) < _ENVELOPE_HEADER_LENGTH:
         raise FrameValidationError("canonical envelope is shorter than the 77-byte protocol header")
+    expected_prefix = expected_header[:5]
     if text[:5] != expected_prefix:
         raise FrameValidationError(
             f"canonical envelope prefix must be {expected_prefix!r}, got {text[:5]!r}"
@@ -553,7 +586,7 @@ def _parse_envelope(
         raise FrameValidationError(
             "canonical envelope schema digest must be 64 lowercase hex digits"
         )
-    expected_digest = schema_digest_hex(schema)
+    expected_digest = expected_header[5:69]
     if digest_text != expected_digest:
         raise FrameValidationError(
             "canonical envelope schema digest does not match the supplied logical schema: "
@@ -564,10 +597,11 @@ def _parse_envelope(
     if _LOWER_HEX_8.fullmatch(field_count_text) is None:
         raise FrameValidationError("canonical envelope field count must be 8 lowercase hex digits")
     field_count = int(field_count_text, 16)
-    if field_count != len(schema.fields):
+    expected_field_count = int(expected_header[69:77], 16)
+    if field_count != expected_field_count:
         raise FrameValidationError(
             "canonical envelope field count does not match the supplied logical schema: "
-            f"header={field_count}, schema={len(schema.fields)}"
+            f"header={field_count}, schema={expected_field_count}"
         )
 
     parsed_fields: list[_ParsedField] = []
@@ -657,6 +691,12 @@ def _require_schema(schema: object) -> CanonicalSchema:
     if not isinstance(schema, CanonicalSchema):
         raise SchemaValidationError("schema must be a CanonicalSchema")
     return schema
+
+
+def _require_context(context: object) -> CanonicalEnvelopeContext:
+    if not isinstance(context, CanonicalEnvelopeContext):
+        raise SchemaValidationError("context must be a CanonicalEnvelopeContext")
+    return context
 
 
 def _require_values(schema: object, values: object) -> None:

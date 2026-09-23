@@ -1,10 +1,14 @@
 from forensic_data.canonical.codec import (
     decode_key,
+    decode_key_with_context,
     decode_payload,
     decode_row,
+    decode_row_with_context,
     encode_key,
+    encode_key_with_context,
     encode_payload,
     encode_row,
+    encode_row_with_context,
 )
 from forensic_data.canonical.hashing import (
     Fingerprint,
@@ -42,7 +46,9 @@ from forensic_data.canonical.model import (
     TimestampParameters,
 )
 from forensic_data.canonical.schema import (
+    CanonicalEnvelopeContext,
     canonical_schema_json,
+    prepare_envelope_context,
     schema_digest,
     schema_digest_hex,
     schema_from_metadata_json,
@@ -50,6 +56,7 @@ from forensic_data.canonical.schema import (
 
 __all__ = (
     "PROTOCOL",
+    "CanonicalEnvelopeContext",
     "CanonicalInput",
     "CanonicalSchema",
     "CanonicalizationError",
@@ -73,16 +80,21 @@ __all__ = (
     "canonical_schema_json",
     "combine_fingerprints",
     "decode_key",
+    "decode_key_with_context",
     "decode_payload",
     "decode_row",
+    "decode_row_with_context",
     "encode_key",
+    "encode_key_with_context",
     "encode_payload",
     "encode_row",
+    "encode_row_with_context",
     "envelope_sha256",
     "fingerprint_hashes",
     "fingerprint_rows",
     "key_bucket",
     "key_segment",
+    "prepare_envelope_context",
     "row_bucket",
     "row_segment",
     "schema_digest",

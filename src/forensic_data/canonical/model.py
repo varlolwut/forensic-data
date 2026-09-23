@@ -101,7 +101,7 @@ class FieldSchema:
     normalization: Normalization
 
     def __post_init__(self) -> None:
-        _validate_unicode_scalars(self.name, "field name", True)
+        _validate_unicode_scalars(self.name, "field name")
         if not _is_logical_type(self.logical_type):
             raise SchemaValidationError("field logical_type must be a LogicalType")
         if type(self.nullable) is not bool:
@@ -152,7 +152,7 @@ type CanonicalInput = int | Decimal | bool | str | date | datetime
 type DecodedValue = int | Decimal | bool | str | date
 
 
-def _validate_unicode_scalars(value: object, context: str, allow_nul: bool) -> None:
+def _validate_unicode_scalars(value: object, context: str) -> None:
     if type(value) is not str:
         raise SchemaValidationError(f"{context} must be a string")
     for index, character in enumerate(value):
@@ -160,10 +160,6 @@ def _validate_unicode_scalars(value: object, context: str, allow_nul: bool) -> N
         if 0xD800 <= code_point <= 0xDFFF:
             raise SchemaValidationError(
                 f"{context} contains a surrogate code point at character {index}"
-            )
-        if not allow_nul and code_point == 0:
-            raise PayloadValidationError(
-                f"{context} contains U+0000, which is outside the common string profile"
             )
 
 
