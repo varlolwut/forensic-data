@@ -20,7 +20,8 @@ from forensic_data.acquisition import (
     readiness_evidence_semantic_value,
     run_request_semantic_value,
 )
-from forensic_data.canonical import schema_digest_hex
+from forensic_data.canonical import Fingerprint, combine_fingerprints, schema_digest_hex
+from forensic_data.comparison import CompletedComparisonArtifact
 from forensic_data.contracts.model import ExecutionBudgets
 from forensic_data.contracts.semantics import (
     SemanticValue,
@@ -64,13 +65,32 @@ from forensic_data.postgres_sql import (
     PostgresPhysicalField,
     PostgresTypeIdentity,
 )
-from forensic_data.result import ReasonCode, ResultReason
+from forensic_data.result import (
+    ComparisonCoverage,
+    ComparisonTotals,
+    ConsistencyLevel,
+    ConsistencyStatus,
+    EvidenceCoverage,
+    ExecutionStatus,
+    Guarantee,
+    PersistenceState,
+    PersistenceStatus,
+    ReasonCode,
+    ResultMetrics,
+    ResultReason,
+    RunResult,
+    Total,
+    Verdict,
+)
 
 __all__ = (
     "AlignedInputCutPersistence",
     "AttemptOutcomeRecord",
     "AttemptStatus",
     "ClaimedRun",
+    "ComparisonSegmentState",
+    "CompletedComparisonDefinition",
+    "IntegerRangeFingerprintPersistence",
     "PersistedInputCut",
     "PersistedReadContext",
     "ReadContextPersistence",
@@ -80,11 +100,14 @@ __all__ = (
     "abandon_expired_postgres_attempt",
     "claim_postgres_run",
     "close_postgres_read_context",
+    "completed_comparison_persistence_from_artifact",
     "mark_postgres_read_context_lost",
     "persist_postgres_aligned_input_cut",
     "persist_postgres_read_context",
+    "publish_postgres_completed_comparison",
     "publish_postgres_terminal_error_attempt",
     "publish_postgres_terminal_incomplete_attempt",
+    "read_postgres_completed_comparison",
     "record_postgres_retryable_error_attempt",
     "record_postgres_retryable_incomplete_attempt",
     "renew_postgres_run_attempt",
@@ -95,10 +118,14 @@ LOGGER = logging.getLogger(__name__)
 
 _METADATA_MAJOR_VERSION: Final[int] = 17
 _WRITER_ROLE: Final[str] = "dfe_metadata_writer"
+_READER_ROLE: Final[str] = "dfe_metadata_reader"
+_CANONICAL_PROTOCOL: Final[str] = "dfe_canon_v1"
+_FINGERPRINT_PROTOCOL: Final[str] = "sha256_sum32_v1"
 
 
 class AttemptStatus(StrEnum):
     RUNNING = "running"
+    COMPLETED = "completed"
     INCOMPLETE = "incomplete"
     ERROR = "error"
     ABANDONED = "abandoned"
@@ -108,6 +135,112 @@ class ReadContextStatus(StrEnum):
     ACTIVE = "active"
     CLOSED = "closed"
     LOST = "lost"
+
+
+class ComparisonSegmentState(StrEnum):
+    SPLIT = "split"
+    FINGERPRINT_MATCH = "fingerprint_match"
+    EXACT_MATCH = "exact_match"
+    EXACT_MISMATCH = "exact_mismatch"
+
+
+@final
+@dataclass(frozen=True, slots=True)
+class IntegerRangeFingerprintPersistence:
+    segment_sequence: int
+    parent_segment_sequence: int | None
+    depth: int
+    lower_inclusive: int
+    upper_exclusive: int | None
+    state: ComparisonSegmentState
+    reference_observation_id: UUID
+    reference_fingerprint: Fingerprint
+    target_observation_id: UUID
+    target_fingerprint: Fingerprint
+
+    def __post_init__(self) -> None:
+        _require_int64(self.segment_sequence, "segment sequence")
+        _require_nonnegative_integer(self.segment_sequence, "segment sequence")
+        if self.parent_segment_sequence is not None:
+            _require_int64(self.parent_segment_sequence, "parent segment sequence")
+            _require_nonnegative_integer(
+                self.parent_segment_sequence,
+                "parent segment sequence",
+            )
+            if self.parent_segment_sequence >= self.segment_sequence:
+                raise ValueError("parent segment sequence must precede its child")
+        _require_nonnegative_int32(self.depth, "segment depth")
+        if (self.depth == 0) != (self.parent_segment_sequence is None):
+            raise ValueError("only a depth-zero segment can have no parent")
+        _require_int64(self.lower_inclusive, "segment lower bound")
+        if self.upper_exclusive is not None:
+            _require_int64(self.upper_exclusive, "segment upper bound")
+            if self.upper_exclusive <= self.lower_inclusive:
+                raise ValueError("bounded segment upper bound must exceed its lower bound")
+        _require_instance(self.state, ComparisonSegmentState, "segment state")
+        _require_uuid(self.reference_observation_id, "reference observation id")
+        _require_instance(
+            self.reference_fingerprint,
+            Fingerprint,
+            "reference segment fingerprint",
+        )
+        _require_uuid(self.target_observation_id, "target observation id")
+        _require_instance(
+            self.target_fingerprint,
+            Fingerprint,
+            "target segment fingerprint",
+        )
+
+
+@final
+@dataclass(frozen=True, slots=True)
+class CompletedComparisonDefinition:
+    check_id: str
+    contract_digest: str
+    scope_digest: str
+    verdict: Verdict
+    consistency: ConsistencyStatus
+    guarantee: Guarantee
+    comparison_coverage: ComparisonCoverage
+    totals: ComparisonTotals
+    evidence_coverage: EvidenceCoverage
+    metrics: ResultMetrics
+    reasons: tuple[ResultReason, ...]
+
+    def __post_init__(self) -> None:
+        if type(self.check_id) is not str or self.check_id.strip() == "":
+            raise ValueError("completed comparison check id must be nonblank")
+        _require_sha256(self.contract_digest, "completed comparison contract digest")
+        _require_sha256(self.scope_digest, "completed comparison scope digest")
+        _require_instance(self.verdict, Verdict, "completed comparison verdict")
+        if self.verdict is Verdict.INCONCLUSIVE:
+            raise ValueError("completed comparison verdict cannot be inconclusive")
+        _require_instance(
+            self.consistency,
+            ConsistencyStatus,
+            "completed comparison consistency",
+        )
+        _require_instance(self.guarantee, Guarantee, "completed comparison guarantee")
+        if self.guarantee not in (Guarantee.EXACT, Guarantee.FINGERPRINT):
+            raise ValueError(
+                "integer-range completed comparison requires exact or fingerprint guarantee"
+            )
+        _require_instance(
+            self.comparison_coverage,
+            ComparisonCoverage,
+            "completed comparison coverage",
+        )
+        _require_instance(self.totals, ComparisonTotals, "completed comparison totals")
+        _require_instance(
+            self.evidence_coverage,
+            EvidenceCoverage,
+            "completed comparison evidence coverage",
+        )
+        _require_instance(self.metrics, ResultMetrics, "completed comparison metrics")
+        if type(self.reasons) is not tuple:
+            raise TypeError("completed comparison reasons must be an immutable tuple")
+        for reason in self.reasons:
+            _require_instance(reason, ResultReason, "completed comparison reason")
 
 
 @final
@@ -474,6 +607,35 @@ class _OutcomeExpectation:
     ended_at: datetime
 
 
+@final
+@dataclass(frozen=True, slots=True)
+class _CompletedComparisonExpectation:
+    attempt: RunAttemptRecord
+    operation_id: UUID
+    comparison: CompletedComparisonDefinition
+    segments: tuple[IntegerRangeFingerprintPersistence, ...]
+    ended_at: datetime
+    result: RunResult
+    result_json: str
+    result_digest: bytes
+
+
+@final
+@dataclass(frozen=True, slots=True)
+class _StoredSegmentSide:
+    observation_id: UUID
+    run_id: UUID
+    attempt_id: UUID
+    direction: PlanDirection
+    segment_sequence: int
+    parent_segment_sequence: int | None
+    depth: int
+    lower_inclusive: int
+    upper_exclusive: int | None
+    state: ComparisonSegmentState
+    fingerprint: Fingerprint
+
+
 @dataclass(frozen=True, slots=True)
 class _ReceiptAbsent:
     pass
@@ -647,6 +809,132 @@ def persist_postgres_aligned_input_cut(
         _cut_operation_identities(expectation),
         lambda connection: _persist_cut_once(connection, settings, expectation),
         lambda connection: _lookup_persisted_cut(connection, settings, expectation),
+    )
+
+
+def completed_comparison_persistence_from_artifact(
+    attempt: RunAttemptRecord,
+    persisted_cut: PersistedInputCut,
+    artifact: CompletedComparisonArtifact,
+) -> tuple[
+    CompletedComparisonDefinition,
+    tuple[IntegerRangeFingerprintPersistence, ...],
+]:
+    _require_instance(attempt, RunAttemptRecord, "run attempt")
+    _require_instance(persisted_cut, PersistedInputCut, "persisted input cut")
+    _require_instance(
+        artifact,
+        CompletedComparisonArtifact,
+        "completed comparison artifact",
+    )
+    if persisted_cut.run_id != attempt.run.run_id or persisted_cut.attempt_id != attempt.attempt_id:
+        raise ValueError("persisted input cut must belong to the comparison attempt")
+    input_cut_digest = persisted_cut.input_cut.input_cut_digest
+    if artifact.input_cut_digest != input_cut_digest:
+        raise ValueError("comparison artifact input cut differs from the persisted attempt cut")
+    for bound_digest in (
+        attempt.run.bound_input_cut_digest,
+        attempt.input_cut_digest,
+    ):
+        if bound_digest is not None and bound_digest != input_cut_digest:
+            raise ValueError("comparison attempt record is bound to a different input cut")
+    if artifact.scope_digest != persisted_cut.input_cut.reference.scope_digest:
+        raise ValueError("comparison artifact scope differs from its persisted input cut")
+    if artifact.reference_full_scans > attempt.execution_budgets.max_full_scans_per_side:
+        raise ValueError("reference full scans exceed the immutable attempt budget")
+    if artifact.target_full_scans > attempt.execution_budgets.max_full_scans_per_side:
+        raise ValueError("target full scans exceed the immutable attempt budget")
+    reference_observation_id, target_observation_id = persisted_cut.observation_ids
+    definition = CompletedComparisonDefinition(
+        check_id=artifact.check_id,
+        contract_digest=artifact.contract_digest,
+        scope_digest=artifact.scope_digest,
+        verdict=artifact.verdict,
+        consistency=artifact.consistency,
+        guarantee=artifact.guarantee,
+        comparison_coverage=artifact.comparison_coverage,
+        totals=artifact.totals,
+        evidence_coverage=artifact.evidence_coverage,
+        metrics=artifact.metrics,
+        reasons=artifact.reasons,
+    )
+    segments = tuple(
+        IntegerRangeFingerprintPersistence(
+            segment_sequence=segment.segment_sequence,
+            parent_segment_sequence=segment.parent_segment_sequence,
+            depth=segment.depth,
+            lower_inclusive=segment.lower_inclusive,
+            upper_exclusive=segment.upper_exclusive,
+            state=ComparisonSegmentState(segment.state.value),
+            reference_observation_id=reference_observation_id,
+            reference_fingerprint=segment.reference_fingerprint,
+            target_observation_id=target_observation_id,
+            target_fingerprint=segment.target_fingerprint,
+        )
+        for segment in artifact.segments
+    )
+    _validate_completed_segments(definition, segments)
+    _validate_completed_budget_use(attempt.execution_budgets, definition, segments)
+    _validate_artifact_summary_closure(artifact, segments[0])
+    return definition, segments
+
+
+def publish_postgres_completed_comparison(
+    settings: PostgresConnectionSettings,
+    retry_policy: PostgresRetryPolicy,
+    attempt: RunAttemptRecord,
+    terminal_operation_id: UUID,
+    comparison: CompletedComparisonDefinition,
+    segments: tuple[IntegerRangeFingerprintPersistence, ...],
+    ended_at: datetime,
+) -> RunResult:
+    _require_instance(settings, PostgresConnectionSettings, "metadata connection settings")
+    _require_instance(retry_policy, PostgresRetryPolicy, "metadata retry policy")
+    _require_instance(attempt, RunAttemptRecord, "run attempt")
+    _require_uuid(terminal_operation_id, "completed comparison operation id")
+    _require_instance(
+        comparison,
+        CompletedComparisonDefinition,
+        "completed comparison definition",
+    )
+    _require_utc_datetime(ended_at, "completed comparison ended_at")
+    expected = _completed_comparison_expectation(
+        attempt,
+        terminal_operation_id,
+        comparison,
+        segments,
+        ended_at,
+    )
+    return _run_with_reconciliation(
+        settings,
+        retry_policy,
+        "publish_completed_comparison",
+        (expected.operation_id,),
+        lambda connection: _publish_completed_comparison_once(connection, settings, expected),
+        lambda connection: _lookup_completed_comparison(connection, settings, expected),
+    )
+
+
+def read_postgres_completed_comparison(
+    settings: PostgresConnectionSettings,
+    retry_policy: PostgresRetryPolicy,
+    run_id: UUID,
+    attempt_id: UUID,
+) -> RunResult:
+    _require_instance(settings, PostgresConnectionSettings, "metadata connection settings")
+    _require_instance(retry_policy, PostgresRetryPolicy, "metadata retry policy")
+    _require_uuid(run_id, "completed comparison run id")
+    _require_uuid(attempt_id, "completed comparison attempt id")
+    return _run_read_with_retries(
+        settings,
+        retry_policy,
+        "read_completed_comparison",
+        lambda connection: _read_completed_comparison_once(
+            connection,
+            settings,
+            run_id,
+            attempt_id,
+        ),
     )
 
 
@@ -2025,6 +2313,155 @@ def _publish_terminal_outcome_once(
     )
 
 
+def _publish_completed_comparison_once(
+    connection: psycopg.Connection[DatabaseRow],
+    settings: PostgresConnectionSettings,
+    expected: _CompletedComparisonExpectation,
+) -> RunResult:
+    _begin_writer_transaction(connection, settings.statement_timeout_milliseconds)
+    _require_current_schema(connection)
+    _lock_operation_identities(connection, (expected.operation_id,))
+    run_row = _lock_run_by_id(connection, expected.attempt.run.run_id)
+    if run_row is None:
+        raise RunLifecycleStateError("cannot publish a comparison for an unknown run")
+    _claimed_run_from_row(run_row, _expectation_for_claimed_run(expected.attempt.run))
+    attempt_row = _lock_attempt_by_id(connection, expected.attempt.attempt_id)
+    if (
+        attempt_row is None
+        or _row_uuid(attempt_row[1], "completed comparison attempt run id")
+        != expected.attempt.run.run_id
+    ):
+        raise AttemptFenceError("completed comparison attempt fence is unknown")
+    if _select_result_by_operation(connection, expected.operation_id) is not None:
+        return _commit_result(
+            connection,
+            _completed_result_from_database(connection, expected),
+        )
+    if _select_attempt_by_end_operation(connection, expected.operation_id) is not None:
+        raise LifecycleOperationConflictError(
+            "completed comparison operation UUID is already bound to a different outcome"
+        )
+    _require_attempt_fence_row(connection, attempt_row, expected.attempt)
+    pre_mutation_lease_expiry = _row_datetime(
+        attempt_row[9],
+        "completed comparison attempt lease expiry",
+    )
+    if _row_optional_uuid(run_row[10], "selected terminal attempt id") is not None:
+        raise RunLifecycleStateError("run already has a selected terminal attempt")
+    _require_locked_completed_comparison_closure(connection, expected)
+    for segment in expected.segments:
+        _insert_completed_segment(connection, expected, segment)
+    attempt_update = connection.execute(
+        "UPDATE dfe_metadata.run_attempts SET status = 'completed', "
+        "end_operation_id = %s, terminal_reason_code = NULL, "
+        "terminal_reason = NULL, ended_at = %s "
+        "WHERE run_id = %s AND attempt_id = %s AND owner_token = %s "
+        "AND lease_revision = %s AND status = 'running' "
+        "AND lease_expires_at > pg_catalog.clock_timestamp()",
+        (
+            expected.operation_id,
+            expected.ended_at,
+            expected.attempt.run.run_id,
+            expected.attempt.attempt_id,
+            expected.attempt.owner_token,
+            expected.attempt.lease_revision,
+        ),
+    )
+    if attempt_update.rowcount != 1:
+        raise AttemptFenceError("completed comparison attempt compare-and-set did not update")
+    connection.execute(
+        "INSERT INTO dfe_metadata.check_results ("
+        "run_id, attempt_id, check_id, result_operation_id, contract_digest, "
+        "scope_digest, execution_status, verdict, guarantee, result_digest, "
+        "result_payload, completed_at) VALUES ("
+        "%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s::jsonb, %s)",
+        (
+            expected.attempt.run.run_id,
+            expected.attempt.attempt_id,
+            expected.comparison.check_id,
+            expected.operation_id,
+            bytes.fromhex(expected.comparison.contract_digest),
+            bytes.fromhex(expected.comparison.scope_digest),
+            ExecutionStatus.COMPLETED.value,
+            expected.comparison.verdict.value,
+            expected.comparison.guarantee.value,
+            expected.result_digest,
+            expected.result_json,
+            expected.ended_at,
+        ),
+    )
+    run_update = connection.execute(
+        "UPDATE dfe_metadata.runs SET selected_terminal_attempt_id = %s, "
+        "terminal_operation_id = %s, terminal_at = %s "
+        "WHERE run_id = %s AND selected_terminal_attempt_id IS NULL",
+        (
+            expected.attempt.attempt_id,
+            expected.operation_id,
+            expected.ended_at,
+            expected.attempt.run.run_id,
+        ),
+    )
+    if run_update.rowcount != 1:
+        raise RunLifecycleStateError(
+            "completed comparison run publication compare-and-set did not update"
+        )
+    result = _completed_result_from_database(connection, expected)
+    return _commit_fenced_result(
+        connection,
+        result,
+        pre_mutation_lease_expiry,
+        "completed comparison publication",
+    )
+
+
+def _lookup_completed_comparison(
+    connection: psycopg.Connection[DatabaseRow],
+    settings: PostgresConnectionSettings,
+    expected: _CompletedComparisonExpectation,
+) -> RunResult | None:
+    if _select_result_by_operation(connection, expected.operation_id) is None:
+        connection.execute("COMMIT")
+        return None
+    return _commit_result(
+        connection,
+        _completed_result_from_database(connection, expected),
+    )
+
+
+def _read_completed_comparison_once(
+    connection: psycopg.Connection[DatabaseRow],
+    settings: PostgresConnectionSettings,
+    run_id: UUID,
+    attempt_id: UUID,
+) -> RunResult:
+    _begin_reader_transaction(connection, settings.statement_timeout_milliseconds)
+    _require_current_schema(connection)
+    rows = _select_results_by_attempt(connection, run_id, attempt_id)
+    if not rows:
+        raise RunLifecycleStateError(
+            "completed comparison does not exist for the requested run and attempt"
+        )
+    if len(rows) != 1:
+        raise StoredLifecycleIntegrityError(
+            "completed attempt must contain exactly one immutable check result"
+        )
+    result, completed_at = _completed_result_from_row(rows[0])
+    if result.run_id != run_id or result.attempt_id != attempt_id:
+        raise StoredLifecycleIntegrityError(
+            "completed result payload identity differs from its lookup key"
+        )
+    segments = _completed_segments_from_database(connection, run_id, attempt_id)
+    _require_valid_stored_segments(result, segments)
+    _require_completed_database_closure(
+        connection,
+        result,
+        segments,
+        completed_at,
+    )
+    _require_completed_terminal_receipt(connection, result, completed_at)
+    return _commit_result(connection, result)
+
+
 def _lookup_retryable_attempt_outcome(
     connection: psycopg.Connection[DatabaseRow],
     settings: PostgresConnectionSettings,
@@ -2220,6 +2657,270 @@ def _abandoned_outcome_expectation(
         reason_json=canonical_semantic_json(_reason_semantic_value(reason)),
         ended_at=ended_at.astimezone(UTC),
     )
+
+
+def _completed_comparison_expectation(
+    attempt: RunAttemptRecord,
+    operation_id: UUID,
+    comparison: CompletedComparisonDefinition,
+    segments: tuple[IntegerRangeFingerprintPersistence, ...],
+    ended_at: datetime,
+) -> _CompletedComparisonExpectation:
+    if attempt.status is not AttemptStatus.RUNNING:
+        raise ValueError("completed comparison publication requires a running attempt record")
+    if comparison.scope_digest != attempt.run.request.scope.scope_digest:
+        raise ValueError("completed comparison scope digest must match the immutable run scope")
+    _validate_completed_segments(comparison, segments)
+    _validate_completed_budget_use(
+        attempt.execution_budgets,
+        comparison,
+        segments,
+    )
+    candidate_result = RunResult(
+        schema_version=1,
+        run_id=attempt.run.run_id,
+        attempt_id=attempt.attempt_id,
+        check_id=comparison.check_id,
+        contract_digest=comparison.contract_digest,
+        scope_digest=comparison.scope_digest,
+        execution_status=ExecutionStatus.COMPLETED,
+        verdict=comparison.verdict,
+        consistency=comparison.consistency,
+        guarantee=comparison.guarantee,
+        comparison_coverage=comparison.comparison_coverage,
+        totals=comparison.totals,
+        evidence_coverage=comparison.evidence_coverage,
+        metrics=comparison.metrics,
+        reasons=comparison.reasons,
+        persistence=PersistenceStatus(
+            state=PersistenceState.CONFIRMED,
+            operation_id=operation_id,
+            reason=None,
+        ),
+    )
+    result = RunResult.model_validate_json(candidate_result.model_dump_json())
+    result_value = semantic_value_from_json(result.model_dump_json())
+    result_json = canonical_semantic_json(result_value)
+    return _CompletedComparisonExpectation(
+        attempt=attempt,
+        operation_id=operation_id,
+        comparison=comparison,
+        segments=segments,
+        ended_at=ended_at.astimezone(UTC),
+        result=result,
+        result_json=result_json,
+        result_digest=bytes.fromhex(semantic_digest_hex(result_value)),
+    )
+
+
+def _validate_completed_segments(
+    comparison: CompletedComparisonDefinition,
+    segments: tuple[IntegerRangeFingerprintPersistence, ...],
+) -> None:
+    if type(segments) is not tuple or not segments:
+        raise ValueError("completed comparison requires a nonempty immutable segment topology")
+    for segment in segments:
+        _require_instance(
+            segment,
+            IntegerRangeFingerprintPersistence,
+            "completed comparison segment",
+        )
+    expected_sequences = tuple(range(len(segments)))
+    if tuple(segment.segment_sequence for segment in segments) != expected_sequences:
+        raise ValueError(
+            "completed comparison segment sequences must be contiguous from zero in order"
+        )
+    reference_observation_id = segments[0].reference_observation_id
+    target_observation_id = segments[0].target_observation_id
+    if reference_observation_id == target_observation_id:
+        raise ValueError("completed comparison observations must be distinct")
+    if any(
+        segment.reference_observation_id != reference_observation_id
+        or segment.target_observation_id != target_observation_id
+        for segment in segments
+    ):
+        raise ValueError("all completed comparison segments must use one observation pair")
+    matched = _available_total_integer(
+        comparison.totals.matched,
+        "completed comparison matched total",
+    )
+    missing = _available_total_integer(
+        comparison.totals.missing,
+        "completed comparison missing total",
+    )
+    extra = _available_total_integer(
+        comparison.totals.extra,
+        "completed comparison extra total",
+    )
+    modified = _available_total_integer(
+        comparison.totals.modified,
+        "completed comparison modified total",
+    )
+    if matched + missing + modified != segments[0].reference_fingerprint.count:
+        raise ValueError("completed comparison totals do not close to the reference root row count")
+    if matched + extra + modified != segments[0].target_fingerprint.count:
+        raise ValueError("completed comparison totals do not close to the target root row count")
+
+    children_by_parent: dict[int, list[IntegerRangeFingerprintPersistence]] = {}
+    for segment in segments[1:]:
+        parent_sequence = segment.parent_segment_sequence
+        if parent_sequence is None:
+            raise ValueError("non-root completed comparison segment must have a parent")
+        children_by_parent.setdefault(parent_sequence, []).append(segment)
+
+    terminal_states = {
+        ComparisonSegmentState.FINGERPRINT_MATCH,
+        ComparisonSegmentState.EXACT_MATCH,
+        ComparisonSegmentState.EXACT_MISMATCH,
+    }
+    for segment in segments:
+        children = tuple(children_by_parent.get(segment.segment_sequence, ()))
+        if segment.state is ComparisonSegmentState.SPLIT:
+            _validate_split_segment(segment, children)
+        elif segment.state in terminal_states:
+            if children:
+                raise ValueError("terminal completed comparison segment cannot have children")
+        else:
+            raise AssertionError("unhandled completed comparison segment state")
+        if (
+            segment.state is ComparisonSegmentState.FINGERPRINT_MATCH
+            and segment.reference_fingerprint != segment.target_fingerprint
+        ):
+            raise ValueError("fingerprint-match segment requires equal side fingerprints")
+        if (
+            segment.state is ComparisonSegmentState.EXACT_MATCH
+            and segment.reference_fingerprint != segment.target_fingerprint
+        ):
+            raise ValueError("exact-match segment requires equal side fingerprints")
+
+    terminal_segments = tuple(segment for segment in segments if segment.state in terminal_states)
+    pruned_segments = sum(
+        segment.state is ComparisonSegmentState.FINGERPRINT_MATCH for segment in terminal_segments
+    )
+    exact_segments = len(terminal_segments) - pruned_segments
+    coverage = comparison.comparison_coverage
+    if (
+        coverage.total_partitions != 1
+        or coverage.covered_partitions != 1
+        or coverage.resolved_segments != len(terminal_segments)
+        or coverage.pruned_segments != pruned_segments
+        or coverage.exact_segments != exact_segments
+        or coverage.unresolved_segments != 0
+        or coverage.unresolved_reasons
+    ):
+        raise ValueError(
+            "completed comparison coverage must exactly describe its terminal range frontier"
+        )
+    if comparison.metrics.fingerprint_nodes != len(segments):
+        raise ValueError(
+            "completed comparison fingerprint_nodes must equal the persisted logical nodes"
+        )
+    has_exact_mismatch = any(
+        segment.state is ComparisonSegmentState.EXACT_MISMATCH for segment in terminal_segments
+    )
+    if (comparison.verdict is Verdict.MISMATCH) != has_exact_mismatch:
+        raise ValueError(
+            "completed comparison verdict must match the exact-mismatch terminal frontier"
+        )
+
+
+def _validate_split_segment(
+    parent: IntegerRangeFingerprintPersistence,
+    children: tuple[IntegerRangeFingerprintPersistence, ...],
+) -> None:
+    if len(children) != 2:
+        raise ValueError("split completed comparison segment must have exactly two children")
+    left, right = sorted(children, key=lambda segment: segment.lower_inclusive)
+    if left.depth != parent.depth + 1 or right.depth != parent.depth + 1:
+        raise ValueError("split completed comparison children must advance depth by one")
+    if (
+        left.lower_inclusive != parent.lower_inclusive
+        or left.upper_exclusive is None
+        or right.lower_inclusive != left.upper_exclusive
+        or right.upper_exclusive != parent.upper_exclusive
+    ):
+        raise ValueError("split completed comparison children must exactly cover their parent")
+    if (
+        combine_fingerprints((left.reference_fingerprint, right.reference_fingerprint))
+        != parent.reference_fingerprint
+    ):
+        raise ValueError("reference child fingerprints must combine to their split parent")
+    if (
+        combine_fingerprints((left.target_fingerprint, right.target_fingerprint))
+        != parent.target_fingerprint
+    ):
+        raise ValueError("target child fingerprints must combine to their split parent")
+
+
+def _available_total_integer(total: Total, context: str) -> int:
+    if total.value is None:
+        raise ValueError(f"{context} must be available for a completed row comparison")
+    return int(total.value)
+
+
+def _validate_completed_budget_use(
+    budgets: ExecutionBudgets,
+    comparison: CompletedComparisonDefinition,
+    segments: tuple[IntegerRangeFingerprintPersistence, ...],
+) -> None:
+    metrics = comparison.metrics
+    for name, actual, maximum in (
+        ("queries", metrics.queries, budgets.max_queries),
+        ("fetched_records", metrics.fetched_records, budgets.max_fetched_records),
+        (
+            "result_bytes",
+            metrics.result_bytes,
+            budgets.max_application_result_bytes,
+        ),
+        ("fingerprint_nodes", metrics.fingerprint_nodes, budgets.max_fingerprint_nodes),
+        (
+            "coordinator_peak_bytes",
+            metrics.coordinator_peak_bytes,
+            budgets.max_coordinator_memory_bytes,
+        ),
+        (
+            "elapsed_milliseconds",
+            metrics.elapsed_milliseconds,
+            budgets.run_timeout_milliseconds,
+        ),
+        (
+            "retained_evidence_records",
+            comparison.evidence_coverage.retained_records,
+            budgets.max_evidence_rows,
+        ),
+        (
+            "retained_evidence_bytes",
+            comparison.evidence_coverage.retained_bytes,
+            budgets.max_evidence_bytes,
+        ),
+    ):
+        if actual > maximum:
+            raise ValueError(f"completed comparison {name} exceeds its immutable attempt budget")
+    if max(segment.depth for segment in segments) > budgets.max_depth:
+        raise ValueError("completed comparison segment depth exceeds its attempt budget")
+
+
+def _validate_artifact_summary_closure(
+    artifact: CompletedComparisonArtifact,
+    root: IntegerRangeFingerprintPersistence,
+) -> None:
+    for direction, summary in (
+        (PlanDirection.REFERENCE, artifact.reference_key_summary),
+        (PlanDirection.TARGET, artifact.target_key_summary),
+    ):
+        if (
+            summary.null_key_count != 0
+            or summary.invalid_key_count != 0
+            or summary.valid_key_count != summary.row_count
+            or summary.distinct_key_count != summary.row_count
+        ):
+            raise ValueError(
+                f"completed {direction.value} artifact violates the unique integer-key contract"
+            )
+    if artifact.reference_key_summary.row_count != root.reference_fingerprint.count:
+        raise ValueError("reference key summary does not close to the root fingerprint")
+    if artifact.target_key_summary.row_count != root.target_fingerprint.count:
+        raise ValueError("target key summary does not close to the root fingerprint")
 
 
 def _validate_context_definition(
@@ -2579,6 +3280,78 @@ def _execution_budgets_semantic_value(
     }
 
 
+def _execution_budgets_from_database(value: object) -> ExecutionBudgets:
+    budgets_json = _canonical_database_json(value, "completed attempt execution budgets")
+    try:
+        budgets = _semantic_object(
+            semantic_value_from_json(budgets_json),
+            "completed attempt execution budgets",
+        )
+        return ExecutionBudgets(
+            version=_semantic_integer(budgets.get("version"), "execution budget version"),
+            max_queries=_semantic_integer(
+                budgets.get("max_queries"),
+                "execution max_queries",
+            ),
+            max_fetched_records=_semantic_integer(
+                budgets.get("max_fetched_records"),
+                "execution max_fetched_records",
+            ),
+            max_application_result_bytes=_semantic_integer(
+                budgets.get("max_application_result_bytes"),
+                "execution max_application_result_bytes",
+            ),
+            max_evidence_rows=_semantic_integer(
+                budgets.get("max_evidence_rows"),
+                "execution max_evidence_rows",
+            ),
+            max_evidence_bytes=_semantic_integer(
+                budgets.get("max_evidence_bytes"),
+                "execution max_evidence_bytes",
+            ),
+            max_fingerprint_nodes=_semantic_integer(
+                budgets.get("max_fingerprint_nodes"),
+                "execution max_fingerprint_nodes",
+            ),
+            max_coordinator_memory_bytes=_semantic_integer(
+                budgets.get("max_coordinator_memory_bytes"),
+                "execution max_coordinator_memory_bytes",
+            ),
+            max_depth=_semantic_integer(
+                budgets.get("max_depth"),
+                "execution max_depth",
+            ),
+            max_full_scans_per_side=_semantic_integer(
+                budgets.get("max_full_scans_per_side"),
+                "execution max_full_scans_per_side",
+            ),
+            statement_timeout_milliseconds=_semantic_integer(
+                budgets.get("statement_timeout_milliseconds"),
+                "execution statement_timeout_milliseconds",
+            ),
+            run_timeout_milliseconds=_semantic_integer(
+                budgets.get("run_timeout_milliseconds"),
+                "execution run_timeout_milliseconds",
+            ),
+            max_attempts=_semantic_integer(
+                budgets.get("max_attempts"),
+                "execution max_attempts",
+            ),
+            max_checks_concurrency=_semantic_integer(
+                budgets.get("max_checks_concurrency"),
+                "execution max_checks_concurrency",
+            ),
+            max_source_concurrency=_semantic_integer(
+                budgets.get("max_source_concurrency"),
+                "execution max_source_concurrency",
+            ),
+        )
+    except ValueError as error:
+        raise StoredLifecycleIntegrityError(
+            f"stored completed attempt budgets are invalid: reason={error}"
+        ) from None
+
+
 def _reason_semantic_value(reason: ResultReason) -> dict[str, SemanticValue]:
     return {
         "message": reason.message,
@@ -2624,6 +3397,21 @@ _OBSERVATION_SELECT: Final[LiteralString] = (
     "readiness_evidence::text, physical_schema_digest, physical_binding_digest, "
     "physical_binding::text, projection_code_artifact_id, readiness_provider_kind, "
     "readiness_code_artifact_id, observed_at FROM dfe_metadata.dataset_observations"
+)
+
+_RESULT_SELECT: Final[LiteralString] = (
+    "SELECT run_id, attempt_id, check_id, result_operation_id, contract_digest, "
+    "scope_digest, execution_status, verdict, guarantee, result_digest, "
+    "result_payload::text, completed_at FROM dfe_metadata.check_results"
+)
+
+_SEGMENT_SELECT: Final[LiteralString] = (
+    "SELECT observation_id, run_id, attempt_id, direction, segment_sequence, "
+    "parent_segment_sequence, depth, boundary_kind, lower_inclusive, upper_exclusive, "
+    "traversal_state, canonical_protocol, fingerprint_protocol, row_count, "
+    "limb_0::text, limb_1::text, limb_2::text, limb_3::text, limb_4::text, "
+    "limb_5::text, limb_6::text, limb_7::text "
+    "FROM dfe_metadata.segment_fingerprints"
 )
 
 _LEASE_RENEWAL_SELECT: Final[LiteralString] = (
@@ -2791,6 +3579,40 @@ def _select_observation_by_id(
         _OBSERVATION_SELECT + " WHERE observation_id = %s",
         (observation_id,),
     ).fetchone()
+
+
+def _select_result_by_operation(
+    connection: psycopg.Connection[DatabaseRow],
+    operation_id: UUID,
+) -> DatabaseRow | None:
+    return connection.execute(
+        _RESULT_SELECT + " WHERE result_operation_id = %s",
+        (operation_id,),
+    ).fetchone()
+
+
+def _select_results_by_attempt(
+    connection: psycopg.Connection[DatabaseRow],
+    run_id: UUID,
+    attempt_id: UUID,
+) -> list[DatabaseRow]:
+    return connection.execute(
+        _RESULT_SELECT + " WHERE run_id = %s AND attempt_id = %s ORDER BY check_id",
+        (run_id, attempt_id),
+    ).fetchall()
+
+
+def _select_segment_rows_by_attempt(
+    connection: psycopg.Connection[DatabaseRow],
+    run_id: UUID,
+    attempt_id: UUID,
+) -> list[DatabaseRow]:
+    return connection.execute(
+        _SEGMENT_SELECT + " WHERE run_id = %s AND attempt_id = %s "
+        "ORDER BY segment_sequence, CASE direction "
+        "WHEN 'reference' THEN 0 WHEN 'target' THEN 1 ELSE 2 END",
+        (run_id, attempt_id),
+    ).fetchall()
 
 
 def _claimed_run_from_row(row: DatabaseRow, expected: _RunExpectation) -> ClaimedRun:
@@ -3129,6 +3951,295 @@ def _outcome_receipt_from_database(
     )
 
 
+def _insert_completed_segment(
+    connection: psycopg.Connection[DatabaseRow],
+    expected: _CompletedComparisonExpectation,
+    segment: IntegerRangeFingerprintPersistence,
+) -> None:
+    _insert_completed_segment_side(
+        connection,
+        expected,
+        segment,
+        PlanDirection.REFERENCE,
+        segment.reference_observation_id,
+        segment.reference_fingerprint,
+    )
+    _insert_completed_segment_side(
+        connection,
+        expected,
+        segment,
+        PlanDirection.TARGET,
+        segment.target_observation_id,
+        segment.target_fingerprint,
+    )
+
+
+def _insert_completed_segment_side(
+    connection: psycopg.Connection[DatabaseRow],
+    expected: _CompletedComparisonExpectation,
+    segment: IntegerRangeFingerprintPersistence,
+    direction: PlanDirection,
+    observation_id: UUID,
+    fingerprint: Fingerprint,
+) -> None:
+    connection.execute(
+        "INSERT INTO dfe_metadata.segment_fingerprints ("
+        "observation_id, run_id, attempt_id, direction, segment_sequence, "
+        "parent_segment_sequence, depth, boundary_kind, lower_inclusive, "
+        "upper_exclusive, traversal_state, canonical_protocol, fingerprint_protocol, "
+        "row_count, limb_0, limb_1, limb_2, limb_3, limb_4, limb_5, limb_6, limb_7) "
+        "VALUES (%s, %s, %s, %s, %s, %s, %s, 'integer_range', %s, %s, %s, %s, %s, "
+        "%s, %s, %s, %s, %s, %s, %s, %s, %s)",
+        (
+            observation_id,
+            expected.attempt.run.run_id,
+            expected.attempt.attempt_id,
+            direction.value,
+            segment.segment_sequence,
+            segment.parent_segment_sequence,
+            segment.depth,
+            segment.lower_inclusive,
+            segment.upper_exclusive,
+            segment.state.value,
+            _CANONICAL_PROTOCOL,
+            _FINGERPRINT_PROTOCOL,
+            fingerprint.count,
+            *fingerprint.limb_sums,
+        ),
+    )
+
+
+def _completed_result_from_database(
+    connection: psycopg.Connection[DatabaseRow],
+    expected: _CompletedComparisonExpectation,
+) -> RunResult:
+    row = _select_result_by_operation(connection, expected.operation_id)
+    if row is None:
+        raise StoredLifecycleIntegrityError("completed comparison operation receipt is missing")
+    result, completed_at = _completed_result_from_row(row)
+    if (
+        result != expected.result
+        or _canonical_database_json(row[10], "completed result payload") != expected.result_json
+        or _row_bytes(row[9], "completed result digest") != expected.result_digest
+        or completed_at != expected.ended_at
+    ):
+        raise LifecycleOperationConflictError(
+            "completed comparison operation UUID is already bound to a different full result"
+        )
+    segments = _completed_segments_from_database(
+        connection,
+        expected.attempt.run.run_id,
+        expected.attempt.attempt_id,
+    )
+    if segments != expected.segments:
+        raise LifecycleOperationConflictError(
+            "completed comparison operation UUID is bound to different segment evidence"
+        )
+    _require_valid_stored_segments(result, segments)
+    _require_completed_database_closure(
+        connection,
+        result,
+        segments,
+        completed_at,
+    )
+    _require_completed_terminal_receipt(connection, result, completed_at)
+    return result
+
+
+def _completed_result_from_row(row: DatabaseRow) -> tuple[RunResult, datetime]:
+    payload_json = _canonical_database_json(row[10], "completed result payload")
+    try:
+        payload_value = semantic_value_from_json(payload_json)
+        result = RunResult.model_validate_json(payload_json)
+        replay_json = canonical_semantic_json(semantic_value_from_json(result.model_dump_json()))
+    except ValueError as error:
+        raise StoredLifecycleIntegrityError(
+            f"stored completed result violates the public result protocol: reason={error}"
+        ) from None
+    if replay_json != payload_json:
+        raise StoredLifecycleIntegrityError(
+            "stored completed result payload contains unsupported or non-round-trippable fields"
+        )
+    digest = bytes.fromhex(semantic_digest_hex(payload_value))
+    actual = (
+        _row_uuid(row[0], "completed result run id"),
+        _row_uuid(row[1], "completed result attempt id"),
+        _row_text(row[2], "completed result check id"),
+        _row_uuid(row[3], "completed result operation id"),
+        _row_bytes(row[4], "completed result contract digest").hex(),
+        _row_bytes(row[5], "completed result scope digest").hex(),
+        _row_text(row[6], "completed result execution status"),
+        _row_text(row[7], "completed result verdict"),
+        _row_text(row[8], "completed result guarantee"),
+        _row_bytes(row[9], "completed result digest"),
+    )
+    expected = (
+        result.run_id,
+        result.attempt_id,
+        result.check_id,
+        result.persistence.operation_id,
+        result.contract_digest,
+        result.scope_digest,
+        result.execution_status.value,
+        result.verdict.value,
+        result.guarantee.value,
+        digest,
+    )
+    if actual != expected:
+        raise StoredLifecycleIntegrityError(
+            "stored completed result columns differ from its canonical public payload"
+        )
+    return result, _row_datetime(row[11], "completed result completed_at")
+
+
+def _comparison_definition_from_result(result: RunResult) -> CompletedComparisonDefinition:
+    return CompletedComparisonDefinition(
+        check_id=result.check_id,
+        contract_digest=result.contract_digest,
+        scope_digest=result.scope_digest,
+        verdict=result.verdict,
+        consistency=result.consistency,
+        guarantee=result.guarantee,
+        comparison_coverage=result.comparison_coverage,
+        totals=result.totals,
+        evidence_coverage=result.evidence_coverage,
+        metrics=result.metrics,
+        reasons=result.reasons,
+    )
+
+
+def _require_valid_stored_segments(
+    result: RunResult,
+    segments: tuple[IntegerRangeFingerprintPersistence, ...],
+) -> None:
+    try:
+        definition = _comparison_definition_from_result(result)
+        _validate_completed_segments(definition, segments)
+    except (TypeError, ValueError) as error:
+        raise StoredLifecycleIntegrityError(
+            f"stored completed segment topology is invalid: reason={error}"
+        ) from None
+
+
+def _completed_segments_from_database(
+    connection: psycopg.Connection[DatabaseRow],
+    run_id: UUID,
+    attempt_id: UUID,
+) -> tuple[IntegerRangeFingerprintPersistence, ...]:
+    rows = _select_segment_rows_by_attempt(connection, run_id, attempt_id)
+    if not rows or len(rows) % 2 != 0:
+        raise StoredLifecycleIntegrityError(
+            "completed comparison requires paired reference and target segment evidence"
+        )
+    segments: list[IntegerRangeFingerprintPersistence] = []
+    for offset in range(0, len(rows), 2):
+        reference = _stored_segment_side_from_row(rows[offset])
+        target = _stored_segment_side_from_row(rows[offset + 1])
+        common_reference = (
+            reference.run_id,
+            reference.attempt_id,
+            reference.segment_sequence,
+            reference.parent_segment_sequence,
+            reference.depth,
+            reference.lower_inclusive,
+            reference.upper_exclusive,
+            reference.state,
+        )
+        common_target = (
+            target.run_id,
+            target.attempt_id,
+            target.segment_sequence,
+            target.parent_segment_sequence,
+            target.depth,
+            target.lower_inclusive,
+            target.upper_exclusive,
+            target.state,
+        )
+        if (
+            reference.direction is not PlanDirection.REFERENCE
+            or target.direction is not PlanDirection.TARGET
+            or common_reference != common_target
+            or reference.run_id != run_id
+            or reference.attempt_id != attempt_id
+        ):
+            raise StoredLifecycleIntegrityError(
+                "stored reference and target segment evidence has inconsistent closure"
+            )
+        try:
+            segment = IntegerRangeFingerprintPersistence(
+                segment_sequence=reference.segment_sequence,
+                parent_segment_sequence=reference.parent_segment_sequence,
+                depth=reference.depth,
+                lower_inclusive=reference.lower_inclusive,
+                upper_exclusive=reference.upper_exclusive,
+                state=reference.state,
+                reference_observation_id=reference.observation_id,
+                reference_fingerprint=reference.fingerprint,
+                target_observation_id=target.observation_id,
+                target_fingerprint=target.fingerprint,
+            )
+        except (TypeError, ValueError) as error:
+            raise StoredLifecycleIntegrityError(
+                f"stored completed segment violates its typed contract: reason={error}"
+            ) from None
+        segments.append(segment)
+    return tuple(segments)
+
+
+def _stored_segment_side_from_row(row: DatabaseRow) -> _StoredSegmentSide:
+    try:
+        direction = PlanDirection(_row_text(row[3], "segment direction"))
+        state = ComparisonSegmentState(_row_text(row[10], "segment traversal state"))
+    except ValueError as error:
+        raise StoredLifecycleIntegrityError(
+            f"stored completed segment enum is unsupported: reason={error}"
+        ) from None
+    if _row_text(row[7], "segment boundary kind") != "integer_range":
+        raise StoredLifecycleIntegrityError("stored completed segment boundary kind is unsupported")
+    if _row_text(row[11], "segment canonical protocol") != _CANONICAL_PROTOCOL:
+        raise StoredLifecycleIntegrityError(
+            "stored completed segment canonical protocol is unsupported"
+        )
+    if _row_text(row[12], "segment fingerprint protocol") != _FINGERPRINT_PROTOCOL:
+        raise StoredLifecycleIntegrityError(
+            "stored completed segment fingerprint protocol is unsupported"
+        )
+    try:
+        fingerprint = Fingerprint(
+            count=_row_integer(row[13], "segment fingerprint count"),
+            limb_sums=(
+                _row_unsigned_decimal_integer(row[14], "segment fingerprint limb 0"),
+                _row_unsigned_decimal_integer(row[15], "segment fingerprint limb 1"),
+                _row_unsigned_decimal_integer(row[16], "segment fingerprint limb 2"),
+                _row_unsigned_decimal_integer(row[17], "segment fingerprint limb 3"),
+                _row_unsigned_decimal_integer(row[18], "segment fingerprint limb 4"),
+                _row_unsigned_decimal_integer(row[19], "segment fingerprint limb 5"),
+                _row_unsigned_decimal_integer(row[20], "segment fingerprint limb 6"),
+                _row_unsigned_decimal_integer(row[21], "segment fingerprint limb 7"),
+            ),
+        )
+    except ValueError as error:
+        raise StoredLifecycleIntegrityError(
+            f"stored completed segment fingerprint is invalid: reason={error}"
+        ) from None
+    return _StoredSegmentSide(
+        observation_id=_row_uuid(row[0], "segment observation id"),
+        run_id=_row_uuid(row[1], "segment run id"),
+        attempt_id=_row_uuid(row[2], "segment attempt id"),
+        direction=direction,
+        segment_sequence=_row_integer(row[4], "segment sequence"),
+        parent_segment_sequence=_row_optional_integer(
+            row[5],
+            "segment parent sequence",
+        ),
+        depth=_row_integer(row[6], "segment depth"),
+        lower_inclusive=_row_integer(row[8], "segment lower bound"),
+        upper_exclusive=_row_optional_integer(row[9], "segment upper bound"),
+        state=state,
+        fingerprint=fingerprint,
+    )
+
+
 def _require_attempt_fence_row(
     connection: psycopg.Connection[DatabaseRow],
     row: DatabaseRow,
@@ -3178,6 +4289,326 @@ def _require_dataset_closure(
     if dataset.definition.dataset_id != expected_batch.dataset_id:
         raise RunLifecycleStateError(
             "dataset logical identity is outside the run request direction closure"
+        )
+
+
+def _require_locked_completed_comparison_closure(
+    connection: psycopg.Connection[DatabaseRow],
+    expected: _CompletedComparisonExpectation,
+) -> None:
+    context_rows = connection.execute(
+        _CONTEXT_SELECT + " WHERE run_id = %s AND attempt_id = %s "
+        "ORDER BY CASE direction WHEN 'reference' THEN 0 WHEN 'target' THEN 1 ELSE 2 END "
+        "FOR UPDATE",
+        (expected.attempt.run.run_id, expected.attempt.attempt_id),
+    ).fetchall()
+    observation_rows = _select_observation_rows_by_attempt(
+        connection,
+        expected.attempt.run.run_id,
+        expected.attempt.attempt_id,
+    )
+    _require_completed_closure_rows(
+        connection,
+        expected.result,
+        expected.segments,
+        expected.ended_at,
+        context_rows,
+        observation_rows,
+    )
+
+
+def _require_completed_database_closure(
+    connection: psycopg.Connection[DatabaseRow],
+    result: RunResult,
+    segments: tuple[IntegerRangeFingerprintPersistence, ...],
+    completed_at: datetime,
+) -> None:
+    context_rows = connection.execute(
+        _CONTEXT_SELECT + " WHERE run_id = %s AND attempt_id = %s "
+        "ORDER BY CASE direction WHEN 'reference' THEN 0 WHEN 'target' THEN 1 ELSE 2 END",
+        (result.run_id, result.attempt_id),
+    ).fetchall()
+    observation_rows = _select_observation_rows_by_attempt(
+        connection,
+        result.run_id,
+        result.attempt_id,
+    )
+    _require_completed_closure_rows(
+        connection,
+        result,
+        segments,
+        completed_at,
+        context_rows,
+        observation_rows,
+    )
+
+
+def _select_observation_rows_by_attempt(
+    connection: psycopg.Connection[DatabaseRow],
+    run_id: UUID,
+    attempt_id: UUID,
+) -> list[DatabaseRow]:
+    return connection.execute(
+        _OBSERVATION_SELECT + " WHERE run_id = %s AND attempt_id = %s "
+        "ORDER BY CASE direction WHEN 'reference' THEN 0 WHEN 'target' THEN 1 ELSE 2 END",
+        (run_id, attempt_id),
+    ).fetchall()
+
+
+def _require_completed_closure_rows(
+    connection: psycopg.Connection[DatabaseRow],
+    result: RunResult,
+    segments: tuple[IntegerRangeFingerprintPersistence, ...],
+    completed_at: datetime,
+    context_rows: list[DatabaseRow],
+    observation_rows: list[DatabaseRow],
+) -> None:
+    if (
+        result.consistency.stable_reads is not ConsistencyLevel.VERIFIED
+        or result.consistency.cut_alignment is not ConsistencyLevel.VERIFIED
+    ):
+        raise RunLifecycleStateError(
+            "completed comparison requires verified stable reads and cut alignment"
+        )
+    if len(context_rows) != 2:
+        raise RunLifecycleStateError(
+            "completed comparison requires exactly two protected read contexts"
+        )
+    reference_context, target_context = context_rows
+    if (
+        _row_text(reference_context[4], "reference context direction")
+        != PlanDirection.REFERENCE.value
+        or _row_text(target_context[4], "target context direction") != PlanDirection.TARGET.value
+    ):
+        raise StoredLifecycleIntegrityError(
+            "completed comparison contexts lack one reference and one target direction"
+        )
+    reference_context_id = _row_uuid(reference_context[0], "reference context id")
+    target_context_id = _row_uuid(target_context[0], "target context id")
+    if result.consistency.read_context_ids != (
+        reference_context_id,
+        target_context_id,
+    ):
+        raise RunLifecycleStateError(
+            "completed result context ids must be ordered as its reference and target contexts"
+        )
+    context_ended_at = (
+        _require_closed_completed_context(
+            reference_context,
+            result,
+            PlanDirection.REFERENCE,
+            completed_at,
+        ),
+        _require_closed_completed_context(
+            target_context,
+            result,
+            PlanDirection.TARGET,
+            completed_at,
+        ),
+    )
+    if not segments:
+        raise StoredLifecycleIntegrityError("completed comparison closure has no segment evidence")
+    if len(observation_rows) != 2:
+        raise RunLifecycleStateError(
+            "completed comparison requires exactly two bound-cut observations"
+        )
+    attempt_row = connection.execute(
+        "SELECT input_cut_digest, execution_budgets::text "
+        "FROM dfe_metadata.run_attempts "
+        "WHERE run_id = %s AND attempt_id = %s",
+        (result.run_id, result.attempt_id),
+    ).fetchone()
+    if attempt_row is None:
+        raise StoredLifecycleIntegrityError("completed comparison attempt closure row is missing")
+    attempt_cut_digest = _row_optional_bytes(
+        attempt_row[0],
+        "completed comparison attempt cut digest",
+    )
+    attempt_budgets = _execution_budgets_from_database(attempt_row[1])
+    _validate_completed_budget_use(
+        attempt_budgets,
+        _comparison_definition_from_result(result),
+        segments,
+    )
+    run_contract_row = connection.execute(
+        "SELECT dfe_run.scope_digest, dfe_run.bound_input_cut_digest, "
+        "dfe_contract.check_id, dfe_contract.semantic_digest, "
+        "dfe_contract.assurance_policy "
+        "FROM dfe_metadata.runs AS dfe_run "
+        "JOIN dfe_metadata.contract_versions AS dfe_contract "
+        "ON dfe_contract.contract_version_id = dfe_run.contract_version_id "
+        "WHERE dfe_run.run_id = %s",
+        (result.run_id,),
+    ).fetchone()
+    if run_contract_row is None:
+        raise StoredLifecycleIntegrityError("completed comparison run contract closure is missing")
+    run_cut_digest = _row_optional_bytes(
+        run_contract_row[1],
+        "completed comparison run cut digest",
+    )
+    if attempt_cut_digest is None or run_cut_digest != attempt_cut_digest:
+        raise RunLifecycleStateError(
+            "completed comparison requires the attempt's aligned cut bound to its run"
+        )
+    if (
+        _row_bytes(run_contract_row[0], "completed comparison run scope digest").hex()
+        != result.scope_digest
+        or _row_text(run_contract_row[2], "completed comparison contract check id")
+        != result.check_id
+        or _row_bytes(
+            run_contract_row[3],
+            "completed comparison contract semantic digest",
+        ).hex()
+        != result.contract_digest
+    ):
+        raise RunLifecycleStateError(
+            "completed result identity differs from its immutable run contract and scope"
+        )
+    assurance_policy = _row_text(
+        run_contract_row[4],
+        "completed comparison contract assurance policy",
+    )
+    if assurance_policy not in ("exact_required", "fingerprint_allowed"):
+        raise StoredLifecycleIntegrityError(
+            "completed comparison contract assurance policy is unsupported"
+        )
+    if assurance_policy == "exact_required" and result.guarantee is not Guarantee.EXACT:
+        raise RunLifecycleStateError(
+            "exact_required contract cannot publish a weaker completed guarantee"
+        )
+    reference_observation, target_observation = observation_rows
+    expected_observation_ids = (
+        segments[0].reference_observation_id,
+        segments[0].target_observation_id,
+    )
+    _require_completed_observation(
+        reference_observation,
+        result,
+        PlanDirection.REFERENCE,
+        reference_context,
+        expected_observation_ids[0],
+        attempt_cut_digest,
+        context_ended_at[0],
+    )
+    _require_completed_observation(
+        target_observation,
+        result,
+        PlanDirection.TARGET,
+        target_context,
+        expected_observation_ids[1],
+        attempt_cut_digest,
+        context_ended_at[1],
+    )
+
+
+def _require_closed_completed_context(
+    row: DatabaseRow,
+    result: RunResult,
+    direction: PlanDirection,
+    completed_at: datetime,
+) -> datetime:
+    if (
+        _row_uuid(row[1], "completed context run id") != result.run_id
+        or _row_uuid(row[2], "completed context attempt id") != result.attempt_id
+        or _row_text(row[4], "completed context direction") != direction.value
+        or _row_bytes(row[6], "completed context scope digest").hex() != result.scope_digest
+    ):
+        raise StoredLifecycleIntegrityError(
+            "completed protected context differs from its run, attempt, direction, or scope"
+        )
+    if _row_text(row[18], "completed context state") != ReadContextStatus.CLOSED.value:
+        raise RunLifecycleStateError(
+            "completed comparison requires both protected read contexts to be closed, not lost"
+        )
+    if _row_optional_uuid(row[19], "completed context end operation id") is None:
+        raise StoredLifecycleIntegrityError("closed completed context has no durable end operation")
+    ended_at = _row_optional_datetime(row[20], "completed context ended_at")
+    if ended_at is None:
+        raise StoredLifecycleIntegrityError("closed completed context has no durable end timestamp")
+    if ended_at > completed_at:
+        raise RunLifecycleStateError(
+            "completed comparison cannot precede protected context closure"
+        )
+    return ended_at
+
+
+def _require_completed_observation(
+    row: DatabaseRow,
+    result: RunResult,
+    direction: PlanDirection,
+    context_row: DatabaseRow,
+    expected_observation_id: UUID,
+    input_cut_digest: bytes,
+    context_ended_at: datetime,
+) -> None:
+    if (
+        _row_uuid(row[0], "completed observation id") != expected_observation_id
+        or _row_uuid(row[2], "completed observation run id") != result.run_id
+        or _row_uuid(row[3], "completed observation attempt id") != result.attempt_id
+        or _row_uuid(row[4], "completed observation context id")
+        != _row_uuid(context_row[0], "completed observation expected context id")
+        or _row_uuid(row[5], "completed observation dataset version id")
+        != _row_uuid(context_row[3], "completed context dataset version id")
+        or _row_text(row[6], "completed observation direction") != direction.value
+        or _row_bytes(row[7], "completed observation scope digest").hex() != result.scope_digest
+        or _row_bytes(row[8], "completed observation input cut digest") != input_cut_digest
+    ):
+        raise StoredLifecycleIntegrityError(
+            "completed segment observation differs from its bound context, cut, or scope"
+        )
+    if _row_datetime(row[16], "completed observation observed_at") > context_ended_at:
+        raise StoredLifecycleIntegrityError(
+            "completed observation was recorded after its protected context closed"
+        )
+
+
+def _require_completed_terminal_receipt(
+    connection: psycopg.Connection[DatabaseRow],
+    result: RunResult,
+    completed_at: datetime,
+) -> None:
+    operation_id = result.persistence.operation_id
+    if operation_id is None:
+        raise StoredLifecycleIntegrityError("completed result has no persistence operation id")
+    attempt_row = _select_attempt_by_id(connection, result.attempt_id)
+    if attempt_row is None:
+        raise StoredLifecycleIntegrityError("completed result attempt is missing")
+    attempt_receipt = (
+        _row_uuid(attempt_row[1], "completed attempt run id"),
+        _row_text(attempt_row[4], "completed attempt status"),
+        _row_optional_uuid(attempt_row[13], "completed attempt end operation id"),
+        _row_optional_text(attempt_row[14], "completed attempt terminal reason code"),
+        _row_optional_canonical_json(
+            attempt_row[15],
+            "completed attempt terminal reason",
+        ),
+        _row_optional_datetime(attempt_row[17], "completed attempt ended_at"),
+    )
+    if attempt_receipt != (
+        result.run_id,
+        AttemptStatus.COMPLETED.value,
+        operation_id,
+        None,
+        None,
+        completed_at,
+    ):
+        raise StoredLifecycleIntegrityError(
+            "completed result differs from its terminal attempt receipt"
+        )
+    run_row = connection.execute(
+        "SELECT selected_terminal_attempt_id, terminal_operation_id, terminal_at "
+        "FROM dfe_metadata.runs WHERE run_id = %s",
+        (result.run_id,),
+    ).fetchone()
+    if run_row is None:
+        raise StoredLifecycleIntegrityError("completed result run is missing")
+    if (
+        _row_optional_uuid(run_row[0], "completed run selected attempt id") != result.attempt_id
+        or _row_optional_uuid(run_row[1], "completed run terminal operation id") != operation_id
+        or _row_optional_datetime(run_row[2], "completed run terminal_at") != completed_at
+    ):
+        raise StoredLifecycleIntegrityError(
+            "completed result differs from its terminal run publication"
         )
 
 
@@ -3343,6 +4774,50 @@ def _lock_operation_identities(
 def _is_ambiguous_connection_failure(error: psycopg.OperationalError) -> bool:
     sqlstate = error.sqlstate
     return sqlstate is None or sqlstate.startswith("08") or sqlstate in ("57P01", "57P02", "57P03")
+
+
+def _run_read_with_retries[ResultT](
+    settings: PostgresConnectionSettings,
+    retry_policy: PostgresRetryPolicy,
+    operation: str,
+    read: Callable[[psycopg.Connection[DatabaseRow]], ResultT],
+) -> ResultT:
+    last_error: psycopg.OperationalError | None = None
+    for attempt_number in range(1, retry_policy.max_attempts + 1):
+        connection: psycopg.Connection[DatabaseRow] | None = None
+        try:
+            connection = _connect(settings)
+            _validate_metadata_profile(connection)
+            return read(connection)
+        except psycopg.OperationalError as error:
+            last_error = error
+        except psycopg.Error as error:
+            raise LifecycleTransactionError(
+                "PostgreSQL lifecycle read transaction definitively failed: "
+                f"operation={operation!r}, error_type={type(error).__name__}, "
+                f"sqlstate={error.sqlstate!r}"
+            ) from None
+        finally:
+            if connection is not None:
+                connection.close()
+        _warn_lifecycle_attempt_failure(
+            settings,
+            retry_policy,
+            operation,
+            attempt_number,
+            last_error,
+        )
+        if attempt_number < retry_policy.max_attempts:
+            time.sleep(retry_policy.delay_seconds)
+    if last_error is None:
+        raise AssertionError("lifecycle read retry loop ended without an operational error")
+    raise LifecycleTransactionError(
+        "PostgreSQL lifecycle read transaction failed after bounded attempts: "
+        f"operation={operation!r}, host={settings.host!r}, port={settings.port}, "
+        f"dbname={settings.dbname!r}, user={settings.user!r}, "
+        f"attempts={retry_policy.max_attempts}, "
+        f"error_type={type(last_error).__name__}, sqlstate={last_error.sqlstate!r}"
+    ) from None
 
 
 def _run_with_reconciliation[ResultT](
@@ -3573,6 +5048,15 @@ def _begin_reconciliation_transaction(
     _configure_transaction(connection, statement_timeout_milliseconds)
 
 
+def _begin_reader_transaction(
+    connection: psycopg.Connection[DatabaseRow],
+    statement_timeout_milliseconds: int,
+) -> None:
+    connection.execute("BEGIN ISOLATION LEVEL REPEATABLE READ READ ONLY")
+    connection.execute(f"SET LOCAL ROLE {_READER_ROLE}")
+    _configure_transaction(connection, statement_timeout_milliseconds)
+
+
 def _configure_transaction(
     connection: psycopg.Connection[DatabaseRow],
     statement_timeout_milliseconds: int,
@@ -3682,6 +5166,21 @@ def _row_optional_integer(value: object, context: str) -> int | None:
     return _row_integer(value, context)
 
 
+def _row_unsigned_decimal_integer(value: object, context: str) -> int:
+    text = _row_text(value, context)
+    try:
+        integer = int(text)
+    except ValueError:
+        raise StoredLifecycleIntegrityError(
+            f"PostgreSQL {context} must be an unsigned decimal integer"
+        ) from None
+    if integer < 0 or str(integer) != text:
+        raise StoredLifecycleIntegrityError(
+            f"PostgreSQL {context} must use canonical unsigned decimal integer text"
+        )
+    return integer
+
+
 def _row_bytes(value: object, context: str) -> bytes:
     if type(value) is bytes:
         return value
@@ -3740,6 +5239,12 @@ def _semantic_text(value: SemanticValue | None, context: str) -> str:
     return value
 
 
+def _semantic_integer(value: SemanticValue | None, context: str) -> int:
+    if type(value) is not int:
+        raise StoredLifecycleIntegrityError(f"{context} must be a semantic integer")
+    return value
+
+
 def _require_instance[ExpectedT](
     value: object,
     expected_type: type[ExpectedT],
@@ -3770,6 +5275,16 @@ def _require_nonnegative_integer(value: object, context: str) -> None:
         raise ValueError(f"{context} must be a non-negative exact integer")
 
 
+def _require_nonnegative_int32(value: object, context: str) -> None:
+    if type(value) is not int or not 0 <= value <= (1 << 31) - 1:
+        raise ValueError(f"{context} must be a non-negative exact signed int32 integer")
+
+
+def _require_int64(value: object, context: str) -> None:
+    if type(value) is not int or not -(1 << 63) <= value <= (1 << 63) - 1:
+        raise ValueError(f"{context} must be an exact signed int64 integer")
+
+
 def _require_utc_datetime(value: object, context: str) -> None:
     if type(value) is not datetime or value.tzinfo is None or value.utcoffset() is None:
         raise ValueError(f"{context} must be an exact timezone-aware datetime")
@@ -3792,3 +5307,9 @@ def _require_optional_sha256(value: object, context: str) -> None:
         or any(character not in "0123456789abcdef" for character in value)
     ):
         raise ValueError(f"{context} must be a lowercase hexadecimal SHA-256 digest")
+
+
+def _require_sha256(value: object, context: str) -> None:
+    if value is None:
+        raise ValueError(f"{context} must be a lowercase hexadecimal SHA-256 digest")
+    _require_optional_sha256(value, context)

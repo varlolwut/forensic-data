@@ -118,7 +118,7 @@ execution:
   max_fingerprint_nodes: 1000
   max_coordinator_memory_bytes: 8388608
   max_depth: 8
-  max_full_scans_per_side: 4
+  max_full_scans_per_side: 5
   statement_timeout_milliseconds: 30000
   run_timeout_milliseconds: 300000
   max_attempts: 2

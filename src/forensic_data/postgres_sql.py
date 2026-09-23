@@ -1,11 +1,14 @@
 from dataclasses import dataclass
+from datetime import date
 from typing import cast, final
 from uuid import UUID
 
 from psycopg import sql
 
+from forensic_data.canonical.codec import decode_payload
 from forensic_data.canonical.model import (
     INT64_MAX,
+    CanonicalizationError,
     CanonicalSchema,
     DecimalParameters,
     FieldSchema,
@@ -125,7 +128,49 @@ class PostgresInspectedRelation:
             _require_field_binding(binding, index)
 
 
-type PostgresParameter = str | int
+type PostgresParameter = str | int | bytes
+
+
+@final
+@dataclass(frozen=True, slots=True)
+class PostgresScopePredicate:
+    field: FieldSchema
+    column_name: str
+    canonical_payload: bytes
+
+    def __post_init__(self) -> None:
+        if not isinstance(cast(object, self.field), FieldSchema):
+            raise PostgresLoweringError("PostgreSQL scope field must be a FieldSchema")
+        if self.field.nullable:
+            raise PostgresLoweringError("PostgreSQL scope field must be non-nullable")
+        _validate_identifier_text(self.column_name, "PostgreSQL scope column")
+        if type(self.canonical_payload) is not bytes:
+            raise PostgresLoweringError("PostgreSQL scope canonical payload must be bytes")
+        try:
+            decode_payload(self.field, self.canonical_payload)
+        except CanonicalizationError as error:
+            raise PostgresLoweringError(
+                "PostgreSQL scope canonical payload does not match its logical field: "
+                f"reason_type={type(error).__name__}"
+            ) from None
+
+
+@final
+@dataclass(frozen=True, slots=True)
+class PostgresIntegerRangeRequest:
+    segment_id: str
+    lower_inclusive: int
+    upper_exclusive: int | None
+
+    def __post_init__(self) -> None:
+        _validate_scalar_text(self.segment_id, "PostgreSQL integer-range segment ID")
+        _validate_int64(self.lower_inclusive, "PostgreSQL integer-range lower bound")
+        if self.upper_exclusive is not None:
+            _validate_int64(self.upper_exclusive, "PostgreSQL integer-range upper bound")
+            if self.upper_exclusive <= self.lower_inclusive:
+                raise PostgresLoweringError(
+                    "PostgreSQL integer-range upper bound must be greater than its lower bound"
+                )
 
 
 @final
@@ -171,6 +216,14 @@ class _RowLowering:
     envelope: sql.Composable
     invalid_row: sql.Composable
     oversized_row: sql.Composable
+
+
+@final
+@dataclass(frozen=True, slots=True)
+class _IntegerKeyLowering:
+    column: sql.Identifier
+    is_valid: sql.Composable
+    envelope: sql.Composable
 
 
 def validate_postgres_inspection(
@@ -304,14 +357,433 @@ def build_postgres_fingerprint_query(
     )
 
 
+def build_postgres_integer_key_summary_query(
+    schema: CanonicalSchema,
+    inspection: PostgresInspectedRelation,
+    key_field_index: int,
+    scope: PostgresScopePredicate | None,
+    max_encoded_envelope_bytes: int,
+) -> PostgresQuery:
+    validate_postgres_inspection(schema, inspection)
+    _validate_positive_integer(
+        max_encoded_envelope_bytes,
+        "PostgreSQL max encoded envelope byte length",
+        INT64_MAX,
+    )
+    key = _integer_key_lowering(schema, inspection, key_field_index, "dfe_origin")
+    scope_filter, scope_parameters = _scope_filter(inspection, scope, "dfe_origin")
+    valid_key = sql.SQL("{column} IS NOT NULL AND ({is_valid})").format(
+        column=key.column,
+        is_valid=key.is_valid,
+    )
+    usable_access_path = _usable_integer_key_access_path(
+        inspection,
+        inspection.bindings[key_field_index].column_name,
+    )
+    statement = sql.SQL(
+        "SELECT (pg_catalog.array_agg((dfe_origin.*)) FILTER (WHERE FALSE))[1] "
+        "AS origin_type, "
+        "count(*)::text AS row_count, "
+        "count(*) FILTER (WHERE {key_column} IS NULL)::text AS null_key_count, "
+        "count(*) FILTER (WHERE {key_column} IS NOT NULL AND NOT ({valid_key}))::text "
+        "AS invalid_key_count, "
+        "count(*) FILTER (WHERE {valid_key})::text AS valid_key_count, "
+        "count(DISTINCT ({key_column})::numeric) FILTER (WHERE {valid_key})::text "
+        "AS distinct_key_count, "
+        "(min(({key_column})::numeric) FILTER (WHERE {valid_key}))::bigint::text "
+        "AS minimum_key, "
+        "(max(({key_column})::numeric) FILTER (WHERE {valid_key}))::bigint::text "
+        "AS maximum_key, "
+        "{usable_access_path} AS usable_access_path "
+        "FROM ONLY {relation} AS dfe_origin WHERE {scope_filter}"
+    ).format(
+        key_column=key.column,
+        valid_key=valid_key,
+        relation=sql.Identifier(*inspection.relation.components),
+        scope_filter=scope_filter,
+        usable_access_path=usable_access_path,
+    )
+    return PostgresQuery(
+        statement=statement,
+        parameters=scope_parameters,
+        context=prepare_envelope_context(schema),
+        inspected_relation=inspection,
+        max_encoded_envelope_bytes=max_encoded_envelope_bytes,
+    )
+
+
+def build_postgres_integer_range_fingerprint_query(
+    schema: CanonicalSchema,
+    inspection: PostgresInspectedRelation,
+    key_field_index: int,
+    scope: PostgresScopePredicate | None,
+    ranges: tuple[PostgresIntegerRangeRequest, ...],
+    max_encoded_envelope_bytes: int,
+) -> PostgresQuery:
+    validate_postgres_inspection(schema, inspection)
+    _validate_positive_integer(
+        max_encoded_envelope_bytes,
+        "PostgreSQL max encoded envelope byte length",
+        INT64_MAX,
+    )
+    _validate_integer_ranges(ranges)
+    context = prepare_envelope_context(schema)
+    row = _row_lowering_for_alias(
+        schema,
+        inspection.bindings,
+        max_encoded_envelope_bytes,
+        "dfe_origin",
+    )
+    key = _integer_key_lowering(schema, inspection, key_field_index, "dfe_origin")
+    scope_filter, scope_parameters = _scope_filter(inspection, scope, "dfe_origin")
+    ranges_values = _integer_range_values(ranges)
+    limb_sums = sql.SQL(", ").join(_limb_sum_expression(index) for index in range(8))
+    statement = sql.SQL(
+        "WITH dfe_ranges(segment_id, lower_inclusive, upper_exclusive, ordinal) AS ("
+        "VALUES {ranges_values}"
+        ") SELECT dfe_aggregate.origin_type, dfe_range.segment_id, "
+        "dfe_aggregate.valid_row_count, dfe_aggregate.limb_0, "
+        "dfe_aggregate.limb_1, dfe_aggregate.limb_2, dfe_aggregate.limb_3, "
+        "dfe_aggregate.limb_4, dfe_aggregate.limb_5, dfe_aggregate.limb_6, "
+        "dfe_aggregate.limb_7, dfe_aggregate.invalid_row_count, "
+        "dfe_aggregate.oversized_row_count, dfe_aggregate.row_envelope_bytes, "
+        "dfe_aggregate.key_envelope_bytes FROM dfe_ranges AS dfe_range "
+        "CROSS JOIN LATERAL (SELECT "
+        "(pg_catalog.array_agg((dfe_origin.*)) FILTER (WHERE FALSE))[1] "
+        "AS origin_type, "
+        "count(*) FILTER (WHERE NOT dfe_row.invalid_row "
+        "AND NOT dfe_row.oversized_row)::text AS valid_row_count, {limb_sums}, "
+        "count(*) FILTER (WHERE dfe_row.invalid_row)::text AS invalid_row_count, "
+        "count(*) FILTER (WHERE dfe_row.oversized_row)::text AS oversized_row_count, "
+        "coalesce(sum(octet_length(dfe_row.row_envelope)) FILTER "
+        "(WHERE NOT dfe_row.invalid_row AND NOT dfe_row.oversized_row), "
+        "0::numeric)::text AS row_envelope_bytes, "
+        "coalesce(sum(octet_length(dfe_row.key_envelope)) FILTER "
+        "(WHERE NOT dfe_row.invalid_row AND NOT dfe_row.oversized_row), "
+        "0::numeric)::text AS key_envelope_bytes "
+        "FROM ONLY {relation} AS dfe_origin "
+        "CROSS JOIN LATERAL (SELECT {row_envelope} AS row_envelope, "
+        "{key_envelope} AS key_envelope, {invalid_row} AS invalid_row, "
+        "{oversized_row} AS oversized_row OFFSET 0) AS dfe_row "
+        "CROSS JOIN LATERAL (SELECT CASE WHEN dfe_row.row_envelope IS NULL "
+        "THEN NULL::bytea ELSE sha256(convert_to(dfe_row.row_envelope, 'UTF8')) "
+        "END AS row_hash OFFSET 0) AS dfe_hash "
+        "WHERE {scope_filter} AND {key_column} IS NOT NULL AND ({key_valid}) "
+        "AND {key_column} >= dfe_range.lower_inclusive "
+        "AND (dfe_range.upper_exclusive IS NULL "
+        "OR {key_column} < dfe_range.upper_exclusive)) AS dfe_aggregate "
+        "ORDER BY dfe_range.ordinal"
+    ).format(
+        ranges_values=ranges_values,
+        row_envelope=row.envelope,
+        key_envelope=key.envelope,
+        invalid_row=row.invalid_row,
+        oversized_row=row.oversized_row,
+        relation=sql.Identifier(*inspection.relation.components),
+        scope_filter=scope_filter,
+        key_column=key.column,
+        key_valid=key.is_valid,
+        limb_sums=limb_sums,
+    )
+    return PostgresQuery(
+        statement=statement,
+        parameters=(context.schema_digest_hex, len(context.schema.fields), *scope_parameters),
+        context=context,
+        inspected_relation=inspection,
+        max_encoded_envelope_bytes=max_encoded_envelope_bytes,
+    )
+
+
+def build_postgres_integer_range_rows_query(
+    schema: CanonicalSchema,
+    inspection: PostgresInspectedRelation,
+    key_field_index: int,
+    scope: PostgresScopePredicate | None,
+    ranges: tuple[PostgresIntegerRangeRequest, ...],
+    max_encoded_envelope_bytes: int,
+) -> PostgresQuery:
+    validate_postgres_inspection(schema, inspection)
+    _validate_positive_integer(
+        max_encoded_envelope_bytes,
+        "PostgreSQL max encoded envelope byte length",
+        INT64_MAX,
+    )
+    _validate_integer_ranges(ranges)
+    context = prepare_envelope_context(schema)
+    row = _row_lowering_for_alias(
+        schema,
+        inspection.bindings,
+        max_encoded_envelope_bytes,
+        "dfe_origin",
+    )
+    key = _integer_key_lowering(schema, inspection, key_field_index, "dfe_origin")
+    scope_filter, scope_parameters = _scope_filter(inspection, scope, "dfe_origin")
+    statement = sql.SQL(
+        "WITH dfe_ranges(segment_id, lower_inclusive, upper_exclusive, ordinal) AS ("
+        "VALUES {ranges_values}"
+        ") SELECT "
+        "CASE WHEN FALSE THEN (dfe_origin.*) ELSE NULL END AS origin_type, "
+        "dfe_range.segment_id, {key_envelope} AS key_envelope, "
+        "{row_envelope} AS row_envelope, {invalid_row} AS invalid_row, "
+        "{oversized_row} AS oversized_row "
+        "FROM dfe_ranges AS dfe_range JOIN ONLY {relation} AS dfe_origin ON "
+        "{scope_filter} AND {key_column} IS NOT NULL AND ({key_valid}) "
+        "AND {key_column} >= dfe_range.lower_inclusive "
+        "AND (dfe_range.upper_exclusive IS NULL "
+        "OR {key_column} < dfe_range.upper_exclusive) "
+        "ORDER BY dfe_range.ordinal, {key_column}"
+    ).format(
+        ranges_values=_integer_range_values(ranges),
+        key_envelope=key.envelope,
+        row_envelope=row.envelope,
+        invalid_row=row.invalid_row,
+        oversized_row=row.oversized_row,
+        relation=sql.Identifier(*inspection.relation.components),
+        scope_filter=scope_filter,
+        key_column=key.column,
+        key_valid=key.is_valid,
+    )
+    return PostgresQuery(
+        statement=statement,
+        parameters=(context.schema_digest_hex, len(context.schema.fields), *scope_parameters),
+        context=context,
+        inspected_relation=inspection,
+        max_encoded_envelope_bytes=max_encoded_envelope_bytes,
+    )
+
+
+def _integer_key_lowering(
+    schema: CanonicalSchema,
+    inspection: PostgresInspectedRelation,
+    key_field_index: int,
+    source_alias: str,
+) -> _IntegerKeyLowering:
+    _validate_key_field_index(schema, key_field_index)
+    field = schema.fields[key_field_index]
+    binding = inspection.bindings[key_field_index]
+    _validate_identifier_text(source_alias, "PostgreSQL source alias")
+    column = sql.Identifier(source_alias, binding.column_name)
+    payload = _int64_payload(column)
+    frame = _field_lowering(field, column)
+    key_schema = CanonicalSchema(protocol=schema.protocol, fields=(field,))
+    key_context = prepare_envelope_context(key_schema)
+    envelope = sql.SQL("{header} || {frame}").format(
+        header=sql.Literal(key_context.key_header),
+        frame=frame.frame,
+    )
+    return _IntegerKeyLowering(
+        column=column,
+        is_valid=payload.is_valid,
+        envelope=envelope,
+    )
+
+
+def _scope_filter(
+    inspection: PostgresInspectedRelation,
+    scope: PostgresScopePredicate | None,
+    source_alias: str,
+) -> tuple[sql.Composable, tuple[PostgresParameter, ...]]:
+    _validate_identifier_text(source_alias, "PostgreSQL source alias")
+    if scope is None:
+        return sql.SQL("TRUE"), ()
+    if not isinstance(cast(object, scope), PostgresScopePredicate):
+        raise PostgresLoweringError("PostgreSQL scope must be a PostgresScopePredicate or None")
+    matches = tuple(
+        (index, binding)
+        for index, binding in enumerate(inspection.bindings)
+        if binding.column_name == scope.column_name
+    )
+    if len(matches) != 1:
+        raise PostgresLoweringError(
+            "PostgreSQL scoped comparison requires the scope column to map to exactly one "
+            "inspected projection field: "
+            f"column={scope.column_name!r}, matching_fields={len(matches)}"
+        )
+    field_index, binding = matches[0]
+    _validate_physical_mapping(scope.field, binding.physical, field_index)
+    column = sql.Identifier(source_alias, scope.column_name)
+    payload = _payload_lowering(scope.field, column)
+    decoded = decode_payload(scope.field, scope.canonical_payload)
+    native_comparison = _native_scope_comparison(scope.field, column, decoded)
+    if native_comparison is not None:
+        native_predicate, parameter = native_comparison
+        predicate = sql.SQL(
+            "{column} IS NOT NULL AND ({is_valid}) AND ({native_predicate})"
+        ).format(
+            column=column,
+            is_valid=payload.is_valid,
+            native_predicate=native_predicate,
+        )
+        return predicate, (parameter,)
+    predicate = sql.SQL("{column} IS NOT NULL AND ({is_valid}) AND ({payload}) = %s::bytea").format(
+        column=column,
+        is_valid=payload.is_valid,
+        payload=payload.payload,
+    )
+    return predicate, (scope.canonical_payload,)
+
+
+def _native_scope_comparison(
+    field: FieldSchema,
+    column: sql.Identifier,
+    value: object,
+) -> tuple[sql.Composable, PostgresParameter] | None:
+    logical_type = field.logical_type
+    if logical_type is LogicalType.INT64:
+        if type(value) is not int:
+            raise PostgresLoweringError("decoded INT64 scope value must be an integer")
+        return sql.SQL("{column} = %s::bigint").format(column=column), value
+    if logical_type is LogicalType.DECIMAL:
+        return sql.SQL("({column})::numeric = %s::numeric").format(column=column), str(value)
+    if logical_type is LogicalType.BOOLEAN:
+        if type(value) is not bool:
+            raise PostgresLoweringError("decoded boolean scope value must be a boolean")
+        return (
+            sql.SQL("{column} = %s::boolean").format(column=column),
+            "true" if value else "false",
+        )
+    if logical_type is LogicalType.DATE:
+        if type(value) is not date:
+            raise PostgresLoweringError("decoded date scope value must be a date")
+        return sql.SQL("{column} = %s::date").format(column=column), value.isoformat()
+    if logical_type is LogicalType.TIMESTAMP_LOCAL:
+        if type(value) is not str:
+            raise PostgresLoweringError(
+                "decoded timestamp_local scope value must be canonical text"
+            )
+        return sql.SQL("{column} = %s::timestamp").format(column=column), value
+    if logical_type is LogicalType.TIMESTAMP_INSTANT:
+        if type(value) is not str:
+            raise PostgresLoweringError(
+                "decoded timestamp_instant scope value must be canonical text"
+            )
+        return sql.SQL("{column} = %s::timestamptz").format(column=column), value
+    if logical_type is LogicalType.STRING:
+        return None
+    raise PostgresLoweringError(
+        f"logical type {logical_type!r} is unsupported for PostgreSQL scope equality"
+    )
+
+
+def _integer_range_values(
+    ranges: tuple[PostgresIntegerRangeRequest, ...],
+) -> sql.Composable:
+    values: list[sql.Composable] = []
+    for ordinal, item in enumerate(ranges):
+        upper = (
+            sql.SQL("NULL::bigint")
+            if item.upper_exclusive is None
+            else sql.SQL("{value}::bigint").format(value=sql.Literal(item.upper_exclusive))
+        )
+        values.append(
+            sql.SQL("({segment_id}, {lower}::bigint, {upper}, {ordinal}::integer)").format(
+                segment_id=sql.Literal(item.segment_id),
+                lower=sql.Literal(item.lower_inclusive),
+                upper=upper,
+                ordinal=sql.Literal(ordinal),
+            )
+        )
+    return sql.SQL(", ").join(values)
+
+
+def _usable_integer_key_access_path(
+    inspection: PostgresInspectedRelation,
+    key_column_name: str,
+) -> sql.Composable:
+    return sql.SQL(
+        "EXISTS (SELECT 1 FROM pg_catalog.pg_index AS dfe_index "
+        "JOIN pg_catalog.pg_class AS dfe_index_relation "
+        "ON dfe_index_relation.oid = dfe_index.indexrelid "
+        "JOIN pg_catalog.pg_am AS dfe_access_method "
+        "ON dfe_access_method.oid = dfe_index_relation.relam "
+        "JOIN pg_catalog.pg_opclass AS dfe_opclass "
+        "ON dfe_opclass.oid = dfe_index.indclass[0] "
+        "JOIN pg_catalog.pg_namespace AS dfe_opclass_namespace "
+        "ON dfe_opclass_namespace.oid = dfe_opclass.opcnamespace "
+        "JOIN pg_catalog.pg_attribute AS dfe_key_attribute "
+        "ON dfe_key_attribute.attrelid = dfe_index.indrelid "
+        "AND dfe_key_attribute.attnum = dfe_index.indkey[0] "
+        "WHERE dfe_index.indrelid = {relation_oid}::oid "
+        "AND dfe_access_method.amname = 'btree' "
+        "AND dfe_opclass_namespace.nspname = 'pg_catalog' "
+        "AND dfe_key_attribute.attname = {key_column_name} "
+        "AND NOT dfe_key_attribute.attisdropped "
+        "AND dfe_index.indnkeyatts >= 1 "
+        "AND dfe_index.indisvalid AND dfe_index.indisready AND dfe_index.indislive "
+        "AND dfe_index.indpred IS NULL AND dfe_index.indexprs IS NULL)"
+    ).format(
+        relation_oid=sql.Literal(inspection.relation_oid),
+        key_column_name=sql.Literal(key_column_name),
+    )
+
+
+def _validate_key_field_index(schema: CanonicalSchema, key_field_index: int) -> None:
+    if type(key_field_index) is not int or not 0 <= key_field_index < len(schema.fields):
+        raise PostgresLoweringError(
+            "PostgreSQL integer-key field index must identify a schema field"
+        )
+    field = schema.fields[key_field_index]
+    if field.logical_type is not LogicalType.INT64 or field.nullable:
+        raise PostgresLoweringError(
+            "PostgreSQL range comparison requires one non-null logical INT64 key field"
+        )
+
+
+def _validate_integer_ranges(value: object) -> None:
+    if type(value) is not tuple or not value:
+        raise PostgresLoweringError(
+            "PostgreSQL integer-range requests must be a non-empty immutable tuple"
+        )
+    ranges = cast(tuple[object, ...], value)
+    seen_ids: set[str] = set()
+    previous_upper: int | None = None
+    for index, item in enumerate(ranges):
+        if not isinstance(item, PostgresIntegerRangeRequest):
+            raise PostgresLoweringError(
+                f"PostgreSQL integer-range request has an unexpected type: range_index={index}"
+            )
+        if item.segment_id in seen_ids:
+            raise PostgresLoweringError(
+                "PostgreSQL integer-range segment IDs must be unique within a query"
+            )
+        seen_ids.add(item.segment_id)
+        if index > 0:
+            if previous_upper is None:
+                raise PostgresLoweringError("PostgreSQL unbounded integer range must be last")
+            if item.lower_inclusive < previous_upper:
+                raise PostgresLoweringError(
+                    "PostgreSQL integer ranges must be ordered and disjoint"
+                )
+        previous_upper = item.upper_exclusive
+
+
 def _row_lowering(
     schema: CanonicalSchema,
     bindings: tuple[PostgresFieldBinding, ...],
     max_encoded_envelope_bytes: int,
 ) -> _RowLowering:
+    columns = tuple(sql.Identifier(binding.column_name) for binding in bindings)
+    return _row_lowering_from_columns(schema, columns, max_encoded_envelope_bytes)
+
+
+def _row_lowering_for_alias(
+    schema: CanonicalSchema,
+    bindings: tuple[PostgresFieldBinding, ...],
+    max_encoded_envelope_bytes: int,
+    source_alias: str,
+) -> _RowLowering:
+    _validate_identifier_text(source_alias, "PostgreSQL source alias")
+    columns = tuple(sql.Identifier(source_alias, binding.column_name) for binding in bindings)
+    return _row_lowering_from_columns(schema, columns, max_encoded_envelope_bytes)
+
+
+def _row_lowering_from_columns(
+    schema: CanonicalSchema,
+    columns: tuple[sql.Identifier, ...],
+    max_encoded_envelope_bytes: int,
+) -> _RowLowering:
     field_lowerings = tuple(
-        _field_lowering(field, sql.Identifier(binding.column_name))
-        for field, binding in zip(schema.fields, bindings, strict=True)
+        _field_lowering(field, column) for field, column in zip(schema.fields, columns, strict=True)
     )
 
     if field_lowerings:
@@ -642,10 +1114,10 @@ def _timestamp_payload_for_value(
 def _limb_sum_expression(index: int) -> sql.Composable:
     offset = index * 4
     limb = sql.SQL(
-        "get_byte(dfe_hash.row_hash, {b0})::numeric * 16777216 + "
-        "get_byte(dfe_hash.row_hash, {b1})::numeric * 65536 + "
-        "get_byte(dfe_hash.row_hash, {b2})::numeric * 256 + "
-        "get_byte(dfe_hash.row_hash, {b3})::numeric"
+        "get_byte(dfe_hash.row_hash, {b0})::bigint * 16777216::bigint + "
+        "get_byte(dfe_hash.row_hash, {b1})::bigint * 65536::bigint + "
+        "get_byte(dfe_hash.row_hash, {b2})::bigint * 256::bigint + "
+        "get_byte(dfe_hash.row_hash, {b3})::bigint"
     ).format(
         b0=sql.Literal(offset),
         b1=sql.Literal(offset + 1),
@@ -732,6 +1204,11 @@ def _validate_optional_integer(value: object, context: str) -> None:
         raise PostgresLoweringError(f"{context} must be an integer or None")
 
 
+def _validate_int64(value: object, context: str) -> None:
+    if type(value) is not int or not INT64_MIN <= value <= INT64_MAX:
+        raise PostgresLoweringError(f"{context} must be a signed int64 integer")
+
+
 def _validate_nonnegative_integer(value: object, context: str) -> None:
     if type(value) is not int or value < 0:
         raise PostgresLoweringError(f"{context} must be a non-negative integer")
@@ -803,9 +1280,9 @@ def _require_query_parameters(value: object) -> None:
         raise PostgresLoweringError("PostgreSQL query parameters must be an immutable tuple")
     parameters = cast(tuple[object, ...], value)
     for index, parameter in enumerate(parameters):
-        if type(parameter) not in (str, int):
+        if type(parameter) not in (str, int, bytes):
             raise PostgresLoweringError(
-                "PostgreSQL query parameter must be an exact string or integer: "
+                "PostgreSQL query parameter must be an exact string, integer, or bytes value: "
                 f"parameter_index={index}"
             )
 

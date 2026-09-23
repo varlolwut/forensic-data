@@ -779,7 +779,7 @@ def test_fingerprint_match_allows_only_zero_inferred_difference_totals() -> None
             )
         }
     )
-    with pytest.raises(ValidationError, match="must be zero"):
+    with pytest.raises(ValidationError, match="match result requires zero difference totals"):
         RunResult(
             schema_version=1,
             run_id=RUN_ID,

@@ -19,19 +19,26 @@ from forensic_data.canonical import (
     CanonicalSchema,
     Fingerprint,
     FingerprintOverflowError,
+    decode_key_with_context,
     decode_row_with_context,
     envelope_sha256,
+    prepare_envelope_context,
 )
 from forensic_data.contracts.model import ReadinessManifestColumns
 from forensic_data.postgres_sql import (
     PostgresFieldBinding,
     PostgresInspectedRelation,
+    PostgresIntegerRangeRequest,
     PostgresParameter,
     PostgresPhysicalField,
     PostgresQuery,
     PostgresRelation,
+    PostgresScopePredicate,
     PostgresTypeIdentity,
     build_postgres_fingerprint_query,
+    build_postgres_integer_key_summary_query,
+    build_postgres_integer_range_fingerprint_query,
+    build_postgres_integer_range_rows_query,
     build_postgres_row_envelope_query,
     validate_postgres_inspection,
 )
@@ -42,6 +49,7 @@ UINT32_MAX = (1 << 32) - 1
 SHA256_BYTES = 32
 _CANONICAL_STATUS_BYTES = 2
 _CURSOR_FETCH_RECORDS = 64
+_DEADLINE_CHECK_RECORDS = 64
 _METADATA_ROW_COLUMNS = 15
 _MANIFEST_TEXT_TYPES: frozenset[tuple[str, int]] = frozenset((("text", 25), ("varchar", 1043)))
 _MANIFEST_DATE_TYPE: tuple[str, int] = ("date", 1082)
@@ -104,6 +112,10 @@ class PostgresDataValidationError(PostgresConnectorError):
 
 class PostgresResultLimitError(PostgresConnectorError):
     """A PostgreSQL result exceeded an explicitly reserved byte or record budget."""
+
+
+class PostgresReadDeadlineExceededError(PostgresConnectorError):
+    """A bounded PostgreSQL read exhausted its absolute monotonic deadline."""
 
 
 class PostgresSslMode(StrEnum):
@@ -234,6 +246,134 @@ class PostgresProtectedRelationInspection:
 class PostgresCanonicalRow:
     envelope: bytes
     sha256: bytes
+
+
+@dataclass(frozen=True, slots=True)
+class PostgresReadDeadline:
+    statement_timeout_milliseconds: int
+    deadline_nanoseconds: int
+
+    def __post_init__(self) -> None:
+        _validate_positive_integer(
+            self.statement_timeout_milliseconds,
+            "statement_timeout_milliseconds",
+        )
+        _validate_nonnegative_integer(self.deadline_nanoseconds, "deadline_nanoseconds")
+
+
+@dataclass(frozen=True, slots=True)
+class PostgresReadMetrics:
+    fetched_records: int
+    result_bytes: int
+
+    def __post_init__(self) -> None:
+        _validate_nonnegative_integer(self.fetched_records, "fetched_records")
+        _validate_nonnegative_integer(self.result_bytes, "result_bytes")
+
+
+@dataclass(frozen=True, slots=True)
+class PostgresIntegerKeySummary:
+    row_count: int
+    null_key_count: int
+    invalid_key_count: int
+    valid_key_count: int
+    distinct_key_count: int
+    minimum_key: int | None
+    maximum_key: int | None
+    usable_access_path: bool
+
+    def __post_init__(self) -> None:
+        for field_name, value in (
+            ("row_count", self.row_count),
+            ("null_key_count", self.null_key_count),
+            ("invalid_key_count", self.invalid_key_count),
+            ("valid_key_count", self.valid_key_count),
+            ("distinct_key_count", self.distinct_key_count),
+        ):
+            _require_bounded_integer(value, field_name, 0, INT64_MAX)
+        if self.row_count != self.null_key_count + self.invalid_key_count + self.valid_key_count:
+            raise PostgresDataValidationError(
+                "PostgreSQL integer-key summary counts do not partition the scoped rows"
+            )
+        if self.distinct_key_count > self.valid_key_count:
+            raise PostgresDataValidationError(
+                "PostgreSQL distinct integer-key count exceeds the valid key count"
+            )
+        if self.valid_key_count == 0:
+            if self.minimum_key is not None or self.maximum_key is not None:
+                raise PostgresDataValidationError(
+                    "PostgreSQL empty integer-key summary must not contain key bounds"
+                )
+        else:
+            minimum = _require_bounded_integer(
+                self.minimum_key,
+                "minimum_key",
+                -(1 << 63),
+                INT64_MAX,
+            )
+            maximum = _require_bounded_integer(
+                self.maximum_key,
+                "maximum_key",
+                -(1 << 63),
+                INT64_MAX,
+            )
+            if minimum > maximum:
+                raise PostgresDataValidationError(
+                    "PostgreSQL integer-key summary minimum exceeds its maximum"
+                )
+        if type(self.usable_access_path) is not bool:
+            raise PostgresDataValidationError(
+                "PostgreSQL integer-key access-path status must be a boolean"
+            )
+
+
+@dataclass(frozen=True, slots=True)
+class PostgresIntegerKeySummaryRead:
+    summary: PostgresIntegerKeySummary
+    metrics: PostgresReadMetrics
+
+
+@dataclass(frozen=True, slots=True)
+class PostgresRangeFingerprint:
+    segment_id: str
+    fingerprint: Fingerprint
+    row_envelope_bytes: int
+    key_envelope_bytes: int
+
+    def __post_init__(self) -> None:
+        _require_text(self.segment_id, "segment_id")
+        if not isinstance(cast(object, self.fingerprint), Fingerprint):
+            raise PostgresDataValidationError(
+                "PostgreSQL range fingerprint must contain a Fingerprint"
+            )
+        _validate_nonnegative_integer(self.row_envelope_bytes, "row_envelope_bytes")
+        _validate_nonnegative_integer(self.key_envelope_bytes, "key_envelope_bytes")
+
+
+@dataclass(frozen=True, slots=True)
+class PostgresRangeFingerprintRead:
+    ranges: tuple[PostgresRangeFingerprint, ...]
+    metrics: PostgresReadMetrics
+
+
+@dataclass(frozen=True, slots=True)
+class PostgresIntegerExactRow:
+    segment_id: str
+    key_value: int
+    key_envelope: bytes
+    row_envelope: bytes
+
+    def __post_init__(self) -> None:
+        _require_text(self.segment_id, "segment_id")
+        _require_bounded_integer(self.key_value, "key_value", -(1 << 63), INT64_MAX)
+        if type(self.key_envelope) is not bytes or type(self.row_envelope) is not bytes:
+            raise PostgresDataValidationError("PostgreSQL exact comparison envelopes must be bytes")
+
+
+@dataclass(frozen=True, slots=True)
+class PostgresIntegerExactRowsRead:
+    rows: tuple[PostgresIntegerExactRow, ...]
+    metrics: PostgresReadMetrics
 
 
 @dataclass(frozen=True, slots=True)
@@ -503,6 +643,88 @@ class PostgresReadContext:
                 f"reason_type={type(error).__name__}"
             ) from None
 
+    def read_integer_key_summary(
+        self,
+        query: PostgresQuery,
+        max_record_bytes: int,
+        max_total_bytes: int,
+        deadline: PostgresReadDeadline,
+    ) -> PostgresIntegerKeySummaryRead:
+        _validate_postgres_query(query)
+        self._require_query_context(query)
+        _require_postgres_read_deadline(deadline, "integer-key summary read")
+        rows = self._execute_compiled_query_before_deadline(
+            query,
+            1,
+            max_record_bytes,
+            max_total_bytes,
+            deadline,
+        )
+        if len(rows) != 1:
+            raise PostgresDataValidationError(
+                "PostgreSQL integer-key summary query must return exactly one row"
+            )
+        return PostgresIntegerKeySummaryRead(
+            summary=_integer_key_summary_from_database(rows[0]),
+            metrics=_read_metrics_before_deadline(rows, deadline),
+        )
+
+    def read_integer_range_fingerprints(
+        self,
+        query: PostgresQuery,
+        ranges: tuple[PostgresIntegerRangeRequest, ...],
+        max_record_bytes: int,
+        max_total_bytes: int,
+        deadline: PostgresReadDeadline,
+    ) -> PostgresRangeFingerprintRead:
+        _validate_postgres_query(query)
+        self._require_query_context(query)
+        _require_postgres_read_deadline(deadline, "integer-range fingerprint read")
+        rows = self._execute_compiled_query_before_deadline(
+            query,
+            len(ranges),
+            max_record_bytes,
+            max_total_bytes,
+            deadline,
+        )
+        parsed = _range_fingerprints_from_database(rows, ranges, query, deadline)
+        return PostgresRangeFingerprintRead(
+            ranges=parsed,
+            metrics=_read_metrics_before_deadline(rows, deadline),
+        )
+
+    def read_integer_range_rows(
+        self,
+        query: PostgresQuery,
+        ranges: tuple[PostgresIntegerRangeRequest, ...],
+        key_field_index: int,
+        max_records: int,
+        max_record_bytes: int,
+        max_total_bytes: int,
+        deadline: PostgresReadDeadline,
+    ) -> PostgresIntegerExactRowsRead:
+        _validate_postgres_query(query)
+        self._require_query_context(query)
+        _require_postgres_read_deadline(deadline, "integer-range exact read")
+        rows = self._execute_compiled_query_before_deadline(
+            query,
+            max_records,
+            max_record_bytes,
+            max_total_bytes,
+            deadline,
+        )
+        parsed = _integer_exact_rows_from_database(
+            rows,
+            ranges,
+            key_field_index,
+            query,
+            deadline,
+        )
+        return PostgresIntegerExactRowsRead(
+            rows=parsed,
+            metrics=_read_metrics_before_deadline(rows, deadline),
+        )
+
     def close(self) -> None:
         failure: str | None = None
         with self._query_lock:
@@ -681,6 +903,108 @@ class PostgresReadContext:
             raise AssertionError("PostgreSQL compiled query completed without a result")
         return records
 
+    def _execute_compiled_query_before_deadline(
+        self,
+        query: PostgresQuery,
+        max_records: int,
+        max_record_bytes: int,
+        max_total_bytes: int,
+        deadline: PostgresReadDeadline,
+    ) -> tuple[DatabaseRow, ...]:
+        _validate_result_limits(max_records, max_record_bytes, max_total_bytes)
+        _require_postgres_read_deadline(deadline, "compiled comparison query")
+        database_failure: str | None = None
+        records: tuple[DatabaseRow, ...] | None = None
+        with self._query_lock:
+            self._require_active()
+            cursor_name = f"dfe_{uuid4().hex}"
+            try:
+                self._restore_session_invariants()
+                self._apply_read_deadline(deadline, "compiled comparison query")
+                with self._connection.cursor(name=cursor_name) as cursor:
+                    cursor.execute(
+                        _executable_statement(query.statement),
+                        query.parameters,
+                    )
+                    _require_compiled_origin_type(
+                        cursor.description,
+                        query.inspected_relation.relation_row_type_oid,
+                    )
+                    records = self._fetch_bounded_rows_before_deadline(
+                        cursor,
+                        max_records,
+                        max_record_bytes,
+                        max_total_bytes,
+                        deadline,
+                    )
+            except psycopg.Error as error:
+                self._state = ReadContextState.LOST
+                self._connection.close()
+                database_failure = _database_error_message(
+                    "execute deadline-bounded compiled query",
+                    error,
+                )
+        if database_failure is not None:
+            raise PostgresQueryError(database_failure)
+        if records is None:
+            raise AssertionError(
+                "PostgreSQL deadline-bounded compiled query completed without a result"
+            )
+        return records
+
+    def _fetch_bounded_rows_before_deadline(
+        self,
+        cursor: ServerCursor[DatabaseRow],
+        max_records: int,
+        max_record_bytes: int,
+        max_total_bytes: int,
+        deadline: PostgresReadDeadline,
+    ) -> tuple[DatabaseRow, ...]:
+        records: list[DatabaseRow] = []
+        total_bytes = 0
+        while True:
+            self._apply_read_deadline(deadline, "comparison portal fetch")
+            remaining = max_records + 1 - len(records)
+            fetch_records = min(_CURSOR_FETCH_RECORDS, remaining)
+            batch = cursor.fetchmany(fetch_records)
+            if not batch:
+                break
+            for row in batch:
+                if len(records) == max_records:
+                    raise PostgresResultLimitError(
+                        "PostgreSQL query exceeded the reserved record budget: "
+                        f"max_records={max_records}"
+                    )
+                record_bytes = _database_row_bytes(row)
+                if record_bytes > max_record_bytes:
+                    raise PostgresResultLimitError(
+                        "PostgreSQL query returned a record above the byte budget: "
+                        f"record_bytes={record_bytes}, max_record_bytes={max_record_bytes}"
+                    )
+                total_bytes += record_bytes
+                if total_bytes > max_total_bytes:
+                    raise PostgresResultLimitError(
+                        "PostgreSQL query exceeded the total byte budget: "
+                        f"observed_bytes={total_bytes}, max_total_bytes={max_total_bytes}"
+                    )
+                records.append(row)
+        return tuple(records)
+
+    def _apply_read_deadline(
+        self,
+        deadline: PostgresReadDeadline,
+        operation: str,
+    ) -> None:
+        timeout_milliseconds = _deadline_statement_timeout_milliseconds(
+            self._statement_timeout_milliseconds,
+            deadline,
+            operation,
+        )
+        self._connection.execute(
+            "SELECT pg_catalog.set_config('statement_timeout', %s, true)",
+            (str(timeout_milliseconds),),
+        )
+
     def _execute_origin_checked_query(
         self,
         statement: ExecutableSql,
@@ -825,6 +1149,90 @@ class PostgresProtectedReadContext:
             query,
             max_record_bytes,
             max_total_bytes,
+        )
+
+    def read_integer_key_summary(
+        self,
+        protected_relation: PostgresProtectedRelationInspection,
+        key_field_index: int,
+        scope: PostgresScopePredicate | None,
+        max_encoded_envelope_bytes: int,
+        max_record_bytes: int,
+        max_total_bytes: int,
+        deadline: PostgresReadDeadline,
+    ) -> PostgresIntegerKeySummaryRead:
+        self._require_protected_relation(protected_relation)
+        query = build_postgres_integer_key_summary_query(
+            protected_relation.acquisition.schema,
+            protected_relation.inspection,
+            key_field_index,
+            scope,
+            max_encoded_envelope_bytes,
+        )
+        return self._read_context.read_integer_key_summary(
+            query,
+            max_record_bytes,
+            max_total_bytes,
+            deadline,
+        )
+
+    def read_integer_range_fingerprints(
+        self,
+        protected_relation: PostgresProtectedRelationInspection,
+        key_field_index: int,
+        scope: PostgresScopePredicate | None,
+        ranges: tuple[PostgresIntegerRangeRequest, ...],
+        max_encoded_envelope_bytes: int,
+        max_record_bytes: int,
+        max_total_bytes: int,
+        deadline: PostgresReadDeadline,
+    ) -> PostgresRangeFingerprintRead:
+        self._require_protected_relation(protected_relation)
+        query = build_postgres_integer_range_fingerprint_query(
+            protected_relation.acquisition.schema,
+            protected_relation.inspection,
+            key_field_index,
+            scope,
+            ranges,
+            max_encoded_envelope_bytes,
+        )
+        return self._read_context.read_integer_range_fingerprints(
+            query,
+            ranges,
+            max_record_bytes,
+            max_total_bytes,
+            deadline,
+        )
+
+    def read_integer_range_rows(
+        self,
+        protected_relation: PostgresProtectedRelationInspection,
+        key_field_index: int,
+        scope: PostgresScopePredicate | None,
+        ranges: tuple[PostgresIntegerRangeRequest, ...],
+        max_encoded_envelope_bytes: int,
+        max_records: int,
+        max_record_bytes: int,
+        max_total_bytes: int,
+        deadline: PostgresReadDeadline,
+    ) -> PostgresIntegerExactRowsRead:
+        self._require_protected_relation(protected_relation)
+        query = build_postgres_integer_range_rows_query(
+            protected_relation.acquisition.schema,
+            protected_relation.inspection,
+            key_field_index,
+            scope,
+            ranges,
+            max_encoded_envelope_bytes,
+        )
+        return self._read_context.read_integer_range_rows(
+            query,
+            ranges,
+            key_field_index,
+            max_records,
+            max_record_bytes,
+            max_total_bytes,
+            deadline,
         )
 
     def read_relation_manifest(
@@ -2124,6 +2532,254 @@ def _canonical_row_from_database(
     return PostgresCanonicalRow(envelope=envelope, sha256=digest)
 
 
+def _integer_key_summary_from_database(row: DatabaseRow) -> PostgresIntegerKeySummary:
+    if len(row) != 9:
+        raise PostgresDataValidationError(
+            "PostgreSQL integer-key summary must return origin type, five counts, two "
+            "bounds, and access-path status"
+        )
+    if row[0] is not None:
+        raise PostgresDataValidationError(
+            "PostgreSQL integer-key summary origin type marker must be NULL"
+        )
+    counts = tuple(_parse_unsigned_decimal(value, 19) for value in row[1:6])
+    minimum = _parse_optional_int64(row[6], "integer-key minimum")
+    maximum = _parse_optional_int64(row[7], "integer-key maximum")
+    return PostgresIntegerKeySummary(
+        row_count=counts[0],
+        null_key_count=counts[1],
+        invalid_key_count=counts[2],
+        valid_key_count=counts[3],
+        distinct_key_count=counts[4],
+        minimum_key=minimum,
+        maximum_key=maximum,
+        usable_access_path=_require_boolean(row[8], "integer-key usable access path"),
+    )
+
+
+def _range_fingerprints_from_database(
+    rows: tuple[DatabaseRow, ...],
+    ranges: tuple[PostgresIntegerRangeRequest, ...],
+    query: PostgresQuery,
+    deadline: PostgresReadDeadline,
+) -> tuple[PostgresRangeFingerprint, ...]:
+    if len(rows) != len(ranges):
+        raise PostgresDataValidationError(
+            "PostgreSQL range fingerprint query must return one row per requested range: "
+            f"expected={len(ranges)}, actual={len(rows)}"
+        )
+    parsed: list[PostgresRangeFingerprint] = []
+    for index, (range_request, row) in enumerate(zip(ranges, rows, strict=True)):
+        if index % _DEADLINE_CHECK_RECORDS == 0:
+            _require_postgres_read_deadline(deadline, "range fingerprint decoding")
+        if len(row) != 15:
+            raise PostgresDataValidationError(
+                "PostgreSQL range fingerprint row must contain exactly fifteen fields"
+            )
+        if row[0] is not None:
+            raise PostgresDataValidationError(
+                "PostgreSQL range fingerprint origin type marker must be NULL"
+            )
+        segment_id = _require_text(row[1], "range fingerprint segment_id")
+        if segment_id != range_request.segment_id:
+            raise PostgresDataValidationError(
+                "PostgreSQL range fingerprint rows do not follow requested segment order"
+            )
+        values = tuple(
+            _parse_unsigned_decimal(value, 19 if index in (0, 9, 10) else 38)
+            for index, value in enumerate(row[2:])
+        )
+        count = values[0]
+        invalid_count = values[9]
+        oversized_count = values[10]
+        if count > INT64_MAX or invalid_count > INT64_MAX or oversized_count > INT64_MAX:
+            raise PostgresDataValidationError(
+                "PostgreSQL range fingerprint row count exceeds the signed int64 bound"
+            )
+        if invalid_count > 0:
+            raise PostgresDataValidationError(
+                "PostgreSQL range fingerprint rejected source rows that cannot be "
+                f"represented losslessly: segment_id={segment_id!r}, "
+                f"invalid_row_count={invalid_count}"
+            )
+        if oversized_count > 0:
+            raise PostgresResultLimitError(
+                "PostgreSQL range fingerprint found canonical envelopes above the "
+                f"configured limit: segment_id={segment_id!r}, "
+                f"oversized_row_count={oversized_count}, "
+                f"max_encoded_envelope_bytes={query.max_encoded_envelope_bytes}"
+            )
+        try:
+            fingerprint = Fingerprint(
+                count=count,
+                limb_sums=(
+                    values[1],
+                    values[2],
+                    values[3],
+                    values[4],
+                    values[5],
+                    values[6],
+                    values[7],
+                    values[8],
+                ),
+            )
+        except FingerprintOverflowError as error:
+            raise PostgresDataValidationError(
+                "PostgreSQL range fingerprint violates canonical accumulator bounds: "
+                f"segment_id={segment_id!r}, reason_type={type(error).__name__}"
+            ) from None
+        parsed.append(
+            PostgresRangeFingerprint(
+                segment_id=segment_id,
+                fingerprint=fingerprint,
+                row_envelope_bytes=values[11],
+                key_envelope_bytes=values[12],
+            )
+        )
+    _require_postgres_read_deadline(deadline, "range fingerprint decoding")
+    return tuple(parsed)
+
+
+def _integer_exact_rows_from_database(
+    rows: tuple[DatabaseRow, ...],
+    ranges: tuple[PostgresIntegerRangeRequest, ...],
+    key_field_index: int,
+    query: PostgresQuery,
+    deadline: PostgresReadDeadline,
+) -> tuple[PostgresIntegerExactRow, ...]:
+    if type(key_field_index) is not int or not 0 <= key_field_index < len(
+        query.context.schema.fields
+    ):
+        raise PostgresDataValidationError(
+            "PostgreSQL exact-row key field index does not identify a schema field"
+        )
+    key_schema = CanonicalSchema(
+        protocol=query.context.schema.protocol,
+        fields=(query.context.schema.fields[key_field_index],),
+    )
+    key_context = prepare_envelope_context(key_schema)
+    ordinals = {item.segment_id: index for index, item in enumerate(ranges)}
+    parsed: list[PostgresIntegerExactRow] = []
+    previous_ordinal = -1
+    previous_key: int | None = None
+    for index, row in enumerate(rows):
+        if index % _DEADLINE_CHECK_RECORDS == 0:
+            _require_postgres_read_deadline(deadline, "exact-row decoding")
+        if len(row) != 6:
+            raise PostgresDataValidationError(
+                "PostgreSQL exact comparison row must contain exactly six fields"
+            )
+        if row[0] is not None:
+            raise PostgresDataValidationError(
+                "PostgreSQL exact comparison origin type marker must be NULL"
+            )
+        segment_id = _require_text(row[1], "exact comparison segment_id")
+        ordinal = ordinals.get(segment_id)
+        if ordinal is None:
+            raise PostgresDataValidationError(
+                "PostgreSQL exact comparison returned an unrequested segment ID"
+            )
+        if ordinal < previous_ordinal:
+            raise PostgresDataValidationError(
+                "PostgreSQL exact comparison rows do not follow requested segment order"
+            )
+        invalid_row = _require_boolean(row[4], "exact invalid-row status")
+        oversized_row = _require_boolean(row[5], "exact oversized-row status")
+        if invalid_row and oversized_row:
+            raise PostgresDataValidationError(
+                "PostgreSQL exact comparison row statuses must be mutually exclusive"
+            )
+        if invalid_row:
+            raise PostgresDataValidationError(
+                "PostgreSQL exact comparison found a row that cannot be represented losslessly"
+            )
+        if oversized_row:
+            raise PostgresResultLimitError(
+                "PostgreSQL exact comparison found a canonical envelope above the "
+                f"configured limit: max_encoded_envelope_bytes="
+                f"{query.max_encoded_envelope_bytes}"
+            )
+        key_envelope = _ascii_envelope(row[2], "exact canonical key envelope")
+        row_envelope = _ascii_envelope(row[3], "exact canonical row envelope")
+        if len(row_envelope) > query.max_encoded_envelope_bytes:
+            raise PostgresResultLimitError(
+                "PostgreSQL exact comparison row envelope exceeds the configured limit: "
+                f"observed_bytes={len(row_envelope)}, "
+                f"max_encoded_envelope_bytes={query.max_encoded_envelope_bytes}"
+            )
+        try:
+            key_values = decode_key_with_context(key_context, key_envelope)
+            row_values = decode_row_with_context(query.context, row_envelope)
+        except CanonicalizationError as error:
+            raise PostgresDataValidationError(
+                "PostgreSQL exact comparison envelope failed reference decoding: "
+                f"reason_type={type(error).__name__}"
+            ) from None
+        key_value = key_values[0]
+        row_key_value = row_values[key_field_index]
+        if type(key_value) is not int or type(row_key_value) is not int:
+            raise PostgresDataValidationError(
+                "PostgreSQL exact comparison key envelope is not logical INT64"
+            )
+        if key_value != row_key_value:
+            raise PostgresDataValidationError(
+                "PostgreSQL exact comparison key and row envelopes disagree"
+            )
+        requested_range = ranges[ordinal]
+        if key_value < requested_range.lower_inclusive or (
+            requested_range.upper_exclusive is not None
+            and key_value >= requested_range.upper_exclusive
+        ):
+            raise PostgresDataValidationError(
+                "PostgreSQL exact comparison key falls outside its requested range: "
+                f"segment_id={segment_id!r}, key_value={key_value}, "
+                f"lower_inclusive={requested_range.lower_inclusive}, "
+                f"upper_exclusive={requested_range.upper_exclusive!r}"
+            )
+        if ordinal == previous_ordinal and previous_key is not None and key_value <= previous_key:
+            raise PostgresDataValidationError(
+                "PostgreSQL exact comparison keys must be strictly increasing within a segment"
+            )
+        previous_ordinal = ordinal
+        previous_key = key_value
+        parsed.append(
+            PostgresIntegerExactRow(
+                segment_id=segment_id,
+                key_value=key_value,
+                key_envelope=key_envelope,
+                row_envelope=row_envelope,
+            )
+        )
+    _require_postgres_read_deadline(deadline, "exact-row decoding")
+    return tuple(parsed)
+
+
+def _ascii_envelope(value: object, context: str) -> bytes:
+    text = _require_text(value, context)
+    try:
+        return text.encode("ascii", errors="strict")
+    except UnicodeEncodeError:
+        raise PostgresDataValidationError(
+            f"PostgreSQL {context} contains non-ASCII bytes"
+        ) from None
+
+
+def _read_metrics_before_deadline(
+    rows: tuple[DatabaseRow, ...],
+    deadline: PostgresReadDeadline,
+) -> PostgresReadMetrics:
+    result_bytes = 0
+    for index, row in enumerate(rows):
+        if index % _DEADLINE_CHECK_RECORDS == 0:
+            _require_postgres_read_deadline(deadline, "comparison read metric calculation")
+        result_bytes += _database_row_bytes(row)
+    _require_postgres_read_deadline(deadline, "comparison read metric calculation")
+    return PostgresReadMetrics(
+        fetched_records=len(rows),
+        result_bytes=result_bytes,
+    )
+
+
 def _origin_type_oid(
     description: Sequence[Column] | None,
     operation: str,
@@ -2255,6 +2911,26 @@ def _parse_unsigned_decimal(value: object, maximum_digits: int) -> int:
             f"digits={len(value)}, maximum={maximum_digits}"
         )
     return int(value)
+
+
+def _parse_optional_int64(value: object, field_name: str) -> int | None:
+    if value is None:
+        return None
+    if type(value) is not str or not value or not value.isascii():
+        raise PostgresDataValidationError(
+            f"PostgreSQL {field_name} must be a canonical signed decimal string or null"
+        )
+    digits = value[1:] if value.startswith("-") else value
+    if not digits.isdecimal() or (len(digits) > 1 and digits[0] == "0") or value == "-0":
+        raise PostgresDataValidationError(
+            f"PostgreSQL {field_name} must be a canonical signed decimal string or null"
+        )
+    parsed = int(value)
+    if not -(1 << 63) <= parsed <= INT64_MAX:
+        raise PostgresDataValidationError(
+            f"PostgreSQL {field_name} is outside the signed int64 range"
+        )
+    return parsed
 
 
 def _database_row_bytes(row: DatabaseRow) -> int:
@@ -2491,6 +3167,44 @@ def _require_boolean(value: object, field_name: str) -> bool:
 def _validate_positive_integer(value: object, field_name: str) -> None:
     if type(value) is not int or value < 1:
         raise ValueError(f"{field_name} must be a positive integer")
+
+
+def _validate_nonnegative_integer(value: object, field_name: str) -> None:
+    if type(value) is not int or value < 0:
+        raise ValueError(f"{field_name} must be a non-negative integer")
+
+
+def _require_postgres_read_deadline(
+    deadline: PostgresReadDeadline,
+    operation: str,
+) -> int:
+    if not isinstance(cast(object, deadline), PostgresReadDeadline):
+        raise TypeError("deadline must be a PostgresReadDeadline")
+    remaining_nanoseconds = deadline.deadline_nanoseconds - time.monotonic_ns()
+    remaining_milliseconds = remaining_nanoseconds // 1_000_000
+    if remaining_milliseconds < 1:
+        raise PostgresReadDeadlineExceededError(
+            "PostgreSQL deadline-bounded read exhausted its absolute monotonic deadline: "
+            f"operation={operation!r}"
+        )
+    return remaining_milliseconds
+
+
+def _deadline_statement_timeout_milliseconds(
+    context_statement_timeout_milliseconds: int,
+    deadline: PostgresReadDeadline,
+    operation: str,
+) -> int:
+    _validate_positive_integer(
+        context_statement_timeout_milliseconds,
+        "context_statement_timeout_milliseconds",
+    )
+    remaining_milliseconds = _require_postgres_read_deadline(deadline, operation)
+    return min(
+        context_statement_timeout_milliseconds,
+        deadline.statement_timeout_milliseconds,
+        remaining_milliseconds,
+    )
 
 
 def _database_error_message(operation: str, error: psycopg.Error) -> str:

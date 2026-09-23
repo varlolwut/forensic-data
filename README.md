@@ -59,6 +59,13 @@ Domains, arrays, blank-padded `character`, lossy decimal/timestamp values, unsup
 kinds, and envelopes above the configured byte budget fail explicitly. Fingerprint mismatch proves
 a content difference; fingerprint match must be treated as probabilistic.
 
+Relation comparison charges one full-scan-equivalent per side for the summary, each fingerprint
+range, and each exact range. The relation-manifest example's corruption path therefore reserves five
+per side: one summary, one root fingerprint range, two child fingerprint ranges, and one exact
+range. A budget of four cannot complete that path. Its reported `coordinator_peak_bytes` is the
+conservative reservation high-water estimate for retained and decoded coordinator data, not a
+measurement of process RSS or allocator peak usage.
+
 ## Prerequisites
 
 - Python 3.12

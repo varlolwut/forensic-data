@@ -91,7 +91,7 @@ jobs:
             --requirements /tmp/forensic-data-runtime.txt
           uv pip install --python .artifact-venv/bin/python --no-deps dist/*.whl
           .artifact-venv/bin/python -c "import forensic_data; print(forensic_data.__version__)"
-          .artifact-venv/bin/python -c "from importlib.resources import files; root = files('forensic_data.persistence'); assert root.joinpath('sql/migrations/0001_initial.sql').read_bytes(); assert root.joinpath('sql/migrations/0002_run_lifecycle.sql').read_bytes(); assert root.joinpath('sql/bootstrap.sql').read_bytes()"
+          .artifact-venv/bin/python -c "from importlib.resources import files; root = files('forensic_data.persistence'); assert root.joinpath('sql/migrations/0001_initial.sql').read_bytes(); assert root.joinpath('sql/migrations/0002_run_lifecycle.sql').read_bytes(); assert root.joinpath('sql/migrations/0003_completed_comparisons.sql').read_bytes(); assert root.joinpath('sql/bootstrap.sql').read_bytes()"
       - name: Upload package artifacts
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:

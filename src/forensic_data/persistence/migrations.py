@@ -8,6 +8,7 @@ _BOOTSTRAP_RESOURCE: Final[str] = "sql/bootstrap.sql"
 _MIGRATION_RESOURCES: Final[tuple[tuple[int, str], ...]] = (
     (1, "0001_initial.sql"),
     (2, "0002_run_lifecycle.sql"),
+    (3, "0003_completed_comparisons.sql"),
 )
 
 

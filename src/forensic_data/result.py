@@ -425,11 +425,6 @@ def _has_positive_proven_difference(result: RunResult) -> bool:
 
 
 def _validate_totals(result: RunResult, reason_codes: set[ReasonCode]) -> None:
-    inferred_differences = tuple(
-        total for total in result.totals.differences() if isinstance(total, InferredTotal)
-    )
-    if any(total.value != "0" for total in inferred_differences):
-        raise ValueError("inferred missing, extra, or modified totals must be zero")
     if any(isinstance(total, InferredTotal) for total in result.totals.values()):
         if result.guarantee is not Guarantee.FINGERPRINT:
             raise ValueError("inferred totals require fingerprint guarantee")
@@ -438,32 +433,38 @@ def _validate_totals(result: RunResult, reason_codes: set[ReasonCode]) -> None:
     has_positive_difference = _has_positive_proven_difference(result)
     has_data_mismatch_reason = ReasonCode.DATA_MISMATCH in reason_codes
     has_contract_violation = ReasonCode.CONTRACT_VIOLATION in reason_codes
-
-    if (has_positive_difference or has_data_mismatch_reason) and not _has_known_consistency(result):
+    has_positive_inferred_difference = any(
+        isinstance(total, InferredTotal) and total.value != "0"
+        for total in result.totals.differences()
+    )
+    has_positive_classified_difference = has_positive_difference or has_positive_inferred_difference
+    if (
+        has_positive_classified_difference or has_data_mismatch_reason
+    ) and not _has_known_consistency(result):
         raise ValueError(
             "proven data mismatch requires known consistency and at least one read context"
         )
     if (
         result.guarantee is Guarantee.FINGERPRINT
-        and has_positive_difference
+        and has_positive_classified_difference
         and result.comparison_coverage.exact_segments == 0
     ):
         raise ValueError("fingerprint difference requires an exact terminal segment")
-    if (
-        result.guarantee is Guarantee.FINGERPRINT
-        and has_data_mismatch_reason
-        and not has_positive_difference
-    ):
-        raise ValueError("fingerprint data_mismatch requires a proven difference")
     if (
         result.guarantee is Guarantee.EXACT
         and result.verdict is Verdict.MISMATCH
         and not has_positive_difference
     ):
         raise ValueError("exact mismatch requires a positive exact difference total")
+    if (
+        result.guarantee is Guarantee.FINGERPRINT
+        and has_data_mismatch_reason
+        and not has_positive_classified_difference
+    ):
+        raise ValueError("fingerprint data_mismatch requires a positive classified difference")
 
     has_proven_mismatch = (
-        has_positive_difference or has_data_mismatch_reason or has_contract_violation
+        has_positive_classified_difference or has_data_mismatch_reason or has_contract_violation
     )
     if has_proven_mismatch and result.verdict is not Verdict.MISMATCH:
         raise ValueError("proven difference or contract violation requires mismatch verdict")
@@ -486,8 +487,6 @@ def _validate_match_totals(result: RunResult) -> None:
     if any(total.value != "0" for total in result.totals.differences()):
         raise ValueError("match result requires zero difference totals")
     if result.guarantee is Guarantee.FINGERPRINT:
-        if not all(isinstance(total, InferredTotal) for total in result.totals.values()):
-            raise ValueError("fingerprint match requires inferred totals")
         return
     if not all(isinstance(total, ExactTotal) for total in result.totals.differences()):
         raise ValueError("non-fingerprint match requires exact zero difference totals")
@@ -497,7 +496,7 @@ def _validate_fingerprint_evidence(result: RunResult) -> None:
     if result.guarantee is not Guarantee.FINGERPRINT:
         return
     if result.verdict is Verdict.INCONCLUSIVE:
-        if not all(isinstance(total, InferredTotal) for total in result.totals.values()):
+        if any(isinstance(total, UnavailableTotal) for total in result.totals.values()):
             raise ValueError("inconclusive full fingerprint requires preserved inferred totals")
 
 
