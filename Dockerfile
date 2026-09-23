@@ -34,4 +34,5 @@ COPY --from=build /app/.venv /app/.venv
 
 USER 10001:10001
 
-CMD ["python", "-c", "import forensic_data; print(forensic_data.__version__)"]
+ENTRYPOINT ["forensics"]
+CMD ["--help"]

@@ -108,3 +108,42 @@ jobs:
           docker image rm forensic-data:ci
           docker image load --input /tmp/forensic-data-ci.tar
           docker run --rm forensic-data:ci
+          test "$(docker run --rm --entrypoint id forensic-data:ci -u)" = "10001"
+      - name: Run Docker quickstart and persistence smoke
+        env:
+          DFE_IMAGE: forensic-data:ci
+        run: |
+          mkdir -p .local/docker-quickstart
+          DFE_HOST_UID="$(id -u)" DFE_HOST_GID="$(id -g)" \
+            docker compose --file examples/docker-quickstart/secrets.compose.yaml run --rm generate
+          docker compose --file examples/docker-quickstart/secrets.compose.yaml down
+          docker compose --profile demo up --detach --wait metadata demo-postgres
+          docker compose run --rm metadata-init
+          docker compose run --rm metadata-migrate
+          docker compose run --rm demo-check
+          docker compose run --rm demo-history
+          docker compose run --rm demo-diff
+          mkdir -p /tmp/forensic-data-quickstart-baseline
+          cp .local/docker-quickstart/output/check.json /tmp/forensic-data-quickstart-baseline/check.json
+          cp .local/docker-quickstart/output/history.json /tmp/forensic-data-quickstart-baseline/history.json
+          cp .local/docker-quickstart/output/diff.json /tmp/forensic-data-quickstart-baseline/diff.json
+          docker compose run --rm --entrypoint /bin/sh demo-check -c \
+            'test ! -e /run/secrets/metadata_admin_password && test ! -e /run/secrets/metadata_migrator_dsn'
+          docker compose stop demo-postgres
+          docker compose stop metadata
+          docker compose rm --force metadata
+          docker compose up --detach --wait metadata
+          docker compose run --rm demo-history
+          docker compose run --rm demo-diff
+          cmp --silent /tmp/forensic-data-quickstart-baseline/check.json .local/docker-quickstart/output/check.json
+          cmp --silent /tmp/forensic-data-quickstart-baseline/history.json .local/docker-quickstart/output/history.json
+          cmp --silent /tmp/forensic-data-quickstart-baseline/diff.json .local/docker-quickstart/output/diff.json
+          docker compose run --rm metadata-init
+          docker compose run --rm metadata-migrate
+      - name: Stop Docker quickstart
+        if: always()
+        env:
+          DFE_IMAGE: forensic-data:ci
+        run: |
+          docker compose --profile setup --profile demo down --volumes --remove-orphans
+          docker compose --file examples/docker-quickstart/secrets.compose.yaml down --remove-orphans

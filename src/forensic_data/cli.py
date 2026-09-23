@@ -3,6 +3,7 @@ import contextlib
 import json
 import os
 import re
+import stat
 import sys
 from collections.abc import Mapping, Sequence
 from datetime import date, datetime
@@ -45,6 +46,7 @@ from forensic_data.contracts.model import (
     RowCheckDefinition,
 )
 from forensic_data.persistence.errors import MetadataError
+from forensic_data.persistence.postgres import migrate_postgres_metadata
 from forensic_data.planning import (
     PlanReport,
     ResolvedScope,
@@ -84,6 +86,8 @@ from forensic_data.result import (
 )
 
 _ENV_SECRET_REF_PATTERN: Final[re.Pattern[str]] = re.compile(r"^env:([A-Za-z_][A-Za-z0-9_]*)$")
+_FILE_SECRET_REF_PREFIX: Final[str] = "file:"
+_MAX_SECRET_FILE_BYTES: Final[int] = 16_384
 _REQUIRED_DSN_FIELDS: Final[frozenset[str]] = frozenset(
     {
         "host",
@@ -102,14 +106,18 @@ _CLI_ORIGIN: Final[str] = "cli"
 _TRUSTED_ARGUMENT_NAMES: Final[frozenset[str]] = frozenset(
     {
         "command",
+        "metadata_command",
         "--attempt-id",
         "--check",
         "--config",
+        "--lock-timeout-milliseconds",
         "--limit",
         "--reference-batch",
         "--request-id",
         "--run-id",
+        "--secret-ref",
         "--scope-json",
+        "--statement-timeout-milliseconds",
         "--target-batch",
     }
 )
@@ -146,6 +154,7 @@ class _SafeArgumentParser(argparse.ArgumentParser):
 
 class _Arguments(argparse.Namespace):
     command: str
+    metadata_command: str
     config: Path
     check: str
     scope_json: str
@@ -157,6 +166,9 @@ class _Arguments(argparse.Namespace):
     cursor_json: str | None
     run_id: str
     attempt_id: str
+    secret_ref: str
+    statement_timeout_milliseconds: int
+    lock_timeout_milliseconds: int
 
 
 def main() -> int:
@@ -249,6 +261,37 @@ def _build_parser() -> _SafeArgumentParser:
         help="DiffCursor JSON returned by the previous page",
     )
     _add_output_argument(diff_parser)
+
+    metadata_parser = commands.add_parser(
+        "metadata",
+        help="run explicit metadata-store administration",
+    )
+    metadata_commands = metadata_parser.add_subparsers(
+        dest="metadata_command",
+        required=True,
+    )
+    migrate_parser = metadata_commands.add_parser(
+        "migrate",
+        help="validate and apply packaged metadata migrations",
+    )
+    migrate_parser.add_argument(
+        "--secret-ref",
+        required=True,
+        help="metadata migrator DSN reference (env:NAME or file:/absolute/path)",
+    )
+    migrate_parser.add_argument(
+        "--statement-timeout-milliseconds",
+        required=True,
+        type=int,
+        help="positive PostgreSQL statement timeout in milliseconds",
+    )
+    migrate_parser.add_argument(
+        "--lock-timeout-milliseconds",
+        required=True,
+        type=int,
+        help="positive metadata migration lock timeout in milliseconds",
+    )
+    _add_migration_output_argument(migrate_parser)
     return parser
 
 
@@ -271,6 +314,15 @@ def _add_output_argument(parser: argparse.ArgumentParser) -> None:
     )
 
 
+def _add_migration_output_argument(parser: argparse.ArgumentParser) -> None:
+    parser.add_argument(
+        "--output",
+        choices=("human", "json"),
+        default="human",
+        help="render a readable migration report or stable JSON (default: human)",
+    )
+
+
 def _dispatch(
     arguments: _Arguments,
     environment: Mapping[str, str],
@@ -284,6 +336,8 @@ def _dispatch(
         return _run_history(arguments, environment, stdout)
     if arguments.command == "diff":
         return _run_diff(arguments, environment, stdout)
+    if arguments.command == "metadata" and arguments.metadata_command == "migrate":
+        return _run_metadata_migrate(arguments, environment, stdout)
     raise CliInputError("unknown command; run 'forensics --help' for usage")
 
 
@@ -364,6 +418,51 @@ def _run_diff(
         _metadata_services(config, environment, "dfe-cli-diff"),
     )
     _write_diff(page, _output_format(arguments.output), stdout)
+    return 0
+
+
+def _run_metadata_migrate(
+    arguments: _Arguments,
+    environment: Mapping[str, str],
+    stdout: TextIO,
+) -> int:
+    statement_timeout_milliseconds = _positive_argument_integer(
+        arguments.statement_timeout_milliseconds,
+        "statement timeout",
+    )
+    lock_timeout_milliseconds = _positive_argument_integer(
+        arguments.lock_timeout_milliseconds,
+        "migration lock timeout",
+    )
+    settings = _connection_settings_from_secret_ref(
+        "metadata_migrator",
+        arguments.secret_ref,
+        environment,
+        statement_timeout_milliseconds,
+        "dfe-cli-metadata-migrate",
+    )
+    report = migrate_postgres_metadata(
+        settings,
+        _retry_policy(),
+        lock_timeout_milliseconds,
+    )
+    if _output_format(arguments.output) == "json":
+        stdout.write(
+            json.dumps(
+                {
+                    "schema_version": 1,
+                    "current_version": report.current_version,
+                    "applied_versions": list(report.applied_versions),
+                },
+                ensure_ascii=False,
+                separators=(",", ":"),
+            )
+        )
+        stdout.write("\n")
+        return 0
+    applied = ", ".join(str(version) for version in report.applied_versions)
+    stdout.write(f"Metadata schema version: {report.current_version}\n")
+    stdout.write(f"Applied migrations: {applied if applied else 'none (already current)'}\n")
     return 0
 
 
@@ -635,41 +734,28 @@ def _connection_settings(
     statement_timeout_milliseconds: int,
     application_name: str,
 ) -> PostgresConnectionSettings:
-    match = _ENV_SECRET_REF_PATTERN.fullmatch(connection.secret_ref)
-    if match is None:
-        raise CliInputError(
-            f"connection {connection.connection_id!r} must use an env:NAME secret reference"
-        )
-    variable_name = match.group(1)
-    dsn = environment.get(variable_name)
-    if dsn is None or dsn == "":
-        raise CliInputError(
-            f"connection {connection.connection_id!r} requires environment variable "
-            f"{variable_name!r}"
-        )
-    try:
-        values = conninfo_to_dict(dsn)
-    except psycopg.ProgrammingError:
-        raise CliInputError(
-            f"environment variable {variable_name!r} must contain a valid PostgreSQL DSN"
-        ) from None
-    fields = frozenset(values)
-    missing = tuple(sorted(_REQUIRED_DSN_FIELDS - fields))
-    unsupported = tuple(sorted(fields - _REQUIRED_DSN_FIELDS))
-    if missing:
-        raise CliInputError(
-            f"PostgreSQL DSN in {variable_name!r} is missing required fields: {', '.join(missing)}"
-        )
-    if unsupported:
-        raise CliInputError(
-            f"PostgreSQL DSN in {variable_name!r} contains unsupported fields: "
-            f"{', '.join(unsupported)}"
-        )
-    required_values = cast(dict[str, str], values)
-    if any(required_values[name] == "" for name in _REQUIRED_DSN_FIELDS):
-        raise CliInputError(
-            f"PostgreSQL DSN in {variable_name!r} must not contain empty required fields"
-        )
+    return _connection_settings_from_secret_ref(
+        connection.connection_id,
+        connection.secret_ref,
+        environment,
+        statement_timeout_milliseconds,
+        application_name,
+    )
+
+
+def _connection_settings_from_secret_ref(
+    connection_id: str,
+    secret_ref: str,
+    environment: Mapping[str, str],
+    statement_timeout_milliseconds: int,
+    application_name: str,
+) -> PostgresConnectionSettings:
+    dsn, source_description = _resolve_connection_secret(
+        connection_id,
+        secret_ref,
+        environment,
+    )
+    required_values = _parse_postgres_dsn(dsn, source_description)
     return PostgresConnectionSettings(
         host=required_values["host"],
         port=_positive_integer(required_values["port"], "PostgreSQL DSN port"),
@@ -686,6 +772,106 @@ def _connection_settings(
     )
 
 
+def _resolve_connection_secret(
+    connection_id: str,
+    secret_ref: str,
+    environment: Mapping[str, str],
+) -> tuple[str, str]:
+    environment_match = _ENV_SECRET_REF_PATTERN.fullmatch(secret_ref)
+    if environment_match is not None:
+        variable_name = environment_match.group(1)
+        dsn = environment.get(variable_name)
+        if dsn is None or dsn == "":
+            raise CliInputError(
+                f"connection {connection_id!r} requires environment variable {variable_name!r}"
+            )
+        return dsn, f"environment variable {variable_name!r}"
+
+    if secret_ref.startswith(_FILE_SECRET_REF_PREFIX):
+        path = Path(secret_ref.removeprefix(_FILE_SECRET_REF_PREFIX))
+        if not path.is_absolute():
+            raise CliInputError(
+                f"connection {connection_id!r} file secret reference must use an absolute path"
+            )
+        return (
+            _read_secret_file(path, connection_id),
+            f"secret file for connection {connection_id!r}",
+        )
+
+    raise CliInputError(
+        f"connection {connection_id!r} must use an env:NAME or file:/absolute/path secret reference"
+    )
+
+
+def _read_secret_file(path: Path, connection_id: str) -> str:
+    unavailable_message = (
+        f"connection {connection_id!r} secret file must be a readable regular file"
+    )
+    try:
+        path_mode = path.stat().st_mode
+    except (OSError, ValueError):
+        raise CliInputError(unavailable_message) from None
+    if not stat.S_ISREG(path_mode):
+        raise CliInputError(unavailable_message)
+    try:
+        with path.open("rb") as secret_file:
+            if not stat.S_ISREG(os.fstat(secret_file.fileno()).st_mode):
+                raise CliInputError(unavailable_message)
+            payload = secret_file.read(_MAX_SECRET_FILE_BYTES + 1)
+    except OSError:
+        raise CliInputError(unavailable_message) from None
+
+    if len(payload) > _MAX_SECRET_FILE_BYTES:
+        raise CliInputError(
+            f"connection {connection_id!r} secret file exceeds the "
+            f"{_MAX_SECRET_FILE_BYTES}-byte limit"
+        )
+    try:
+        text = payload.decode("utf-8", errors="strict")
+    except UnicodeDecodeError:
+        raise CliInputError(
+            f"connection {connection_id!r} secret file must contain strict UTF-8"
+        ) from None
+
+    if text.endswith("\r\n"):
+        dsn = text[:-2]
+    elif text.endswith("\n"):
+        dsn = text[:-1]
+    else:
+        dsn = text
+    if dsn == "" or dsn.splitlines() != [dsn]:
+        raise CliInputError(
+            f"connection {connection_id!r} secret file must contain exactly one non-empty DSN line"
+        )
+    return dsn
+
+
+def _parse_postgres_dsn(dsn: str, source_description: str) -> dict[str, str]:
+    try:
+        values = conninfo_to_dict(dsn)
+    except psycopg.ProgrammingError:
+        raise CliInputError(f"{source_description} must contain a valid PostgreSQL DSN") from None
+    fields = frozenset(values)
+    missing = tuple(sorted(_REQUIRED_DSN_FIELDS - fields))
+    unsupported = tuple(sorted(fields - _REQUIRED_DSN_FIELDS))
+    if missing:
+        raise CliInputError(
+            f"PostgreSQL DSN from {source_description} is missing required fields: "
+            f"{', '.join(missing)}"
+        )
+    if unsupported:
+        raise CliInputError(
+            f"PostgreSQL DSN from {source_description} contains unsupported fields: "
+            f"{', '.join(unsupported)}"
+        )
+    required_values = cast(dict[str, str], values)
+    if any(required_values[name] == "" for name in _REQUIRED_DSN_FIELDS):
+        raise CliInputError(
+            f"PostgreSQL DSN from {source_description} must not contain empty required fields"
+        )
+    return required_values
+
+
 def _positive_integer(value: str, context: str) -> int:
     if not value.isascii() or not value.isdecimal():
         raise CliInputError(f"{context} must be a positive decimal integer")
@@ -693,6 +879,12 @@ def _positive_integer(value: str, context: str) -> int:
     if parsed < 1:
         raise CliInputError(f"{context} must be a positive decimal integer")
     return parsed
+
+
+def _positive_argument_integer(value: int, context: str) -> int:
+    if type(value) is not int or value < 1:
+        raise CliInputError(f"{context} must be a positive integer")
+    return value
 
 
 def _sslmode(value: str) -> PostgresSslMode:

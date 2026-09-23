@@ -57,7 +57,7 @@ required-version = "==0.12.18"
 [tool.uv.build-backend]
 module-name = "forensic_data"
 module-root = "src"
-source-include = ["examples/**", "uv.lock"]
+source-include = [".dockerignore", "Dockerfile", "compose.yaml", "examples/**", "uv.lock"]
 source-exclude = [
     ".agents",
     ".codex",

@@ -1,0 +1,210 @@
+name: forensic-data
+
+x-dfe-service: &dfe-service
+  image: ${DFE_IMAGE:-forensic-data:local}
+  build:
+    context: .
+    dockerfile: Dockerfile
+  platform: linux/amd64
+  user: "10001:10001"
+  read_only: true
+  cap_drop:
+    - ALL
+  security_opt:
+    - no-new-privileges:true
+  tmpfs:
+    - /tmp
+  restart: "no"
+
+x-dfe-volumes: &dfe-volumes
+  - type: bind
+    source: ./examples/docker-quickstart
+    target: /config
+    read_only: true
+  - type: bind
+    source: ./.local/docker-quickstart/output
+    target: /output
+
+services:
+  metadata:
+    image: postgres:17.11-bookworm@sha256:91eb910c44c7ed13f7f1a4ccadaa9ca72ef14cddc04cacb6e070e48eb44731a3
+    platform: linux/amd64
+    environment:
+      POSTGRES_DB: dfe_metadata
+      POSTGRES_USER: postgres
+      POSTGRES_PASSWORD_FILE: /run/secrets/metadata_admin_password
+    secrets:
+      - metadata_admin_password
+    volumes:
+      - metadata-data:/var/lib/postgresql/data
+    healthcheck:
+      test:
+        [
+          "CMD-SHELL",
+          "pg_isready --host 127.0.0.1 --username postgres --dbname dfe_metadata",
+        ]
+      interval: 2s
+      timeout: 2s
+      retries: 30
+      start_period: 5s
+    restart: "no"
+
+  metadata-init:
+    image: postgres:17.11-bookworm@sha256:91eb910c44c7ed13f7f1a4ccadaa9ca72ef14cddc04cacb6e070e48eb44731a3
+    platform: linux/amd64
+    profiles: [setup]
+    user: postgres
+    read_only: true
+    cap_drop:
+      - ALL
+    security_opt:
+      - no-new-privileges:true
+    tmpfs:
+      - /tmp
+    environment:
+      PGHOST: metadata
+      PGPORT: "5432"
+      PGDATABASE: dfe_metadata
+      PGUSER: postgres
+    depends_on:
+      metadata:
+        condition: service_healthy
+    secrets:
+      - metadata_admin_password
+      - metadata_migrator_password
+      - metadata_writer_password
+      - metadata_reader_password
+    volumes:
+      - ./src/forensic_data/persistence/sql/bootstrap.sql:/opt/forensic-data/bootstrap.sql:ro
+      - ./examples/docker-quickstart/metadata-init.sh:/opt/forensic-data/metadata-init.sh:ro
+      - ./examples/docker-quickstart/metadata-logins.sql:/opt/forensic-data/metadata-logins.sql:ro
+    entrypoint: ["/bin/bash", "/opt/forensic-data/metadata-init.sh"]
+    restart: "no"
+
+  metadata-migrate:
+    <<: *dfe-service
+    profiles: [setup]
+    depends_on:
+      metadata:
+        condition: service_healthy
+    secrets:
+      - metadata_migrator_dsn
+    command:
+      - metadata
+      - migrate
+      - --secret-ref
+      - file:/run/secrets/metadata_migrator_dsn
+      - --statement-timeout-milliseconds
+      - "30000"
+      - --lock-timeout-milliseconds
+      - "5000"
+
+  dfe:
+    <<: *dfe-service
+    volumes: *dfe-volumes
+    command: ["--help"]
+
+  demo-postgres:
+    image: postgres:17.11-bookworm@sha256:91eb910c44c7ed13f7f1a4ccadaa9ca72ef14cddc04cacb6e070e48eb44731a3
+    platform: linux/amd64
+    profiles: [demo]
+    environment:
+      POSTGRES_DB: dfe_demo
+      POSTGRES_USER: postgres
+      POSTGRES_PASSWORD_FILE: /run/secrets/demo_admin_password
+    secrets:
+      - demo_admin_password
+      - demo_reader_password
+    volumes:
+      - demo-data:/var/lib/postgresql/data
+      - ./examples/docker-quickstart/demo-init.sh:/docker-entrypoint-initdb.d/001-demo.sh:ro
+      - ./examples/docker-quickstart/demo.sql:/opt/forensic-data/demo.sql:ro
+    healthcheck:
+      test:
+        - CMD-SHELL
+        - >-
+          PGPASSWORD="$$(cat /run/secrets/demo_reader_password)"
+          psql --no-psqlrc --set=ON_ERROR_STOP=1
+          --host 127.0.0.1 --username dfe_demo_reader --dbname dfe_demo
+          --tuples-only --no-align
+          --command="SELECT
+          (SELECT pg_catalog.count(*) FROM dfe_demo.reference_orders
+          WHERE business_date = DATE '2026-09-23') = 3
+          AND (SELECT pg_catalog.count(*) FROM dfe_demo.target_orders
+          WHERE business_date = DATE '2026-09-23') = 3
+          AND EXISTS (SELECT 1 FROM dfe_demo.target_orders
+          WHERE order_id = 1004 AND amount = 40.00)"
+          | grep --quiet --line-regexp t
+      interval: 2s
+      timeout: 2s
+      retries: 30
+      start_period: 5s
+    restart: "no"
+
+  demo-check:
+    <<: *dfe-service
+    profiles: [demo]
+    depends_on:
+      metadata:
+        condition: service_healthy
+      demo-postgres:
+        condition: service_healthy
+    secrets:
+      - reference_dsn
+      - target_dsn
+      - source: metadata_writer_dsn
+        target: metadata_dsn
+    volumes: *dfe-volumes
+    entrypoint: ["python", "/config/demo_check.py"]
+
+  demo-history:
+    <<: *dfe-service
+    profiles: [demo]
+    depends_on:
+      metadata:
+        condition: service_healthy
+    secrets:
+      - source: metadata_reader_dsn
+        target: metadata_dsn
+    volumes: *dfe-volumes
+    entrypoint: ["python", "/config/demo_history.py"]
+
+  demo-diff:
+    <<: *dfe-service
+    profiles: [demo]
+    depends_on:
+      metadata:
+        condition: service_healthy
+    secrets:
+      - source: metadata_reader_dsn
+        target: metadata_dsn
+    volumes: *dfe-volumes
+    entrypoint: ["python", "/config/demo_diff.py"]
+
+volumes:
+  metadata-data:
+  demo-data:
+
+secrets:
+  metadata_admin_password:
+    file: ./.local/docker-quickstart/secrets/metadata_admin_password
+  metadata_migrator_password:
+    file: ./.local/docker-quickstart/secrets/metadata_migrator_password
+  metadata_writer_password:
+    file: ./.local/docker-quickstart/secrets/metadata_writer_password
+  metadata_reader_password:
+    file: ./.local/docker-quickstart/secrets/metadata_reader_password
+  metadata_migrator_dsn:
+    file: ./.local/docker-quickstart/secrets/metadata_migrator_dsn
+  metadata_writer_dsn:
+    file: ./.local/docker-quickstart/secrets/metadata_writer_dsn
+  metadata_reader_dsn:
+    file: ./.local/docker-quickstart/secrets/metadata_reader_dsn
+  demo_admin_password:
+    file: ./.local/docker-quickstart/secrets/demo_admin_password
+  demo_reader_password:
+    file: ./.local/docker-quickstart/secrets/demo_reader_password
+  reference_dsn:
+    file: ./.local/docker-quickstart/secrets/reference_dsn
+  target_dsn:
+    file: ./.local/docker-quickstart/secrets/target_dsn

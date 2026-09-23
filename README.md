@@ -24,6 +24,108 @@ There is no scheduler integration, background service, or multi-engine execution
 Static planning does not connect to a database or prove readiness, capability, schema presence, or
 data equality.
 
+## Docker quickstart
+
+The primary delivery is a one-shot, non-root DFE container plus a dedicated PostgreSQL 17.11
+metadata store. The synthetic source is opt-in through the `demo` profile; the default box does not
+contain or connect to a production warehouse. This path needs Docker with Compose, not host Python,
+`uv`, or `psql`.
+
+The commands below were verified on Linux/amd64 containers with Docker Desktop 4.86.0, Docker
+Engine 29.7.2, and Docker Compose 5.3.1. A lower Docker/Compose or resource minimum has not yet been
+certified.
+
+From a clean checkout, generate random local credentials and an output directory. The generator is
+idempotent and never overwrites existing secrets:
+
+```console
+mkdir -p .local/docker-quickstart
+DFE_HOST_UID="$(id -u)" DFE_HOST_GID="$(id -g)" \
+  docker compose --file examples/docker-quickstart/secrets.compose.yaml run --rm generate
+docker compose --file examples/docker-quickstart/secrets.compose.yaml down
+```
+
+On Docker Desktop for Windows, use PowerShell; the host IDs default to the container UID/GID
+`10001`:
+
+```powershell
+New-Item -ItemType Directory -Force .local/docker-quickstart | Out-Null
+docker compose --file examples/docker-quickstart/secrets.compose.yaml run --rm generate
+docker compose --file examples/docker-quickstart/secrets.compose.yaml down
+```
+
+On native Linux, pass the host IDs as shown in the first block so the protected secret directory and
+output remain accessible to the invoking account. Pre-creating the state path also prevents Docker
+from creating an undeletable root-owned `.local` parent.
+
+The generated files live under the ignored `.local/docker-quickstart` directory. They are mounted
+through Compose secrets and are never copied into the image. Keep them with the metadata backup: if
+one is lost after initialization, restore that original secret rather than generating a new set.
+
+Build the DFE image, start the persistent metadata database and opt-in synthetic source, then run
+the explicit bootstrap and migrations:
+
+```console
+docker compose build dfe
+docker compose --profile demo up --detach --wait metadata demo-postgres
+docker compose run --rm metadata-init
+docker compose run --rm metadata-migrate
+```
+
+`metadata-init` has the admin and login-password secrets. `metadata-migrate` has only the migrator
+DSN. Neither `up` nor a normal DFE command silently bootstraps, migrates, resets, or deletes the
+metadata volume. Both setup commands are safe to repeat against compatible state; a repeated
+migration reports `Applied migrations: none (already current)`.
+
+Run the real comparison, then inspect durable history and retained row differences:
+
+```console
+docker compose run --rm demo-check
+docker compose run --rm demo-history
+docker compose run --rm demo-diff
+```
+
+The demo intentionally returns a completed mismatch: one modified row, one missing row, and one
+extra row, all under exact coverage. The underlying `forensics check` exit code is `1`, meaning a
+completed data mismatch rather than an engine failure; the demo wrapper validates that expected
+outcome and exits successfully. It prints the verdict, coverage, totals, and next action. Machine
+JSON is written to `.local/docker-quickstart/output/{check,history,diff}.json` through the separate
+writable output bind. The check service receives only source-reader and metadata runtime-writer
+secrets; history and diff receive only the metadata-reader secret and never query the source.
+
+To prove persistence, stop the demo source, recreate the metadata container without deleting its
+named volume, and read the same stored result again:
+
+```console
+docker compose stop demo-postgres
+docker compose stop metadata
+docker compose rm --force metadata
+docker compose up --detach --wait metadata
+docker compose run --rm demo-history
+docker compose run --rm demo-diff
+```
+
+Normal shutdown preserves both named volumes:
+
+```console
+docker compose --profile demo down
+```
+
+Do not use `down --volumes` for normal shutdown or upgrade. Before changing the DFE or PostgreSQL
+image, back up the `forensic-data_metadata-data` volume and the matching secret files using the
+organization's PostgreSQL backup procedure, start the compatible metadata service, and run the
+explicit `metadata-init` and `metadata-migrate` commands. Migration refuses gaps, changed checksums,
+and unknown newer versions rather than resetting the store.
+
+For your own data, start from `examples/docker-quickstart/contract.yaml`, replace the synthetic
+relations and manifests, and mount one full PostgreSQL DSN per connection at the absolute
+`file:/run/secrets/...` paths named by the contract. Add those secret mounts with a local Compose
+override so each one-shot service receives only the endpoints it uses. Source logins must be
+read-only; the metadata runtime login needs both writer and reader capability memberships. The
+standalone CLI and orchestrators may continue to use `env:NAME` references. The generated demo DSNs
+use `sslmode=disable` only on the private local Compose network; use the organization's required TLS
+mode and certificates for external endpoints.
+
 ## Verified scope
 
 The PostgreSQL path is verified against PostgreSQL 17.11 on Linux/amd64 with Psycopg 3.3.6. The
@@ -68,11 +170,11 @@ range. A budget of four cannot complete that path. Its reported `coordinator_pea
 conservative reservation high-water estimate for retained and decoded coordinator data, not a
 measurement of process RSS or allocator peak usage.
 
-## Prerequisites
+## Developer setup
 
 - Python 3.12
 - [uv](https://docs.astral.sh/uv/) 0.12.18
-- Docker with Compose for the PostgreSQL integration tests
+- Docker with Compose for PostgreSQL integration tests
 
 Install the locked development environment:
 
@@ -83,8 +185,8 @@ uv run python -c "import forensic_data; print(forensic_data.__version__)"
 
 ## CLI and application workflow
 
-The installed `forensics` command exposes four bounded operations. The relation-manifest example
-uses the check and scope names shown below:
+The installed `forensics` command exposes four bounded data operations plus explicit metadata
+migration administration. The relation-manifest example uses the check and scope names shown below:
 
 ```console
 uv run forensics plan --config examples/postgres-relation-manifest/contract.yaml --check daily_orders --scope-json '{"business_date":"2026-09-23"}' --output json
@@ -105,18 +207,29 @@ same durable outcome instead of silently creating a different run. History and d
 bound to the run, attempt, check, immutable result operation, and last retained sequence, so it
 cannot be reused for another result.
 
-For every connection a command resolves, the CLI accepts endpoint secrets only through contract
-references of the form `env:NAME`. The referenced variable must contain a complete PostgreSQL DSN
-with `host`, `port`, `dbname`, `user`, `password`, `sslmode`, and `connect_timeout`; there is no
-raw-DSN command-line flag or fallback. `plan` neither resolves secret references nor opens a
-connection. `history` and `diff` resolve only the metadata connection and never query a source or
-target endpoint.
+For every connection a command resolves, the CLI accepts endpoint secrets through an exact
+`env:NAME` or `file:/absolute/path` contract reference. Either source must contain one complete
+PostgreSQL DSN with `host`, `port`, `dbname`, `user`, `password`, `sslmode`, and `connect_timeout`;
+there is no raw-DSN command-line flag or provider fallback. A secret file must be a readable regular
+file of at most 16 KiB containing exactly one non-empty UTF-8 DSN line. Errors never print its path
+or contents. `plan` neither resolves secret references nor opens a connection. `history` and `diff`
+resolve only the metadata connection and never query a source or target endpoint.
 
 The metadata login used by `check` or `execute_check` must be a member of both
 `dfe_metadata_writer` and `dfe_metadata_reader`. The login used by `history`, `diff`,
 `read_history`, or `read_diff` needs only `dfe_metadata_reader`. Keep those capability roles
 separate and grant both memberships to the runtime writer login; metadata migrator and database
 administrator credentials are only for setup and bootstrap.
+
+Packaged metadata migrations are applied explicitly with a migrator-only connection:
+
+```console
+forensics metadata migrate --secret-ref file:/run/secrets/metadata_migrator_dsn --statement-timeout-milliseconds 30000 --lock-timeout-milliseconds 5000
+```
+
+The command validates the PostgreSQL 17 profile, takes the migration advisory lock, checks the
+entire stored checksum prefix, and applies the pending batch transactionally. It is never invoked by
+`check`, `history`, or `diff`.
 
 Evidence retention is explicit per projected field. `store` retains the typed canonical value;
 `redact` retains the field/type and an explicit unavailable marker but not the raw value; `omit`
@@ -358,7 +471,7 @@ paging after source mutation, typed numeric evidence, and durable partial-result
 
 ## Build artifacts
 
-Build the wheel/source distribution and the non-root container smoke image:
+Build the wheel/source distribution and the non-root one-shot CLI image:
 
 ```console
 uv sync --frozen --only-group build
@@ -368,6 +481,5 @@ docker build --platform linux/amd64 --tag forensic-data:dev .
 docker run --rm forensic-data:dev
 ```
 
-The current container is a build smoke image whose default command prints the installed package
-version. The installed package includes the `forensics` CLI, but the image is not configured as a
-long-running service.
+The default container command prints CLI help. Supply a normal `forensics` argument list after the
+image name; the image remains a one-shot process rather than a long-running service.
