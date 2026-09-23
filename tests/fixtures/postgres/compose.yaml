@@ -16,7 +16,15 @@ services:
       - postgres-data:/var/lib/postgresql/data
       - ./init:/docker-entrypoint-initdb.d:ro
     healthcheck:
-      test: ["CMD-SHELL", "pg_isready --username postgres --dbname dfe_fixture"]
+      test:
+        - CMD
+        - pg_isready
+        - --host
+        - 127.0.0.1
+        - --username
+        - postgres
+        - --dbname
+        - dfe_fixture
       interval: 2s
       timeout: 2s
       retries: 30
