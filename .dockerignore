@@ -1,6 +1,7 @@
 # The image build context is an allowlist containing package inputs only.
 **
 !Dockerfile
+!README.md
 !pyproject.toml
 !uv.lock
 !src/

@@ -462,8 +462,8 @@ class PostgresReadContext:
         )
         if not rows:
             raise PostgresMetadataError(
-                "PostgreSQL relation is missing, inaccessible, or not a supported "
-                "table/partitioned-table"
+                "PostgreSQL relation is missing, inaccessible, or not a supported physical "
+                "regular table"
             )
         row = rows[0]
         if len(row) != 6:
@@ -483,7 +483,7 @@ class PostgresReadContext:
         has_select = _require_boolean(row[5], "relation SELECT privilege")
         if relation_kind != "r":
             raise PostgresMetadataError(
-                "PostgreSQL relation kind is unsupported by the Phase 01 profile: "
+                "PostgreSQL relation kind is unsupported by the v1 physical-table profile: "
                 f"relation_kind={relation_kind!r}, allowed=('r',)"
             )
         if not has_select:
@@ -752,7 +752,7 @@ def _validate_profile(profile: PostgresServerProfile, row: DatabaseRow) -> None:
         failures.append("transaction_read_only=off, required=on")
     if failures:
         raise UnsupportedPostgresProfileError(
-            "PostgreSQL Phase 01 capability profile is unsupported: " + "; ".join(failures)
+            "PostgreSQL 17 capability profile is unsupported: " + "; ".join(failures)
         )
 
 

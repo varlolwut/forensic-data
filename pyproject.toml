@@ -6,6 +6,7 @@ build-backend = "uv_build"
 name = "forensic-data"
 version = "0.1.0.dev0"
 description = "Typed, read-only data reconciliation foundations"
+readme = "README.md"
 requires-python = ">=3.12,<3.13"
 dependencies = [
     "psycopg[binary]>=3.3.6,<4",
