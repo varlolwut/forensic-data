@@ -1,8 +1,10 @@
+import hashlib
 import logging
 import time
 from collections.abc import Callable
 from dataclasses import dataclass
-from datetime import UTC, datetime
+from datetime import UTC, date, datetime
+from decimal import Decimal
 from enum import StrEnum
 from typing import Final, LiteralString, cast, final
 from uuid import UUID, uuid5
@@ -20,12 +22,37 @@ from forensic_data.acquisition import (
     readiness_evidence_semantic_value,
     run_request_semantic_value,
 )
-from forensic_data.canonical import Fingerprint, combine_fingerprints, schema_digest_hex
+from forensic_data.canonical import (
+    DecimalParameters,
+    FieldSchema,
+    Fingerprint,
+    LogicalType,
+    NoParameters,
+    Normalization,
+    TimestampParameters,
+    canonical_schema_json,
+    combine_fingerprints,
+    decode_payload,
+    encode_payload,
+    schema_digest_hex,
+    schema_from_metadata_json,
+)
 from forensic_data.comparison import (
+    ComparisonSegmentRecord,
     CompletedComparisonArtifact,
     CompletedStructuralComparisonArtifact,
+    PartialComparisonArtifact,
+    PartialComparisonFrontier,
+    UnresolvedComparisonSegment,
+    canonical_partial_comparison_frontier_bytes,
+    partial_comparison_frontier_from_canonical_bytes,
 )
-from forensic_data.contracts.model import ExecutionBudgets
+from forensic_data.contracts.model import (
+    EvidenceAction,
+    ExecutionBudgets,
+    RelationScope,
+    SqlDialect,
+)
 from forensic_data.contracts.semantics import (
     SemanticValue,
     canonical_semantic_json,
@@ -44,7 +71,9 @@ from forensic_data.persistence.errors import (
     LifecycleTransactionError,
     MetadataMigrationChecksumError,
     MetadataMigrationHistoryError,
+    PartialComparisonNotFoundError,
     RunAttemptLimitError,
+    RunInvocationContinuationError,
     RunLifecycleStateError,
     RunRequestConflictError,
     StoredLifecycleIntegrityError,
@@ -72,13 +101,28 @@ from forensic_data.postgres_sql import (
 from forensic_data.reporting import (
     DIFF_PAGE_LIMIT_MAX,
     HISTORY_PAGE_LIMIT_MAX,
+    ComparisonContext,
+    ComparisonDirection,
+    ComparisonField,
+    ComparisonScopeValue,
+    ComparisonSideIdentity,
     DetailAvailability,
+    DiffCursor,
+    DifferenceKind,
+    DifferenceRecord,
     DiffPage,
+    EvidenceFieldValue,
+    EvidenceValueAvailability,
     HistoryAttemptStatus,
     HistoryCursor,
     HistoryEntry,
     HistoryPage,
+    KeyAvailability,
+    RelationComparisonLocator,
+    SqlComparisonLocator,
     StoredResultAvailability,
+    canonical_difference_key_bytes,
+    canonical_difference_record_bytes,
 )
 from forensic_data.result import (
     ComparisonCoverage,
@@ -86,8 +130,11 @@ from forensic_data.result import (
     ConsistencyLevel,
     ConsistencyStatus,
     EvidenceCoverage,
+    ExactTotal,
     ExecutionStatus,
     Guarantee,
+    InferredTotal,
+    LowerBoundTotal,
     PersistenceState,
     PersistenceStatus,
     ReasonCode,
@@ -108,6 +155,7 @@ __all__ = (
     "CompletedComparisonDefinition",
     "CompletedStructuralComparisonDefinition",
     "IntegerRangeFingerprintPersistence",
+    "PartialComparisonDefinition",
     "PersistedInputCut",
     "PersistedReadContext",
     "ReadContextPersistence",
@@ -120,18 +168,24 @@ __all__ = (
     "completed_comparison_persistence_from_artifact",
     "completed_structural_comparison_persistence_from_artifact",
     "mark_postgres_read_context_lost",
+    "partial_comparison_persistence_from_artifact",
     "persist_postgres_aligned_input_cut",
     "persist_postgres_read_context",
     "publish_postgres_completed_comparison",
     "publish_postgres_completed_structural_comparison",
     "publish_postgres_terminal_error_attempt",
+    "publish_postgres_terminal_error_comparison",
     "publish_postgres_terminal_incomplete_attempt",
+    "publish_postgres_terminal_incomplete_comparison",
     "read_postgres_completed_comparison",
     "read_postgres_diff",
     "read_postgres_history",
+    "read_postgres_partial_comparison",
     "read_postgres_terminal_attempt",
     "record_postgres_retryable_error_attempt",
+    "record_postgres_retryable_error_comparison",
     "record_postgres_retryable_incomplete_attempt",
+    "record_postgres_retryable_incomplete_comparison",
     "renew_postgres_run_attempt",
     "start_postgres_run_attempt",
 )
@@ -275,6 +329,77 @@ class CompletedComparisonDefinition:
             raise TypeError("completed comparison reasons must be an immutable tuple")
         for reason in self.reasons:
             _require_instance(reason, ResultReason, "completed comparison reason")
+
+
+@final
+@dataclass(frozen=True, slots=True)
+class PartialComparisonDefinition:
+    check_id: str
+    contract_digest: str
+    scope_digest: str
+    input_cut_digest: str
+    execution_status: ExecutionStatus
+    verdict: Verdict
+    consistency: ConsistencyStatus
+    guarantee: Guarantee
+    comparison_coverage: ComparisonCoverage
+    totals: ComparisonTotals
+    evidence_coverage: EvidenceCoverage
+    metrics: ResultMetrics
+    primary_reason: ResultReason
+    additional_reasons: tuple[ResultReason, ...]
+    frontier: PartialComparisonFrontier
+    reference_observation_id: UUID
+    target_observation_id: UUID
+    anomalies: tuple[DifferenceRecord, ...]
+
+    def __post_init__(self) -> None:
+        _require_nonblank_text(self.check_id, "partial comparison check id")
+        _require_sha256(self.contract_digest, "partial comparison contract digest")
+        _require_sha256(self.scope_digest, "partial comparison scope digest")
+        _require_sha256(self.input_cut_digest, "partial comparison input cut digest")
+        _require_instance(
+            self.execution_status,
+            ExecutionStatus,
+            "partial comparison execution status",
+        )
+        if self.execution_status is ExecutionStatus.COMPLETED:
+            raise ValueError("partial comparison execution status cannot be completed")
+        _require_instance(self.verdict, Verdict, "partial comparison verdict")
+        _require_instance(self.consistency, ConsistencyStatus, "partial comparison consistency")
+        _require_instance(self.guarantee, Guarantee, "partial comparison guarantee")
+        if self.guarantee is not Guarantee.NOT_ESTABLISHED:
+            raise ValueError("partial comparison requires not_established guarantee")
+        _require_instance(
+            self.comparison_coverage,
+            ComparisonCoverage,
+            "partial comparison coverage",
+        )
+        _require_instance(self.totals, ComparisonTotals, "partial comparison totals")
+        _require_instance(
+            self.evidence_coverage,
+            EvidenceCoverage,
+            "partial comparison evidence coverage",
+        )
+        _require_instance(self.metrics, ResultMetrics, "partial comparison metrics")
+        _require_instance(self.primary_reason, ResultReason, "partial comparison primary reason")
+        if type(self.additional_reasons) is not tuple:
+            raise TypeError("partial comparison additional reasons must be an immutable tuple")
+        for reason in self.additional_reasons:
+            _require_instance(reason, ResultReason, "partial comparison additional reason")
+        _require_instance(self.frontier, PartialComparisonFrontier, "partial comparison frontier")
+        _require_uuid(self.reference_observation_id, "partial reference observation id")
+        _require_uuid(self.target_observation_id, "partial target observation id")
+        if self.reference_observation_id == self.target_observation_id:
+            raise ValueError("partial comparison observations must be distinct")
+        if type(self.anomalies) is not tuple:
+            raise TypeError("partial comparison anomalies must be an immutable tuple")
+        for anomaly in self.anomalies:
+            _require_instance(anomaly, DifferenceRecord, "partial comparison anomaly")
+
+    @property
+    def reasons(self) -> tuple[ResultReason, ...]:
+        return (self.primary_reason, *self.additional_reasons)
 
 
 @final
@@ -697,10 +822,53 @@ class _CompletedComparisonExpectation:
     operation_id: UUID
     comparison: _CompletedResultDefinition
     segments: tuple[IntegerRangeFingerprintPersistence, ...]
+    anomalies: tuple["_AnomalyExpectation", ...]
+    evidence_manifest_digest: bytes
     ended_at: datetime
     result: RunResult
     result_json: str
     result_digest: bytes
+
+
+@final
+@dataclass(frozen=True, slots=True)
+class _AnomalyExpectation:
+    record: DifferenceRecord
+    payload_json: str
+    payload_digest: bytes
+    payload_byte_length: int
+    record_digest: bytes
+
+
+@final
+@dataclass(frozen=True, slots=True)
+class _AnomalyManifestSummary:
+    retained_records: int
+    retained_bytes: int
+    manifest_digest: bytes | None
+
+
+@final
+@dataclass(frozen=True, slots=True)
+class _ComparisonEvidenceBoundary:
+    context: ComparisonContext
+    actions: tuple[EvidenceAction, ...]
+
+
+@final
+@dataclass(frozen=True, slots=True)
+class _PartialComparisonExpectation:
+    attempt: RunAttemptRecord
+    operation_id: UUID
+    comparison: PartialComparisonDefinition
+    ended_at: datetime
+    result: RunResult
+    result_json: str
+    result_digest: bytes
+    frontier_json: str
+    frontier_digest: bytes
+    anomalies: tuple[_AnomalyExpectation, ...]
+    evidence_manifest_digest: bytes
 
 
 @final
@@ -902,6 +1070,7 @@ def completed_comparison_persistence_from_artifact(
 ) -> tuple[
     CompletedComparisonDefinition,
     tuple[IntegerRangeFingerprintPersistence, ...],
+    tuple[DifferenceRecord, ...],
 ]:
     _require_instance(attempt, RunAttemptRecord, "run attempt")
     _require_instance(persisted_cut, PersistedInputCut, "persisted input cut")
@@ -959,7 +1128,63 @@ def completed_comparison_persistence_from_artifact(
     _validate_completed_segments(definition, segments)
     _validate_completed_budget_use(attempt.execution_budgets, definition, segments)
     _validate_artifact_summary_closure(artifact, segments[0])
-    return definition, segments
+    _validate_anomaly_coverage(definition.evidence_coverage, artifact.anomalies)
+    _validate_completed_anomaly_segments(artifact.anomalies, segments)
+    return definition, segments, artifact.anomalies
+
+
+def partial_comparison_persistence_from_artifact(
+    attempt: RunAttemptRecord,
+    persisted_cut: PersistedInputCut,
+    artifact: PartialComparisonArtifact,
+    execution_status: ExecutionStatus,
+    primary_reason: ResultReason,
+    additional_reasons: tuple[ResultReason, ...],
+) -> PartialComparisonDefinition:
+    _require_instance(attempt, RunAttemptRecord, "run attempt")
+    _require_instance(persisted_cut, PersistedInputCut, "persisted input cut")
+    _require_instance(artifact, PartialComparisonArtifact, "partial comparison artifact")
+    _require_instance(execution_status, ExecutionStatus, "partial comparison execution status")
+    _require_instance(primary_reason, ResultReason, "partial comparison primary reason")
+    if type(additional_reasons) is not tuple:
+        raise TypeError("partial comparison additional reasons must be an immutable tuple")
+    if persisted_cut.run_id != attempt.run.run_id or persisted_cut.attempt_id != attempt.attempt_id:
+        raise ValueError("persisted input cut must belong to the partial comparison attempt")
+    input_cut_digest = persisted_cut.input_cut.input_cut_digest
+    if artifact.input_cut_digest != input_cut_digest:
+        raise ValueError("partial comparison artifact cut differs from the persisted attempt cut")
+    for bound_digest in (attempt.run.bound_input_cut_digest, attempt.input_cut_digest):
+        if bound_digest is not None and bound_digest != input_cut_digest:
+            raise ValueError("partial comparison attempt is bound to a different input cut")
+    if artifact.scope_digest != persisted_cut.input_cut.reference.scope_digest:
+        raise ValueError("partial comparison artifact scope differs from its persisted cut")
+    if artifact.reference_full_scans > attempt.execution_budgets.max_full_scans_per_side:
+        raise ValueError("partial reference full scans exceed the immutable attempt budget")
+    if artifact.target_full_scans > attempt.execution_budgets.max_full_scans_per_side:
+        raise ValueError("partial target full scans exceed the immutable attempt budget")
+    reference_observation_id, target_observation_id = persisted_cut.observation_ids
+    definition = PartialComparisonDefinition(
+        check_id=artifact.check_id,
+        contract_digest=artifact.contract_digest,
+        scope_digest=artifact.scope_digest,
+        input_cut_digest=artifact.input_cut_digest,
+        execution_status=execution_status,
+        verdict=artifact.verdict,
+        consistency=artifact.consistency,
+        guarantee=artifact.guarantee,
+        comparison_coverage=artifact.comparison_coverage,
+        totals=artifact.totals,
+        evidence_coverage=artifact.evidence_coverage,
+        metrics=artifact.metrics,
+        primary_reason=primary_reason,
+        additional_reasons=additional_reasons,
+        frontier=artifact.frontier,
+        reference_observation_id=reference_observation_id,
+        target_observation_id=target_observation_id,
+        anomalies=artifact.anomalies,
+    )
+    _validate_partial_definition(attempt.execution_budgets, definition)
+    return definition
 
 
 def completed_structural_comparison_persistence_from_artifact(
@@ -1017,6 +1242,7 @@ def publish_postgres_completed_comparison(
     terminal_operation_id: UUID,
     comparison: CompletedComparisonDefinition,
     segments: tuple[IntegerRangeFingerprintPersistence, ...],
+    anomalies: tuple[DifferenceRecord, ...],
     ended_at: datetime,
 ) -> RunResult:
     _require_instance(settings, PostgresConnectionSettings, "metadata connection settings")
@@ -1034,6 +1260,7 @@ def publish_postgres_completed_comparison(
         terminal_operation_id,
         comparison,
         segments,
+        anomalies,
         ended_at,
     )
     return _run_with_reconciliation(
@@ -1069,6 +1296,7 @@ def publish_postgres_completed_structural_comparison(
         terminal_operation_id,
         comparison,
         (),
+        (),
         ended_at,
     )
     return _run_with_reconciliation(
@@ -1078,6 +1306,146 @@ def publish_postgres_completed_structural_comparison(
         (expected.operation_id,),
         lambda connection: _publish_completed_comparison_once(connection, settings, expected),
         lambda connection: _lookup_completed_comparison(connection, settings, expected),
+    )
+
+
+def record_postgres_retryable_incomplete_comparison(
+    settings: PostgresConnectionSettings,
+    retry_policy: PostgresRetryPolicy,
+    attempt: RunAttemptRecord,
+    operation_id: UUID,
+    comparison: PartialComparisonDefinition,
+    ended_at: datetime,
+) -> RunResult:
+    _require_instance(settings, PostgresConnectionSettings, "metadata connection settings")
+    _require_instance(retry_policy, PostgresRetryPolicy, "metadata retry policy")
+    expected = _partial_comparison_expectation(
+        attempt,
+        operation_id,
+        comparison,
+        ExecutionStatus.INCOMPLETE,
+        ended_at,
+    )
+    return _run_with_reconciliation(
+        settings,
+        retry_policy,
+        "record_retryable_incomplete_comparison",
+        (expected.operation_id,),
+        lambda connection: _record_retryable_partial_comparison_once(
+            connection,
+            settings,
+            expected,
+        ),
+        lambda connection: _lookup_retryable_partial_comparison(
+            connection,
+            settings,
+            expected,
+        ),
+    )
+
+
+def record_postgres_retryable_error_comparison(
+    settings: PostgresConnectionSettings,
+    retry_policy: PostgresRetryPolicy,
+    attempt: RunAttemptRecord,
+    operation_id: UUID,
+    comparison: PartialComparisonDefinition,
+    ended_at: datetime,
+) -> RunResult:
+    _require_instance(settings, PostgresConnectionSettings, "metadata connection settings")
+    _require_instance(retry_policy, PostgresRetryPolicy, "metadata retry policy")
+    expected = _partial_comparison_expectation(
+        attempt,
+        operation_id,
+        comparison,
+        ExecutionStatus.ERROR,
+        ended_at,
+    )
+    return _run_with_reconciliation(
+        settings,
+        retry_policy,
+        "record_retryable_error_comparison",
+        (expected.operation_id,),
+        lambda connection: _record_retryable_partial_comparison_once(
+            connection,
+            settings,
+            expected,
+        ),
+        lambda connection: _lookup_retryable_partial_comparison(
+            connection,
+            settings,
+            expected,
+        ),
+    )
+
+
+def publish_postgres_terminal_incomplete_comparison(
+    settings: PostgresConnectionSettings,
+    retry_policy: PostgresRetryPolicy,
+    attempt: RunAttemptRecord,
+    operation_id: UUID,
+    comparison: PartialComparisonDefinition,
+    ended_at: datetime,
+) -> RunResult:
+    _require_instance(settings, PostgresConnectionSettings, "metadata connection settings")
+    _require_instance(retry_policy, PostgresRetryPolicy, "metadata retry policy")
+    expected = _partial_comparison_expectation(
+        attempt,
+        operation_id,
+        comparison,
+        ExecutionStatus.INCOMPLETE,
+        ended_at,
+    )
+    return _run_with_reconciliation(
+        settings,
+        retry_policy,
+        "publish_terminal_incomplete_comparison",
+        (expected.operation_id,),
+        lambda connection: _publish_terminal_partial_comparison_once(
+            connection,
+            settings,
+            expected,
+        ),
+        lambda connection: _lookup_terminal_partial_comparison(
+            connection,
+            settings,
+            expected,
+        ),
+    )
+
+
+def publish_postgres_terminal_error_comparison(
+    settings: PostgresConnectionSettings,
+    retry_policy: PostgresRetryPolicy,
+    attempt: RunAttemptRecord,
+    operation_id: UUID,
+    comparison: PartialComparisonDefinition,
+    ended_at: datetime,
+) -> RunResult:
+    _require_instance(settings, PostgresConnectionSettings, "metadata connection settings")
+    _require_instance(retry_policy, PostgresRetryPolicy, "metadata retry policy")
+    expected = _partial_comparison_expectation(
+        attempt,
+        operation_id,
+        comparison,
+        ExecutionStatus.ERROR,
+        ended_at,
+    )
+    return _run_with_reconciliation(
+        settings,
+        retry_policy,
+        "publish_terminal_error_comparison",
+        (expected.operation_id,),
+        lambda connection: _publish_terminal_partial_comparison_once(
+            connection,
+            settings,
+            expected,
+        ),
+        lambda connection: _lookup_terminal_partial_comparison(
+            connection,
+            settings,
+            expected,
+        ),
     )
 
 
@@ -1104,33 +1472,60 @@ def read_postgres_completed_comparison(
     )
 
 
+def read_postgres_partial_comparison(
+    settings: PostgresConnectionSettings,
+    retry_policy: PostgresRetryPolicy,
+    run_id: UUID,
+    attempt_id: UUID,
+) -> RunResult:
+    _require_instance(settings, PostgresConnectionSettings, "metadata connection settings")
+    _require_instance(retry_policy, PostgresRetryPolicy, "metadata retry policy")
+    _require_uuid(run_id, "partial comparison run id")
+    _require_uuid(attempt_id, "partial comparison attempt id")
+    return _run_read_with_retries(
+        settings,
+        retry_policy,
+        "read_partial_comparison",
+        lambda connection: _read_partial_comparison_once(
+            connection,
+            settings,
+            run_id,
+            attempt_id,
+        ),
+    )
+
+
 def read_postgres_diff(
     settings: PostgresConnectionSettings,
     retry_policy: PostgresRetryPolicy,
     run_id: UUID,
     attempt_id: UUID,
     limit: int,
+    cursor: DiffCursor | None,
 ) -> DiffPage:
+    _require_instance(settings, PostgresConnectionSettings, "metadata connection settings")
+    _require_instance(retry_policy, PostgresRetryPolicy, "metadata retry policy")
+    _require_uuid(run_id, "diff run id")
+    _require_uuid(attempt_id, "diff attempt id")
     _require_positive_integer(limit, "diff page limit")
     if limit > DIFF_PAGE_LIMIT_MAX:
         raise ValueError(f"diff page limit cannot exceed {DIFF_PAGE_LIMIT_MAX}")
-    result = read_postgres_completed_comparison(
+    if cursor is not None:
+        _require_instance(cursor, DiffCursor, "diff cursor")
+        if cursor.run_id != run_id or cursor.attempt_id != attempt_id:
+            raise ValueError("diff cursor belongs to a different run or attempt")
+    return _run_read_with_retries(
         settings,
         retry_policy,
-        run_id,
-        attempt_id,
-    )
-    return DiffPage(
-        schema_version=1,
-        run_id=run_id,
-        attempt_id=attempt_id,
-        requested_limit=limit,
-        stored_result=result,
-        detail_availability=DetailAvailability.NOT_RETAINED,
-        found_records=result.evidence_coverage.found_records,
-        retained_records=0,
-        details=(),
-        next_cursor=None,
+        "read_diff",
+        lambda connection: _read_postgres_diff_once(
+            connection,
+            settings,
+            run_id,
+            attempt_id,
+            limit,
+            cursor,
+        ),
     )
 
 
@@ -1503,7 +1898,7 @@ def _start_attempt_once(
     if current_run.selected_terminal_attempt_id is not None:
         raise RunLifecycleStateError("cannot start an attempt for a terminal run")
     attempt_rows = connection.execute(
-        "SELECT attempt_id, status FROM dfe_metadata.run_attempts "
+        "SELECT attempt_id, status, owner_token FROM dfe_metadata.run_attempts "
         "WHERE run_id = %s ORDER BY ordinal FOR UPDATE",
         (expected.run.run_id,),
     ).fetchall()
@@ -1513,6 +1908,15 @@ def _start_attempt_once(
         raise ActiveRunAttemptError(
             "run already has a fenced running attempt; expired attempts require explicit "
             "maintenance abandonment"
+        )
+    if any(
+        _row_uuid(row[2], "attempt invocation owner token") != expected.owner_token
+        for row in attempt_rows
+    ):
+        raise RunInvocationContinuationError(
+            "run has prior attempts admitted by a different process invocation and cannot "
+            "safely reset whole-run source budgets: "
+            f"run_id={expected.run.run_id}; inspect durable history and use a new request UUID"
         )
     if len(attempt_rows) >= expected.run.request.execution_policy.max_attempts:
         raise RunAttemptLimitError(
@@ -2590,6 +2994,10 @@ def _publish_completed_comparison_once(
             connection,
             _completed_result_from_database(connection, expected),
         )
+    if _select_partial_result_by_operation(connection, expected.operation_id) is not None:
+        raise LifecycleOperationConflictError(
+            "completed comparison operation UUID is already bound to a partial result"
+        )
     if _select_attempt_by_end_operation(connection, expected.operation_id) is not None:
         raise LifecycleOperationConflictError(
             "completed comparison operation UUID is already bound to a different outcome"
@@ -2602,6 +3010,14 @@ def _publish_completed_comparison_once(
     if _row_optional_uuid(run_row[10], "selected terminal attempt id") is not None:
         raise RunLifecycleStateError("run already has a selected terminal attempt")
     _require_locked_completed_comparison_closure(connection, expected)
+    comparison_boundary = _comparison_evidence_boundary_from_database(
+        connection,
+        expected.result,
+    )
+    _validate_anomaly_evidence_boundary(
+        tuple(anomaly.record for anomaly in expected.anomalies),
+        comparison_boundary,
+    )
     for segment in expected.segments:
         _insert_completed_segment(connection, expected, segment)
     attempt_update = connection.execute(
@@ -2626,8 +3042,8 @@ def _publish_completed_comparison_once(
         "INSERT INTO dfe_metadata.check_results ("
         "run_id, attempt_id, check_id, result_operation_id, contract_digest, "
         "scope_digest, execution_status, verdict, guarantee, result_digest, "
-        "result_payload, completed_at) VALUES ("
-        "%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s::jsonb, %s)",
+        "result_payload, completed_at, evidence_manifest_digest) VALUES ("
+        "%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s::jsonb, %s, %s)",
         (
             expected.attempt.run.run_id,
             expected.attempt.attempt_id,
@@ -2641,8 +3057,23 @@ def _publish_completed_comparison_once(
             expected.result_digest,
             expected.result_json,
             expected.ended_at,
+            expected.evidence_manifest_digest,
         ),
     )
+    if expected.anomalies:
+        reference_observation_id = expected.segments[0].reference_observation_id
+        target_observation_id = expected.segments[0].target_observation_id
+        for anomaly in expected.anomalies:
+            _insert_anomaly(
+                connection,
+                expected.attempt.run.run_id,
+                expected.attempt.attempt_id,
+                expected.comparison.check_id,
+                expected.operation_id,
+                reference_observation_id,
+                target_observation_id,
+                anomaly,
+            )
     run_update = connection.execute(
         "UPDATE dfe_metadata.runs SET selected_terminal_attempt_id = %s, "
         "terminal_operation_id = %s, terminal_at = %s "
@@ -2667,6 +3098,208 @@ def _publish_completed_comparison_once(
     )
 
 
+def _record_retryable_partial_comparison_once(
+    connection: psycopg.Connection[DatabaseRow],
+    settings: PostgresConnectionSettings,
+    expected: _PartialComparisonExpectation,
+) -> RunResult:
+    _begin_writer_transaction(connection, settings.statement_timeout_milliseconds)
+    _require_current_schema(connection)
+    _lock_operation_identities(connection, (expected.operation_id,))
+    run_row = _lock_run_by_id(connection, expected.attempt.run.run_id)
+    if run_row is None:
+        raise RunLifecycleStateError("cannot record a partial comparison for an unknown run")
+    _claimed_run_from_row(run_row, _expectation_for_claimed_run(expected.attempt.run))
+    attempt_row = _lock_attempt_by_id(connection, expected.attempt.attempt_id)
+    if (
+        attempt_row is None
+        or _row_uuid(attempt_row[1], "partial comparison attempt run id")
+        != expected.attempt.run.run_id
+    ):
+        raise AttemptFenceError("partial comparison attempt fence is unknown")
+    if _select_partial_result_by_operation(connection, expected.operation_id) is not None:
+        result = _partial_result_from_database(connection, expected)
+        _require_retryable_partial_selection(connection, result)
+        return _commit_result(connection, result)
+    _require_new_partial_operation(connection, expected.operation_id)
+    _require_attempt_fence_row(connection, attempt_row, expected.attempt)
+    pre_mutation_lease_expiry = _row_datetime(
+        attempt_row[9],
+        "retryable partial comparison attempt lease expiry",
+    )
+    if _row_optional_uuid(run_row[10], "selected terminal attempt id") is not None:
+        raise RunLifecycleStateError("run already has a selected terminal attempt")
+    _require_locked_partial_comparison_closure(connection, expected)
+    _finish_partial_attempt(connection, expected)
+    _insert_partial_result(connection, expected)
+    _insert_partial_anomalies(connection, expected)
+    result = _partial_result_from_database(connection, expected)
+    _require_retryable_partial_selection(connection, result)
+    return _commit_fenced_result(
+        connection,
+        result,
+        pre_mutation_lease_expiry,
+        "retryable partial comparison publication",
+    )
+
+
+def _publish_terminal_partial_comparison_once(
+    connection: psycopg.Connection[DatabaseRow],
+    settings: PostgresConnectionSettings,
+    expected: _PartialComparisonExpectation,
+) -> RunResult:
+    _begin_writer_transaction(connection, settings.statement_timeout_milliseconds)
+    _require_current_schema(connection)
+    _lock_operation_identities(connection, (expected.operation_id,))
+    run_row = _lock_run_by_id(connection, expected.attempt.run.run_id)
+    if run_row is None:
+        raise RunLifecycleStateError("cannot publish a partial comparison for an unknown run")
+    _claimed_run_from_row(run_row, _expectation_for_claimed_run(expected.attempt.run))
+    attempt_row = _lock_attempt_by_id(connection, expected.attempt.attempt_id)
+    if (
+        attempt_row is None
+        or _row_uuid(attempt_row[1], "partial comparison attempt run id")
+        != expected.attempt.run.run_id
+    ):
+        raise AttemptFenceError("partial comparison attempt fence is unknown")
+    if _select_partial_result_by_operation(connection, expected.operation_id) is not None:
+        result = _partial_result_from_database(connection, expected)
+        _require_selected_partial_comparison(connection, result, expected.ended_at)
+        return _commit_result(connection, result)
+    _require_new_partial_operation(connection, expected.operation_id)
+    _require_attempt_fence_row(connection, attempt_row, expected.attempt)
+    pre_mutation_lease_expiry = _row_datetime(
+        attempt_row[9],
+        "terminal partial comparison attempt lease expiry",
+    )
+    if _row_optional_uuid(run_row[10], "selected terminal attempt id") is not None:
+        raise RunLifecycleStateError("run already has a selected terminal attempt")
+    _require_locked_partial_comparison_closure(connection, expected)
+    _finish_partial_attempt(connection, expected)
+    _insert_partial_result(connection, expected)
+    _insert_partial_anomalies(connection, expected)
+    run_update = connection.execute(
+        "UPDATE dfe_metadata.runs SET selected_terminal_attempt_id = %s, "
+        "terminal_operation_id = %s, terminal_at = %s "
+        "WHERE run_id = %s AND selected_terminal_attempt_id IS NULL",
+        (
+            expected.attempt.attempt_id,
+            expected.operation_id,
+            expected.ended_at,
+            expected.attempt.run.run_id,
+        ),
+    )
+    if run_update.rowcount != 1:
+        raise RunLifecycleStateError(
+            "terminal partial comparison run publication compare-and-set did not update"
+        )
+    result = _partial_result_from_database(connection, expected)
+    _require_selected_partial_comparison(connection, result, expected.ended_at)
+    return _commit_fenced_result(
+        connection,
+        result,
+        pre_mutation_lease_expiry,
+        "terminal partial comparison publication",
+    )
+
+
+def _require_new_partial_operation(
+    connection: psycopg.Connection[DatabaseRow],
+    operation_id: UUID,
+) -> None:
+    if _select_result_by_operation(connection, operation_id) is not None:
+        raise LifecycleOperationConflictError(
+            "partial comparison operation UUID is already bound to a completed result"
+        )
+    if _select_attempt_by_end_operation(connection, operation_id) is not None:
+        raise LifecycleOperationConflictError(
+            "partial comparison operation UUID is already bound to a different outcome"
+        )
+
+
+def _finish_partial_attempt(
+    connection: psycopg.Connection[DatabaseRow],
+    expected: _PartialComparisonExpectation,
+) -> None:
+    reason = expected.comparison.primary_reason
+    reason_json = canonical_semantic_json(_reason_semantic_value(reason))
+    cursor = connection.execute(
+        "UPDATE dfe_metadata.run_attempts SET status = %s, end_operation_id = %s, "
+        "terminal_reason_code = %s, terminal_reason = %s::jsonb, ended_at = %s "
+        "WHERE run_id = %s AND attempt_id = %s AND owner_token = %s "
+        "AND lease_revision = %s AND status = 'running' "
+        "AND lease_expires_at > pg_catalog.clock_timestamp()",
+        (
+            expected.comparison.execution_status.value,
+            expected.operation_id,
+            reason.code.value,
+            reason_json,
+            expected.ended_at,
+            expected.attempt.run.run_id,
+            expected.attempt.attempt_id,
+            expected.attempt.owner_token,
+            expected.attempt.lease_revision,
+        ),
+    )
+    if cursor.rowcount != 1:
+        raise AttemptFenceError("partial comparison attempt compare-and-set did not update")
+
+
+def _insert_partial_result(
+    connection: psycopg.Connection[DatabaseRow],
+    expected: _PartialComparisonExpectation,
+) -> None:
+    comparison = expected.comparison
+    connection.execute(
+        "INSERT INTO dfe_metadata.partial_check_results ("
+        "run_id, attempt_id, check_id, end_operation_id, contract_digest, scope_digest, "
+        "input_cut_digest, reference_observation_id, reference_direction, "
+        "target_observation_id, target_direction, execution_status, verdict, guarantee, "
+        "result_digest, result_payload, frontier_digest, frontier_payload, "
+        "evidence_manifest_digest, ended_at) VALUES ("
+        "%s, %s, %s, %s, %s, %s, %s, %s, 'reference', %s, 'target', %s, %s, %s, "
+        "%s, %s::jsonb, %s, %s::jsonb, %s, %s)",
+        (
+            expected.attempt.run.run_id,
+            expected.attempt.attempt_id,
+            comparison.check_id,
+            expected.operation_id,
+            bytes.fromhex(comparison.contract_digest),
+            bytes.fromhex(comparison.scope_digest),
+            bytes.fromhex(comparison.input_cut_digest),
+            comparison.reference_observation_id,
+            comparison.target_observation_id,
+            comparison.execution_status.value,
+            comparison.verdict.value,
+            comparison.guarantee.value,
+            expected.result_digest,
+            expected.result_json,
+            expected.frontier_digest,
+            expected.frontier_json,
+            expected.evidence_manifest_digest,
+            expected.ended_at,
+        ),
+    )
+
+
+def _insert_partial_anomalies(
+    connection: psycopg.Connection[DatabaseRow],
+    expected: _PartialComparisonExpectation,
+) -> None:
+    comparison = expected.comparison
+    for anomaly in expected.anomalies:
+        _insert_anomaly(
+            connection,
+            expected.attempt.run.run_id,
+            expected.attempt.attempt_id,
+            comparison.check_id,
+            expected.operation_id,
+            comparison.reference_observation_id,
+            comparison.target_observation_id,
+            anomaly,
+        )
+
+
 def _lookup_completed_comparison(
     connection: psycopg.Connection[DatabaseRow],
     settings: PostgresConnectionSettings,
@@ -2679,6 +3312,32 @@ def _lookup_completed_comparison(
         connection,
         _completed_result_from_database(connection, expected),
     )
+
+
+def _lookup_retryable_partial_comparison(
+    connection: psycopg.Connection[DatabaseRow],
+    settings: PostgresConnectionSettings,
+    expected: _PartialComparisonExpectation,
+) -> RunResult | None:
+    if _select_partial_result_by_operation(connection, expected.operation_id) is None:
+        connection.execute("COMMIT")
+        return None
+    result = _partial_result_from_database(connection, expected)
+    _require_retryable_partial_selection(connection, result)
+    return _commit_result(connection, result)
+
+
+def _lookup_terminal_partial_comparison(
+    connection: psycopg.Connection[DatabaseRow],
+    settings: PostgresConnectionSettings,
+    expected: _PartialComparisonExpectation,
+) -> RunResult | None:
+    if _select_partial_result_by_operation(connection, expected.operation_id) is None:
+        connection.execute("COMMIT")
+        return None
+    result = _partial_result_from_database(connection, expected)
+    _require_selected_partial_comparison(connection, result, expected.ended_at)
+    return _commit_result(connection, result)
 
 
 def _read_completed_comparison_once(
@@ -2705,6 +3364,19 @@ def _read_completed_comparison_once(
         )
     segments = _completed_segments_from_database(connection, run_id, attempt_id)
     _require_valid_stored_segments(result, segments)
+    manifest_digest = _row_optional_bytes(
+        rows[0][12],
+        "completed result evidence manifest digest",
+    )
+    observation_ids = _completed_observation_ids(connection, result, segments)
+    anomalies = _anomalies_from_database(
+        connection,
+        result,
+        observation_ids,
+        manifest_digest,
+    )
+    comparison_boundary = _comparison_evidence_boundary_from_database(connection, result)
+    _validate_anomaly_evidence_boundary(anomalies, comparison_boundary)
     _require_completed_database_closure(
         connection,
         result,
@@ -2713,6 +3385,170 @@ def _read_completed_comparison_once(
     )
     _require_completed_terminal_receipt(connection, result, completed_at)
     return _commit_result(connection, result)
+
+
+def _read_partial_comparison_once(
+    connection: psycopg.Connection[DatabaseRow],
+    settings: PostgresConnectionSettings,
+    run_id: UUID,
+    attempt_id: UUID,
+) -> RunResult:
+    _begin_reader_transaction(connection, settings.statement_timeout_milliseconds)
+    _require_current_schema(connection)
+    completed_rows = _select_results_by_attempt(connection, run_id, attempt_id)
+    partial_rows = _select_partial_results_by_attempt(connection, run_id, attempt_id)
+    if not partial_rows:
+        raise PartialComparisonNotFoundError(
+            "partial comparison does not exist for the requested run and attempt"
+        )
+    if len(partial_rows) != 1 or completed_rows:
+        raise StoredLifecycleIntegrityError(
+            "partial attempt must contain exactly one partial parent and no completed parent"
+        )
+    result, ended_at, frontier, input_cut_digest, observation_ids, manifest_digest = (
+        _partial_result_from_row(partial_rows[0])
+    )
+    if result.run_id != run_id or result.attempt_id != attempt_id:
+        raise StoredLifecycleIntegrityError(
+            "partial result payload identity differs from its lookup key"
+        )
+    anomalies = _anomalies_from_database(
+        connection,
+        result,
+        observation_ids,
+        manifest_digest,
+    )
+    _require_valid_stored_partial(result, frontier, observation_ids, anomalies)
+    _validate_anomaly_evidence_boundary(
+        anomalies,
+        _comparison_evidence_boundary_from_database(connection, result),
+    )
+    _require_partial_database_closure(
+        connection,
+        result,
+        frontier,
+        input_cut_digest,
+        observation_ids,
+        ended_at,
+    )
+    _require_partial_terminal_receipt(connection, result, ended_at)
+    return _commit_result(connection, result)
+
+
+def _read_postgres_diff_once(
+    connection: psycopg.Connection[DatabaseRow],
+    settings: PostgresConnectionSettings,
+    run_id: UUID,
+    attempt_id: UUID,
+    limit: int,
+    cursor: DiffCursor | None,
+) -> DiffPage:
+    _begin_reader_transaction(connection, settings.statement_timeout_milliseconds)
+    _require_current_schema(connection)
+    completed_rows = _select_results_by_attempt(connection, run_id, attempt_id)
+    partial_rows = _select_partial_results_by_attempt(connection, run_id, attempt_id)
+    if len(completed_rows) + len(partial_rows) == 0:
+        raise CompletedComparisonNotFoundError(
+            "comparison result does not exist for the requested run and attempt"
+        )
+    if len(completed_rows) + len(partial_rows) != 1:
+        raise StoredLifecycleIntegrityError(
+            "diff identity requires exactly one completed or partial result parent"
+        )
+    segments: tuple[IntegerRangeFingerprintPersistence, ...] | None = None
+    frontier: PartialComparisonFrontier | None = None
+    input_cut_digest: str | None = None
+    if completed_rows:
+        result, ended_at = _completed_result_from_row(completed_rows[0])
+        segments = _completed_segments_from_database(connection, run_id, attempt_id)
+        observation_ids = _completed_observation_ids(connection, result, segments)
+        manifest_digest = _row_optional_bytes(
+            completed_rows[0][12],
+            "diff completed evidence manifest digest",
+        )
+    else:
+        result, ended_at, frontier, input_cut_digest, observation_ids, manifest_digest = (
+            _partial_result_from_row(partial_rows[0])
+        )
+    if result.run_id != run_id or result.attempt_id != attempt_id:
+        raise StoredLifecycleIntegrityError("diff result payload differs from its lookup key")
+    _anomaly_manifest_summary_from_database(connection, result, manifest_digest)
+    if segments is not None:
+        _require_valid_stored_segments(result, segments)
+        _require_completed_database_closure(connection, result, segments, ended_at)
+        _require_completed_terminal_receipt(connection, result, ended_at)
+    elif frontier is not None and input_cut_digest is not None:
+        _require_valid_stored_partial_snapshot(result, frontier, observation_ids)
+        _require_partial_database_closure(
+            connection,
+            result,
+            frontier,
+            input_cut_digest,
+            observation_ids,
+            ended_at,
+        )
+        _require_partial_terminal_receipt(connection, result, ended_at)
+    else:
+        raise AssertionError("validated diff parent has no completed or partial closure")
+    operation_id = result.persistence.operation_id
+    if operation_id is None:
+        raise StoredLifecycleIntegrityError("diff result has no persistence operation id")
+    if cursor is not None and (
+        cursor.check_id != result.check_id or cursor.result_operation_id != operation_id
+    ):
+        raise ValueError("diff cursor belongs to a different immutable result")
+    comparison_boundary = _comparison_evidence_boundary_from_database(connection, result)
+    after_sequence = cursor.sequence if cursor is not None else -1
+    page_records = _anomaly_page_from_database(
+        connection,
+        result,
+        observation_ids,
+        after_sequence,
+        limit + 1,
+    )
+    if segments is not None:
+        _validate_completed_anomaly_segments(page_records, segments)
+    elif frontier is not None:
+        _validate_partial_anomaly_records(frontier, page_records)
+    else:
+        raise AssertionError("validated diff parent has no segment topology")
+    _validate_anomaly_evidence_boundary(page_records, comparison_boundary)
+    details = page_records[:limit]
+    next_cursor = None
+    if len(page_records) > limit:
+        next_cursor = DiffCursor(
+            run_id=run_id,
+            attempt_id=attempt_id,
+            check_id=result.check_id,
+            result_operation_id=operation_id,
+            sequence=details[-1].sequence,
+        )
+    coverage = result.evidence_coverage
+    if coverage.found_records == coverage.retained_records:
+        detail_availability = DetailAvailability.AVAILABLE
+    elif coverage.retained_records == 0:
+        detail_availability = DetailAvailability.NOT_RETAINED
+    else:
+        detail_availability = DetailAvailability.PARTIALLY_RETAINED
+    try:
+        page = DiffPage(
+            schema_version=1,
+            run_id=run_id,
+            attempt_id=attempt_id,
+            requested_limit=limit,
+            stored_result=result,
+            comparison_context=comparison_boundary.context,
+            detail_availability=detail_availability,
+            found_records=coverage.found_records,
+            retained_records=coverage.retained_records,
+            details=details,
+            next_cursor=next_cursor,
+        )
+    except ValueError as error:
+        raise StoredLifecycleIntegrityError(
+            f"stored diff violates the public reporting protocol: reason={error}"
+        ) from None
+    return _commit_result(connection, page)
 
 
 def _read_postgres_history_once(
@@ -2776,21 +3612,30 @@ def _read_postgres_terminal_attempt_once(
         raise RunLifecycleStateError("terminal attempt does not exist for the requested identity")
     outcome = _attempt_outcome_from_stored_row(row, run_id, attempt_id)
     _require_stored_attempt_closure(connection, run_id, attempt_id)
+    _require_attempt_anomaly_parent_closure(connection, run_id, attempt_id)
     result_count_row = connection.execute(
-        "SELECT pg_catalog.count(*) FROM dfe_metadata.check_results "
-        "WHERE run_id = %s AND attempt_id = %s",
-        (run_id, attempt_id),
+        "SELECT "
+        "(SELECT pg_catalog.count(*) FROM dfe_metadata.check_results "
+        "WHERE run_id = %s AND attempt_id = %s), "
+        "(SELECT pg_catalog.count(*) FROM dfe_metadata.partial_check_results "
+        "WHERE run_id = %s AND attempt_id = %s)",
+        (run_id, attempt_id, run_id, attempt_id),
     ).fetchone()
     if (
         result_count_row is None
         or _row_integer(
             result_count_row[0],
-            "terminal attempt result count",
+            "terminal attempt completed result count",
+        )
+        != 0
+        or _row_integer(
+            result_count_row[1],
+            "terminal attempt partial result count",
         )
         != 0
     ):
         raise StoredLifecycleIntegrityError(
-            "noncompleted terminal attempt cannot contain a completed result"
+            "lifecycle-only terminal read cannot contain a completed or partial result parent"
         )
     _require_terminal_attempt_run_binding(connection, outcome)
     return _commit_result(connection, outcome)
@@ -2998,6 +3843,7 @@ def _completed_comparison_expectation(
     operation_id: UUID,
     comparison: _CompletedResultDefinition,
     segments: tuple[IntegerRangeFingerprintPersistence, ...],
+    anomaly_records: tuple[DifferenceRecord, ...],
     ended_at: datetime,
 ) -> _CompletedComparisonExpectation:
     if attempt.status is not AttemptStatus.RUNNING:
@@ -3010,6 +3856,8 @@ def _completed_comparison_expectation(
         comparison,
         segments,
     )
+    _validate_anomaly_coverage(comparison.evidence_coverage, anomaly_records)
+    _validate_completed_anomaly_segments(anomaly_records, segments)
     candidate_result = RunResult(
         schema_version=1,
         run_id=attempt.run.run_id,
@@ -3035,16 +3883,490 @@ def _completed_comparison_expectation(
     result = RunResult.model_validate_json(candidate_result.model_dump_json())
     result_value = semantic_value_from_json(result.model_dump_json())
     result_json = canonical_semantic_json(result_value)
+    reference_observation_id = segments[0].reference_observation_id if segments else None
+    target_observation_id = segments[0].target_observation_id if segments else None
+    anomalies = _anomaly_expectations(
+        attempt.run.run_id,
+        attempt.attempt_id,
+        comparison.check_id,
+        operation_id,
+        reference_observation_id,
+        target_observation_id,
+        anomaly_records,
+    )
     return _CompletedComparisonExpectation(
         attempt=attempt,
         operation_id=operation_id,
         comparison=comparison,
         segments=segments,
+        anomalies=anomalies,
+        evidence_manifest_digest=_evidence_manifest_digest(anomalies),
         ended_at=ended_at.astimezone(UTC),
         result=result,
         result_json=result_json,
         result_digest=bytes.fromhex(semantic_digest_hex(result_value)),
     )
+
+
+def _partial_comparison_expectation(
+    attempt: RunAttemptRecord,
+    operation_id: UUID,
+    comparison: PartialComparisonDefinition,
+    expected_status: ExecutionStatus,
+    ended_at: datetime,
+) -> _PartialComparisonExpectation:
+    _require_instance(attempt, RunAttemptRecord, "run attempt")
+    _require_uuid(operation_id, "partial comparison operation id")
+    _require_instance(comparison, PartialComparisonDefinition, "partial comparison definition")
+    _require_instance(expected_status, ExecutionStatus, "expected partial execution status")
+    _require_utc_datetime(ended_at, "partial comparison ended_at")
+    if attempt.status is not AttemptStatus.RUNNING:
+        raise ValueError("partial comparison publication requires a running attempt record")
+    if comparison.execution_status is not expected_status:
+        raise ValueError("partial comparison execution status differs from the selected publisher")
+    if comparison.scope_digest != attempt.run.request.scope.scope_digest:
+        raise ValueError("partial comparison scope digest must match the immutable run scope")
+    for bound_digest in (
+        attempt.input_cut_digest,
+        attempt.run.bound_input_cut_digest,
+    ):
+        if bound_digest is not None and comparison.input_cut_digest != bound_digest:
+            raise ValueError("partial comparison differs from an immutable input-cut binding")
+    _validate_partial_definition(attempt.execution_budgets, comparison)
+    if expected_status is ExecutionStatus.INCOMPLETE:
+        _validate_incomplete_reason(comparison.primary_reason)
+        attempt_status = AttemptStatus.INCOMPLETE
+    elif expected_status is ExecutionStatus.ERROR:
+        _validate_error_reason(comparison.primary_reason)
+        attempt_status = AttemptStatus.ERROR
+    else:
+        raise ValueError("partial comparison publisher requires incomplete or error status")
+    candidate_result = RunResult(
+        schema_version=1,
+        run_id=attempt.run.run_id,
+        attempt_id=attempt.attempt_id,
+        check_id=comparison.check_id,
+        contract_digest=comparison.contract_digest,
+        scope_digest=comparison.scope_digest,
+        execution_status=expected_status,
+        verdict=comparison.verdict,
+        consistency=comparison.consistency,
+        guarantee=comparison.guarantee,
+        comparison_coverage=comparison.comparison_coverage,
+        totals=comparison.totals,
+        evidence_coverage=comparison.evidence_coverage,
+        metrics=comparison.metrics,
+        reasons=comparison.reasons,
+        persistence=PersistenceStatus(
+            state=PersistenceState.CONFIRMED,
+            operation_id=operation_id,
+            reason=None,
+        ),
+    )
+    result = RunResult.model_validate_json(candidate_result.model_dump_json())
+    if attempt_status.value != result.execution_status.value:
+        raise AssertionError("partial comparison attempt and result statuses diverged")
+    result_value = semantic_value_from_json(result.model_dump_json())
+    result_json = canonical_semantic_json(result_value)
+    frontier_bytes = canonical_partial_comparison_frontier_bytes(comparison.frontier)
+    frontier_json = frontier_bytes.decode("utf-8", errors="strict")
+    frontier_value = semantic_value_from_json(frontier_json)
+    if canonical_semantic_json(frontier_value) != frontier_json:
+        raise ValueError("partial comparison frontier is not canonical semantic JSON")
+    anomalies = _anomaly_expectations(
+        attempt.run.run_id,
+        attempt.attempt_id,
+        comparison.check_id,
+        operation_id,
+        comparison.reference_observation_id,
+        comparison.target_observation_id,
+        comparison.anomalies,
+    )
+    return _PartialComparisonExpectation(
+        attempt=attempt,
+        operation_id=operation_id,
+        comparison=comparison,
+        ended_at=ended_at.astimezone(UTC),
+        result=result,
+        result_json=result_json,
+        result_digest=bytes.fromhex(semantic_digest_hex(result_value)),
+        frontier_json=frontier_json,
+        frontier_digest=bytes.fromhex(semantic_digest_hex(frontier_value)),
+        anomalies=anomalies,
+        evidence_manifest_digest=_evidence_manifest_digest(anomalies),
+    )
+
+
+def _anomaly_expectations(
+    run_id: UUID,
+    attempt_id: UUID,
+    check_id: str,
+    operation_id: UUID,
+    reference_observation_id: UUID | None,
+    target_observation_id: UUID | None,
+    records: tuple[DifferenceRecord, ...],
+) -> tuple[_AnomalyExpectation, ...]:
+    if records and (reference_observation_id is None or target_observation_id is None):
+        raise ValueError("retained anomalies require an exact observation pair")
+    expectations: list[_AnomalyExpectation] = []
+    for record in records:
+        payload_bytes = canonical_difference_record_bytes(record)
+        payload_json = payload_bytes.decode("utf-8", errors="strict")
+        payload_value = semantic_value_from_json(payload_json)
+        payload_digest = bytes.fromhex(semantic_digest_hex(payload_value))
+        record_value: SemanticValue = {
+            "attempt_id": str(attempt_id),
+            "check_id": check_id,
+            "end_operation_id": str(operation_id),
+            "key_digest": record.key_digest,
+            "kind": record.kind.value,
+            "payload_byte_length": len(payload_bytes),
+            "payload_digest": payload_digest.hex(),
+            "record_version": 1,
+            "reference_direction": PlanDirection.REFERENCE.value,
+            "reference_observation_id": (
+                str(reference_observation_id) if reference_observation_id is not None else None
+            ),
+            "run_id": str(run_id),
+            "segment_sequence": record.segment_sequence,
+            "sequence": record.sequence,
+            "target_direction": PlanDirection.TARGET.value,
+            "target_observation_id": (
+                str(target_observation_id) if target_observation_id is not None else None
+            ),
+        }
+        expectations.append(
+            _AnomalyExpectation(
+                record=record,
+                payload_json=payload_json,
+                payload_digest=payload_digest,
+                payload_byte_length=len(payload_bytes),
+                record_digest=bytes.fromhex(semantic_digest_hex(record_value)),
+            )
+        )
+    return tuple(expectations)
+
+
+def _evidence_manifest_digest(anomalies: tuple[_AnomalyExpectation, ...]) -> bytes:
+    value: SemanticValue = {
+        "manifest_version": 1,
+        "record_digests": [anomaly.record_digest.hex() for anomaly in anomalies],
+    }
+    return bytes.fromhex(semantic_digest_hex(value))
+
+
+def _validate_anomaly_coverage(
+    coverage: EvidenceCoverage,
+    anomalies: tuple[DifferenceRecord, ...],
+) -> None:
+    if type(anomalies) is not tuple:
+        raise TypeError("comparison anomalies must be an immutable tuple")
+    for anomaly in anomalies:
+        _require_instance(anomaly, DifferenceRecord, "comparison anomaly")
+    if tuple(anomaly.sequence for anomaly in anomalies) != tuple(range(len(anomalies))):
+        raise ValueError("retained anomaly sequences must be contiguous from zero in order")
+    retained_bytes = sum(len(canonical_difference_record_bytes(item)) for item in anomalies)
+    if coverage.retained_records != len(anomalies):
+        raise ValueError("retained evidence count differs from the anomaly records")
+    if coverage.retained_bytes != retained_bytes:
+        raise ValueError("retained evidence bytes differ from canonical anomaly payload bytes")
+
+
+def _validate_completed_anomaly_segments(
+    anomalies: tuple[DifferenceRecord, ...],
+    segments: tuple[IntegerRangeFingerprintPersistence, ...],
+) -> None:
+    if not anomalies:
+        return
+    by_sequence = {segment.segment_sequence: segment for segment in segments}
+    for anomaly in anomalies:
+        segment = by_sequence.get(anomaly.segment_sequence)
+        if segment is None:
+            raise ValueError("retained anomaly references an unknown completed segment")
+        if segment.state is not ComparisonSegmentState.EXACT_MISMATCH:
+            raise ValueError("retained anomaly must belong to an exact-mismatch segment")
+
+
+def _validate_partial_definition(
+    budgets: ExecutionBudgets,
+    comparison: PartialComparisonDefinition,
+) -> None:
+    _validate_anomaly_coverage(comparison.evidence_coverage, comparison.anomalies)
+    _validate_partial_anomaly_segments(comparison)
+    _validate_partial_frontier_closure(
+        comparison.frontier,
+        comparison.metrics,
+        comparison.comparison_coverage,
+        comparison.totals,
+        comparison.verdict,
+        comparison.consistency,
+        comparison.reasons,
+    )
+    _validate_partial_budget_use(
+        budgets,
+        comparison.metrics,
+        comparison.evidence_coverage,
+        comparison.frontier,
+    )
+
+
+def _validate_partial_budget_use(
+    budgets: ExecutionBudgets,
+    metrics: ResultMetrics,
+    evidence_coverage: EvidenceCoverage,
+    frontier: PartialComparisonFrontier,
+) -> None:
+    for name, actual, maximum in (
+        ("queries", metrics.queries, budgets.max_queries),
+        (
+            "fingerprint_nodes",
+            metrics.fingerprint_nodes,
+            budgets.max_fingerprint_nodes,
+        ),
+        (
+            "coordinator_peak_bytes",
+            metrics.coordinator_peak_bytes,
+            budgets.max_coordinator_memory_bytes,
+        ),
+        (
+            "retained_evidence_records",
+            evidence_coverage.retained_records,
+            budgets.max_evidence_rows,
+        ),
+        (
+            "retained_evidence_bytes",
+            evidence_coverage.retained_bytes,
+            budgets.max_evidence_bytes,
+        ),
+    ):
+        if actual > maximum:
+            raise ValueError(f"partial comparison {name} exceeds its immutable attempt budget")
+    nodes = (*frontier.topology, *frontier.unresolved)
+    if nodes and max(segment.depth for segment in nodes) > budgets.max_depth:
+        raise ValueError("partial comparison segment depth exceeds its attempt budget")
+
+
+def _validate_partial_frontier_closure(
+    frontier: PartialComparisonFrontier,
+    metrics: ResultMetrics,
+    coverage: ComparisonCoverage,
+    totals: ComparisonTotals,
+    verdict: Verdict,
+    consistency: ConsistencyStatus,
+    reasons: tuple[ResultReason, ...],
+) -> None:
+    if consistency.stable_reads not in (
+        ConsistencyLevel.UNKNOWN,
+        ConsistencyLevel.VERIFIED,
+    ):
+        raise ValueError("partial comparison cannot claim asserted stable-read proof")
+    if consistency.cut_alignment is not ConsistencyLevel.VERIFIED:
+        raise ValueError("partial comparison requires its verified persisted aligned cut")
+    topology = frontier.topology
+    unresolved = frontier.unresolved
+    nodes: tuple[ComparisonSegmentRecord | UnresolvedComparisonSegment, ...] = (
+        *topology,
+        *unresolved,
+    )
+    structural_empty_frontier = (
+        not nodes
+        and coverage.resolved_segments == 1
+        and coverage.pruned_segments == 0
+        and coverage.exact_segments == 1
+        and all(isinstance(total, UnavailableTotal) for total in totals.values())
+    )
+    if structural_empty_frontier:
+        if metrics.fingerprint_nodes != 0:
+            raise ValueError("structural partial comparison cannot claim fingerprint nodes")
+    elif not nodes:
+        raise ValueError("row partial comparison requires a nonempty persisted frontier")
+    else:
+        _validate_partial_frontier_tree(frontier)
+        witnessed = sum(item.reference_fingerprint is not None for item in unresolved)
+        minimum_queried = len(topology) + witnessed
+        if not minimum_queried <= metrics.fingerprint_nodes <= len(nodes):
+            raise ValueError(
+                "partial fingerprint_nodes must cover persisted topology and witnesses "
+                "without exceeding the allocated frontier"
+            )
+
+    pruned = sum(
+        item.state.value == ComparisonSegmentState.FINGERPRINT_MATCH.value for item in topology
+    )
+    exact = sum(
+        item.state.value
+        in (
+            ComparisonSegmentState.EXACT_MATCH.value,
+            ComparisonSegmentState.EXACT_MISMATCH.value,
+        )
+        for item in topology
+    )
+    if not structural_empty_frontier and (
+        coverage.resolved_segments != pruned + exact
+        or coverage.pruned_segments != pruned
+        or coverage.exact_segments != exact
+    ):
+        raise ValueError("partial comparison coverage differs from its terminal topology")
+    unresolved_reasons = tuple(dict.fromkeys(item.reason for item in unresolved))
+    if (
+        coverage.total_partitions != 1
+        or coverage.covered_partitions
+        != (1 if not unresolved and coverage.resolved_segments > 0 else 0)
+        or coverage.unresolved_segments != len(unresolved)
+        or coverage.unresolved_reasons != unresolved_reasons
+    ):
+        raise ValueError("partial comparison coverage differs from its unresolved frontier")
+
+    total_values = totals.values()
+    if any(isinstance(total, (ExactTotal, InferredTotal)) for total in total_values):
+        raise ValueError("partial comparison totals cannot claim exact or inferred precision")
+    if any(isinstance(total, LowerBoundTotal) for total in total_values) and exact == 0:
+        raise ValueError("partial lower-bound totals require a completed exact segment")
+    has_proven_mismatch = any(
+        item.reference_fingerprint != item.target_fingerprint for item in topology
+    ) or any(item.reference_fingerprint is not None for item in unresolved)
+    if any(
+        isinstance(total, LowerBoundTotal) and total.value != "0" for total in totals.differences()
+    ):
+        has_proven_mismatch = True
+    reason_codes = {reason.code for reason in reasons}
+    contract_reasons = tuple(
+        reason for reason in reasons if reason.code is ReasonCode.CONTRACT_VIOLATION
+    )
+    if len(contract_reasons) > 1:
+        raise ValueError("partial comparison cannot contain duplicate contract proofs")
+    has_contract_proof = bool(contract_reasons)
+    if contract_reasons:
+        if consistency.stable_reads is not ConsistencyLevel.VERIFIED:
+            raise ValueError("partial contract proof requires verified summary reads")
+        if structural_empty_frontier:
+            _validate_structural_summary_reason(contract_reasons[0])
+        else:
+            _validate_partial_contract_summary_reason(contract_reasons[0])
+    if (ReasonCode.DATA_MISMATCH in reason_codes) != has_proven_mismatch:
+        raise ValueError("partial data_mismatch reason must exactly match persisted row evidence")
+    if (verdict is Verdict.MISMATCH) != (has_proven_mismatch or has_contract_proof):
+        raise ValueError(
+            "partial mismatch verdict requires persisted row evidence or contract-violation proof"
+        )
+    if structural_empty_frontier and not has_contract_proof:
+        raise ValueError("structural partial comparison requires contract-violation proof")
+
+
+def _validate_partial_frontier_tree(frontier: PartialComparisonFrontier) -> None:
+    nodes: tuple[ComparisonSegmentRecord | UnresolvedComparisonSegment, ...] = (
+        *frontier.topology,
+        *frontier.unresolved,
+    )
+    by_sequence = {item.segment_sequence: item for item in nodes}
+    if tuple(sorted(by_sequence)) != tuple(range(len(nodes))):
+        raise ValueError("partial frontier sequences must be contiguous from zero")
+    root = by_sequence[0]
+    if root.parent_segment_sequence is not None or root.depth != 0:
+        raise ValueError("partial frontier root must be the depth-zero segment")
+    children_by_parent: dict[
+        int,
+        list[ComparisonSegmentRecord | UnresolvedComparisonSegment],
+    ] = {}
+    for sequence in range(1, len(nodes)):
+        node = by_sequence[sequence]
+        parent_sequence = node.parent_segment_sequence
+        if parent_sequence is None or parent_sequence not in by_sequence:
+            raise ValueError("non-root partial frontier segment requires a known parent")
+        children_by_parent.setdefault(parent_sequence, []).append(node)
+
+    topology_sequences = {item.segment_sequence for item in frontier.topology}
+    for segment in frontier.topology:
+        children = tuple(children_by_parent.get(segment.segment_sequence, ()))
+        if segment.state.value == ComparisonSegmentState.SPLIT.value:
+            _validate_partial_split_segment(segment, children)
+        elif children:
+            raise ValueError("terminal partial topology segment cannot have children")
+        if (
+            segment.state.value
+            in (
+                ComparisonSegmentState.FINGERPRINT_MATCH.value,
+                ComparisonSegmentState.EXACT_MATCH.value,
+            )
+            and segment.reference_fingerprint != segment.target_fingerprint
+        ):
+            raise ValueError("matched partial topology segment requires equal fingerprints")
+        if (
+            segment.state.value
+            in (
+                ComparisonSegmentState.SPLIT.value,
+                ComparisonSegmentState.EXACT_MISMATCH.value,
+            )
+            and segment.reference_fingerprint == segment.target_fingerprint
+        ):
+            raise ValueError("mismatched partial topology segment requires unequal fingerprints")
+    for segment in frontier.unresolved:
+        if children_by_parent.get(segment.segment_sequence):
+            raise ValueError("unresolved partial frontier segment cannot have children")
+        parent_sequence = segment.parent_segment_sequence
+        if parent_sequence is not None and parent_sequence not in topology_sequences:
+            raise ValueError("unresolved partial frontier parent must be persisted topology")
+
+
+def _validate_partial_split_segment(
+    parent: ComparisonSegmentRecord,
+    children: tuple[ComparisonSegmentRecord | UnresolvedComparisonSegment, ...],
+) -> None:
+    if len(children) != 2:
+        raise ValueError("split partial topology segment must have exactly two children")
+    left, right = sorted(children, key=lambda segment: segment.lower_inclusive)
+    if left.depth != parent.depth + 1 or right.depth != parent.depth + 1:
+        raise ValueError("split partial topology children must advance depth by one")
+    if (
+        left.lower_inclusive != parent.lower_inclusive
+        or left.upper_exclusive is None
+        or right.lower_inclusive != left.upper_exclusive
+        or right.upper_exclusive != parent.upper_exclusive
+    ):
+        raise ValueError("split partial topology children must exactly cover their parent")
+    left_fingerprints = _partial_frontier_fingerprints(left)
+    right_fingerprints = _partial_frontier_fingerprints(right)
+    if left_fingerprints is None or right_fingerprints is None:
+        return
+    if (
+        combine_fingerprints((left_fingerprints[0], right_fingerprints[0]))
+        != parent.reference_fingerprint
+    ):
+        raise ValueError("known reference child fingerprints must combine to their split parent")
+    if (
+        combine_fingerprints((left_fingerprints[1], right_fingerprints[1]))
+        != parent.target_fingerprint
+    ):
+        raise ValueError("known target child fingerprints must combine to their split parent")
+
+
+def _partial_frontier_fingerprints(
+    segment: ComparisonSegmentRecord | UnresolvedComparisonSegment,
+) -> tuple[Fingerprint, Fingerprint] | None:
+    if isinstance(segment, ComparisonSegmentRecord):
+        return segment.reference_fingerprint, segment.target_fingerprint
+    reference = segment.reference_fingerprint
+    target = segment.target_fingerprint
+    if reference is None or target is None:
+        return None
+    return reference, target
+
+
+def _validate_partial_anomaly_segments(comparison: PartialComparisonDefinition) -> None:
+    _validate_partial_anomaly_records(comparison.frontier, comparison.anomalies)
+
+
+def _validate_partial_anomaly_records(
+    frontier: PartialComparisonFrontier,
+    anomalies: tuple[DifferenceRecord, ...],
+) -> None:
+    by_sequence = {segment.segment_sequence: segment for segment in frontier.topology}
+    for anomaly in anomalies:
+        segment = by_sequence.get(anomaly.segment_sequence)
+        if segment is None:
+            raise ValueError("retained anomaly references an unknown partial segment")
+        if segment.state.value != ComparisonSegmentState.EXACT_MISMATCH.value:
+            raise ValueError("retained anomaly must belong to an exact-mismatch segment")
 
 
 def _validate_completed_structural_definition(
@@ -3091,19 +4413,34 @@ def _validate_completed_structural_definition(
     ):
         raise ValueError("completed structural comparison cannot claim row evidence")
     if (
-        comparison.metrics.queries != 2
-        or comparison.metrics.fetched_records != 2
+        comparison.metrics.queries < 2
+        or comparison.metrics.fetched_records < 2
         or comparison.metrics.fingerprint_nodes != 0
     ):
-        raise ValueError(
-            "completed structural comparison requires exactly two summary-read receipts"
-        )
+        raise ValueError("completed structural comparison requires both summary-read receipts")
     if len(comparison.reasons) != 1:
         raise ValueError("completed structural comparison requires one contract reason")
     _validate_structural_summary_reason(comparison.reasons[0])
 
 
 def _validate_structural_summary_reason(reason: ResultReason) -> None:
+    reference, target = _canonical_contract_summary(reason)
+    for direction, summary in (("reference", reference), ("target", target)):
+        if summary[2] != 0:
+            raise ValueError(
+                f"completed structural {direction} summary contains invalid mapped keys"
+            )
+    _require_contract_summary_violation(reference, target)
+
+
+def _validate_partial_contract_summary_reason(reason: ResultReason) -> None:
+    reference, target = _canonical_contract_summary(reason)
+    _require_contract_summary_violation(reference, target)
+
+
+def _canonical_contract_summary(
+    reason: ResultReason,
+) -> tuple[tuple[int, int, int, int, int], tuple[int, int, int, int, int]]:
     if (
         reason.code is not ReasonCode.CONTRACT_VIOLATION
         or reason.operation != "validate_integer_key_contract"
@@ -3122,8 +4459,8 @@ def _validate_structural_summary_reason(reason: ResultReason) -> None:
         _canonical_nonnegative_parameter(parameter.value, parameter.name)
         for parameter in reason.safe_parameters
     )
-    reference = values[:5]
-    target = values[5:]
+    reference = cast(tuple[int, int, int, int, int], values[:5])
+    target = cast(tuple[int, int, int, int, int], values[5:])
     for direction, summary in (("reference", reference), ("target", target)):
         row_count, null_count, invalid_count, valid_count, distinct_count = summary
         if row_count != null_count + invalid_count + valid_count:
@@ -3132,10 +4469,13 @@ def _validate_structural_summary_reason(reason: ResultReason) -> None:
             )
         if distinct_count > valid_count:
             raise ValueError(f"completed structural {direction} distinct keys exceed valid keys")
-        if invalid_count != 0:
-            raise ValueError(
-                f"completed structural {direction} summary contains invalid mapped keys"
-            )
+    return reference, target
+
+
+def _require_contract_summary_violation(
+    reference: tuple[int, int, int, int, int],
+    target: tuple[int, int, int, int, int],
+) -> None:
     reference_violation = reference[1] > 0 or reference[3] != reference[4]
     target_violation = target[1] > 0 or target[3] != target[4]
     if not reference_violation and not target_violation:
@@ -3377,8 +4717,12 @@ def _validate_structural_artifact_summary_closure(
 ) -> None:
     if artifact.reference_full_scans != 1 or artifact.target_full_scans != 1:
         raise ValueError("completed structural artifact requires one summary scan per side")
-    if artifact.metrics.queries != 2 or artifact.metrics.fingerprint_nodes != 0:
-        raise ValueError("completed structural artifact must contain summary-read metrics only")
+    if (
+        artifact.metrics.queries < 2
+        or artifact.metrics.fetched_records < 2
+        or artifact.metrics.fingerprint_nodes != 0
+    ):
+        raise ValueError("completed structural artifact requires both summary-read receipts")
     definition = CompletedStructuralComparisonDefinition(
         check_id=artifact.check_id,
         contract_digest=artifact.contract_digest,
@@ -3874,7 +5218,24 @@ _OBSERVATION_SELECT: Final[LiteralString] = (
 _RESULT_SELECT: Final[LiteralString] = (
     "SELECT run_id, attempt_id, check_id, result_operation_id, contract_digest, "
     "scope_digest, execution_status, verdict, guarantee, result_digest, "
-    "result_payload::text, completed_at FROM dfe_metadata.check_results"
+    "result_payload::text, completed_at, evidence_manifest_digest "
+    "FROM dfe_metadata.check_results"
+)
+
+_PARTIAL_RESULT_SELECT: Final[LiteralString] = (
+    "SELECT run_id, attempt_id, check_id, end_operation_id, contract_digest, "
+    "scope_digest, input_cut_digest, reference_observation_id, reference_direction, "
+    "target_observation_id, target_direction, execution_status, verdict, guarantee, "
+    "result_digest, result_payload::text, frontier_digest, frontier_payload::text, "
+    "evidence_manifest_digest, ended_at FROM dfe_metadata.partial_check_results"
+)
+
+_ANOMALY_SELECT: Final[LiteralString] = (
+    "SELECT run_id, attempt_id, check_id, end_operation_id, anomaly_sequence, "
+    "segment_sequence, anomaly_kind, key_digest, reference_observation_id, "
+    "reference_direction, target_observation_id, target_direction, "
+    "evidence_payload::text, payload_digest, payload_byte_length, record_digest "
+    "FROM dfe_metadata.anomalies"
 )
 
 _HISTORY_SELECT: Final[LiteralString] = (
@@ -3886,7 +5247,17 @@ _HISTORY_SELECT: Final[LiteralString] = (
     "dfe_result.run_id, dfe_result.attempt_id, dfe_result.check_id, "
     "dfe_result.result_operation_id, dfe_result.contract_digest, dfe_result.scope_digest, "
     "dfe_result.execution_status, dfe_result.verdict, dfe_result.guarantee, "
-    "dfe_result.result_digest, dfe_result.result_payload::text, dfe_result.completed_at "
+    "dfe_result.result_digest, dfe_result.result_payload::text, dfe_result.completed_at, "
+    "dfe_result.evidence_manifest_digest, "
+    "dfe_partial.run_id, dfe_partial.attempt_id, dfe_partial.check_id, "
+    "dfe_partial.end_operation_id, dfe_partial.contract_digest, "
+    "dfe_partial.scope_digest, dfe_partial.input_cut_digest, "
+    "dfe_partial.reference_observation_id, dfe_partial.reference_direction, "
+    "dfe_partial.target_observation_id, dfe_partial.target_direction, "
+    "dfe_partial.execution_status, dfe_partial.verdict, dfe_partial.guarantee, "
+    "dfe_partial.result_digest, dfe_partial.result_payload::text, "
+    "dfe_partial.frontier_digest, dfe_partial.frontier_payload::text, "
+    "dfe_partial.evidence_manifest_digest, dfe_partial.ended_at "
     "FROM dfe_metadata.run_attempts AS dfe_attempt "
     "JOIN dfe_metadata.runs AS dfe_run ON dfe_run.run_id = dfe_attempt.run_id "
     "JOIN dfe_metadata.contract_versions AS dfe_contract "
@@ -3895,6 +5266,10 @@ _HISTORY_SELECT: Final[LiteralString] = (
     "ON dfe_result.run_id = dfe_attempt.run_id "
     "AND dfe_result.attempt_id = dfe_attempt.attempt_id "
     "AND dfe_result.check_id = dfe_contract.check_id "
+    "LEFT JOIN dfe_metadata.partial_check_results AS dfe_partial "
+    "ON dfe_partial.run_id = dfe_attempt.run_id "
+    "AND dfe_partial.attempt_id = dfe_attempt.attempt_id "
+    "AND dfe_partial.check_id = dfe_contract.check_id "
     "WHERE dfe_contract.check_id = %s AND dfe_run.scope_digest = %s"
 )
 
@@ -4103,6 +5478,64 @@ def _select_results_by_attempt(
     return connection.execute(
         _RESULT_SELECT + " WHERE run_id = %s AND attempt_id = %s ORDER BY check_id",
         (run_id, attempt_id),
+    ).fetchall()
+
+
+def _select_partial_result_by_operation(
+    connection: psycopg.Connection[DatabaseRow],
+    operation_id: UUID,
+) -> DatabaseRow | None:
+    return connection.execute(
+        _PARTIAL_RESULT_SELECT + " WHERE end_operation_id = %s",
+        (operation_id,),
+    ).fetchone()
+
+
+def _select_partial_results_by_attempt(
+    connection: psycopg.Connection[DatabaseRow],
+    run_id: UUID,
+    attempt_id: UUID,
+) -> list[DatabaseRow]:
+    return connection.execute(
+        _PARTIAL_RESULT_SELECT + " WHERE run_id = %s AND attempt_id = %s ORDER BY check_id",
+        (run_id, attempt_id),
+    ).fetchall()
+
+
+def _select_anomaly_rows_by_attempt(
+    connection: psycopg.Connection[DatabaseRow],
+    run_id: UUID,
+    attempt_id: UUID,
+    check_id: str,
+) -> list[DatabaseRow]:
+    return connection.execute(
+        _ANOMALY_SELECT + " WHERE run_id = %s AND attempt_id = %s AND check_id = %s "
+        "ORDER BY anomaly_sequence",
+        (run_id, attempt_id, check_id),
+    ).fetchall()
+
+
+def _select_anomaly_page_rows(
+    connection: psycopg.Connection[DatabaseRow],
+    result: RunResult,
+    after_sequence: int,
+    limit: int,
+) -> list[DatabaseRow]:
+    operation_id = result.persistence.operation_id
+    if operation_id is None:
+        raise StoredLifecycleIntegrityError("stored result has no persistence operation id")
+    return connection.execute(
+        _ANOMALY_SELECT + " WHERE run_id = %s AND attempt_id = %s AND check_id = %s "
+        "AND end_operation_id = %s AND anomaly_sequence > %s "
+        "ORDER BY anomaly_sequence LIMIT %s",
+        (
+            result.run_id,
+            result.attempt_id,
+            result.check_id,
+            operation_id,
+            after_sequence,
+            limit,
+        ),
     ).fetchall()
 
 
@@ -4539,6 +5972,47 @@ def _insert_completed_segment_side(
     )
 
 
+def _insert_anomaly(
+    connection: psycopg.Connection[DatabaseRow],
+    run_id: UUID,
+    attempt_id: UUID,
+    check_id: str,
+    operation_id: UUID,
+    reference_observation_id: UUID,
+    target_observation_id: UUID,
+    anomaly: _AnomalyExpectation,
+) -> None:
+    connection.execute(
+        "INSERT INTO dfe_metadata.anomalies ("
+        "run_id, attempt_id, check_id, end_operation_id, anomaly_sequence, "
+        "segment_sequence, anomaly_kind, key_digest, reference_observation_id, "
+        "reference_direction, target_observation_id, target_direction, "
+        "evidence_payload, payload_digest, payload_byte_length, record_digest) "
+        "VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, 'reference', %s, 'target', "
+        "%s::jsonb, %s, %s, %s)",
+        (
+            run_id,
+            attempt_id,
+            check_id,
+            operation_id,
+            anomaly.record.sequence,
+            anomaly.record.segment_sequence,
+            anomaly.record.kind.value,
+            (
+                bytes.fromhex(anomaly.record.key_digest)
+                if anomaly.record.key_digest is not None
+                else None
+            ),
+            reference_observation_id,
+            target_observation_id,
+            anomaly.payload_json,
+            anomaly.payload_digest,
+            anomaly.payload_byte_length,
+            anomaly.record_digest,
+        ),
+    )
+
+
 def _completed_result_from_database(
     connection: psycopg.Connection[DatabaseRow],
     expected: _CompletedComparisonExpectation,
@@ -4552,6 +6026,8 @@ def _completed_result_from_database(
         or _canonical_database_json(row[10], "completed result payload") != expected.result_json
         or _row_bytes(row[9], "completed result digest") != expected.result_digest
         or completed_at != expected.ended_at
+        or _row_optional_bytes(row[12], "completed evidence manifest digest")
+        != expected.evidence_manifest_digest
     ):
         raise LifecycleOperationConflictError(
             "completed comparison operation UUID is already bound to a different full result"
@@ -4566,6 +6042,27 @@ def _completed_result_from_database(
             "completed comparison operation UUID is bound to different segment evidence"
         )
     _require_valid_stored_segments(result, segments)
+    if _select_partial_results_by_attempt(
+        connection,
+        expected.attempt.run.run_id,
+        expected.attempt.attempt_id,
+    ):
+        raise StoredLifecycleIntegrityError(
+            "completed comparison cannot also contain a partial result parent"
+        )
+    observation_ids = _completed_observation_ids(connection, result, segments)
+    anomalies = _anomalies_from_database(
+        connection,
+        result,
+        observation_ids,
+        expected.evidence_manifest_digest,
+    )
+    if anomalies != tuple(anomaly.record for anomaly in expected.anomalies):
+        raise LifecycleOperationConflictError(
+            "completed comparison operation UUID is bound to different retained anomalies"
+        )
+    comparison_boundary = _comparison_evidence_boundary_from_database(connection, result)
+    _validate_anomaly_evidence_boundary(anomalies, comparison_boundary)
     _require_completed_database_closure(
         connection,
         result,
@@ -4622,16 +6119,1352 @@ def _completed_result_from_row(row: DatabaseRow) -> tuple[RunResult, datetime]:
     return result, _row_datetime(row[11], "completed result completed_at")
 
 
+def _partial_result_from_database(
+    connection: psycopg.Connection[DatabaseRow],
+    expected: _PartialComparisonExpectation,
+) -> RunResult:
+    row = _select_partial_result_by_operation(connection, expected.operation_id)
+    if row is None:
+        raise StoredLifecycleIntegrityError("partial comparison operation receipt is missing")
+    (
+        result,
+        ended_at,
+        frontier,
+        input_cut_digest,
+        observation_ids,
+        manifest_digest,
+    ) = _partial_result_from_row(row)
+    if (
+        result != expected.result
+        or _canonical_database_json(row[15], "partial result payload") != expected.result_json
+        or _row_bytes(row[14], "partial result digest") != expected.result_digest
+        or frontier != expected.comparison.frontier
+        or _canonical_database_json(row[17], "partial frontier payload") != expected.frontier_json
+        or _row_bytes(row[16], "partial frontier digest") != expected.frontier_digest
+        or input_cut_digest != expected.comparison.input_cut_digest
+        or observation_ids
+        != (
+            expected.comparison.reference_observation_id,
+            expected.comparison.target_observation_id,
+        )
+        or manifest_digest != expected.evidence_manifest_digest
+        or ended_at != expected.ended_at
+    ):
+        raise LifecycleOperationConflictError(
+            "partial comparison operation UUID is already bound to a different full result"
+        )
+    if _select_results_by_attempt(
+        connection,
+        expected.attempt.run.run_id,
+        expected.attempt.attempt_id,
+    ):
+        raise StoredLifecycleIntegrityError(
+            "partial comparison cannot also contain a completed result parent"
+        )
+    anomalies = _anomalies_from_database(
+        connection,
+        result,
+        observation_ids,
+        manifest_digest,
+    )
+    if anomalies != tuple(anomaly.record for anomaly in expected.anomalies):
+        raise LifecycleOperationConflictError(
+            "partial comparison operation UUID is bound to different retained anomalies"
+        )
+    _require_valid_stored_partial(result, frontier, observation_ids, anomalies)
+    _validate_anomaly_evidence_boundary(
+        anomalies,
+        _comparison_evidence_boundary_from_database(connection, result),
+    )
+    _require_partial_database_closure(
+        connection,
+        result,
+        frontier,
+        input_cut_digest,
+        observation_ids,
+        ended_at,
+    )
+    _require_partial_terminal_receipt(connection, result, ended_at)
+    return result
+
+
+def _partial_result_from_row(
+    row: DatabaseRow,
+) -> tuple[
+    RunResult,
+    datetime,
+    PartialComparisonFrontier,
+    str,
+    tuple[UUID, UUID],
+    bytes,
+]:
+    if len(row) != 20:
+        raise StoredLifecycleIntegrityError(
+            f"PostgreSQL partial result row has an invalid column count: "
+            f"actual={len(row)}, expected=20"
+        )
+    payload_json = _canonical_database_json(row[15], "partial result payload")
+    try:
+        payload_value = semantic_value_from_json(payload_json)
+        result = RunResult.model_validate_json(payload_json)
+        replay_json = canonical_semantic_json(semantic_value_from_json(result.model_dump_json()))
+    except ValueError as error:
+        raise StoredLifecycleIntegrityError(
+            f"stored partial result violates the public result protocol: reason={error}"
+        ) from None
+    if replay_json != payload_json:
+        raise StoredLifecycleIntegrityError(
+            "stored partial result payload contains unsupported or non-round-trippable fields"
+        )
+    frontier_json = _canonical_database_json(row[17], "partial frontier payload")
+    try:
+        frontier = partial_comparison_frontier_from_canonical_bytes(
+            frontier_json.encode("utf-8", errors="strict")
+        )
+        replay_frontier_json = canonical_partial_comparison_frontier_bytes(frontier).decode(
+            "utf-8",
+            errors="strict",
+        )
+    except ValueError as error:
+        raise StoredLifecycleIntegrityError(
+            f"stored partial frontier violates the comparison protocol: reason={error}"
+        ) from None
+    if replay_frontier_json != frontier_json:
+        raise StoredLifecycleIntegrityError(
+            "stored partial frontier contains unsupported or non-round-trippable fields"
+        )
+    result_digest = bytes.fromhex(semantic_digest_hex(payload_value))
+    frontier_digest = bytes.fromhex(semantic_digest_hex(semantic_value_from_json(frontier_json)))
+    input_cut_digest = _row_bytes(row[6], "partial result input cut digest").hex()
+    observation_ids = (
+        _row_uuid(row[7], "partial result reference observation id"),
+        _row_uuid(row[9], "partial result target observation id"),
+    )
+    actual = (
+        _row_uuid(row[0], "partial result run id"),
+        _row_uuid(row[1], "partial result attempt id"),
+        _row_text(row[2], "partial result check id"),
+        _row_uuid(row[3], "partial result operation id"),
+        _row_bytes(row[4], "partial result contract digest").hex(),
+        _row_bytes(row[5], "partial result scope digest").hex(),
+        _row_text(row[8], "partial result reference direction"),
+        _row_text(row[10], "partial result target direction"),
+        _row_text(row[11], "partial result execution status"),
+        _row_text(row[12], "partial result verdict"),
+        _row_text(row[13], "partial result guarantee"),
+        _row_bytes(row[14], "partial result digest"),
+        _row_bytes(row[16], "partial frontier digest"),
+    )
+    expected = (
+        result.run_id,
+        result.attempt_id,
+        result.check_id,
+        result.persistence.operation_id,
+        result.contract_digest,
+        result.scope_digest,
+        PlanDirection.REFERENCE.value,
+        PlanDirection.TARGET.value,
+        result.execution_status.value,
+        result.verdict.value,
+        result.guarantee.value,
+        result_digest,
+        frontier_digest,
+    )
+    if actual != expected:
+        raise StoredLifecycleIntegrityError(
+            "stored partial result columns differ from its canonical payloads"
+        )
+    manifest_digest = _row_bytes(row[18], "partial evidence manifest digest")
+    if len(manifest_digest) != 32:
+        raise StoredLifecycleIntegrityError("partial evidence manifest digest is not SHA-256")
+    return (
+        result,
+        _row_datetime(row[19], "partial result ended_at"),
+        frontier,
+        input_cut_digest,
+        observation_ids,
+        manifest_digest,
+    )
+
+
+def _require_valid_stored_partial(
+    result: RunResult,
+    frontier: PartialComparisonFrontier,
+    observation_ids: tuple[UUID, UUID],
+    anomalies: tuple[DifferenceRecord, ...],
+) -> None:
+    _require_valid_stored_partial_snapshot(result, frontier, observation_ids)
+    try:
+        _validate_anomaly_coverage(result.evidence_coverage, anomalies)
+        by_sequence = {segment.segment_sequence: segment for segment in frontier.topology}
+        for anomaly in anomalies:
+            segment = by_sequence.get(anomaly.segment_sequence)
+            if (
+                segment is None
+                or segment.state.value != ComparisonSegmentState.EXACT_MISMATCH.value
+            ):
+                raise ValueError(
+                    "partial anomaly must reference a persisted exact-mismatch segment"
+                )
+    except (TypeError, ValueError) as error:
+        raise StoredLifecycleIntegrityError(
+            f"stored partial comparison is invalid: reason={error}"
+        ) from None
+
+
+def _require_valid_stored_partial_snapshot(
+    result: RunResult,
+    frontier: PartialComparisonFrontier,
+    observation_ids: tuple[UUID, UUID],
+) -> None:
+    try:
+        if result.execution_status is ExecutionStatus.COMPLETED:
+            raise ValueError("partial result cannot have completed execution status")
+        if result.guarantee is not Guarantee.NOT_ESTABLISHED:
+            raise ValueError("partial result requires not_established guarantee")
+        if result.verdict is Verdict.MATCH:
+            raise ValueError("partial result cannot claim a match")
+        if len(result.consistency.read_context_ids) != 2:
+            raise ValueError("partial result requires two protected context identities")
+        if observation_ids[0] == observation_ids[1]:
+            raise ValueError("partial result observation identities must be distinct")
+        _validate_partial_frontier_closure(
+            frontier,
+            result.metrics,
+            result.comparison_coverage,
+            result.totals,
+            result.verdict,
+            result.consistency,
+            result.reasons,
+        )
+    except (TypeError, ValueError) as error:
+        raise StoredLifecycleIntegrityError(
+            f"stored partial comparison snapshot is invalid: reason={error}"
+        ) from None
+
+
+def _completed_observation_ids(
+    connection: psycopg.Connection[DatabaseRow],
+    result: RunResult,
+    segments: tuple[IntegerRangeFingerprintPersistence, ...],
+) -> tuple[UUID, UUID]:
+    if segments:
+        return (
+            segments[0].reference_observation_id,
+            segments[0].target_observation_id,
+        )
+    rows = _select_observation_rows_by_attempt(connection, result.run_id, result.attempt_id)
+    if len(rows) != 2:
+        raise StoredLifecycleIntegrityError(
+            "completed structural comparison requires one observation per direction"
+        )
+    if (
+        _row_text(rows[0][6], "completed reference observation direction")
+        != PlanDirection.REFERENCE.value
+        or _row_text(rows[1][6], "completed target observation direction")
+        != PlanDirection.TARGET.value
+    ):
+        raise StoredLifecycleIntegrityError(
+            "completed structural observations are not ordered reference then target"
+        )
+    return (
+        _row_uuid(rows[0][0], "completed reference observation id"),
+        _row_uuid(rows[1][0], "completed target observation id"),
+    )
+
+
+def _anomalies_from_database(
+    connection: psycopg.Connection[DatabaseRow],
+    result: RunResult,
+    observation_ids: tuple[UUID, UUID],
+    manifest_digest: bytes | None,
+) -> tuple[DifferenceRecord, ...]:
+    operation_id = result.persistence.operation_id
+    if operation_id is None:
+        raise StoredLifecycleIntegrityError("stored result has no persistence operation id")
+    _require_attempt_anomaly_parent_closure(connection, result.run_id, result.attempt_id)
+    _require_exact_result_parent(connection, result, operation_id)
+    rows = _select_anomaly_rows_by_attempt(
+        connection,
+        result.run_id,
+        result.attempt_id,
+        result.check_id,
+    )
+    if manifest_digest is None:
+        if rows:
+            raise StoredLifecycleIntegrityError(
+                "historical result without an evidence manifest contains anomaly rows"
+            )
+        if (
+            result.evidence_coverage.retained_records != 0
+            or result.evidence_coverage.retained_bytes != 0
+        ):
+            raise StoredLifecycleIntegrityError(
+                "historical result without an evidence manifest claims retained evidence"
+            )
+        return ()
+    if len(manifest_digest) != 32:
+        raise StoredLifecycleIntegrityError("stored evidence manifest digest is not SHA-256")
+    expectations = tuple(
+        _anomaly_from_row(row, result, operation_id, observation_ids) for row in rows
+    )
+    records = tuple(item.record for item in expectations)
+    try:
+        _validate_anomaly_coverage(result.evidence_coverage, records)
+    except (TypeError, ValueError) as error:
+        raise StoredLifecycleIntegrityError(
+            f"stored anomaly coverage is invalid: reason={error}"
+        ) from None
+    if _evidence_manifest_digest(expectations) != manifest_digest:
+        raise StoredLifecycleIntegrityError(
+            "stored anomaly record digests do not close to the evidence manifest"
+        )
+    return records
+
+
+def _anomaly_manifest_summary_from_database(
+    connection: psycopg.Connection[DatabaseRow],
+    result: RunResult,
+    manifest_digest: bytes | None,
+) -> _AnomalyManifestSummary:
+    operation_id = result.persistence.operation_id
+    if operation_id is None:
+        raise StoredLifecycleIntegrityError("stored result has no persistence operation id")
+    _require_attempt_anomaly_parent_closure(connection, result.run_id, result.attempt_id)
+    _require_exact_result_parent(connection, result, operation_id)
+    cursor = connection.execute(
+        "SELECT anomaly_sequence, payload_byte_length, record_digest, end_operation_id "
+        "FROM dfe_metadata.anomalies "
+        "WHERE run_id = %s AND attempt_id = %s AND check_id = %s "
+        "ORDER BY anomaly_sequence",
+        (result.run_id, result.attempt_id, result.check_id),
+    )
+    digest = hashlib.sha256()
+    digest.update(b'{"manifest_version":1,"record_digests":[')
+    retained_records = 0
+    retained_bytes = 0
+    for row in cursor:
+        sequence = _row_integer(row[0], "anomaly manifest sequence")
+        if sequence != retained_records:
+            raise StoredLifecycleIntegrityError(
+                "stored anomaly manifest sequences are not contiguous from zero"
+            )
+        payload_byte_length = _row_integer(row[1], "anomaly manifest payload byte length")
+        if payload_byte_length <= 0:
+            raise StoredLifecycleIntegrityError(
+                "stored anomaly manifest contains a nonpositive payload length"
+            )
+        record_digest = _row_bytes(row[2], "anomaly manifest record digest")
+        if len(record_digest) != 32:
+            raise StoredLifecycleIntegrityError(
+                "stored anomaly manifest contains a non-SHA-256 record digest"
+            )
+        if _row_uuid(row[3], "anomaly manifest operation id") != operation_id:
+            raise StoredLifecycleIntegrityError(
+                "stored anomaly manifest contains a different result operation identity"
+            )
+        if retained_records:
+            digest.update(b",")
+        digest.update(b'"')
+        digest.update(record_digest.hex().encode("ascii"))
+        digest.update(b'"')
+        retained_records += 1
+        retained_bytes += payload_byte_length
+    digest.update(b"]}")
+    coverage = result.evidence_coverage
+    if retained_records != coverage.retained_records or retained_bytes != coverage.retained_bytes:
+        raise StoredLifecycleIntegrityError(
+            "stored anomaly manifest counts or bytes differ from evidence coverage"
+        )
+    if manifest_digest is None:
+        if retained_records != 0:
+            raise StoredLifecycleIntegrityError(
+                "historical result without an evidence manifest contains anomaly rows"
+            )
+        return _AnomalyManifestSummary(
+            retained_records=retained_records,
+            retained_bytes=retained_bytes,
+            manifest_digest=None,
+        )
+    if len(manifest_digest) != 32:
+        raise StoredLifecycleIntegrityError("stored evidence manifest digest is not SHA-256")
+    if digest.digest() != manifest_digest:
+        raise StoredLifecycleIntegrityError(
+            "stored anomaly record digests do not close to the evidence manifest"
+        )
+    return _AnomalyManifestSummary(
+        retained_records=retained_records,
+        retained_bytes=retained_bytes,
+        manifest_digest=manifest_digest,
+    )
+
+
+def _anomaly_page_from_database(
+    connection: psycopg.Connection[DatabaseRow],
+    result: RunResult,
+    observation_ids: tuple[UUID, UUID],
+    after_sequence: int,
+    limit: int,
+) -> tuple[DifferenceRecord, ...]:
+    operation_id = result.persistence.operation_id
+    if operation_id is None:
+        raise StoredLifecycleIntegrityError("stored result has no persistence operation id")
+    rows = _select_anomaly_page_rows(
+        connection,
+        result,
+        after_sequence,
+        limit,
+    )
+    records = tuple(
+        _anomaly_from_row(row, result, operation_id, observation_ids).record for row in rows
+    )
+    if records and records[0].sequence != after_sequence + 1:
+        raise StoredLifecycleIntegrityError(
+            "stored anomaly keyset page does not begin at the next retained sequence"
+        )
+    if tuple(record.sequence for record in records) != tuple(
+        range(after_sequence + 1, after_sequence + 1 + len(records))
+    ):
+        raise StoredLifecycleIntegrityError(
+            "stored anomaly keyset page is not contiguous in ascending sequence order"
+        )
+    return records
+
+
+def _anomaly_from_row(
+    row: DatabaseRow,
+    result: RunResult,
+    operation_id: UUID,
+    observation_ids: tuple[UUID, UUID],
+) -> _AnomalyExpectation:
+    if len(row) != 16:
+        raise StoredLifecycleIntegrityError(
+            f"PostgreSQL anomaly row has an invalid column count: actual={len(row)}, expected=16"
+        )
+    payload_json = _canonical_database_json(row[12], "anomaly evidence payload")
+    try:
+        record = DifferenceRecord.model_validate_json(payload_json)
+        replay_json = canonical_difference_record_bytes(record).decode("utf-8", errors="strict")
+    except ValueError as error:
+        raise StoredLifecycleIntegrityError(
+            f"stored anomaly violates the public evidence protocol: reason={error}"
+        ) from None
+    if replay_json != payload_json:
+        raise StoredLifecycleIntegrityError(
+            "stored anomaly payload contains unsupported or non-round-trippable fields"
+        )
+    expected = _anomaly_expectations(
+        result.run_id,
+        result.attempt_id,
+        result.check_id,
+        operation_id,
+        observation_ids[0],
+        observation_ids[1],
+        (record,),
+    )[0]
+    key_digest = _row_optional_bytes(row[7], "anomaly key digest")
+    actual_closure = (
+        _row_uuid(row[0], "anomaly run id"),
+        _row_uuid(row[1], "anomaly attempt id"),
+        _row_text(row[2], "anomaly check id"),
+        _row_uuid(row[3], "anomaly end operation id"),
+        _row_integer(row[4], "anomaly sequence"),
+        _row_integer(row[5], "anomaly segment sequence"),
+        _row_text(row[6], "anomaly kind"),
+        key_digest.hex() if key_digest is not None else None,
+        _row_uuid(row[8], "anomaly reference observation id"),
+        _row_text(row[9], "anomaly reference direction"),
+        _row_uuid(row[10], "anomaly target observation id"),
+        _row_text(row[11], "anomaly target direction"),
+        _row_bytes(row[13], "anomaly payload digest"),
+        _row_integer(row[14], "anomaly payload byte length"),
+        _row_bytes(row[15], "anomaly record digest"),
+    )
+    expected_closure = (
+        result.run_id,
+        result.attempt_id,
+        result.check_id,
+        operation_id,
+        record.sequence,
+        record.segment_sequence,
+        record.kind.value,
+        record.key_digest,
+        observation_ids[0],
+        PlanDirection.REFERENCE.value,
+        observation_ids[1],
+        PlanDirection.TARGET.value,
+        expected.payload_digest,
+        expected.payload_byte_length,
+        expected.record_digest,
+    )
+    if actual_closure != expected_closure:
+        raise StoredLifecycleIntegrityError(
+            "stored anomaly columns differ from its canonical evidence payload and closure"
+        )
+    return expected
+
+
+def _require_exact_result_parent(
+    connection: psycopg.Connection[DatabaseRow],
+    result: RunResult,
+    operation_id: UUID,
+) -> None:
+    row = connection.execute(
+        "SELECT "
+        "(SELECT pg_catalog.count(*) FROM dfe_metadata.check_results "
+        "WHERE run_id = %s AND attempt_id = %s AND check_id = %s "
+        "AND result_operation_id = %s), "
+        "(SELECT pg_catalog.count(*) FROM dfe_metadata.partial_check_results "
+        "WHERE run_id = %s AND attempt_id = %s AND check_id = %s "
+        "AND end_operation_id = %s)",
+        (
+            result.run_id,
+            result.attempt_id,
+            result.check_id,
+            operation_id,
+            result.run_id,
+            result.attempt_id,
+            result.check_id,
+            operation_id,
+        ),
+    ).fetchone()
+    if row is None:
+        raise StoredLifecycleIntegrityError("stored result parent count query returned no row")
+    completed_count = _row_integer(row[0], "completed anomaly parent count")
+    partial_count = _row_integer(row[1], "partial anomaly parent count")
+    if completed_count + partial_count != 1:
+        raise StoredLifecycleIntegrityError(
+            "anomaly result identity requires exactly one completed or partial parent"
+        )
+
+
+def _require_attempt_anomaly_parent_closure(
+    connection: psycopg.Connection[DatabaseRow],
+    run_id: UUID,
+    attempt_id: UUID,
+) -> None:
+    row = connection.execute(
+        "SELECT pg_catalog.count(*) FROM dfe_metadata.anomalies AS dfe_anomaly "
+        "LEFT JOIN dfe_metadata.check_results AS dfe_completed "
+        "ON dfe_completed.run_id = dfe_anomaly.run_id "
+        "AND dfe_completed.attempt_id = dfe_anomaly.attempt_id "
+        "AND dfe_completed.check_id = dfe_anomaly.check_id "
+        "AND dfe_completed.result_operation_id = dfe_anomaly.end_operation_id "
+        "LEFT JOIN dfe_metadata.partial_check_results AS dfe_partial "
+        "ON dfe_partial.run_id = dfe_anomaly.run_id "
+        "AND dfe_partial.attempt_id = dfe_anomaly.attempt_id "
+        "AND dfe_partial.check_id = dfe_anomaly.check_id "
+        "AND dfe_partial.end_operation_id = dfe_anomaly.end_operation_id "
+        "WHERE dfe_anomaly.run_id = %s AND dfe_anomaly.attempt_id = %s "
+        "AND ((dfe_completed.attempt_id IS NULL) = (dfe_partial.attempt_id IS NULL))",
+        (run_id, attempt_id),
+    ).fetchone()
+    if row is None:
+        raise StoredLifecycleIntegrityError("anomaly parent closure query returned no row")
+    if _row_integer(row[0], "invalid anomaly parent count") != 0:
+        raise StoredLifecycleIntegrityError(
+            "every anomaly must have exactly one completed or partial result parent"
+        )
+
+
+def _comparison_evidence_boundary_from_database(
+    connection: psycopg.Connection[DatabaseRow],
+    result: RunResult,
+) -> _ComparisonEvidenceBoundary:
+    row = connection.execute(
+        "SELECT dfe_run.request_identity_digest, dfe_run.request_payload::text, "
+        "dfe_run.contract_version_id, dfe_run.scope_digest, "
+        "dfe_contract.contract_version_id, dfe_contract.check_id, "
+        "dfe_contract.semantic_digest, dfe_contract.comparison_schema_digest, "
+        "dfe_contract.semantic_payload::text, dfe_contract.resolved_definition::text, "
+        "dfe_reference.dataset_version_id, dfe_reference.dataset_id, "
+        "dfe_reference.semantic_digest, dfe_reference.connection_id, "
+        "dfe_reference.locator_kind, dfe_reference.semantic_payload::text, "
+        "dfe_target.dataset_version_id, dfe_target.dataset_id, "
+        "dfe_target.semantic_digest, dfe_target.connection_id, "
+        "dfe_target.locator_kind, dfe_target.semantic_payload::text "
+        "FROM dfe_metadata.runs AS dfe_run "
+        "JOIN dfe_metadata.contract_versions AS dfe_contract "
+        "ON dfe_contract.contract_version_id = dfe_run.contract_version_id "
+        "JOIN dfe_metadata.dataset_versions AS dfe_reference "
+        "ON dfe_reference.dataset_version_id = dfe_contract.reference_dataset_version_id "
+        "JOIN dfe_metadata.dataset_versions AS dfe_target "
+        "ON dfe_target.dataset_version_id = dfe_contract.target_dataset_version_id "
+        "WHERE dfe_run.run_id = %s",
+        (result.run_id,),
+    ).fetchone()
+    if row is None:
+        raise StoredLifecycleIntegrityError(
+            "comparison context metadata is missing for the requested result"
+        )
+    request_json = _canonical_database_json(row[1], "comparison context run request")
+    contract_json = _canonical_database_json(row[8], "comparison context contract")
+    contract_resolved_json = _canonical_database_json(
+        row[9],
+        "comparison context resolved contract",
+    )
+    reference_json = _canonical_database_json(row[15], "comparison context reference dataset")
+    target_json = _canonical_database_json(row[21], "comparison context target dataset")
+    request_value = _semantic_object(
+        semantic_value_from_json(request_json),
+        "comparison context run request",
+    )
+    contract_value = _semantic_object(
+        semantic_value_from_json(contract_json),
+        "comparison context contract",
+    )
+    reference_value = _semantic_object(
+        semantic_value_from_json(reference_json),
+        "comparison context reference dataset",
+    )
+    target_value = _semantic_object(
+        semantic_value_from_json(target_json),
+        "comparison context target dataset",
+    )
+    if (
+        bytes.fromhex(semantic_digest_hex(request_value))
+        != _row_bytes(row[0], "comparison context request identity digest")
+        or bytes.fromhex(semantic_digest_hex(contract_value))
+        != _row_bytes(row[6], "comparison context contract digest")
+        or bytes.fromhex(semantic_digest_hex(reference_value))
+        != _row_bytes(row[12], "comparison context reference dataset digest")
+        or bytes.fromhex(semantic_digest_hex(target_value))
+        != _row_bytes(row[18], "comparison context target dataset digest")
+    ):
+        raise StoredLifecycleIntegrityError(
+            "comparison context immutable metadata digest closure is invalid"
+        )
+    contract_version_id = _row_uuid(row[2], "comparison context run contract version id")
+    if contract_version_id != _row_uuid(row[4], "comparison context contract version id"):
+        raise StoredLifecycleIntegrityError(
+            "comparison context run references a different contract version"
+        )
+    if (
+        _semantic_text(
+            request_value.get("contract_version_id"),
+            "comparison context request contract version id",
+        )
+        != str(contract_version_id)
+        or _row_text(row[5], "comparison context check id") != result.check_id
+        or _row_bytes(row[6], "comparison context contract digest").hex() != result.contract_digest
+        or _row_bytes(row[3], "comparison context run scope digest").hex() != result.scope_digest
+    ):
+        raise StoredLifecycleIntegrityError(
+            "comparison context identity differs from the stored result"
+        )
+    direction = _semantic_object(
+        contract_value.get("direction"),
+        "comparison context contract direction",
+    )
+    reference_body = _semantic_object(
+        reference_value.get("dataset"),
+        "comparison context reference dataset body",
+    )
+    target_body = _semantic_object(
+        target_value.get("dataset"),
+        "comparison context target dataset body",
+    )
+    if direction.get("reference") != reference_body or direction.get("target") != target_body:
+        raise StoredLifecycleIntegrityError(
+            "comparison context contract directions differ from their dataset versions"
+        )
+    reference = _comparison_side_from_semantics(
+        row,
+        10,
+        11,
+        13,
+        14,
+        reference_body,
+        ComparisonDirection.REFERENCE,
+    )
+    target = _comparison_side_from_semantics(
+        row,
+        16,
+        17,
+        19,
+        20,
+        target_body,
+        ComparisonDirection.TARGET,
+    )
+    _require_request_batch_context(request_value, reference, target)
+    scope = _comparison_scope_from_semantics(request_value, contract_value, result.scope_digest)
+    comparison_fields, ordered_key = _comparison_schema_from_semantics(
+        contract_value,
+        contract_resolved_json,
+        _row_bytes(row[7], "comparison context schema digest").hex(),
+    )
+    try:
+        context = ComparisonContext(
+            reference=reference,
+            target=target,
+            scope=scope,
+            comparison_fields=comparison_fields,
+            ordered_key=ordered_key,
+        )
+    except ValueError as error:
+        raise StoredLifecycleIntegrityError(
+            f"stored comparison context violates the reporting protocol: reason={error}"
+        ) from None
+    return _ComparisonEvidenceBoundary(
+        context=context,
+        actions=_evidence_actions_from_request(request_value, context),
+    )
+
+
+def _evidence_actions_from_request(
+    request: dict[str, SemanticValue],
+    context: ComparisonContext,
+) -> tuple[EvidenceAction, ...]:
+    policy = _semantic_object(
+        request.get("evidence_policy"),
+        "comparison context evidence policy",
+    )
+    rules = _semantic_array(
+        policy.get("field_rules"),
+        "comparison context evidence field rules",
+    )
+    overrides: dict[str, EvidenceAction] = {}
+    try:
+        default_action = EvidenceAction(
+            _semantic_text(
+                policy.get("unspecified_fields"),
+                "comparison context unspecified evidence action",
+            )
+        )
+        for index, item in enumerate(rules):
+            rule = _semantic_object(item, f"comparison context evidence rule {index}")
+            field_name = _semantic_text(
+                rule.get("field_name"),
+                f"comparison context evidence rule {index} field",
+            )
+            if field_name in overrides:
+                raise StoredLifecycleIntegrityError(
+                    "comparison context evidence policy contains duplicate field rules"
+                )
+            overrides[field_name] = EvidenceAction(
+                _semantic_text(
+                    rule.get("action"),
+                    f"comparison context evidence rule {index} action",
+                )
+            )
+    except ValueError as error:
+        raise StoredLifecycleIntegrityError(
+            f"stored comparison evidence policy is invalid: reason={error}"
+        ) from None
+    field_names = tuple(field.field_name for field in context.comparison_fields)
+    unknown = tuple(name for name in overrides if name not in set(field_names))
+    if unknown:
+        raise StoredLifecycleIntegrityError(
+            "comparison context evidence policy references fields outside the comparison schema"
+        )
+    return tuple(overrides.get(name, default_action) for name in field_names)
+
+
+def _comparison_side_from_semantics(
+    row: DatabaseRow,
+    version_id_index: int,
+    dataset_id_index: int,
+    connection_id_index: int,
+    locator_kind_index: int,
+    body: dict[str, SemanticValue],
+    direction: ComparisonDirection,
+) -> ComparisonSideIdentity:
+    dataset_id = _row_text(row[dataset_id_index], f"{direction.value} dataset id")
+    connection_id = _row_text(
+        row[connection_id_index],
+        f"{direction.value} connection id",
+    )
+    if _row_uuid(row[version_id_index], f"{direction.value} dataset version id").int == 0:
+        raise StoredLifecycleIntegrityError("dataset version UUID cannot be nil")
+    connection = _semantic_object(
+        body.get("connection"),
+        f"comparison context {direction.value} connection",
+    )
+    if (
+        _semantic_text(body.get("dataset_id"), f"{direction.value} payload dataset id")
+        != dataset_id
+        or _semantic_text(
+            connection.get("connection_id"),
+            f"{direction.value} payload connection id",
+        )
+        != connection_id
+    ):
+        raise StoredLifecycleIntegrityError(
+            f"comparison context {direction.value} dataset columns differ from its payload"
+        )
+    locator = _semantic_object(
+        body.get("locator"),
+        f"comparison context {direction.value} locator",
+    )
+    locator_kind = _row_text(
+        row[locator_kind_index],
+        f"{direction.value} locator kind",
+    )
+    if _semantic_text(locator.get("kind"), f"{direction.value} payload locator kind") != (
+        locator_kind
+    ):
+        raise StoredLifecycleIntegrityError(
+            f"comparison context {direction.value} locator kind differs from its payload"
+        )
+    if locator_kind == DatasetLocatorKind.RELATION.value:
+        catalog_value = locator.get("catalog")
+        catalog = (
+            None
+            if catalog_value is None
+            else _semantic_text(
+                catalog_value,
+                f"{direction.value} relation catalog",
+            )
+        )
+        try:
+            public_locator = RelationComparisonLocator(
+                locator_type="relation",
+                catalog=catalog,
+                schema=_semantic_text(locator.get("schema"), f"{direction.value} schema"),
+                name=_semantic_text(locator.get("name"), f"{direction.value} relation"),
+                relation_scope=RelationScope(
+                    _semantic_text(
+                        locator.get("relation_scope"),
+                        f"{direction.value} relation scope",
+                    )
+                ),
+            )
+        except ValueError as error:
+            raise StoredLifecycleIntegrityError(
+                f"stored {direction.value} relation locator is invalid: reason={error}"
+            ) from None
+    elif locator_kind == DatasetLocatorKind.SQL.value:
+        try:
+            public_locator = SqlComparisonLocator(
+                locator_type="sql",
+                dialect=SqlDialect(
+                    _semantic_text(locator.get("dialect"), f"{direction.value} SQL dialect")
+                ),
+                content_sha256=_semantic_text(
+                    locator.get("content_sha256"),
+                    f"{direction.value} SQL content digest",
+                ),
+            )
+        except ValueError as error:
+            raise StoredLifecycleIntegrityError(
+                f"stored {direction.value} SQL locator is invalid: reason={error}"
+            ) from None
+    else:
+        raise StoredLifecycleIntegrityError(f"stored {direction.value} locator kind is unsupported")
+    return ComparisonSideIdentity(
+        direction=direction,
+        connection_id=connection_id,
+        dataset_id=dataset_id,
+        locator=public_locator,
+    )
+
+
+def _require_request_batch_context(
+    request: dict[str, SemanticValue],
+    reference: ComparisonSideIdentity,
+    target: ComparisonSideIdentity,
+) -> None:
+    batches = _semantic_array(
+        request.get("expected_batches"),
+        "comparison context expected batches",
+    )
+    if len(batches) != 2:
+        raise StoredLifecycleIntegrityError(
+            "comparison context request requires two expected batches"
+        )
+    for item, side in zip(batches, (reference, target), strict=True):
+        batch = _semantic_object(item, f"comparison context {side.direction.value} batch")
+        if (
+            _semantic_text(batch.get("direction"), "comparison context batch direction")
+            != side.direction.value
+            or _semantic_text(batch.get("dataset_id"), "comparison context batch dataset")
+            != side.dataset_id
+        ):
+            raise StoredLifecycleIntegrityError(
+                "comparison context expected batch differs from its dataset direction"
+            )
+
+
+def _comparison_scope_from_semantics(
+    request: dict[str, SemanticValue],
+    contract: dict[str, SemanticValue],
+    scope_digest: str,
+) -> tuple[ComparisonScopeValue, ...]:
+    request_scope = _semantic_object(request.get("scope"), "comparison context request scope")
+    if semantic_digest_hex(request_scope) != scope_digest:
+        raise StoredLifecycleIntegrityError(
+            "comparison context request scope differs from the run scope digest"
+        )
+    contract_scope = _semantic_object(
+        contract.get("scope"),
+        "comparison context contract scope",
+    )
+    request_parameters = _semantic_array(
+        request_scope.get("parameters"),
+        "comparison context request scope parameters",
+    )
+    declared_parameters = _semantic_array(
+        contract_scope.get("parameters"),
+        "comparison context declared scope parameters",
+    )
+    if len(request_parameters) != len(declared_parameters):
+        raise StoredLifecycleIntegrityError(
+            "comparison context resolved scope count differs from its contract declaration"
+        )
+    values: list[ComparisonScopeValue] = []
+    for index, (request_item, declared_item) in enumerate(
+        zip(request_parameters, declared_parameters, strict=True)
+    ):
+        resolved = _semantic_object(request_item, f"resolved scope parameter {index}")
+        declared = _semantic_object(declared_item, f"declared scope parameter {index}")
+        name = _semantic_text(resolved.get("name"), f"resolved scope parameter {index} name")
+        if name != _semantic_text(
+            declared.get("name"),
+            f"declared scope parameter {index} name",
+        ):
+            raise StoredLifecycleIntegrityError(
+                "comparison context resolved scope order differs from its contract"
+            )
+        field = _scope_field_from_semantics(
+            name,
+            _semantic_object(resolved.get("type"), f"resolved scope parameter {name} type"),
+        )
+        if _scope_field_signature(field) != _declared_scope_type_signature(
+            _semantic_object(declared.get("type"), f"declared scope parameter {name} type")
+        ):
+            raise StoredLifecycleIntegrityError(
+                f"comparison context scope parameter {name!r} type differs from its contract"
+            )
+        payload_hex = _semantic_text(
+            resolved.get("payload_hex"),
+            f"resolved scope parameter {name} payload",
+        )
+        try:
+            payload = bytes.fromhex(payload_hex)
+        except ValueError:
+            raise StoredLifecycleIntegrityError(
+                f"comparison context scope parameter {name!r} payload is not hexadecimal"
+            ) from None
+        if payload.hex() != payload_hex:
+            raise StoredLifecycleIntegrityError(
+                f"comparison context scope parameter {name!r} payload is not lowercase hex"
+            )
+        decoded = decode_payload(field, payload)
+        if decoded is True:
+            canonical_value = "true"
+        elif decoded is False:
+            canonical_value = "false"
+        elif isinstance(decoded, (date, datetime)):
+            canonical_value = decoded.isoformat()
+        else:
+            canonical_value = str(decoded)
+        values.append(
+            ComparisonScopeValue(
+                name=name,
+                logical_type=field.logical_type,
+                canonical_value=canonical_value,
+            )
+        )
+    return tuple(values)
+
+
+def _scope_field_from_semantics(
+    name: str,
+    value: dict[str, SemanticValue],
+) -> FieldSchema:
+    try:
+        logical_type = LogicalType(_semantic_text(value.get("kind"), "scope logical type"))
+        normalization = Normalization(
+            _semantic_text(value.get("normalization"), "scope normalization")
+        )
+        if logical_type is LogicalType.DECIMAL:
+            parameters = DecimalParameters(
+                precision=_semantic_integer(value.get("precision"), "scope decimal precision"),
+                scale=_semantic_integer(value.get("scale"), "scope decimal scale"),
+            )
+        elif logical_type in (LogicalType.TIMESTAMP_LOCAL, LogicalType.TIMESTAMP_INSTANT):
+            parameters = TimestampParameters(
+                precision=_semantic_integer(
+                    value.get("precision"),
+                    "scope timestamp precision",
+                )
+            )
+        else:
+            parameters = NoParameters()
+        return FieldSchema(
+            name=name,
+            logical_type=logical_type,
+            nullable=False,
+            parameters=parameters,
+            normalization=normalization,
+        )
+    except ValueError as error:
+        raise StoredLifecycleIntegrityError(
+            f"stored resolved scope type is invalid: reason={error}"
+        ) from None
+
+
+def _scope_field_signature(
+    field: FieldSchema,
+) -> tuple[LogicalType, int | None, int | None, int | None]:
+    if isinstance(field.parameters, DecimalParameters):
+        return (
+            field.logical_type,
+            field.parameters.precision,
+            field.parameters.scale,
+            None,
+        )
+    if isinstance(field.parameters, TimestampParameters):
+        return (field.logical_type, None, None, field.parameters.precision)
+    return (field.logical_type, None, None, None)
+
+
+def _declared_scope_type_signature(
+    value: dict[str, SemanticValue],
+) -> tuple[LogicalType, int | None, int | None, int | None]:
+    try:
+        logical_type = LogicalType(_semantic_text(value.get("kind"), "declared scope logical type"))
+    except ValueError as error:
+        raise StoredLifecycleIntegrityError(
+            f"stored declared scope type is invalid: reason={error}"
+        ) from None
+    if _semantic_text(value.get("normalization"), "declared scope normalization") != (
+        Normalization.NONE.value
+    ):
+        raise StoredLifecycleIntegrityError("declared scope normalization is unsupported")
+    parameters = _semantic_object(value.get("parameters"), "declared scope type parameters")
+    if logical_type is LogicalType.DECIMAL:
+        return (
+            logical_type,
+            _semantic_integer(parameters.get("precision"), "declared decimal precision"),
+            _semantic_integer(parameters.get("scale"), "declared decimal scale"),
+            None,
+        )
+    if logical_type in (LogicalType.TIMESTAMP_LOCAL, LogicalType.TIMESTAMP_INSTANT):
+        return (
+            logical_type,
+            None,
+            None,
+            _semantic_integer(parameters.get("precision"), "declared timestamp precision"),
+        )
+    if parameters:
+        raise StoredLifecycleIntegrityError(
+            "declared non-parameterized scope type contains parameters"
+        )
+    return (logical_type, None, None, None)
+
+
+def _comparison_schema_from_semantics(
+    contract: dict[str, SemanticValue],
+    resolved_contract_json: str,
+    expected_digest: str,
+) -> tuple[tuple[ComparisonField, ...], tuple[str, ...]]:
+    resolved = _semantic_object(
+        semantic_value_from_json(resolved_contract_json),
+        "comparison context resolved contract",
+    )
+    schema_value = resolved.get("comparison_schema")
+    schema_json = canonical_semantic_json(schema_value)
+    try:
+        schema = schema_from_metadata_json(schema_json)
+    except ValueError as error:
+        raise StoredLifecycleIntegrityError(
+            f"stored comparison schema is invalid: reason={error}"
+        ) from None
+    if schema_digest_hex(schema) != expected_digest:
+        raise StoredLifecycleIntegrityError(
+            "stored comparison schema differs from its immutable digest"
+        )
+    contract_schema = _semantic_object(
+        contract.get("logical_schema"),
+        "comparison context contract logical schema",
+    )
+    if (
+        _semantic_text(
+            contract_schema.get("logical_schema_digest"),
+            "comparison context contract schema digest",
+        )
+        != expected_digest
+    ):
+        raise StoredLifecycleIntegrityError(
+            "contract logical schema digest differs from its resolved schema"
+        )
+    fields = tuple(_comparison_field(field) for field in schema.fields)
+    ordered_key = tuple(
+        _semantic_text(item, f"comparison context key item {index}")
+        for index, item in enumerate(
+            _semantic_array(contract.get("key"), "comparison context ordered key")
+        )
+    )
+    field_names = {field.field_name for field in fields}
+    if not ordered_key or len(set(ordered_key)) != len(ordered_key):
+        raise StoredLifecycleIntegrityError("comparison context ordered key is invalid")
+    if any(name not in field_names for name in ordered_key):
+        raise StoredLifecycleIntegrityError(
+            "comparison context ordered key references an unknown comparison field"
+        )
+    if canonical_schema_json(schema) != schema_json:
+        raise StoredLifecycleIntegrityError("stored comparison schema contains unsupported fields")
+    return fields, ordered_key
+
+
+def _comparison_field(field: FieldSchema) -> ComparisonField:
+    if isinstance(field.parameters, DecimalParameters):
+        decimal_precision = field.parameters.precision
+        decimal_scale = field.parameters.scale
+        timestamp_precision = None
+    elif isinstance(field.parameters, TimestampParameters):
+        decimal_precision = None
+        decimal_scale = None
+        timestamp_precision = field.parameters.precision
+    else:
+        decimal_precision = None
+        decimal_scale = None
+        timestamp_precision = None
+    return ComparisonField(
+        field_name=field.name,
+        logical_type=field.logical_type,
+        decimal_precision=decimal_precision,
+        decimal_scale=decimal_scale,
+        timestamp_precision=timestamp_precision,
+    )
+
+
+def _validate_anomaly_schema(
+    anomalies: tuple[DifferenceRecord, ...],
+    context: ComparisonContext,
+) -> None:
+    fields = {field.field_name: field for field in context.comparison_fields}
+    ordered_fields = tuple(field.field_name for field in context.comparison_fields)
+    for anomaly in anomalies:
+        groups = (anomaly.key_values, anomaly.reference_values, anomaly.target_values)
+        for group in groups:
+            group_names = tuple(value.field_name for value in group)
+            if group_names != tuple(name for name in ordered_fields if name in group_names):
+                raise StoredLifecycleIntegrityError(
+                    "stored anomaly fields do not follow comparison schema order"
+                )
+            for value in group:
+                expected = fields.get(value.field_name)
+                if expected is None or (
+                    value.logical_type,
+                    value.decimal_precision,
+                    value.decimal_scale,
+                    value.timestamp_precision,
+                ) != (
+                    expected.logical_type,
+                    expected.decimal_precision,
+                    expected.decimal_scale,
+                    expected.timestamp_precision,
+                ):
+                    raise StoredLifecycleIntegrityError(
+                        "stored anomaly field differs from the immutable comparison schema"
+                    )
+        if tuple(value.field_name for value in anomaly.key_values) not in (
+            context.ordered_key,
+            (),
+        ):
+            raise StoredLifecycleIntegrityError(
+                "stored anomaly key fields differ from the immutable ordered key"
+            )
+        if tuple(anomaly.omitted_field_names) != tuple(
+            name for name in ordered_fields if name in anomaly.omitted_field_names
+        ):
+            raise StoredLifecycleIntegrityError(
+                "stored anomaly omitted fields do not follow comparison schema order"
+            )
+        if any(name not in fields for name in anomaly.omitted_field_names):
+            raise StoredLifecycleIntegrityError(
+                "stored anomaly omits a field outside the comparison schema"
+            )
+
+
+def _validate_anomaly_evidence_boundary(
+    anomalies: tuple[DifferenceRecord, ...],
+    boundary: _ComparisonEvidenceBoundary,
+) -> None:
+    _validate_anomaly_schema(anomalies, boundary.context)
+    fields = boundary.context.comparison_fields
+    if len(fields) != len(boundary.actions):
+        raise StoredLifecycleIntegrityError(
+            "comparison evidence policy action count differs from its immutable schema"
+        )
+    actions = {
+        field.field_name: action for field, action in zip(fields, boundary.actions, strict=True)
+    }
+    field_definitions = {field.field_name: field for field in fields}
+    ordered_key = boundary.context.ordered_key
+    ordered_key_set = set(ordered_key)
+    expected_omitted = tuple(
+        field.field_name
+        for field, action in zip(fields, boundary.actions, strict=True)
+        if action is EvidenceAction.OMIT
+    )
+    expected_key_fields = tuple(
+        name for name in ordered_key if actions[name] is not EvidenceAction.OMIT
+    )
+    expected_side_fields = tuple(
+        field.field_name
+        for field, action in zip(fields, boundary.actions, strict=True)
+        if field.field_name not in ordered_key_set and action is not EvidenceAction.OMIT
+    )
+    all_key_fields_stored = all(actions[name] is EvidenceAction.STORE for name in ordered_key)
+    for anomaly in anomalies:
+        if anomaly.omitted_field_names != expected_omitted:
+            raise StoredLifecycleIntegrityError(
+                "stored anomaly omitted fields differ from the immutable evidence policy"
+            )
+        _require_evidence_group_policy(
+            anomaly.key_values,
+            expected_key_fields,
+            actions,
+            field_definitions,
+            "key",
+        )
+        reference_fields = () if anomaly.kind is DifferenceKind.EXTRA else expected_side_fields
+        target_fields = () if anomaly.kind is DifferenceKind.MISSING else expected_side_fields
+        _require_evidence_group_policy(
+            anomaly.reference_values,
+            reference_fields,
+            actions,
+            field_definitions,
+            "reference",
+        )
+        _require_evidence_group_policy(
+            anomaly.target_values,
+            target_fields,
+            actions,
+            field_definitions,
+            "target",
+        )
+        if all_key_fields_stored:
+            if any(value.is_null for value in anomaly.key_values):
+                raise StoredLifecycleIntegrityError(
+                    "stored anomaly cannot retain a NULL ordered-key component"
+                )
+            expected_key_digest = hashlib.sha256(
+                canonical_difference_key_bytes(anomaly.key_values)
+            ).hexdigest()
+            if (
+                anomaly.key_availability is not KeyAvailability.AVAILABLE
+                or anomaly.key_digest != expected_key_digest
+            ):
+                raise StoredLifecycleIntegrityError(
+                    "stored anomaly key digest differs from its policy-safe retained key"
+                )
+        elif (
+            anomaly.key_availability is not KeyAvailability.KEYSET_UNAVAILABLE
+            or anomaly.key_digest is not None
+        ):
+            raise StoredLifecycleIntegrityError(
+                "stored anomaly exposes keyset availability forbidden by its evidence policy"
+            )
+
+
+def _require_evidence_group_policy(
+    values: tuple[EvidenceFieldValue, ...],
+    expected_fields: tuple[str, ...],
+    actions: dict[str, EvidenceAction],
+    field_definitions: dict[str, ComparisonField],
+    direction: str,
+) -> None:
+    actual_fields = tuple(value.field_name for value in values)
+    if actual_fields != expected_fields:
+        raise StoredLifecycleIntegrityError(
+            f"stored anomaly {direction} fields differ from the immutable evidence policy"
+        )
+    for value in values:
+        action = actions[value.field_name]
+        expected_availability = (
+            EvidenceValueAvailability.STORED
+            if action is EvidenceAction.STORE
+            else EvidenceValueAvailability.REDACTED
+        )
+        if value.availability is not expected_availability:
+            raise StoredLifecycleIntegrityError(
+                f"stored anomaly {direction} representation differs from the immutable "
+                "evidence policy"
+            )
+        if value.availability is EvidenceValueAvailability.STORED and not value.is_null:
+            _require_canonical_evidence_value(value, field_definitions[value.field_name])
+
+
+def _require_canonical_evidence_value(
+    value: EvidenceFieldValue,
+    field: ComparisonField,
+) -> None:
+    if value.canonical_text is None or value.canonical_hex is not None:
+        raise StoredLifecycleIntegrityError(
+            "stored non-NULL anomaly value requires its canonical text representation"
+        )
+    if field.logical_type is LogicalType.DECIMAL:
+        if field.decimal_precision is None or field.decimal_scale is None:
+            raise StoredLifecycleIntegrityError(
+                "stored decimal anomaly field lacks immutable precision or scale"
+            )
+        parameters = DecimalParameters(
+            precision=field.decimal_precision,
+            scale=field.decimal_scale,
+        )
+    elif field.logical_type in (LogicalType.TIMESTAMP_LOCAL, LogicalType.TIMESTAMP_INSTANT):
+        if field.timestamp_precision is None:
+            raise StoredLifecycleIntegrityError(
+                "stored timestamp anomaly field lacks immutable precision"
+            )
+        parameters = TimestampParameters(precision=field.timestamp_precision)
+    else:
+        parameters = NoParameters()
+    schema_field = FieldSchema(
+        name=field.field_name,
+        logical_type=field.logical_type,
+        nullable=True,
+        parameters=parameters,
+        normalization=Normalization.NONE,
+    )
+    text = value.canonical_text
+    try:
+        if field.logical_type is LogicalType.INT64:
+            candidate: int | bool | str = int(text)
+        elif field.logical_type is LogicalType.BOOLEAN:
+            if text not in ("true", "false"):
+                raise ValueError("boolean evidence text must be true or false")
+            candidate = text == "true"
+        else:
+            candidate = text
+        decoded = decode_payload(schema_field, encode_payload(schema_field, candidate))
+    except ValueError as error:
+        raise StoredLifecycleIntegrityError(
+            "stored anomaly value is invalid for its immutable logical schema: "
+            f"field={field.field_name!r}, reason={error}"
+        ) from None
+    if decoded is True:
+        replay = "true"
+    elif decoded is False:
+        replay = "false"
+    elif isinstance(decoded, Decimal):
+        replay = format(decoded, "f")
+    elif type(decoded) is date:
+        replay = decoded.isoformat()
+    else:
+        replay = str(decoded)
+    if replay != text:
+        raise StoredLifecycleIntegrityError(
+            "stored anomaly value is not canonical for its immutable logical schema: "
+            f"field={field.field_name!r}"
+        )
+
+
 def _history_entry_from_row(
     connection: psycopg.Connection[DatabaseRow],
     row: DatabaseRow,
 ) -> HistoryEntry:
-    if len(row) != 25:
+    if len(row) != 46:
         raise StoredLifecycleIntegrityError(
-            f"PostgreSQL history row has an invalid column count: actual={len(row)}, expected=25"
+            f"PostgreSQL history row has an invalid column count: actual={len(row)}, expected=46"
         )
     run_id = _row_uuid(row[0], "history run id")
     attempt_id = _row_uuid(row[1], "history attempt id")
+    _require_attempt_anomaly_parent_closure(connection, run_id, attempt_id)
     try:
         status = HistoryAttemptStatus(_row_text(row[3], "history attempt status"))
     except ValueError:
@@ -4645,7 +7478,8 @@ def _history_entry_from_row(
     check_id = _row_text(row[10], "history check id")
     contract_digest = _row_bytes(row[11], "history contract digest").hex()
     scope_digest = _row_bytes(row[12], "history scope digest").hex()
-    result_row = row[13:]
+    completed_row = row[13:26]
+    partial_row = row[26:46]
     result: RunResult | None = None
     terminal_reason: ResultReason | None = None
     availability = StoredResultAvailability.NOT_CREATED
@@ -4663,7 +7497,7 @@ def _history_entry_from_row(
             raise StoredLifecycleIntegrityError(
                 "stored running history attempt belongs to an already terminal run"
             )
-        if any(value is not None for value in result_row):
+        if any(value is not None for value in (*completed_row, *partial_row)):
             raise StoredLifecycleIntegrityError(
                 "stored running history attempt unexpectedly has a check result"
             )
@@ -4676,13 +7510,28 @@ def _history_entry_from_row(
             raise StoredLifecycleIntegrityError(
                 "stored completed history attempt unexpectedly has a terminal reason"
             )
-        if any(value is None for value in result_row):
+        if any(value is None for value in completed_row[:12]):
             raise StoredLifecycleIntegrityError(
                 "stored completed history attempt lacks its immutable result"
             )
-        result, completed_at = _completed_result_from_row(result_row)
+        if any(value is not None for value in partial_row):
+            raise StoredLifecycleIntegrityError(
+                "stored completed history attempt also contains a partial result"
+            )
+        result, completed_at = _completed_result_from_row(completed_row)
         segments = _completed_segments_from_database(connection, run_id, attempt_id)
         _require_valid_stored_segments(result, segments)
+        observation_ids = _completed_observation_ids(connection, result, segments)
+        anomalies = _anomalies_from_database(
+            connection,
+            result,
+            observation_ids,
+            _row_optional_bytes(completed_row[12], "history evidence manifest digest"),
+        )
+        _validate_anomaly_evidence_boundary(
+            anomalies,
+            _comparison_evidence_boundary_from_database(connection, result),
+        )
         _require_completed_database_closure(
             connection,
             result,
@@ -4696,11 +7545,45 @@ def _history_entry_from_row(
             raise StoredLifecycleIntegrityError(
                 "stored noncompleted history attempt lacks terminal fields"
             )
-        if any(value is not None for value in result_row):
+        if any(value is not None for value in completed_row):
             raise StoredLifecycleIntegrityError(
                 "stored noncompleted history attempt unexpectedly has a check result"
             )
         terminal_reason = _terminal_reason_from_database(row[5], row[6])
+        if any(value is not None for value in partial_row):
+            if any(value is None for value in partial_row):
+                raise StoredLifecycleIntegrityError(
+                    "stored history partial comparison row is incomplete"
+                )
+            (
+                result,
+                partial_ended_at,
+                frontier,
+                input_cut_digest,
+                observation_ids,
+                manifest_digest,
+            ) = _partial_result_from_row(partial_row)
+            anomalies = _anomalies_from_database(
+                connection,
+                result,
+                observation_ids,
+                manifest_digest,
+            )
+            _require_valid_stored_partial(result, frontier, observation_ids, anomalies)
+            _validate_anomaly_evidence_boundary(
+                anomalies,
+                _comparison_evidence_boundary_from_database(connection, result),
+            )
+            _require_partial_database_closure(
+                connection,
+                result,
+                frontier,
+                input_cut_digest,
+                observation_ids,
+                partial_ended_at,
+            )
+            _require_partial_terminal_receipt(connection, result, partial_ended_at)
+            availability = StoredResultAvailability.AVAILABLE
     try:
         entry = HistoryEntry(
             run_id=run_id,
@@ -5128,6 +8011,223 @@ def _require_locked_completed_comparison_closure(
     )
 
 
+def _require_locked_partial_comparison_closure(
+    connection: psycopg.Connection[DatabaseRow],
+    expected: _PartialComparisonExpectation,
+) -> None:
+    context_rows = connection.execute(
+        _CONTEXT_SELECT + " WHERE run_id = %s AND attempt_id = %s "
+        "ORDER BY CASE direction WHEN 'reference' THEN 0 WHEN 'target' THEN 1 ELSE 2 END "
+        "FOR UPDATE",
+        (expected.attempt.run.run_id, expected.attempt.attempt_id),
+    ).fetchall()
+    observation_rows = _select_observation_rows_by_attempt(
+        connection,
+        expected.attempt.run.run_id,
+        expected.attempt.attempt_id,
+    )
+    _require_partial_closure_rows(
+        connection,
+        expected.result,
+        expected.comparison.frontier,
+        expected.comparison.input_cut_digest,
+        (
+            expected.comparison.reference_observation_id,
+            expected.comparison.target_observation_id,
+        ),
+        expected.ended_at,
+        context_rows,
+        observation_rows,
+    )
+    _validate_anomaly_evidence_boundary(
+        tuple(anomaly.record for anomaly in expected.anomalies),
+        _comparison_evidence_boundary_from_database(connection, expected.result),
+    )
+
+
+def _require_partial_database_closure(
+    connection: psycopg.Connection[DatabaseRow],
+    result: RunResult,
+    frontier: PartialComparisonFrontier,
+    input_cut_digest: str,
+    observation_ids: tuple[UUID, UUID],
+    ended_at: datetime,
+) -> None:
+    context_rows = connection.execute(
+        _CONTEXT_SELECT + " WHERE run_id = %s AND attempt_id = %s "
+        "ORDER BY CASE direction WHEN 'reference' THEN 0 WHEN 'target' THEN 1 ELSE 2 END",
+        (result.run_id, result.attempt_id),
+    ).fetchall()
+    observation_rows = _select_observation_rows_by_attempt(
+        connection,
+        result.run_id,
+        result.attempt_id,
+    )
+    _require_partial_closure_rows(
+        connection,
+        result,
+        frontier,
+        input_cut_digest,
+        observation_ids,
+        ended_at,
+        context_rows,
+        observation_rows,
+    )
+
+
+def _require_partial_closure_rows(
+    connection: psycopg.Connection[DatabaseRow],
+    result: RunResult,
+    frontier: PartialComparisonFrontier,
+    input_cut_digest: str,
+    observation_ids: tuple[UUID, UUID],
+    ended_at: datetime,
+    context_rows: list[DatabaseRow],
+    observation_rows: list[DatabaseRow],
+) -> None:
+    if len(context_rows) != 2:
+        raise RunLifecycleStateError(
+            "partial comparison requires exactly two protected read contexts"
+        )
+    reference_context, target_context = context_rows
+    if (
+        _row_text(reference_context[4], "partial reference context direction")
+        != PlanDirection.REFERENCE.value
+        or _row_text(target_context[4], "partial target context direction")
+        != PlanDirection.TARGET.value
+    ):
+        raise StoredLifecycleIntegrityError(
+            "partial comparison contexts lack one reference and one target direction"
+        )
+    context_ids = (
+        _row_uuid(reference_context[0], "partial reference context id"),
+        _row_uuid(target_context[0], "partial target context id"),
+    )
+    if result.consistency.read_context_ids != context_ids:
+        raise RunLifecycleStateError(
+            "partial result context ids must be ordered reference then target"
+        )
+    context_ended_at = (
+        _require_terminal_partial_context(
+            reference_context,
+            result,
+            PlanDirection.REFERENCE,
+            ended_at,
+        ),
+        _require_terminal_partial_context(
+            target_context,
+            result,
+            PlanDirection.TARGET,
+            ended_at,
+        ),
+    )
+    if len(observation_rows) != 2:
+        raise RunLifecycleStateError(
+            "partial comparison requires exactly two bound-cut observations"
+        )
+    attempt_row = connection.execute(
+        "SELECT input_cut_digest, execution_budgets::text FROM dfe_metadata.run_attempts "
+        "WHERE run_id = %s AND attempt_id = %s",
+        (result.run_id, result.attempt_id),
+    ).fetchone()
+    if attempt_row is None:
+        raise StoredLifecycleIntegrityError("partial comparison attempt closure is missing")
+    attempt_cut = _row_optional_bytes(attempt_row[0], "partial attempt cut digest")
+    if attempt_cut is None or attempt_cut.hex() != input_cut_digest:
+        raise StoredLifecycleIntegrityError(
+            "partial parent input cut differs from the attempt binding"
+        )
+    run_contract_row = connection.execute(
+        "SELECT dfe_run.scope_digest, dfe_run.bound_input_cut_digest, "
+        "dfe_contract.check_id, dfe_contract.semantic_digest "
+        "FROM dfe_metadata.runs AS dfe_run "
+        "JOIN dfe_metadata.contract_versions AS dfe_contract "
+        "ON dfe_contract.contract_version_id = dfe_run.contract_version_id "
+        "WHERE dfe_run.run_id = %s",
+        (result.run_id,),
+    ).fetchone()
+    if run_contract_row is None:
+        raise StoredLifecycleIntegrityError("partial comparison run contract closure is missing")
+    if (
+        _row_bytes(run_contract_row[0], "partial run scope digest").hex() != result.scope_digest
+        or _row_optional_bytes(run_contract_row[1], "partial run cut digest") != attempt_cut
+        or _row_text(run_contract_row[2], "partial contract check id") != result.check_id
+        or _row_bytes(run_contract_row[3], "partial contract digest").hex()
+        != result.contract_digest
+    ):
+        raise StoredLifecycleIntegrityError(
+            "partial result identity differs from its immutable run, cut, or contract"
+        )
+    if len(result.reasons) == 0:
+        raise StoredLifecycleIntegrityError("partial result requires a primary terminal reason")
+    try:
+        _require_valid_stored_partial_snapshot(result, frontier, observation_ids)
+        _validate_partial_budget_use(
+            _execution_budgets_from_database(attempt_row[1]),
+            result.metrics,
+            result.evidence_coverage,
+            frontier,
+        )
+        if result.execution_status is ExecutionStatus.INCOMPLETE:
+            _validate_incomplete_reason(result.reasons[0])
+        else:
+            _validate_error_reason(result.reasons[0])
+    except (TypeError, ValueError) as error:
+        raise StoredLifecycleIntegrityError(
+            f"stored partial comparison closure is invalid: reason={error}"
+        ) from None
+    reference_observation, target_observation = observation_rows
+    _require_completed_observation(
+        reference_observation,
+        result,
+        PlanDirection.REFERENCE,
+        reference_context,
+        observation_ids[0],
+        attempt_cut,
+        context_ended_at[0],
+    )
+    _require_completed_observation(
+        target_observation,
+        result,
+        PlanDirection.TARGET,
+        target_context,
+        observation_ids[1],
+        attempt_cut,
+        context_ended_at[1],
+    )
+
+
+def _require_terminal_partial_context(
+    row: DatabaseRow,
+    result: RunResult,
+    direction: PlanDirection,
+    ended_at: datetime,
+) -> datetime:
+    if (
+        _row_uuid(row[1], "partial context run id") != result.run_id
+        or _row_uuid(row[2], "partial context attempt id") != result.attempt_id
+        or _row_text(row[4], "partial context direction") != direction.value
+        or _row_bytes(row[6], "partial context scope digest").hex() != result.scope_digest
+    ):
+        raise StoredLifecycleIntegrityError(
+            "partial context differs from its run, attempt, direction, or scope"
+        )
+    try:
+        state = ReadContextStatus(_row_text(row[18], "partial context state"))
+    except ValueError:
+        raise StoredLifecycleIntegrityError("partial context state is unsupported") from None
+    if state not in (ReadContextStatus.CLOSED, ReadContextStatus.LOST):
+        raise RunLifecycleStateError("partial comparison requires every context to be terminal")
+    if _row_optional_uuid(row[19], "partial context end operation id") is None:
+        raise StoredLifecycleIntegrityError("terminal partial context lacks an end operation")
+    context_ended_at = _row_optional_datetime(row[20], "partial context ended_at")
+    if context_ended_at is None or context_ended_at > ended_at:
+        raise StoredLifecycleIntegrityError(
+            "partial context end timestamp is absent or later than its result"
+        )
+    return context_ended_at
+
+
 def _require_completed_database_closure(
     connection: psycopg.Connection[DatabaseRow],
     result: RunResult,
@@ -5431,6 +8531,91 @@ def _require_completed_terminal_receipt(
     ):
         raise StoredLifecycleIntegrityError(
             "completed result differs from its terminal run publication"
+        )
+
+
+def _require_partial_terminal_receipt(
+    connection: psycopg.Connection[DatabaseRow],
+    result: RunResult,
+    ended_at: datetime,
+) -> None:
+    operation_id = result.persistence.operation_id
+    if operation_id is None:
+        raise StoredLifecycleIntegrityError("partial result has no persistence operation id")
+    if not result.reasons:
+        raise StoredLifecycleIntegrityError("partial result has no primary terminal reason")
+    attempt_row = _select_attempt_by_id(connection, result.attempt_id)
+    if attempt_row is None:
+        raise StoredLifecycleIntegrityError("partial result attempt is missing")
+    primary_reason = result.reasons[0]
+    expected_reason_json = canonical_semantic_json(_reason_semantic_value(primary_reason))
+    actual = (
+        _row_uuid(attempt_row[1], "partial attempt run id"),
+        _row_text(attempt_row[4], "partial attempt status"),
+        _row_optional_uuid(attempt_row[13], "partial attempt end operation id"),
+        _row_optional_text(attempt_row[14], "partial attempt terminal reason code"),
+        _row_optional_canonical_json(attempt_row[15], "partial attempt terminal reason"),
+        _row_optional_datetime(attempt_row[17], "partial attempt ended_at"),
+    )
+    expected = (
+        result.run_id,
+        result.execution_status.value,
+        operation_id,
+        primary_reason.code.value,
+        expected_reason_json,
+        ended_at,
+    )
+    if actual != expected:
+        raise StoredLifecycleIntegrityError(
+            "partial result differs from its terminal attempt receipt"
+        )
+    outcome = AttemptOutcomeRecord(
+        run_id=result.run_id,
+        attempt_id=result.attempt_id,
+        status=AttemptStatus(result.execution_status.value),
+        operation_id=operation_id,
+        reason=primary_reason,
+        ended_at=ended_at,
+    )
+    _require_terminal_attempt_run_binding(connection, outcome)
+
+
+def _require_retryable_partial_selection(
+    connection: psycopg.Connection[DatabaseRow],
+    result: RunResult,
+) -> None:
+    row = connection.execute(
+        "SELECT selected_terminal_attempt_id FROM dfe_metadata.runs WHERE run_id = %s",
+        (result.run_id,),
+    ).fetchone()
+    if row is None:
+        raise StoredLifecycleIntegrityError("retryable partial result run is missing")
+    if _row_optional_uuid(row[0], "retryable partial selected attempt") == result.attempt_id:
+        raise LifecycleOperationConflictError(
+            "retryable partial comparison is unexpectedly the selected run outcome"
+        )
+
+
+def _require_selected_partial_comparison(
+    connection: psycopg.Connection[DatabaseRow],
+    result: RunResult,
+    ended_at: datetime,
+) -> None:
+    operation_id = result.persistence.operation_id
+    row = connection.execute(
+        "SELECT selected_terminal_attempt_id, terminal_operation_id, terminal_at "
+        "FROM dfe_metadata.runs WHERE run_id = %s",
+        (result.run_id,),
+    ).fetchone()
+    if row is None:
+        raise StoredLifecycleIntegrityError("terminal partial result run is missing")
+    if (
+        _row_optional_uuid(row[0], "terminal partial selected attempt") != result.attempt_id
+        or _row_optional_uuid(row[1], "terminal partial operation id") != operation_id
+        or _row_optional_datetime(row[2], "terminal partial terminal_at") != ended_at
+    ):
+        raise LifecycleOperationConflictError(
+            "terminal partial comparison differs from the selected run publication"
         )
 
 

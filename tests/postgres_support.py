@@ -1,18 +1,41 @@
 import os
 from collections.abc import Mapping
+from uuid import uuid4
 
 import psycopg
 from psycopg.conninfo import conninfo_to_dict
 from psycopg.rows import tuple_row
 from pydantic import SecretStr
 
+from forensic_data.contracts.model import ExecutionBudgets
 from forensic_data.postgres import (
     DatabaseRow,
     PostgresConnectionSettings,
     PostgresReadContext,
     PostgresRetryPolicy,
+    PostgresSourceBudgetAttempt,
+    PostgresSourceBudgetLedger,
+    PostgresSourceDirection,
     PostgresSslMode,
     open_postgres_read_context,
+)
+
+_INTEGRATION_EXECUTION_BUDGETS = ExecutionBudgets(
+    version=1,
+    max_queries=10_000,
+    max_fetched_records=1_000_000,
+    max_application_result_bytes=1_073_741_824,
+    max_evidence_rows=10_000,
+    max_evidence_bytes=134_217_728,
+    max_fingerprint_nodes=100_000,
+    max_coordinator_memory_bytes=134_217_728,
+    max_depth=64,
+    max_full_scans_per_side=1_000,
+    statement_timeout_milliseconds=5_000,
+    run_timeout_milliseconds=300_000,
+    max_attempts=2,
+    max_checks_concurrency=2,
+    max_source_concurrency=1,
 )
 
 
@@ -96,7 +119,14 @@ def open_reader_context(settings: PostgresConnectionSettings) -> PostgresReadCon
     return open_postgres_read_context(
         settings,
         PostgresRetryPolicy(max_attempts=1, delay_seconds=0.0),
+        source_budget_attempt(),
+        PostgresSourceDirection.REFERENCE,
     )
+
+
+def source_budget_attempt() -> PostgresSourceBudgetAttempt:
+    ledger = PostgresSourceBudgetLedger(_INTEGRATION_EXECUTION_BUDGETS)
+    return ledger.start_attempt(uuid4())
 
 
 def connect_writer(

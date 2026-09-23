@@ -28,11 +28,16 @@ from forensic_data.postgres import (
     PostgresRelationAcquisition,
     PostgresRelationPersistence,
     PostgresRetryPolicy,
+    PostgresSourceDirection,
     open_postgres_protected_read_context,
     open_postgres_read_context,
 )
 from forensic_data.postgres_sql import PostgresRelation
-from tests.postgres_support import connect_writer, required_connection_settings
+from tests.postgres_support import (
+    connect_writer,
+    required_connection_settings,
+    source_budget_attempt,
+)
 
 pytestmark = [pytest.mark.integration, pytest.mark.postgres]
 
@@ -196,6 +201,8 @@ def test_protected_acquisition_waits_for_truncate_then_holds_the_full_relation_s
                 PostgresRetryPolicy(max_attempts=2, delay_seconds=2.0),
                 acquisitions,
                 100,
+                source_budget_attempt(),
+                PostgresSourceDirection.REFERENCE,
             )
         direct_failure_elapsed = time.monotonic() - direct_failure_started_at
         assert direct_failure_elapsed < 1.5
@@ -283,6 +290,8 @@ def test_protected_acquisition_waits_for_truncate_then_holds_the_full_relation_s
         ordinary_context = open_postgres_read_context(
             reader_settings,
             PostgresRetryPolicy(max_attempts=1, delay_seconds=0.0),
+            source_budget_attempt(),
+            PostgresSourceDirection.REFERENCE,
         )
         try:
             with pytest.raises(
@@ -506,6 +515,8 @@ def _open_protected_context(
         retry_policy,
         acquisitions,
         4_000,
+        source_budget_attempt(),
+        PostgresSourceDirection.REFERENCE,
     )
 
 

@@ -15,9 +15,9 @@ The current `0.1.0.dev0` package is a development release with a typed applicati
 - a bounded PostgreSQL read connector, protected relation-manifest readiness acquisition, and SQL
   lowering for the initial common type profile;
 - versioned PostgreSQL metadata migrations, typed immutable contract registration, durable
-  run/acquisition lifecycle records, and completed comparison results;
-- bounded PostgreSQL check execution, idempotent request IDs, attempt history, and stored-result
-  summaries; and
+  run/acquisition lifecycle records, and completed or interrupted comparison results;
+- bounded PostgreSQL check execution, idempotent request IDs, attempt history, retained typed
+  difference evidence, and metadata-only result replay; and
 - reproducible Python package, PostgreSQL fixture, container, and CI builds.
 
 There is no scheduler integration, background service, or multi-engine execution workflow yet.
@@ -94,12 +94,16 @@ uv run forensics check --config examples/postgres-relation-manifest/contract.yam
 uv run forensics history --config examples/postgres-relation-manifest/contract.yaml --check daily_orders --scope-json '{"business_date":"2026-09-23"}' --limit 20 --output json
 
 uv run forensics diff --config examples/postgres-relation-manifest/contract.yaml --run-id 04be2d56-6c2f-4f66-8c84-4cfdb33a79ea --attempt-id 2d4d807a-a079-424a-8a67-a48b27777386 --limit 20 --output json
+
+uv run forensics diff --config examples/postgres-relation-manifest/contract.yaml --run-id 04be2d56-6c2f-4f66-8c84-4cfdb33a79ea --attempt-id 2d4d807a-a079-424a-8a67-a48b27777386 --limit 20 --cursor-json '{"run_id":"04be2d56-6c2f-4f66-8c84-4cfdb33a79ea","attempt_id":"2d4d807a-a079-424a-8a67-a48b27777386","check_id":"daily_orders","result_operation_id":"6c499e11-e120-484b-945a-c49960e2d17c","sequence":19}' --output json
 ```
 
 Scope input is an exact JSON object whose values are booleans, integers, or strings. `check`
 requires both expected batch IDs and a canonical request UUID; repeating that request reads the
-same durable outcome instead of silently creating a different run. History pagination uses
-`--cursor-json` with the exact `next_cursor` object returned by the previous page.
+same durable outcome instead of silently creating a different run. History and diff pagination use
+`--cursor-json` with the exact `next_cursor` object returned by the previous page. A diff cursor is
+bound to the run, attempt, check, immutable result operation, and last retained sequence, so it
+cannot be reused for another result.
 
 For every connection a command resolves, the CLI accepts endpoint secrets only through contract
 references of the form `env:NAME`. The referenced variable must contain a complete PostgreSQL DSN
@@ -114,12 +118,27 @@ The metadata login used by `check` or `execute_check` must be a member of both
 separate and grant both memberships to the runtime writer login; metadata migrator and database
 administrator credentials are only for setup and bootstrap.
 
+Evidence retention is explicit per projected field. `store` retains the typed canonical value;
+`redact` retains the field/type and an explicit unavailable marker but not the raw value; `omit`
+retains no value for that field. `unspecified_fields` applies the declared action to every field
+without an explicit entry. The shipped relation-manifest example stores `order_id` and `amount`,
+omits `business_date`, and omits any otherwise unspecified field. A key digest exists only when the
+complete key is retained; no key digest is emitted for a redacted or omitted key.
+Human diff rows show a missing side as `<absent>`, a retained SQL null as `NULL`, and a redacted
+value as `<redacted>`; omitted field names are listed separately from both nulls and absent sides.
+
 Human output is the default. `--output json` emits the exact schema-version 1 typed model returned
 by the corresponding application API: `PlanReport`, `RunResult`, `HistoryPage`, or `DiffPage`.
 In `forensic_data.application`, `plan_check` accepts a compiled contract and typed request,
 `execute_check` adds explicit PostgreSQL execution services, and `read_history`/`read_diff` accept
 typed requests with metadata-only services. A `PlanReport` is informational and cannot be supplied
 to `execute_check`; execution resolves and validates the compiled contract again.
+
+Human `check` and `diff` output names the logical connection and dataset, the quoted qualified
+relation (or SQL dialect and content digest), and canonical scope values. It never prints a DSN,
+secret reference, or credential. `check` renders current labels only after the returned result
+identity matches the validated check, contract, and scope. Historical `diff` uses the immutable
+comparison context stored with the result rather than relabeling it from the current YAML.
 
 | Exit code | Meaning |
 |---:|---|
@@ -129,8 +148,18 @@ to `execute_check`; execution resolves and validates the compiled contract again
 | `3` | The check is incomplete, such as when readiness or a required execution budget was not established. |
 
 History returns bounded durable attempt metadata and an optional stored result. Diff is also a
-metadata-only view: this release reports `detail_availability` as `not_retained`, returns no row
-details, and does not revisit the compared endpoints.
+metadata-only view: it pages immutable retained evidence and never revisits the compared endpoints,
+so later source mutations cannot change an already published page. `found_records` describes the
+comparison findings while `retained_records` and `detail_availability` truthfully describe what the
+evidence row/byte policy allowed the metadata store to keep. A completed full manifest supports
+full replay only after the complete ordered retained-evidence manifest validates; partial retention
+is explicitly marked and completeness must not be inferred from a count or a final page alone.
+
+If a query, snapshot, or execution budget interrupts comparison after useful work, the attempt keeps
+an immutable partial result with its established totals, coverage frontier, metrics, reasons, and
+any policy-permitted anomaly prefix. It remains an incomplete or error outcome rather than being
+reported as completed. Replaying the same request returns that durable outcome and diff pages expose
+only its retained prefix, with truncation explicit.
 
 ## Canonical API example
 
@@ -233,11 +262,19 @@ the protected snapshot under that publication protocol, not that the provider in
 the manifest's truthfulness.
 
 Metadata persistence records immutable run requests, leased attempts, protected read contexts,
-per-dataset readiness observations, and completed comparison results. The first aligned input cut
-is bound once to the run; retries may use a new snapshot but cannot silently change that cut.
-Attempts may be completed, incomplete, error, or abandoned. A completed result is published only
-after its observations, closed protected contexts, comparison output, and terminal attempt state
-pass durable closure validation.
+per-dataset readiness observations, and completed or partial comparison results. The first aligned
+input cut is bound once to the run; retries may use a new snapshot but cannot silently change that
+cut. Observations and retained anomalies must belong to the same attempt, so a retry cannot publish
+evidence captured under an earlier snapshot. Attempts may be completed, incomplete, error, or
+abandoned. A result is published only after its observations, closed protected contexts, comparison
+output, retained-evidence manifest, and terminal attempt state pass durable closure validation.
+
+Internal retries within one `forensics check` invocation share one owner token and one in-memory
+whole-run source budget. A fresh process, including an Airflow task retry, cannot resume a
+nonterminal run that already admitted an attempt: inspect its durable history and start the retry
+with a new request UUID. Version 0.1 deliberately does not persist cross-process source-budget
+usage, so treating an external retry as continuation would make the configured whole-run limits
+untruthful.
 
 ## PostgreSQL metadata bootstrap
 
@@ -266,8 +303,9 @@ versions and append-only SQL capture records. Secret references, artifact paths,
 bytes disabled by the evidence policy are never stored. A later enabled capture creates a separate
 record without mutating the semantic version. Migration `0002` adds run, attempt, protected
 read-context, and dataset-observation records plus narrow immutable lease-renewal receipts;
-migration `0003` adds completed check results and segment fingerprints. Individual row anomalies
-are not retained in this release.
+migration `0003` adds completed check results and segment fingerprints; migration `0004` adds
+partial check results, immutable retained anomalies and their full-replay manifest, plus the typed
+numeric-difference inspection view.
 
 ## PostgreSQL fixture and checks
 
@@ -302,7 +340,7 @@ previously started with different values, run the cleanup command below before s
 The protocol/result tests can run without Docker, but this does not verify PostgreSQL support:
 
 ```console
-uv run pytest --ignore=tests/test_postgres_integration.py --ignore=tests/test_postgres_metadata_integration.py --ignore=tests/test_postgres_protected_integration.py --ignore=tests/test_postgres_lifecycle_schema_integration.py --ignore=tests/test_postgres_lifecycle_integration.py
+uv run pytest --ignore=tests/test_postgres_integration.py --ignore=tests/test_postgres_metadata_integration.py --ignore=tests/test_postgres_protected_integration.py --ignore=tests/test_postgres_lifecycle_schema_integration.py --ignore=tests/test_postgres_lifecycle_integration.py --ignore=tests/test_postgres_comparison_integration.py
 ```
 
 Stop and remove only this disposable fixture and its data volume:
@@ -315,7 +353,8 @@ The integration suite exercises real catalog inspection, canonical row/hash equi
 server-side cursors, duplicate bags, empty tables, precision rejection, relation replacement, row
 level security, read-only enforcement, concurrent-writer snapshot stability, protected
 dataset/manifest locking, metadata migration serialization and rollback, role separation, immutable
-registration/readback, and lifecycle fencing and identity constraints.
+registration/readback, lifecycle fencing and identity constraints, million-row retained-difference
+paging after source mutation, typed numeric evidence, and durable partial-result replay.
 
 ## Build artifacts
 

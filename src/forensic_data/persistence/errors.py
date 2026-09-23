@@ -66,12 +66,20 @@ class CompletedComparisonNotFoundError(RunLifecycleStateError):
     """A requested run attempt has no completed comparison result."""
 
 
+class PartialComparisonNotFoundError(RunLifecycleStateError):
+    """A requested run attempt has no partial comparison result."""
+
+
 class ActiveRunAttemptError(RunLifecycleStateError):
     """A run already has a running attempt, including an expired fenced attempt."""
 
 
 class RunAttemptLimitError(RunLifecycleStateError):
     """A run has exhausted the request's immutable attempt budget."""
+
+
+class RunInvocationContinuationError(RunLifecycleStateError):
+    """A new process invocation cannot continue an already admitted run."""
 
 
 class AttemptFenceError(RunLifecycleStateError):

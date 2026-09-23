@@ -26,12 +26,15 @@ from forensic_data.canonical import (
 )
 from forensic_data.comparison import (
     ComparisonBudgetExceededError,
+    ComparisonInterruptedError,
     ComparisonKeyMappingError,
     ComparisonProtocolError,
     CompletedComparisonArtifact,
     CompletedStructuralComparisonArtifact,
+    PartialComparisonArtifact,
     UnsupportedComparisonError,
     execute_postgres_integer_key_comparison,
+    partial_comparison_artifact_from_completed,
 )
 from forensic_data.contracts.errors import ContractReferenceError
 from forensic_data.contracts.model import (
@@ -46,12 +49,14 @@ from forensic_data.persistence.definitions import build_metadata_registration_de
 from forensic_data.persistence.errors import (
     CompletedComparisonNotFoundError,
     LifecyclePersistenceError,
+    PartialComparisonNotFoundError,
 )
 from forensic_data.persistence.lifecycle import (
     AlignedInputCutPersistence,
     AttemptOutcomeRecord,
     AttemptStatus,
     ClaimedRun,
+    PartialComparisonDefinition,
     PersistedInputCut,
     PersistedReadContext,
     ReadContextPersistence,
@@ -62,18 +67,24 @@ from forensic_data.persistence.lifecycle import (
     completed_comparison_persistence_from_artifact,
     completed_structural_comparison_persistence_from_artifact,
     mark_postgres_read_context_lost,
+    partial_comparison_persistence_from_artifact,
     persist_postgres_aligned_input_cut,
     persist_postgres_read_context,
     publish_postgres_completed_comparison,
     publish_postgres_completed_structural_comparison,
     publish_postgres_terminal_error_attempt,
+    publish_postgres_terminal_error_comparison,
     publish_postgres_terminal_incomplete_attempt,
+    publish_postgres_terminal_incomplete_comparison,
     read_postgres_completed_comparison,
     read_postgres_diff,
     read_postgres_history,
+    read_postgres_partial_comparison,
     read_postgres_terminal_attempt,
     record_postgres_retryable_error_attempt,
+    record_postgres_retryable_error_comparison,
     record_postgres_retryable_incomplete_attempt,
+    record_postgres_retryable_incomplete_comparison,
     start_postgres_run_attempt,
 )
 from forensic_data.persistence.model import DatasetVersionRecord, MetadataRegistration
@@ -103,12 +114,16 @@ from forensic_data.postgres import (
     PostgresRelationAcquisition,
     PostgresResultLimitError,
     PostgresRetryPolicy,
+    PostgresSourceBudgetAttempt,
+    PostgresSourceBudgetExceededError,
+    PostgresSourceBudgetLedger,
+    PostgresSourceDirection,
     ReadContextState,
     UnsupportedPostgresProfileError,
     open_postgres_protected_read_context,
 )
 from forensic_data.postgres_sql import PostgresRelation
-from forensic_data.reporting import DiffPage, HistoryCursor, HistoryPage
+from forensic_data.reporting import DiffCursor, DiffPage, HistoryCursor, HistoryPage
 from forensic_data.result import (
     ComparisonCoverage,
     ComparisonTotals,
@@ -117,6 +132,7 @@ from forensic_data.result import (
     EvidenceCoverage,
     ExecutionStatus,
     Guarantee,
+    LowerBoundTotal,
     PersistenceState,
     PersistenceStatus,
     ReasonCode,
@@ -225,11 +241,18 @@ class DiffRequest:
     run_id: UUID
     attempt_id: UUID
     limit: int
+    cursor: DiffCursor | None
 
     def __post_init__(self) -> None:
         if type(self.run_id) is not UUID or type(self.attempt_id) is not UUID:
             raise TypeError("diff run_id and attempt_id must be UUIDs")
         _require_positive_integer(self.limit, "diff limit")
+        if self.cursor is not None and not isinstance(cast(object, self.cursor), DiffCursor):
+            raise TypeError("diff cursor must be DiffCursor or None")
+        if self.cursor is not None and (
+            self.cursor.run_id != self.run_id or self.cursor.attempt_id != self.attempt_id
+        ):
+            raise ValueError("diff cursor identity differs from its request")
 
 
 @final
@@ -329,6 +352,8 @@ class _AttemptFailure:
     comparison_coverage: ComparisonCoverage
     evidence_coverage: EvidenceCoverage
     metrics: ResultMetrics
+    partial_artifact: PartialComparisonArtifact | None
+    persisted_cut: PersistedInputCut | None
 
 
 @final
@@ -368,6 +393,7 @@ def read_diff(
         request.run_id,
         request.attempt_id,
         request.limit,
+        request.cursor,
     )
 
 
@@ -380,6 +406,8 @@ def execute_check(
     check = _find_check(config, request.check_id)
     _validate_service_closure(config, check, services)
     scope = resolve_scope_values(check, _scope_mapping(request.scope_values))
+    source_budget = PostgresSourceBudgetLedger(config.execution)
+    invocation_owner_token = uuid4()
     registration = register_postgres_metadata(
         services.metadata_settings,
         services.metadata_retry_policy,
@@ -412,39 +440,57 @@ def execute_check(
                 run.selected_terminal_attempt_id,
             )
         except CompletedComparisonNotFoundError:
-            outcome = read_postgres_terminal_attempt(
-                services.metadata_settings,
-                services.metadata_retry_policy,
-                run.run_id,
-                run.selected_terminal_attempt_id,
-            )
-            return _run_result_from_terminal_readback(check, scope, outcome)
+            try:
+                return read_postgres_partial_comparison(
+                    services.metadata_settings,
+                    services.metadata_retry_policy,
+                    run.run_id,
+                    run.selected_terminal_attempt_id,
+                )
+            except PartialComparisonNotFoundError:
+                outcome = read_postgres_terminal_attempt(
+                    services.metadata_settings,
+                    services.metadata_retry_policy,
+                    run.run_id,
+                    run.selected_terminal_attempt_id,
+                )
+                return _run_result_from_terminal_readback(check, scope, outcome)
 
     static_outcome = classify_check_acquisition(check)
     while True:
-        attempt = _start_attempt(run, config, services)
+        attempt = _start_attempt(run, config, invocation_owner_token, services)
+        attempt_source_budget = source_budget.start_attempt(attempt.attempt_id)
         if static_outcome is None:
             attempt_result = _execute_attempt(
                 check,
                 scope,
                 registration,
                 attempt,
+                attempt_source_budget,
                 services,
             )
         else:
-            attempt_result = _failure_from_early_outcome(static_outcome, (), False)
+            attempt_result = _failure_from_early_outcome(
+                static_outcome,
+                (),
+                False,
+                _result_metrics_from_source_budget(attempt_source_budget),
+            )
         if isinstance(attempt_result, RunResult):
             return attempt_result
         if attempt_result.retryable and attempt.ordinal < config.execution.max_attempts:
             _record_retryable_failure(attempt, attempt_result, services)
             continue
         outcome = _publish_terminal_failure(attempt, attempt_result, services)
+        if isinstance(outcome, RunResult):
+            return outcome
         return _run_result_from_attempt_outcome(check, scope, outcome, attempt_result)
 
 
 def _start_attempt(
     run: ClaimedRun,
     config: LoadedContractConfig,
+    invocation_owner_token: UUID,
     services: PostgresExecutionServices,
 ) -> RunAttemptRecord:
     lease_expires_at = datetime.now(UTC) + timedelta(
@@ -456,7 +502,7 @@ def _start_attempt(
         run,
         uuid4(),
         uuid4(),
-        uuid4(),
+        invocation_owner_token,
         lease_expires_at,
         config.execution,
     )
@@ -467,6 +513,7 @@ def _execute_attempt(
     scope: ResolvedScope,
     registration: MetadataRegistration,
     attempt: RunAttemptRecord,
+    source_budget: PostgresSourceBudgetAttempt,
     services: PostgresExecutionServices,
 ) -> RunResult | _AttemptFailure:
     resources: list[_AttemptResource] = []
@@ -474,7 +521,7 @@ def _execute_attempt(
     persisted_cut: PersistedInputCut | None = None
     failure: _AttemptFailure | None = None
     try:
-        reference = _open_side(check, PlanDirection.REFERENCE, services)
+        reference = _open_side(check, PlanDirection.REFERENCE, source_budget, services)
         resources.append(_AttemptResource(reference, None))
         reference_receipt = _persist_context(
             attempt,
@@ -495,9 +542,10 @@ def _execute_attempt(
                 reference_readiness,
                 _context_ids(resources),
                 False,
+                _result_metrics_from_source_budget(source_budget),
             )
         else:
-            target = _open_side(check, PlanDirection.TARGET, services)
+            target = _open_side(check, PlanDirection.TARGET, source_budget, services)
             resources.append(_AttemptResource(target, None))
             target_receipt = _persist_context(
                 attempt,
@@ -518,6 +566,7 @@ def _execute_attempt(
                     target_readiness,
                     _context_ids(resources),
                     False,
+                    _result_metrics_from_source_budget(source_budget),
                 )
             else:
                 input_cut = build_input_cut_definition(
@@ -530,6 +579,7 @@ def _execute_attempt(
                         alignment_outcome,
                         _context_ids(resources),
                         False,
+                        _result_metrics_from_source_budget(source_budget),
                     )
                 else:
                     ready_reference = _ReadySide(reference, reference_readiness)
@@ -554,7 +604,15 @@ def _execute_attempt(
                         scope,
                         input_cut,
                         attempt.execution_budgets,
+                        attempt.run.request.evidence_policy,
+                        source_budget,
                     )
+    except ComparisonInterruptedError as error:
+        failure = _failure_from_comparison_interruption(
+            error,
+            resources,
+            persisted_cut,
+        )
     except ComparisonKeyMappingError as error:
         contract_reason = error.contract_violation_reason
         failure = _AttemptFailure(
@@ -589,14 +647,21 @@ def _execute_attempt(
                 retained_bytes=0,
             ),
             metrics=error.metrics,
+            partial_artifact=None,
+            persisted_cut=persisted_cut,
         )
     except UnsupportedComparisonError as error:
         failure = _failure_from_unsupported_comparison(
             error,
             resources,
             persisted_cut is not None,
+            source_budget,
         )
-    except (ComparisonBudgetExceededError, PostgresReadDeadlineExceededError) as error:
+    except (
+        ComparisonBudgetExceededError,
+        PostgresReadDeadlineExceededError,
+        PostgresSourceBudgetExceededError,
+    ) as error:
         failure = _failure_from_error(
             ExecutionStatus.INCOMPLETE,
             ReasonCode.BUDGET_EXHAUSTED,
@@ -606,6 +671,7 @@ def _execute_attempt(
             False,
             resources,
             persisted_cut is not None,
+            source_budget,
         )
     except PostgresResultLimitError as error:
         failure = _failure_from_error(
@@ -617,6 +683,7 @@ def _execute_attempt(
             False,
             resources,
             persisted_cut is not None,
+            source_budget,
         )
     except (PostgresContextLostError, PostgresAcquisitionRaceError) as error:
         failure = _failure_from_error(
@@ -628,6 +695,7 @@ def _execute_attempt(
             True,
             resources,
             persisted_cut is not None,
+            source_budget,
         )
     except (PostgresConnectionError, PostgresQueryError, PostgresMetadataError) as error:
         failure = _failure_from_error(
@@ -639,6 +707,7 @@ def _execute_attempt(
             True,
             resources,
             persisted_cut is not None,
+            source_budget,
         )
     except UnsupportedPostgresProfileError as error:
         failure = _failure_from_error(
@@ -650,6 +719,7 @@ def _execute_attempt(
             False,
             resources,
             persisted_cut is not None,
+            source_budget,
         )
     except (
         AcquisitionValidationError,
@@ -667,6 +737,7 @@ def _execute_attempt(
             False,
             resources,
             persisted_cut is not None,
+            source_budget,
         )
     finally:
         context_lost = _close_attempt_resources(attempt, tuple(resources), services)
@@ -676,12 +747,19 @@ def _execute_attempt(
         if failure is not None:
             failure = _failure_with_secondary_context_loss(failure, context_loss_reason)
         elif artifact is not None:
-            failure = _failure_from_artifact_context_loss(artifact, context_loss_reason)
+            if persisted_cut is None:
+                raise AssertionError("completed comparison is missing its persisted input cut")
+            failure = _failure_from_artifact_context_loss(
+                artifact,
+                persisted_cut,
+                context_loss_reason,
+            )
         else:
             failure = _failure_from_cleanup_context_loss(
                 context_loss_reason,
                 _context_ids(resources),
                 persisted_cut is not None,
+                _result_metrics_from_source_budget(source_budget),
             )
         artifact = None
     if failure is not None:
@@ -702,7 +780,7 @@ def _execute_attempt(
             structural,
             datetime.now(UTC),
         )
-    comparison, segments = completed_comparison_persistence_from_artifact(
+    comparison, segments, anomalies = completed_comparison_persistence_from_artifact(
         attempt,
         persisted_cut,
         artifact,
@@ -714,6 +792,7 @@ def _execute_attempt(
         uuid4(),
         comparison,
         segments,
+        anomalies,
         datetime.now(UTC),
     )
 
@@ -721,6 +800,7 @@ def _execute_attempt(
 def _open_side(
     check: RowCheckDefinition,
     direction: PlanDirection,
+    source_budget: PostgresSourceBudgetAttempt,
     services: PostgresExecutionServices,
 ) -> _ProtectedSide:
     dataset, consistency, settings = _side_definitions(check, direction, services)
@@ -761,6 +841,8 @@ def _open_side(
             ),
         ),
         services.protected_lock_timeout_milliseconds,
+        source_budget,
+        PostgresSourceDirection(direction.value),
     )
     return _ProtectedSide(
         direction=direction,
@@ -945,11 +1027,14 @@ def _failure_with_secondary_context_loss(
         comparison_coverage=failure.comparison_coverage,
         evidence_coverage=failure.evidence_coverage,
         metrics=failure.metrics,
+        partial_artifact=failure.partial_artifact,
+        persisted_cut=failure.persisted_cut,
     )
 
 
 def _failure_from_artifact_context_loss(
     artifact: CompletedComparisonArtifact | CompletedStructuralComparisonArtifact,
+    persisted_cut: PersistedInputCut,
     context_loss_reason: ResultReason,
 ) -> _AttemptFailure:
     state = _ConsistencyState(
@@ -962,7 +1047,7 @@ def _failure_from_artifact_context_loss(
         verdict=(
             Verdict.MISMATCH if artifact.verdict is Verdict.MISMATCH else Verdict.INCONCLUSIVE
         ),
-        reason=_artifact_context_loss_reason(context_loss_reason, artifact, state),
+        reason=_reason_with_cleanup_state(context_loss_reason, state),
         additional_reasons=artifact.reasons,
         retryable=artifact.verdict is not Verdict.MISMATCH,
         context_ids=state.context_ids,
@@ -971,6 +1056,11 @@ def _failure_from_artifact_context_loss(
         comparison_coverage=artifact.comparison_coverage,
         evidence_coverage=artifact.evidence_coverage,
         metrics=artifact.metrics,
+        partial_artifact=partial_comparison_artifact_from_completed(
+            artifact,
+            ReasonCode.SNAPSHOT_LOST,
+        ),
+        persisted_cut=persisted_cut,
     )
 
 
@@ -978,6 +1068,7 @@ def _failure_from_cleanup_context_loss(
     context_loss_reason: ResultReason,
     context_ids: tuple[UUID, ...],
     cut_aligned: bool,
+    metrics: ResultMetrics,
 ) -> _AttemptFailure:
     state = _ConsistencyState(
         context_ids=context_ids,
@@ -987,7 +1078,10 @@ def _failure_from_cleanup_context_loss(
     return _AttemptFailure(
         execution_status=ExecutionStatus.INCOMPLETE,
         verdict=Verdict.INCONCLUSIVE,
-        reason=_reason_with_cleanup_state(context_loss_reason, state),
+        reason=_reason_with_cleanup_state(
+            _reason_with_failure_metrics(context_loss_reason, metrics),
+            state,
+        ),
         additional_reasons=(),
         retryable=True,
         context_ids=context_ids,
@@ -995,7 +1089,9 @@ def _failure_from_cleanup_context_loss(
         cut_aligned=cut_aligned,
         comparison_coverage=_empty_comparison_coverage(),
         evidence_coverage=_empty_evidence_coverage(),
-        metrics=_empty_metrics(),
+        metrics=metrics,
+        partial_artifact=None,
+        persisted_cut=None,
     )
 
 
@@ -1008,8 +1104,9 @@ def _degraded_stable_reads(level: ConsistencyLevel) -> ConsistencyLevel:
 def _reason_with_failure_consistency(
     reason: ResultReason,
     state: _ConsistencyState,
+    metrics: ResultMetrics,
 ) -> ResultReason:
-    parameters = _failure_consistency_parameters(state)
+    parameters = (*_failure_consistency_parameters(state), *_failure_metrics_parameters(metrics))
     existing_names = {parameter.name for parameter in reason.safe_parameters}
     if any(parameter.name in existing_names for parameter in parameters):
         raise ApplicationStateError("attempt reason conflicts with failure consistency parameters")
@@ -1037,6 +1134,37 @@ def _failure_consistency_parameters(
         for index, context_id in enumerate(state.context_ids)
     )
     return tuple(SafeParameter(name=name, value=value) for name, value in values)
+
+
+def _failure_metrics_parameters(metrics: ResultMetrics) -> tuple[SafeParameter, ...]:
+    values = (
+        ("failure_metrics_queries", str(metrics.queries)),
+        ("failure_metrics_fetched_records", str(metrics.fetched_records)),
+        ("failure_metrics_result_bytes", str(metrics.result_bytes)),
+        ("failure_metrics_fingerprint_nodes", str(metrics.fingerprint_nodes)),
+        ("failure_metrics_coordinator_peak_bytes", str(metrics.coordinator_peak_bytes)),
+        ("failure_metrics_elapsed_milliseconds", str(metrics.elapsed_milliseconds)),
+    )
+    return tuple(SafeParameter(name=name, value=value) for name, value in values)
+
+
+def _reason_with_failure_metrics(
+    reason: ResultReason,
+    metrics: ResultMetrics,
+) -> ResultReason:
+    parameters = _failure_metrics_parameters(metrics)
+    existing_names = {parameter.name for parameter in reason.safe_parameters}
+    if any(parameter.name in existing_names for parameter in parameters):
+        raise ApplicationStateError("attempt reason conflicts with failure metric parameters")
+    return ResultReason(
+        code=reason.code,
+        operation=reason.operation,
+        message=reason.message,
+        safe_parameters=(*reason.safe_parameters, *parameters),
+        native_error_code=reason.native_error_code,
+        query_id=reason.query_id,
+        redacted_response=reason.redacted_response,
+    )
 
 
 def _reason_without_failure_consistency(reason: ResultReason) -> ResultReason:
@@ -1092,50 +1220,30 @@ def _cleanup_state_parameters(state: _ConsistencyState) -> tuple[SafeParameter, 
     return tuple(SafeParameter(name=name, value=value) for name, value in values)
 
 
-def _artifact_context_loss_reason(
-    context_loss_reason: ResultReason,
-    artifact: CompletedComparisonArtifact | CompletedStructuralComparisonArtifact,
-    state: _ConsistencyState,
-) -> ResultReason:
-    parameters = [
-        *_cleanup_state_parameters(state),
-        SafeParameter(name="cleanup_artifact", value="1"),
-    ]
-    parameters.extend(_artifact_progress_parameters(artifact))
-    return ResultReason(
-        code=context_loss_reason.code,
-        operation=context_loss_reason.operation,
-        message=context_loss_reason.message,
-        safe_parameters=tuple(parameters),
-        native_error_code=context_loss_reason.native_error_code,
-        query_id=context_loss_reason.query_id,
-        redacted_response=context_loss_reason.redacted_response,
-    )
-
-
-def _artifact_progress_parameters(
-    artifact: CompletedComparisonArtifact | CompletedStructuralComparisonArtifact,
-) -> tuple[SafeParameter, ...]:
-    values = [
-        ("observed_verdict", artifact.verdict.value),
-        ("observed_comparison_coverage", artifact.comparison_coverage.model_dump_json()),
-        ("observed_evidence_coverage", artifact.evidence_coverage.model_dump_json()),
-        ("observed_metrics", artifact.metrics.model_dump_json()),
-    ]
-    if len(artifact.reasons) > 1:
-        raise ApplicationStateError("completed artifact has unsupported multiple findings")
-    if not artifact.reasons:
-        values.append(("observed_finding", "none"))
-    else:
-        values.append(("observed_finding", artifact.reasons[0].model_dump_json()))
-    return tuple(SafeParameter(name=name, value=value) for name, value in values)
-
-
 def _record_retryable_failure(
     attempt: RunAttemptRecord,
     failure: _AttemptFailure,
     services: PostgresExecutionServices,
-) -> AttemptOutcomeRecord:
+) -> AttemptOutcomeRecord | RunResult:
+    if failure.partial_artifact is not None:
+        comparison = _partial_comparison_definition(attempt, failure)
+        if failure.execution_status is ExecutionStatus.INCOMPLETE:
+            return record_postgres_retryable_incomplete_comparison(
+                services.metadata_settings,
+                services.metadata_retry_policy,
+                attempt,
+                uuid4(),
+                comparison,
+                datetime.now(UTC),
+            )
+        return record_postgres_retryable_error_comparison(
+            services.metadata_settings,
+            services.metadata_retry_policy,
+            attempt,
+            uuid4(),
+            comparison,
+            datetime.now(UTC),
+        )
     if failure.execution_status is ExecutionStatus.INCOMPLETE:
         return record_postgres_retryable_incomplete_attempt(
             services.metadata_settings,
@@ -1159,7 +1267,26 @@ def _publish_terminal_failure(
     attempt: RunAttemptRecord,
     failure: _AttemptFailure,
     services: PostgresExecutionServices,
-) -> AttemptOutcomeRecord:
+) -> AttemptOutcomeRecord | RunResult:
+    if failure.partial_artifact is not None:
+        comparison = _partial_comparison_definition(attempt, failure)
+        if failure.execution_status is ExecutionStatus.INCOMPLETE:
+            return publish_postgres_terminal_incomplete_comparison(
+                services.metadata_settings,
+                services.metadata_retry_policy,
+                attempt,
+                uuid4(),
+                comparison,
+                datetime.now(UTC),
+            )
+        return publish_postgres_terminal_error_comparison(
+            services.metadata_settings,
+            services.metadata_retry_policy,
+            attempt,
+            uuid4(),
+            comparison,
+            datetime.now(UTC),
+        )
     if failure.execution_status is ExecutionStatus.INCOMPLETE:
         return publish_postgres_terminal_incomplete_attempt(
             services.metadata_settings,
@@ -1176,6 +1303,26 @@ def _publish_terminal_failure(
         uuid4(),
         failure.reason,
         datetime.now(UTC),
+    )
+
+
+def _partial_comparison_definition(
+    attempt: RunAttemptRecord,
+    failure: _AttemptFailure,
+) -> PartialComparisonDefinition:
+    artifact = failure.partial_artifact
+    persisted_cut = failure.persisted_cut
+    if artifact is None or persisted_cut is None:
+        raise ApplicationStateError(
+            "partial comparison publication requires its artifact and persisted cut"
+        )
+    return partial_comparison_persistence_from_artifact(
+        attempt,
+        persisted_cut,
+        artifact,
+        failure.execution_status,
+        failure.reason,
+        failure.additional_reasons,
     )
 
 
@@ -1224,6 +1371,7 @@ def _failure_from_early_outcome(
     outcome: EarlyExecutionOutcome,
     context_ids: tuple[UUID, ...],
     cut_aligned: bool,
+    metrics: ResultMetrics,
 ) -> _AttemptFailure:
     state = _ConsistencyState(
         context_ids=context_ids,
@@ -1233,7 +1381,7 @@ def _failure_from_early_outcome(
     return _AttemptFailure(
         execution_status=outcome.execution_status,
         verdict=Verdict.INCONCLUSIVE,
-        reason=_reason_with_failure_consistency(outcome.reason, state),
+        reason=_reason_with_failure_consistency(outcome.reason, state, metrics),
         additional_reasons=(),
         retryable=outcome.execution_status is ExecutionStatus.INCOMPLETE,
         context_ids=state.context_ids,
@@ -1241,7 +1389,153 @@ def _failure_from_early_outcome(
         cut_aligned=state.cut_aligned,
         comparison_coverage=_empty_comparison_coverage(),
         evidence_coverage=_empty_evidence_coverage(),
-        metrics=_empty_metrics(),
+        metrics=metrics,
+        partial_artifact=None,
+        persisted_cut=None,
+    )
+
+
+def _failure_from_comparison_interruption(
+    error: ComparisonInterruptedError,
+    resources: list[_AttemptResource],
+    persisted_cut: PersistedInputCut | None,
+) -> _AttemptFailure:
+    if persisted_cut is None:
+        raise ApplicationStateError(
+            "interrupted comparison requires its persisted aligned input cut"
+        )
+    artifact = error.artifact
+    cause = error.cause
+    additional_reasons: tuple[ResultReason, ...] = ()
+    if isinstance(cause, ComparisonKeyMappingError):
+        contract_reason = cause.contract_violation_reason
+        execution_status = ExecutionStatus.ERROR
+        reason = _reason(
+            ReasonCode.LOSSY_TRANSPORT,
+            "validate_key_mapping",
+            "scoped key values cannot map losslessly to logical INT64",
+            _mapping_error_parameters(cause, artifact.consistency.read_context_ids),
+        )
+        additional_reasons = () if contract_reason is None else (contract_reason,)
+        retryable = False
+    elif isinstance(cause, UnsupportedComparisonError):
+        execution_status = ExecutionStatus.ERROR
+        message = str(cause).strip()
+        if not message:
+            raise ApplicationStateError(
+                "unsupported comparison error must include a safe actionable explanation"
+            )
+        reason = _reason(ReasonCode.UNSUPPORTED_CAPABILITY, "compare", message, ())
+        retryable = False
+    elif isinstance(
+        cause,
+        (
+            ComparisonBudgetExceededError,
+            PostgresReadDeadlineExceededError,
+            PostgresResultLimitError,
+            PostgresSourceBudgetExceededError,
+        ),
+    ):
+        execution_status = ExecutionStatus.INCOMPLETE
+        reason = _reason(
+            ReasonCode.BUDGET_EXHAUSTED,
+            "compare",
+            "the check exhausted an immutable execution budget",
+            (SafeParameter(name="error_type", value=type(cause).__name__),),
+        )
+        retryable = False
+    elif isinstance(cause, (PostgresContextLostError, PostgresAcquisitionRaceError)):
+        execution_status = ExecutionStatus.INCOMPLETE
+        reason = _reason(
+            ReasonCode.SNAPSHOT_LOST,
+            "read_source",
+            "a protected PostgreSQL snapshot was lost before completion",
+            (SafeParameter(name="error_type", value=type(cause).__name__),),
+        )
+        retryable = True
+    elif isinstance(cause, (PostgresConnectionError, PostgresQueryError, PostgresMetadataError)):
+        execution_status = ExecutionStatus.ERROR
+        reason = _reason(
+            ReasonCode.QUERY_ERROR,
+            "read_source",
+            "a PostgreSQL source operation failed",
+            (SafeParameter(name="error_type", value=type(cause).__name__),),
+        )
+        retryable = True
+    elif isinstance(cause, UnsupportedPostgresProfileError):
+        execution_status = ExecutionStatus.ERROR
+        reason = _reason(
+            ReasonCode.UNSUPPORTED_CAPABILITY,
+            "open_source",
+            "a PostgreSQL source does not satisfy the required profile",
+            (SafeParameter(name="error_type", value=type(cause).__name__),),
+        )
+        retryable = False
+    elif isinstance(
+        cause,
+        (
+            AcquisitionValidationError,
+            ComparisonProtocolError,
+            PostgresContextClosedError,
+            PostgresDataValidationError,
+            PostgresQueryContextError,
+        ),
+    ):
+        execution_status = ExecutionStatus.ERROR
+        reason = _reason(
+            ReasonCode.PROTOCOL_VIOLATION,
+            "execute_check",
+            "source evidence violated the declared PostgreSQL check protocol",
+            (SafeParameter(name="error_type", value=type(cause).__name__),),
+        )
+        retryable = False
+    else:
+        raise AssertionError(f"unhandled comparison interruption cause {type(cause).__name__}")
+
+    if artifact.verdict is Verdict.MISMATCH and not any(
+        item.code in (ReasonCode.DATA_MISMATCH, ReasonCode.CONTRACT_VIOLATION)
+        for item in additional_reasons
+    ):
+        additional_reasons = (*additional_reasons, _partial_data_mismatch_reason(artifact))
+    consistency = artifact.consistency
+    if tuple(consistency.read_context_ids) != _context_ids(resources):
+        raise ApplicationStateError(
+            "partial comparison context identity differs from the active attempt resources"
+        )
+    return _AttemptFailure(
+        execution_status=execution_status,
+        verdict=artifact.verdict,
+        reason=reason,
+        additional_reasons=additional_reasons,
+        retryable=retryable,
+        context_ids=consistency.read_context_ids,
+        stable_reads=consistency.stable_reads,
+        cut_aligned=consistency.cut_alignment is not ConsistencyLevel.UNKNOWN,
+        comparison_coverage=artifact.comparison_coverage,
+        evidence_coverage=artifact.evidence_coverage,
+        metrics=artifact.metrics,
+        partial_artifact=artifact,
+        persisted_cut=persisted_cut,
+    )
+
+
+def _partial_data_mismatch_reason(artifact: PartialComparisonArtifact) -> ResultReason:
+    difference_names = ("missing", "extra", "modified")
+    difference_totals = artifact.totals.differences()
+    parameters = tuple(
+        SafeParameter(name=f"{name}_lower_bound", value=total.value)
+        for name, total in zip(difference_names, difference_totals, strict=True)
+        if isinstance(total, LowerBoundTotal) and total.value != "0"
+    )
+    return _reason(
+        ReasonCode.DATA_MISMATCH,
+        "compare_integer_key_rows",
+        (
+            "completed exact leaves established row differences"
+            if parameters
+            else "comparable fingerprints established a content difference"
+        ),
+        parameters,
     )
 
 
@@ -1254,12 +1548,14 @@ def _failure_from_error(
     retryable: bool,
     resources: list[_AttemptResource],
     cut_aligned: bool,
+    source_budget: PostgresSourceBudgetAttempt,
 ) -> _AttemptFailure:
     state = _ConsistencyState(
         context_ids=_context_ids(resources),
         stable_reads=ConsistencyLevel.UNKNOWN,
         cut_aligned=cut_aligned,
     )
+    metrics = _result_metrics_from_source_budget(source_budget)
     return _AttemptFailure(
         execution_status=execution_status,
         verdict=Verdict.INCONCLUSIVE,
@@ -1271,6 +1567,7 @@ def _failure_from_error(
                 (SafeParameter(name="error_type", value=type(error).__name__),),
             ),
             state,
+            metrics,
         ),
         additional_reasons=(),
         retryable=retryable,
@@ -1279,7 +1576,9 @@ def _failure_from_error(
         cut_aligned=state.cut_aligned,
         comparison_coverage=_empty_comparison_coverage(),
         evidence_coverage=_empty_evidence_coverage(),
-        metrics=_empty_metrics(),
+        metrics=metrics,
+        partial_artifact=None,
+        persisted_cut=None,
     )
 
 
@@ -1287,6 +1586,7 @@ def _failure_from_unsupported_comparison(
     error: UnsupportedComparisonError,
     resources: list[_AttemptResource],
     cut_aligned: bool,
+    source_budget: PostgresSourceBudgetAttempt,
 ) -> _AttemptFailure:
     message = str(error).strip()
     if not message:
@@ -1302,6 +1602,7 @@ def _failure_from_unsupported_comparison(
         False,
         resources,
         cut_aligned,
+        source_budget,
     )
 
 
@@ -1346,7 +1647,8 @@ def _run_result_from_terminal_readback(
     cleanup_state = _cleanup_state_from_reason(outcome.reason)
     contract_reason = _mapping_contract_reason(outcome.reason)
     verdict = Verdict.MISMATCH if contract_reason is not None else Verdict.INCONCLUSIVE
-    metrics = _mapping_metrics(outcome.reason)
+    failure_metrics = _failure_metrics_from_reason(outcome.reason)
+    metrics = failure_metrics if failure_metrics is not None else _mapping_metrics(outcome.reason)
     mapping_failure = outcome.reason.code is ReasonCode.LOSSY_TRANSPORT
     failure_state = _failure_consistency_from_reason(outcome.reason)
     if failure_state is not None and (cleanup_state is not None or mapping_failure):
@@ -1388,6 +1690,8 @@ def _run_result_from_terminal_readback(
         ),
         evidence_coverage=_empty_evidence_coverage(),
         metrics=metrics,
+        partial_artifact=None,
+        persisted_cut=None,
     )
     return _run_result_from_attempt_outcome(check, scope, outcome, failure)
 
@@ -1423,6 +1727,8 @@ def _failure_from_stored_artifact_context_loss(reason: ResultReason) -> _Attempt
         comparison_coverage=_stored_artifact_coverage(values),
         evidence_coverage=_stored_artifact_evidence(values),
         metrics=_stored_artifact_metrics(values),
+        partial_artifact=None,
+        persisted_cut=None,
     )
 
 
@@ -1459,6 +1765,36 @@ def _failure_consistency_from_reason(reason: ResultReason) -> _ConsistencyState 
         context_ids=context_ids,
         stable_reads=stable_reads,
         cut_aligned=cut_aligned,
+    )
+
+
+def _failure_metrics_from_reason(reason: ResultReason) -> ResultMetrics | None:
+    values = _safe_parameter_mapping(reason)
+    marker = values.get("failure_metrics_queries")
+    if marker is None:
+        return None
+    return ResultMetrics(
+        queries=_nonnegative_decimal(marker, "failure_metrics_queries"),
+        fetched_records=_nonnegative_decimal(
+            values.get("failure_metrics_fetched_records"),
+            "failure_metrics_fetched_records",
+        ),
+        result_bytes=_nonnegative_decimal(
+            values.get("failure_metrics_result_bytes"),
+            "failure_metrics_result_bytes",
+        ),
+        fingerprint_nodes=_nonnegative_decimal(
+            values.get("failure_metrics_fingerprint_nodes"),
+            "failure_metrics_fingerprint_nodes",
+        ),
+        coordinator_peak_bytes=_nonnegative_decimal(
+            values.get("failure_metrics_coordinator_peak_bytes"),
+            "failure_metrics_coordinator_peak_bytes",
+        ),
+        elapsed_milliseconds=_nonnegative_decimal(
+            values.get("failure_metrics_elapsed_milliseconds"),
+            "failure_metrics_elapsed_milliseconds",
+        ),
     )
 
 
@@ -1754,6 +2090,20 @@ def _empty_metrics() -> ResultMetrics:
         fingerprint_nodes=0,
         coordinator_peak_bytes=0,
         elapsed_milliseconds=0,
+    )
+
+
+def _result_metrics_from_source_budget(
+    source_budget: PostgresSourceBudgetAttempt,
+) -> ResultMetrics:
+    snapshot = source_budget.snapshot()
+    return ResultMetrics(
+        queries=snapshot.queries,
+        fetched_records=snapshot.fetched_records,
+        result_bytes=snapshot.result_bytes,
+        fingerprint_nodes=0,
+        coordinator_peak_bytes=0,
+        elapsed_milliseconds=snapshot.elapsed_milliseconds,
     )
 
 

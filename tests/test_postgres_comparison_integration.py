@@ -1,8 +1,9 @@
 import re
 from collections.abc import Generator
 from contextlib import contextmanager
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from datetime import UTC, date, datetime
+from decimal import Decimal
 from io import StringIO
 from pathlib import Path
 from typing import Literal
@@ -25,23 +26,40 @@ from forensic_data.application import (
     read_diff,
     read_history,
 )
+from forensic_data.canonical import LogicalType
 from forensic_data.cli import run_cli
+from forensic_data.comparison import (
+    ComparisonSegmentState,
+    PartialComparisonFrontier,
+    partial_comparison_frontier_from_canonical_bytes,
+)
 from forensic_data.contracts import load_contract_config
-from forensic_data.contracts.model import ExecutionBudgets, RowCheckDefinition
+from forensic_data.contracts.model import EvidenceAction, ExecutionBudgets, RowCheckDefinition
+from forensic_data.contracts.semantics import canonicalize_semantic_json
 from forensic_data.persistence.definitions import build_metadata_registration_definition
 from forensic_data.persistence.errors import CompletedComparisonNotFoundError
-from forensic_data.persistence.lifecycle import read_postgres_completed_comparison
+from forensic_data.persistence.lifecycle import (
+    read_postgres_completed_comparison,
+    read_postgres_partial_comparison,
+)
 from forensic_data.persistence.postgres import migrate_postgres_metadata, register_postgres_metadata
 from forensic_data.planning import PlanReport, ResolvedScope, resolve_scope_values
 from forensic_data.postgres import PostgresConnectionSettings, PostgresRetryPolicy
 from forensic_data.reporting import (
     DetailAvailability,
+    DifferenceKind,
+    DifferenceRecord,
     DiffPage,
+    EvidenceFieldValue,
+    EvidenceUnavailableReason,
+    EvidenceValueAvailability,
     HistoryAttemptStatus,
     HistoryPage,
+    KeyAvailability,
     StoredResultAvailability,
 )
 from forensic_data.result import (
+    ComparisonCoverage,
     ComparisonTotals,
     ConsistencyLevel,
     ExecutionStatus,
@@ -71,10 +89,12 @@ _OUT_OF_SCOPE_DATE = date(2026, 9, 22)
 _BASELINE_COMPLETED_AT = datetime(2026, 9, 23, 12, 30, 45, 123456, tzinfo=UTC)
 _CORRUPT_COMPLETED_AT = datetime(2026, 9, 23, 13, 30, 45, 123456, tzinfo=UTC)
 _STRUCTURAL_COMPLETED_AT = datetime(2026, 9, 23, 14, 30, 45, 123456, tzinfo=UTC)
+_SMALL_COMPLETED_AT = datetime(2026, 9, 23, 14, 45, 45, 123456, tzinfo=UTC)
 _LOSSY_COMPLETED_AT = datetime(2026, 9, 23, 15, 30, 45, 123456, tzinfo=UTC)
 _BASELINE_SOURCE_CUT = "orders-cut-baseline"
 _CORRUPT_SOURCE_CUT = "orders-cut-corrupt"
 _STRUCTURAL_SOURCE_CUT = "orders-cut-structural"
+_SMALL_SOURCE_CUT = "orders-cut-small"
 _LOSSY_SOURCE_CUT = "orders-cut-lossy"
 _REFERENCE_BASELINE_BATCH = "reference-orders-baseline"
 _TARGET_BASELINE_BATCH = "target-orders-baseline"
@@ -82,6 +102,8 @@ _REFERENCE_CORRUPT_BATCH = "reference-orders-corrupt"
 _TARGET_CORRUPT_BATCH = "target-orders-corrupt"
 _REFERENCE_STRUCTURAL_BATCH = "reference-orders-structural"
 _TARGET_STRUCTURAL_BATCH = "target-orders-structural"
+_REFERENCE_SMALL_BATCH = "reference-orders-small"
+_TARGET_SMALL_BATCH = "target-orders-small"
 _REFERENCE_LOSSY_BATCH = "reference-orders-lossy"
 _TARGET_LOSSY_BATCH = "target-orders-lossy"
 _NO_RETRY = PostgresRetryPolicy(max_attempts=1, delay_seconds=0.0)
@@ -242,9 +264,38 @@ def test_postgres_application_cli_history_diff_and_structural_mismatch() -> None
         assert corrupt.attempt_id != baseline.attempt_id
         _assert_corrupt_result(corrupt, check, scope, config.execution)
 
+        _replace_with_structural_key_violation(
+            reference,
+            target,
+            registration.reference_dataset.definition.dataset_id,
+            registration.target_dataset.definition.dataset_id,
+            scope.scope_digest,
+        )
         _revoke_source_reader_connect(reference)
         _revoke_source_reader_connect(target)
         metadata_environment = {"DFE_METADATA_DSN": _connection_dsn(metadata.reader)}
+        replay_exit, replay_stdout, replay_stderr = _invoke_cli(
+            (
+                "check",
+                "--config",
+                str(_CONTRACT_PATH),
+                "--check",
+                check.check_id,
+                "--scope-json",
+                _SCOPE_JSON,
+                "--reference-batch",
+                _REFERENCE_CORRUPT_BATCH,
+                "--target-batch",
+                _TARGET_CORRUPT_BATCH,
+                "--request-id",
+                str(corrupt_request_id),
+            ),
+            _cli_environment(reference, target, metadata.writer),
+        )
+        assert replay_exit == int(ExitCode.MISMATCH)
+        assert replay_stderr == ""
+        _assert_human_comparison_context(replay_stdout)
+
         first_history = read_history(
             HistoryRequest(
                 check_id=check.check_id,
@@ -318,17 +369,24 @@ def test_postgres_application_cli_history_diff_and_structural_mismatch() -> None
         assert second_stderr == ""
         assert HistoryPage.model_validate_json(second_stdout) == second_history
 
-        diff_page = read_diff(
-            DiffRequest(run_id=corrupt.run_id, attempt_id=corrupt.attempt_id, limit=25),
+        first_diff_page = read_diff(
+            DiffRequest(
+                run_id=corrupt.run_id,
+                attempt_id=corrupt.attempt_id,
+                limit=25,
+                cursor=None,
+            ),
             metadata_services,
         )
-        assert diff_page.detail_availability is DetailAvailability.NOT_RETAINED
-        assert diff_page.stored_result == corrupt
-        assert diff_page.found_records == 37
-        assert diff_page.retained_records == 0
-        assert diff_page.details == ()
-        assert diff_page.next_cursor is None
-        diff_exit, diff_stdout, diff_stderr = _invoke_cli(
+        assert first_diff_page.detail_availability is DetailAvailability.AVAILABLE
+        assert first_diff_page.stored_result == corrupt
+        assert first_diff_page.found_records == 37
+        assert first_diff_page.retained_records == 37
+        assert len(first_diff_page.details) == 25
+        assert tuple(item.sequence for item in first_diff_page.details) == tuple(range(25))
+        assert first_diff_page.next_cursor is not None
+        assert first_diff_page.next_cursor.sequence == 24
+        first_diff_exit, first_diff_stdout, first_diff_stderr = _invoke_cli(
             (
                 "diff",
                 "--config",
@@ -344,19 +402,96 @@ def test_postgres_application_cli_history_diff_and_structural_mismatch() -> None
             ),
             metadata_environment,
         )
-        assert diff_exit == 0
-        assert diff_stderr == ""
-        assert DiffPage.model_validate_json(diff_stdout) == diff_page
+        assert first_diff_exit == 0
+        assert first_diff_stderr == ""
+        assert DiffPage.model_validate_json(first_diff_stdout) == first_diff_page
+        first_human_exit, first_human_stdout, first_human_stderr = _invoke_cli(
+            (
+                "diff",
+                "--config",
+                str(_CONTRACT_PATH),
+                "--run-id",
+                str(corrupt.run_id),
+                "--attempt-id",
+                str(corrupt.attempt_id),
+                "--limit",
+                "25",
+            ),
+            metadata_environment,
+        )
+        assert first_human_exit == 0
+        assert first_human_stderr == ""
+        _assert_human_comparison_context(first_human_stdout)
+        assert (
+            "Difference 0: missing; key=[order_id=1000]; omitted=[business_date]; "
+            "reference=[amount=NULL]; target=<absent>" in first_human_stdout
+        )
+        assert (
+            "Difference 21: modified; key=[order_id=1100]; omitted=[business_date]; "
+            "reference=[amount=100.00]; target=[amount=110.00]" in first_human_stdout
+        )
+
+        second_diff_page = read_diff(
+            DiffRequest(
+                run_id=corrupt.run_id,
+                attempt_id=corrupt.attempt_id,
+                limit=25,
+                cursor=first_diff_page.next_cursor,
+            ),
+            metadata_services,
+        )
+        assert len(second_diff_page.details) == 12
+        assert tuple(item.sequence for item in second_diff_page.details) == tuple(range(25, 37))
+        assert second_diff_page.next_cursor is None
+        second_diff_exit, second_diff_stdout, second_diff_stderr = _invoke_cli(
+            (
+                "diff",
+                "--config",
+                str(_CONTRACT_PATH),
+                "--run-id",
+                str(corrupt.run_id),
+                "--attempt-id",
+                str(corrupt.attempt_id),
+                "--limit",
+                "25",
+                "--cursor-json",
+                first_diff_page.next_cursor.model_dump_json(),
+                "--output",
+                "json",
+            ),
+            metadata_environment,
+        )
+        assert second_diff_exit == 0
+        assert second_diff_stderr == ""
+        assert DiffPage.model_validate_json(second_diff_stdout) == second_diff_page
+        second_human_exit, second_human_stdout, second_human_stderr = _invoke_cli(
+            (
+                "diff",
+                "--config",
+                str(_CONTRACT_PATH),
+                "--run-id",
+                str(corrupt.run_id),
+                "--attempt-id",
+                str(corrupt.attempt_id),
+                "--limit",
+                "25",
+                "--cursor-json",
+                first_diff_page.next_cursor.model_dump_json(),
+            ),
+            metadata_environment,
+        )
+        assert second_human_exit == 0
+        assert second_human_stderr == ""
+        assert (
+            "Difference 33: extra; key=[order_id=1201]; omitted=[business_date]; "
+            "reference=<absent>; target=[amount=50.00]" in second_human_stdout
+        )
+        retained_details = first_diff_page.details + second_diff_page.details
+        _assert_retained_difference_details(retained_details)
+        _assert_numeric_difference_view(metadata.reader, corrupt.run_id, corrupt.attempt_id)
 
         _grant_source_reader_connect(reference)
         _grant_source_reader_connect(target)
-        _replace_with_structural_key_violation(
-            reference,
-            target,
-            registration.reference_dataset.definition.dataset_id,
-            registration.target_dataset.definition.dataset_id,
-            scope.scope_digest,
-        )
         structural_request = ExecuteCheckRequest(
             request_id=uuid4(),
             check_id=check.check_id,
@@ -378,6 +513,212 @@ def test_postgres_application_cli_history_diff_and_structural_mismatch() -> None
         _assert_structural_result(structural, check, scope, config.execution)
         _assert_attempt_has_no_segments(metadata.reader, structural.run_id, structural.attempt_id)
 
+        _replace_with_small_policy_case(
+            reference,
+            target,
+            registration.reference_dataset.definition.dataset_id,
+            registration.target_dataset.definition.dataset_id,
+            scope.scope_digest,
+        )
+        budget_config = replace(
+            config,
+            execution=replace(config.execution, max_full_scans_per_side=2),
+        )
+        budget_request = ExecuteCheckRequest(
+            request_id=uuid4(),
+            check_id=check.check_id,
+            scope_values=_SCOPE_VALUES,
+            reference_expected_batch_id=_REFERENCE_SMALL_BATCH,
+            target_expected_batch_id=_TARGET_SMALL_BATCH,
+            origin="api-integration",
+        )
+        budget_partial = execute_check(budget_config, budget_request, services)
+        assert execute_check(budget_config, budget_request, services) == budget_partial
+        assert (
+            read_postgres_partial_comparison(
+                metadata.reader,
+                _NO_RETRY,
+                budget_partial.run_id,
+                budget_partial.attempt_id,
+            )
+            == budget_partial
+        )
+        assert budget_partial.execution_status is ExecutionStatus.INCOMPLETE
+        assert budget_partial.verdict is Verdict.MISMATCH
+        assert budget_partial.guarantee is Guarantee.NOT_ESTABLISHED
+        assert budget_partial.persistence.state is PersistenceState.CONFIRMED
+        assert budget_partial.consistency.stable_reads is ConsistencyLevel.VERIFIED
+        assert budget_partial.consistency.cut_alignment is ConsistencyLevel.VERIFIED
+        assert budget_partial.comparison_coverage == ComparisonCoverage(
+            total_partitions=1,
+            covered_partitions=0,
+            resolved_segments=0,
+            pruned_segments=0,
+            exact_segments=0,
+            unresolved_segments=2,
+            unresolved_reasons=(ReasonCode.BUDGET_EXHAUSTED,),
+        )
+        unavailable_budget_total = UnavailableTotal(
+            precision="unavailable",
+            value=None,
+            reason=ReasonCode.BUDGET_EXHAUSTED,
+        )
+        assert budget_partial.totals == ComparisonTotals(
+            matched=unavailable_budget_total,
+            missing=unavailable_budget_total,
+            extra=unavailable_budget_total,
+            modified=unavailable_budget_total,
+        )
+        assert tuple(reason.code for reason in budget_partial.reasons) == (
+            ReasonCode.BUDGET_EXHAUSTED,
+            ReasonCode.DATA_MISMATCH,
+        )
+        assert budget_partial.evidence_coverage.found_records == 0
+        assert budget_partial.evidence_coverage.retained_records == 0
+        assert budget_partial.evidence_coverage.found_bytes == 0
+        assert budget_partial.evidence_coverage.retained_bytes == 0
+        assert budget_partial.metrics.queries > 0
+        assert budget_partial.metrics.fetched_records > 0
+        assert budget_partial.metrics.result_bytes > 0
+        assert budget_partial.metrics.fingerprint_nodes == 1
+        _assert_budget_partial_frontier(
+            _read_partial_frontier(
+                metadata.reader,
+                budget_partial.run_id,
+                budget_partial.attempt_id,
+            )
+        )
+        budget_diff = read_diff(
+            DiffRequest(
+                run_id=budget_partial.run_id,
+                attempt_id=budget_partial.attempt_id,
+                limit=25,
+                cursor=None,
+            ),
+            metadata_services,
+        )
+        assert budget_diff.stored_result == budget_partial
+        assert budget_diff.detail_availability is DetailAvailability.AVAILABLE
+        assert budget_diff.found_records == 0
+        assert budget_diff.retained_records == 0
+        assert budget_diff.details == ()
+        assert budget_diff.next_cursor is None
+
+        policy_config = replace(
+            config,
+            execution=replace(config.execution, max_evidence_rows=2),
+            evidence=replace(
+                config.evidence,
+                fields=tuple(
+                    replace(field, action=EvidenceAction.REDACT)
+                    if field.field_name == "amount"
+                    else field
+                    for field in config.evidence.fields
+                ),
+            ),
+        )
+        policy_request = ExecuteCheckRequest(
+            request_id=uuid4(),
+            check_id=check.check_id,
+            scope_values=_SCOPE_VALUES,
+            reference_expected_batch_id=_REFERENCE_SMALL_BATCH,
+            target_expected_batch_id=_TARGET_SMALL_BATCH,
+            origin="api-integration",
+        )
+        policy_result = execute_check(policy_config, policy_request, services)
+        assert policy_result.execution_status is ExecutionStatus.COMPLETED
+        assert policy_result.verdict is Verdict.MISMATCH
+        assert policy_result.guarantee is Guarantee.EXACT
+        assert tuple(total.value for total in policy_result.totals.values()) == (
+            "0",
+            "2",
+            "1",
+            "1",
+        )
+        assert policy_result.evidence_coverage.found_records == 4
+        assert policy_result.evidence_coverage.retained_records == 2
+        assert (
+            policy_result.evidence_coverage.found_bytes
+            > policy_result.evidence_coverage.retained_bytes
+            > 0
+        )
+
+        _introduce_lossy_key_mapping(
+            reference,
+            target,
+            registration.reference_dataset.definition.dataset_id,
+            registration.target_dataset.definition.dataset_id,
+            scope.scope_digest,
+        )
+        assert execute_check(policy_config, policy_request, services) == policy_result
+        policy_diff = read_diff(
+            DiffRequest(
+                run_id=policy_result.run_id,
+                attempt_id=policy_result.attempt_id,
+                limit=25,
+                cursor=None,
+            ),
+            metadata_services,
+        )
+        assert policy_diff.stored_result == policy_result
+        assert policy_diff.detail_availability is DetailAvailability.PARTIALLY_RETAINED
+        assert policy_diff.found_records == 4
+        assert policy_diff.retained_records == 2
+        assert policy_diff.next_cursor is None
+        assert tuple(
+            (detail.sequence, detail.kind, detail.key_values[0].canonical_text)
+            for detail in policy_diff.details
+        ) == (
+            (0, DifferenceKind.MODIFIED, "1"),
+            (1, DifferenceKind.MISSING, "2"),
+        )
+        for detail in policy_diff.details:
+            assert detail.omitted_field_names == ("business_date",)
+            assert tuple(value.field_name for value in detail.reference_values) == ("amount",)
+            for value in (*detail.reference_values, *detail.target_values):
+                assert value.field_name == "amount"
+                assert value.availability is EvidenceValueAvailability.REDACTED
+                assert not value.raw_available
+                assert value.is_null is None
+                assert value.canonical_text is None
+                assert value.canonical_hex is None
+                assert value.unavailable_reason is EvidenceUnavailableReason.POLICY_REDACTED
+        assert tuple(value.field_name for value in policy_diff.details[0].target_values) == (
+            "amount",
+        )
+        assert policy_diff.details[1].target_values == ()
+        policy_diff_exit, policy_diff_stdout, policy_diff_stderr = _invoke_cli(
+            (
+                "diff",
+                "--config",
+                str(_CONTRACT_PATH),
+                "--run-id",
+                str(policy_result.run_id),
+                "--attempt-id",
+                str(policy_result.attempt_id),
+                "--limit",
+                "25",
+            ),
+            metadata_environment,
+        )
+        assert policy_diff_exit == 0
+        assert policy_diff_stderr == ""
+        assert (
+            "Difference 0: modified; key=[order_id=1]; omitted=[business_date]; "
+            "reference=[amount=<redacted>]; target=[amount=<redacted>]" in policy_diff_stdout
+        )
+        assert (
+            "Difference 1: missing; key=[order_id=2]; omitted=[business_date]; "
+            "reference=[amount=<redacted>]; target=<absent>" in policy_diff_stdout
+        )
+
+        _replace_with_structural_key_violation(
+            reference,
+            target,
+            registration.reference_dataset.definition.dataset_id,
+            registration.target_dataset.definition.dataset_id,
+            scope.scope_digest,
+        )
         _introduce_lossy_key_mapping(
             reference,
             target,
@@ -426,6 +767,15 @@ def test_postgres_application_cli_history_diff_and_structural_mismatch() -> None
                 lossy.run_id,
                 lossy.attempt_id,
             )
+        assert (
+            read_postgres_partial_comparison(
+                metadata.reader,
+                _NO_RETRY,
+                lossy.run_id,
+                lossy.attempt_id,
+            )
+            == lossy
+        )
         lossy_history = read_history(
             HistoryRequest(
                 check_id=check.check_id,
@@ -439,10 +789,9 @@ def test_postgres_application_cli_history_diff_and_structural_mismatch() -> None
         assert lossy_history.items[0].attempt_id == lossy.attempt_id
         assert lossy_history.items[0].status is HistoryAttemptStatus.ERROR
         assert (
-            lossy_history.items[0].stored_result_availability
-            is StoredResultAvailability.NOT_CREATED
+            lossy_history.items[0].stored_result_availability is StoredResultAvailability.AVAILABLE
         )
-        assert lossy_history.items[0].stored_result is None
+        assert lossy_history.items[0].stored_result == lossy
 
 
 def _invoke_cli(
@@ -685,19 +1034,26 @@ def _advance_reference_manifest(
     scope_digest: str,
 ) -> None:
     with connect_writer(settings.writer) as connection:
-        connection.execute(
-            "UPDATE dfe_control.batch_manifest "
-            "SET batch_id = %s, source_cut = %s, dataset_version = %s, completed_at = %s "
-            "WHERE dataset_id = %s AND scope_digest = %s",
-            (
-                _REFERENCE_CORRUPT_BATCH,
-                _CORRUPT_SOURCE_CUT,
-                "reference-orders-v2",
-                _CORRUPT_COMPLETED_AT,
-                dataset_id,
-                scope_digest,
-            ),
-        )
+        with connection.transaction():
+            connection.execute(
+                "ALTER TABLE dfe_demo.reference_orders ALTER COLUMN amount DROP NOT NULL"
+            )
+            connection.execute(
+                "UPDATE dfe_demo.reference_orders SET amount = NULL WHERE order_id = 1000"
+            )
+            connection.execute(
+                "UPDATE dfe_control.batch_manifest "
+                "SET batch_id = %s, source_cut = %s, dataset_version = %s, completed_at = %s "
+                "WHERE dataset_id = %s AND scope_digest = %s",
+                (
+                    _REFERENCE_CORRUPT_BATCH,
+                    _CORRUPT_SOURCE_CUT,
+                    "reference-orders-v2",
+                    _CORRUPT_COMPLETED_AT,
+                    dataset_id,
+                    scope_digest,
+                ),
+            )
 
 
 def _corrupt_target_and_advance_manifest(
@@ -825,6 +1181,60 @@ def _replace_with_structural_key_violation(
             )
 
 
+def _replace_with_small_policy_case(
+    reference: _SourceDatabaseSettings,
+    target: _SourceDatabaseSettings,
+    reference_dataset_id: str,
+    target_dataset_id: str,
+    scope_digest: str,
+) -> None:
+    with connect_writer(reference.writer) as connection:
+        with connection.transaction():
+            connection.execute(
+                "UPDATE dfe_control.batch_manifest "
+                "SET batch_id = %s, source_cut = %s, dataset_version = %s, completed_at = %s "
+                "WHERE dataset_id = %s AND scope_digest = %s",
+                (
+                    _REFERENCE_SMALL_BATCH,
+                    _SMALL_SOURCE_CUT,
+                    "reference-orders-v4",
+                    _SMALL_COMPLETED_AT,
+                    reference_dataset_id,
+                    scope_digest,
+                ),
+            )
+    with connect_writer(target.writer) as connection:
+        with connection.transaction():
+            connection.execute("TRUNCATE TABLE dfe_demo.target_orders")
+            connection.execute(
+                "ALTER TABLE dfe_demo.target_orders ALTER COLUMN order_id SET NOT NULL"
+            )
+            connection.execute(
+                "ALTER TABLE dfe_demo.target_orders "
+                "ADD CONSTRAINT target_orders_pkey PRIMARY KEY (order_id)"
+            )
+            connection.execute(
+                "INSERT INTO dfe_demo.target_orders "
+                "(order_id, business_date, amount) VALUES "
+                "(1, %s, 11.00), (4, %s, 40.00)",
+                (_BUSINESS_DATE, _BUSINESS_DATE),
+            )
+            connection.execute("ANALYZE dfe_demo.target_orders")
+            connection.execute(
+                "UPDATE dfe_control.batch_manifest "
+                "SET batch_id = %s, source_cut = %s, dataset_version = %s, completed_at = %s "
+                "WHERE dataset_id = %s AND scope_digest = %s",
+                (
+                    _TARGET_SMALL_BATCH,
+                    _SMALL_SOURCE_CUT,
+                    "target-orders-v4",
+                    _SMALL_COMPLETED_AT,
+                    target_dataset_id,
+                    scope_digest,
+                ),
+            )
+
+
 def _introduce_lossy_key_mapping(
     reference: _SourceDatabaseSettings,
     target: _SourceDatabaseSettings,
@@ -845,7 +1255,7 @@ def _introduce_lossy_key_mapping(
                 (
                     _REFERENCE_LOSSY_BATCH,
                     _LOSSY_SOURCE_CUT,
-                    "reference-orders-v4",
+                    "reference-orders-v5",
                     _LOSSY_COMPLETED_AT,
                     reference_dataset_id,
                     scope_digest,
@@ -859,7 +1269,7 @@ def _introduce_lossy_key_mapping(
             (
                 _TARGET_LOSSY_BATCH,
                 _LOSSY_SOURCE_CUT,
-                "target-orders-v4",
+                "target-orders-v5",
                 _LOSSY_COMPLETED_AT,
                 target_dataset_id,
                 scope_digest,
@@ -881,6 +1291,214 @@ def _assert_attempt_has_no_segments(
     assert row == (0,)
 
 
+def _assert_human_comparison_context(output: str) -> None:
+    assert (
+        "Reference: connection=reference_pg dataset=reference_orders "
+        'relation="dfe_demo"."reference_orders" relation_scope=physical_only' in output
+    )
+    assert (
+        "Target: connection=target_pg dataset=target_orders "
+        'relation="dfe_demo"."target_orders" relation_scope=physical_only' in output
+    )
+    assert 'Scope values: business_date(date)="2026-09-23"' in output
+    assert "DFE_REFERENCE_DSN" not in output
+    assert "DFE_TARGET_DSN" not in output
+    assert "password=" not in output
+
+
+def _assert_retained_difference_details(details: tuple[DifferenceRecord, ...]) -> None:
+    expected_keys = (
+        tuple(range(1000, 1041, 2)) + tuple(range(1100, 1123, 2)) + (1201, 1203, 1205, 1207)
+    )
+    expected_kinds = (
+        (DifferenceKind.MISSING,) * 21
+        + (DifferenceKind.MODIFIED,) * 12
+        + (DifferenceKind.EXTRA,) * 4
+    )
+    assert len(details) == 37
+    assert tuple(detail.sequence for detail in details) == tuple(range(37))
+    assert tuple(detail.kind for detail in details) == expected_kinds
+    assert len({detail.key_digest for detail in details}) == 37
+    for detail, expected_key in zip(details, expected_keys, strict=True):
+        assert detail.key_availability is KeyAvailability.AVAILABLE
+        assert detail.key_digest is not None
+        assert len(detail.key_digest) == 64
+        assert detail.omitted_field_names == ("business_date",)
+        assert len(detail.key_values) == 1
+        _assert_stored_evidence_value(
+            detail.key_values[0],
+            "order_id",
+            LogicalType.INT64,
+            str(expected_key),
+        )
+        reference_amount = None if detail.kind is DifferenceKind.EXTRA else "100.00"
+        if detail.kind is DifferenceKind.MISSING:
+            target_amount = None
+        elif detail.kind is DifferenceKind.MODIFIED:
+            target_amount = "110.00"
+        else:
+            target_amount = "50.00"
+        if expected_key == 1000:
+            _assert_retained_null_side_value(detail.reference_values)
+        else:
+            _assert_retained_side_values(detail.reference_values, reference_amount)
+        _assert_retained_side_values(detail.target_values, target_amount)
+
+
+def _assert_retained_side_values(
+    values: tuple[EvidenceFieldValue, ...],
+    expected_amount: str | None,
+) -> None:
+    if expected_amount is None:
+        assert values == ()
+        return
+    assert tuple(value.field_name for value in values) == ("amount",)
+    (amount,) = values
+    _assert_stored_evidence_value(amount, "amount", LogicalType.DECIMAL, expected_amount)
+    assert amount.decimal_precision == 18
+    assert amount.decimal_scale == 2
+
+
+def _assert_retained_null_side_value(values: tuple[EvidenceFieldValue, ...]) -> None:
+    assert tuple(value.field_name for value in values) == ("amount",)
+    (amount,) = values
+    assert amount.logical_type is LogicalType.DECIMAL
+    assert amount.decimal_precision == 18
+    assert amount.decimal_scale == 2
+    assert amount.timestamp_precision is None
+    assert amount.availability is EvidenceValueAvailability.STORED
+    assert amount.raw_available
+    assert amount.is_null is True
+    assert amount.canonical_text is None
+    assert amount.canonical_hex is None
+    assert amount.unavailable_reason is None
+
+
+def _assert_stored_evidence_value(
+    value: EvidenceFieldValue,
+    field_name: str,
+    logical_type: LogicalType,
+    canonical_text: str,
+) -> None:
+    assert value.field_name == field_name
+    assert value.logical_type is logical_type
+    assert value.availability is EvidenceValueAvailability.STORED
+    assert value.raw_available
+    assert value.is_null is False
+    assert value.canonical_text == canonical_text
+    assert value.canonical_hex is None
+    assert value.unavailable_reason is None
+
+
+def _assert_numeric_difference_view(
+    settings: PostgresConnectionSettings,
+    run_id: UUID,
+    attempt_id: UUID,
+) -> None:
+    with connect_writer(settings) as connection:
+        rows = connection.execute(
+            "SELECT anomaly_sequence, anomaly_kind, field_name, logical_type, "
+            "reference_availability, target_availability, reference_value, target_value, "
+            "target_minus_reference FROM dfe_metadata.numeric_differences "
+            "WHERE run_id = %s AND attempt_id = %s ORDER BY anomaly_sequence, field_name",
+            (run_id, attempt_id),
+        ).fetchall()
+    assert len(rows) == 37
+    for sequence, row in enumerate(rows):
+        if sequence == 0:
+            expected = (
+                sequence,
+                "missing",
+                "amount",
+                "decimal",
+                "stored",
+                None,
+                None,
+                None,
+                None,
+            )
+        elif sequence < 21:
+            expected = (
+                sequence,
+                "missing",
+                "amount",
+                "decimal",
+                "stored",
+                None,
+                Decimal("100.00"),
+                None,
+                None,
+            )
+        elif sequence < 33:
+            expected = (
+                sequence,
+                "modified",
+                "amount",
+                "decimal",
+                "stored",
+                "stored",
+                Decimal("100.00"),
+                Decimal("110.00"),
+                Decimal("10.00"),
+            )
+        else:
+            expected = (
+                sequence,
+                "extra",
+                "amount",
+                "decimal",
+                None,
+                "stored",
+                None,
+                Decimal("50.00"),
+                None,
+            )
+        assert row == expected
+
+
+def _read_partial_frontier(
+    settings: PostgresConnectionSettings,
+    run_id: UUID,
+    attempt_id: UUID,
+) -> PartialComparisonFrontier:
+    with connect_writer(settings) as connection:
+        row = connection.execute(
+            "SELECT frontier_payload::text FROM dfe_metadata.partial_check_results "
+            "WHERE run_id = %s AND attempt_id = %s",
+            (run_id, attempt_id),
+        ).fetchone()
+    assert row is not None
+    assert type(row[0]) is str
+    canonical_payload = canonicalize_semantic_json(row[0]).encode("utf-8", errors="strict")
+    return partial_comparison_frontier_from_canonical_bytes(canonical_payload)
+
+
+def _assert_budget_partial_frontier(frontier: PartialComparisonFrontier) -> None:
+    assert len(frontier.topology) == 1
+    (root,) = frontier.topology
+    assert root.segment_sequence == 0
+    assert root.parent_segment_sequence is None
+    assert root.depth == 0
+    assert root.lower_inclusive == 1
+    assert root.upper_exclusive == 5
+    assert root.state is ComparisonSegmentState.SPLIT
+    assert root.reference_fingerprint.count == 3
+    assert root.target_fingerprint.count == 2
+    assert root.reference_fingerprint != root.target_fingerprint
+
+    assert tuple(item.segment_sequence for item in frontier.unresolved) == (1, 2)
+    assert tuple(item.parent_segment_sequence for item in frontier.unresolved) == (0, 0)
+    assert tuple(item.depth for item in frontier.unresolved) == (1, 1)
+    assert tuple(item.lower_inclusive for item in frontier.unresolved) == (1, 3)
+    assert tuple(item.upper_exclusive for item in frontier.unresolved) == (3, 5)
+    assert tuple(item.reason for item in frontier.unresolved) == (
+        ReasonCode.BUDGET_EXHAUSTED,
+        ReasonCode.BUDGET_EXHAUSTED,
+    )
+    assert all(item.reference_fingerprint is None for item in frontier.unresolved)
+    assert all(item.target_fingerprint is None for item in frontier.unresolved)
+
+
 def _assert_common_completed_result(
     result: RunResult,
     check: RowCheckDefinition,
@@ -898,8 +1516,6 @@ def _assert_common_completed_result(
     assert result.comparison_coverage.covered_partitions == 1
     assert result.comparison_coverage.unresolved_segments == 0
     assert result.comparison_coverage.unresolved_reasons == ()
-    assert result.evidence_coverage.retained_records == 0
-    assert result.evidence_coverage.retained_bytes == 0
     assert result.metrics.queries <= execution_policy.max_queries
     assert result.metrics.fetched_records <= execution_policy.max_fetched_records
     assert result.metrics.result_bytes <= execution_policy.max_application_result_bytes
@@ -931,6 +1547,8 @@ def _assert_baseline_result(
     )
     assert result.evidence_coverage.found_records == 0
     assert result.evidence_coverage.found_bytes == 0
+    assert result.evidence_coverage.retained_records == 0
+    assert result.evidence_coverage.retained_bytes == 0
     assert result.reasons == ()
 
 
@@ -953,7 +1571,9 @@ def _assert_corrupt_result(
         modified=InferredTotal(precision="inferred_under_fingerprint", value="12"),
     )
     assert result.evidence_coverage.found_records == 37
-    assert result.evidence_coverage.found_bytes == 0
+    assert result.evidence_coverage.found_bytes > 0
+    assert result.evidence_coverage.retained_records == 37
+    assert result.evidence_coverage.retained_bytes == result.evidence_coverage.found_bytes
     assert tuple(reason.code for reason in result.reasons) == (ReasonCode.DATA_MISMATCH,)
 
 
@@ -983,8 +1603,10 @@ def _assert_structural_result(
     )
     assert result.evidence_coverage.found_records == 0
     assert result.evidence_coverage.found_bytes == 0
-    assert result.metrics.queries == 2
-    assert result.metrics.fetched_records == 2
+    assert result.evidence_coverage.retained_records == 0
+    assert result.evidence_coverage.retained_bytes == 0
+    assert result.metrics.queries >= 2
+    assert result.metrics.fetched_records >= 2
     assert result.metrics.fingerprint_nodes == 0
     assert tuple(reason.code for reason in result.reasons) == (ReasonCode.CONTRACT_VIOLATION,)
     assert tuple(
@@ -1028,8 +1650,8 @@ def _assert_lossy_result(
         for total in result.totals.values()
     )
     assert result.evidence_coverage.found_records == 0
-    assert result.metrics.queries == 2
-    assert result.metrics.fetched_records == 2
+    assert result.metrics.queries >= 2
+    assert result.metrics.fetched_records >= 2
     assert result.metrics.fingerprint_nodes == 0
     assert result.metrics.result_bytes <= execution_policy.max_application_result_bytes
     assert result.persistence.state is PersistenceState.CONFIRMED

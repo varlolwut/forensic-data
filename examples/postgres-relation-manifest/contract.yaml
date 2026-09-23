@@ -131,5 +131,6 @@ evidence:
   ddl_capture: enabled
   fields:
     order_id: store
-    amount: redact
+    business_date: omit
+    amount: store
   unspecified_fields: omit

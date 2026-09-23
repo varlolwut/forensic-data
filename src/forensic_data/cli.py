@@ -5,6 +5,7 @@ import os
 import re
 import sys
 from collections.abc import Mapping, Sequence
+from datetime import date, datetime
 from pathlib import Path
 from typing import Final, NoReturn, TextIO, cast
 from uuid import UUID
@@ -27,22 +28,52 @@ from forensic_data.application import (
     read_diff,
     read_history,
 )
+from forensic_data.canonical import (
+    DecimalParameters,
+    FieldSchema,
+    LogicalType,
+    TimestampParameters,
+    decode_payload,
+)
 from forensic_data.contracts.compiler import load_contract_config
 from forensic_data.contracts.errors import ContractError
 from forensic_data.contracts.model import (
     ConnectionDefinition,
+    DatasetDefinition,
     LoadedContractConfig,
+    RelationLocator,
     RowCheckDefinition,
 )
 from forensic_data.persistence.errors import MetadataError
-from forensic_data.planning import PlanReport
+from forensic_data.planning import (
+    PlanReport,
+    ResolvedScope,
+    ResolvedScopeParameter,
+    resolve_scope_values,
+)
 from forensic_data.postgres import (
     PostgresConnectionSettings,
     PostgresConnectorError,
     PostgresRetryPolicy,
     PostgresSslMode,
 )
-from forensic_data.reporting import DiffPage, HistoryCursor, HistoryPage
+from forensic_data.reporting import (
+    ComparisonContext,
+    ComparisonDirection,
+    ComparisonField,
+    ComparisonScopeValue,
+    ComparisonSideIdentity,
+    DiffCursor,
+    DifferenceKind,
+    DifferenceRecord,
+    DiffPage,
+    EvidenceFieldValue,
+    EvidenceValueAvailability,
+    HistoryCursor,
+    HistoryPage,
+    RelationComparisonLocator,
+    SqlComparisonLocator,
+)
 from forensic_data.result import (
     Guarantee,
     ReasonCode,
@@ -207,12 +238,16 @@ def _build_parser() -> _SafeArgumentParser:
 
     diff_parser = commands.add_parser(
         "diff",
-        help="read stored result metadata; row details are not retained in this release",
+        help="page retained difference evidence from metadata only",
     )
     diff_parser.add_argument("--config", required=True, type=Path, help="contract YAML path")
     diff_parser.add_argument("--run-id", required=True, help="full run UUID")
     diff_parser.add_argument("--attempt-id", required=True, help="full attempt UUID")
     diff_parser.add_argument("--limit", required=True, type=int, help="page size, from 1 to 100")
+    diff_parser.add_argument(
+        "--cursor-json",
+        help="DiffCursor JSON returned by the previous page",
+    )
     _add_output_argument(diff_parser)
     return parser
 
@@ -277,8 +312,18 @@ def _run_check(
     services = _execution_services(
         config, check.reference.connection, check.target.connection, environment
     )
+    scope = resolve_scope_values(
+        check,
+        {value.name: value.value for value in request.scope_values},
+    )
     result = execute_check(config, request, services)
-    _write_run_result(result, _output_format(arguments.output), stdout)
+    _require_renderable_result_identity(result, check, scope)
+    _write_run_result(
+        result,
+        _comparison_context(check, scope),
+        _output_format(arguments.output),
+        stdout,
+    )
     return int(exit_code_for_result(result))
 
 
@@ -314,6 +359,7 @@ def _run_diff(
             run_id=_parse_uuid(arguments.run_id, "run ID"),
             attempt_id=_parse_uuid(arguments.attempt_id, "attempt ID"),
             limit=arguments.limit,
+            cursor=_diff_cursor(arguments.cursor_json),
         ),
         _metadata_services(config, environment, "dfe-cli-diff"),
     )
@@ -354,6 +400,17 @@ def _history_cursor(value: str | None) -> HistoryCursor | None:
     if type(decoded) is not dict:
         raise CliInputError("history cursor JSON must be an object")
     return HistoryCursor.model_validate_json(
+        json.dumps(decoded, ensure_ascii=False, separators=(",", ":"))
+    )
+
+
+def _diff_cursor(value: str | None) -> DiffCursor | None:
+    if value is None:
+        return None
+    decoded = _decode_json(value, "diff cursor")
+    if type(decoded) is not dict:
+        raise CliInputError("diff cursor JSON must be an object")
+    return DiffCursor.model_validate_json(
         json.dumps(decoded, ensure_ascii=False, separators=(",", ":"))
     )
 
@@ -401,6 +458,102 @@ def _find_check(config: LoadedContractConfig, check_id: str) -> RowCheckDefiniti
     if len(matches) != 1:
         raise CliInputError("check ID does not identify exactly one configured check")
     return matches[0]
+
+
+def _require_renderable_result_identity(
+    result: RunResult,
+    check: RowCheckDefinition,
+    scope: ResolvedScope,
+) -> None:
+    expected = (check.check_id, check.contract_digest, scope.scope_digest)
+    actual = (result.check_id, result.contract_digest, result.scope_digest)
+    if actual != expected:
+        raise ApplicationError(
+            "check result identity differs from the validated contract and scope; "
+            "refusing to render current endpoint labels for a different durable result"
+        )
+
+
+def _comparison_context(
+    check: RowCheckDefinition,
+    scope: ResolvedScope,
+) -> ComparisonContext:
+    return ComparisonContext(
+        reference=_comparison_side(ComparisonDirection.REFERENCE, check.reference),
+        target=_comparison_side(ComparisonDirection.TARGET, check.target),
+        scope=tuple(
+            ComparisonScopeValue(
+                name=parameter.name,
+                logical_type=parameter.field.logical_type,
+                canonical_value=_scope_value_text(parameter),
+            )
+            for parameter in scope.parameters
+        ),
+        comparison_fields=tuple(
+            _comparison_field(field) for field in check.comparison_schema.schema.fields
+        ),
+        ordered_key=check.key,
+    )
+
+
+def _comparison_side(
+    direction: ComparisonDirection,
+    dataset: DatasetDefinition,
+) -> ComparisonSideIdentity:
+    locator = dataset.locator
+    if isinstance(locator, RelationLocator):
+        reporting_locator: RelationComparisonLocator | SqlComparisonLocator = (
+            RelationComparisonLocator(
+                locator_type="relation",
+                catalog=locator.catalog,
+                schema=locator.schema,
+                name=locator.name,
+                relation_scope=locator.relation_scope,
+            )
+        )
+    else:
+        reporting_locator = SqlComparisonLocator(
+            locator_type="sql",
+            dialect=locator.dialect,
+            content_sha256=locator.content_sha256,
+        )
+    return ComparisonSideIdentity(
+        direction=direction,
+        connection_id=dataset.connection.connection_id,
+        dataset_id=dataset.dataset_id,
+        locator=reporting_locator,
+    )
+
+
+def _scope_value_text(parameter: ResolvedScopeParameter) -> str:
+    value = decode_payload(parameter.field, parameter.canonical_payload)
+    if type(value) is bool:
+        return "true" if value else "false"
+    if type(value) is int:
+        return str(value)
+    if isinstance(value, (date, datetime)):
+        return value.isoformat()
+    if type(value) is str:
+        return value
+    return str(value)
+
+
+def _comparison_field(field: FieldSchema) -> ComparisonField:
+    decimal_precision: int | None = None
+    decimal_scale: int | None = None
+    timestamp_precision: int | None = None
+    if isinstance(field.parameters, DecimalParameters):
+        decimal_precision = field.parameters.precision
+        decimal_scale = field.parameters.scale
+    elif isinstance(field.parameters, TimestampParameters):
+        timestamp_precision = field.parameters.precision
+    return ComparisonField(
+        field_name=field.name,
+        logical_type=field.logical_type,
+        decimal_precision=decimal_precision,
+        decimal_scale=decimal_scale,
+        timestamp_precision=timestamp_precision,
+    )
 
 
 def _execution_services(
@@ -572,7 +725,12 @@ def _write_plan(report: PlanReport, output: str, stdout: TextIO) -> None:
     _write_lines(stdout, lines)
 
 
-def _write_run_result(result: RunResult, output: str, stdout: TextIO) -> None:
+def _write_run_result(
+    result: RunResult,
+    comparison_context: ComparisonContext,
+    output: str,
+    stdout: TextIO,
+) -> None:
     if output == "json":
         _write_json_model(result, stdout)
         return
@@ -593,6 +751,7 @@ def _write_run_result(result: RunResult, output: str, stdout: TextIO) -> None:
         f"modified={_total_text(result.totals.modified)}",
         f"Persistence: {result.persistence.state.value}",
     ]
+    lines.extend(_comparison_context_lines(comparison_context))
     lines.extend(f"Reason: {reason.code.value} — {reason.message}" for reason in result.reasons)
     lines.extend(_structural_summary_lines(result))
     _write_lines(stdout, tuple(lines))
@@ -636,11 +795,110 @@ def _write_diff(page: DiffPage, output: str, stdout: TextIO) -> None:
         f"Stored verdict: {result.verdict.value} ({result.guarantee.value})",
         f"Row details: {page.detail_availability.value}",
         f"Difference records found: {page.found_records}",
-        "Retained row details: 0; source endpoints were not queried.",
+        f"Retained row details: {page.retained_records}; source endpoints were not queried.",
     ]
+    lines.extend(_comparison_context_lines(page.comparison_context))
     lines.extend(f"Reason: {reason.code.value} — {reason.message}" for reason in result.reasons)
     lines.extend(_structural_summary_lines(result))
+    lines.extend(_difference_record_line(detail) for detail in page.details)
+    if page.next_cursor is None:
+        lines.append("Next cursor: none")
+    else:
+        lines.append(f"Next cursor: {page.next_cursor.model_dump_json()}")
     _write_lines(stdout, tuple(lines))
+
+
+def _difference_record_line(detail: DifferenceRecord) -> str:
+    key = ", ".join(_evidence_field_text(value) for value in detail.key_values)
+    omitted = ", ".join(_escape_inline_text(name) for name in detail.omitted_field_names)
+    reference = _difference_side_text(
+        detail.reference_values,
+        detail.kind is not DifferenceKind.EXTRA,
+    )
+    target = _difference_side_text(
+        detail.target_values,
+        detail.kind is not DifferenceKind.MISSING,
+    )
+    return (
+        f"Difference {detail.sequence}: {detail.kind.value}; "
+        f"key=[{key if key else '<unavailable>'}]; "
+        f"omitted=[{omitted if omitted else '<none>'}]; "
+        f"reference={reference}; target={target}"
+    )
+
+
+def _difference_side_text(
+    values: tuple[EvidenceFieldValue, ...],
+    side_present: bool,
+) -> str:
+    if not side_present:
+        return "<absent>"
+    rendered = ", ".join(_evidence_field_text(value) for value in values)
+    return f"[{rendered if rendered else '<no retained values>'}]"
+
+
+def _comparison_context_lines(context: ComparisonContext) -> tuple[str, ...]:
+    scope = ", ".join(
+        f"{_escape_inline_text(value.name)}({value.logical_type.value})="
+        f"{json.dumps(value.canonical_value, ensure_ascii=False)}"
+        for value in context.scope
+    )
+    return (
+        _comparison_side_line(context.reference),
+        _comparison_side_line(context.target),
+        f"Scope values: {scope if scope else '<none>'}",
+    )
+
+
+def _comparison_side_line(side: ComparisonSideIdentity) -> str:
+    locator = side.locator
+    if isinstance(locator, RelationComparisonLocator):
+        components = (() if locator.catalog is None else (locator.catalog,)) + (
+            locator.schema_name,
+            locator.name,
+        )
+        locator_text = (
+            "relation="
+            + ".".join(_quote_identifier(component) for component in components)
+            + f" relation_scope={locator.relation_scope.value}"
+        )
+    else:
+        locator_text = (
+            f"sql_dialect={_escape_inline_text(locator.dialect.value)} "
+            f"sql_sha256={locator.content_sha256}"
+        )
+    return (
+        f"{side.direction.value.title()}: "
+        f"connection={_escape_inline_text(side.connection_id)} "
+        f"dataset={_escape_inline_text(side.dataset_id)} {locator_text}"
+    )
+
+
+def _quote_identifier(value: str) -> str:
+    return json.dumps(value, ensure_ascii=False)
+
+
+def _escape_inline_text(value: str) -> str:
+    return json.dumps(value, ensure_ascii=False)[1:-1]
+
+
+def _evidence_field_text(value: EvidenceFieldValue) -> str:
+    field_name = _escape_inline_text(value.field_name)
+    if value.availability is EvidenceValueAvailability.REDACTED:
+        return f"{field_name}=<redacted>"
+    if value.is_null:
+        return f"{field_name}=NULL"
+    canonical_value = (
+        value.canonical_text if value.canonical_text is not None else value.canonical_hex
+    )
+    if canonical_value is None:
+        raise ApplicationError("stored evidence field is missing its canonical value")
+    rendered_value = (
+        json.dumps(canonical_value, ensure_ascii=False)
+        if value.logical_type is LogicalType.STRING
+        else canonical_value
+    )
+    return f"{field_name}={rendered_value}"
 
 
 def _structural_summary_lines(result: RunResult) -> tuple[str, ...]:

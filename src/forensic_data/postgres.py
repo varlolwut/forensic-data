@@ -6,7 +6,7 @@ from dataclasses import dataclass
 from datetime import UTC, date, datetime, timedelta
 from enum import StrEnum
 from threading import Lock
-from typing import cast
+from typing import LiteralString, cast
 from uuid import UUID, uuid4
 
 import psycopg
@@ -17,6 +17,7 @@ from pydantic import BaseModel, ConfigDict, Field, SecretStr, field_validator
 from forensic_data.canonical import (
     CanonicalizationError,
     CanonicalSchema,
+    DecodedValue,
     Fingerprint,
     FingerprintOverflowError,
     decode_key_with_context,
@@ -24,7 +25,7 @@ from forensic_data.canonical import (
     envelope_sha256,
     prepare_envelope_context,
 )
-from forensic_data.contracts.model import ReadinessManifestColumns
+from forensic_data.contracts.model import ExecutionBudgets, ReadinessManifestColumns
 from forensic_data.postgres_sql import (
     PostgresFieldBinding,
     PostgresInspectedRelation,
@@ -118,11 +119,20 @@ class PostgresReadDeadlineExceededError(PostgresConnectorError):
     """A bounded PostgreSQL read exhausted its absolute monotonic deadline."""
 
 
+class PostgresSourceBudgetExceededError(PostgresConnectorError):
+    """The immutable whole-run source budget cannot admit more source work."""
+
+
 class PostgresSslMode(StrEnum):
     DISABLE = "disable"
     REQUIRE = "require"
     VERIFY_CA = "verify-ca"
     VERIFY_FULL = "verify-full"
+
+
+class PostgresSourceDirection(StrEnum):
+    REFERENCE = "reference"
+    TARGET = "target"
 
 
 class PostgresRelationPersistence(StrEnum):
@@ -272,6 +282,295 @@ class PostgresReadMetrics:
 
 
 @dataclass(frozen=True, slots=True)
+class PostgresSourceUsageSnapshot:
+    queries: int
+    fetched_records: int
+    result_bytes: int
+    reference_full_scans: int
+    target_full_scans: int
+    elapsed_milliseconds: int
+
+    def __post_init__(self) -> None:
+        for name, value in (
+            ("queries", self.queries),
+            ("fetched_records", self.fetched_records),
+            ("result_bytes", self.result_bytes),
+            ("reference_full_scans", self.reference_full_scans),
+            ("target_full_scans", self.target_full_scans),
+            ("elapsed_milliseconds", self.elapsed_milliseconds),
+        ):
+            _validate_nonnegative_integer(value, f"source usage {name}")
+
+
+@dataclass(frozen=True, slots=True)
+class PostgresSourceCapacitySnapshot:
+    queries: int
+    fetched_records: int
+    result_bytes: int
+    reference_full_scans: int
+    target_full_scans: int
+    deadline_nanoseconds: int
+
+    def __post_init__(self) -> None:
+        for name, value in (
+            ("queries", self.queries),
+            ("fetched_records", self.fetched_records),
+            ("result_bytes", self.result_bytes),
+            ("reference_full_scans", self.reference_full_scans),
+            ("target_full_scans", self.target_full_scans),
+            ("deadline_nanoseconds", self.deadline_nanoseconds),
+        ):
+            _validate_nonnegative_integer(value, f"source capacity {name}")
+
+
+@dataclass(slots=True)
+class _PostgresSourceUsage:
+    queries: int
+    fetched_records: int
+    result_bytes: int
+    reference_full_scans: int
+    target_full_scans: int
+
+
+class PostgresSourceBudgetLedger:
+    """One mutable source-work ledger shared by every snapshot attempt of a run."""
+
+    def __init__(self, budgets: ExecutionBudgets) -> None:
+        if not isinstance(cast(object, budgets), ExecutionBudgets):
+            raise TypeError("source budget ledger requires ExecutionBudgets")
+        self._budgets = budgets
+        self._started_nanoseconds = time.monotonic_ns()
+        self._deadline_nanoseconds = self._started_nanoseconds + (
+            budgets.run_timeout_milliseconds * 1_000_000
+        )
+        self._usage = _PostgresSourceUsage(0, 0, 0, 0, 0)
+        self._attempt_ids: set[UUID] = set()
+        self._lock = Lock()
+
+    @property
+    def deadline_nanoseconds(self) -> int:
+        return self._deadline_nanoseconds
+
+    def start_attempt(self, attempt_id: UUID) -> "PostgresSourceBudgetAttempt":
+        if type(attempt_id) is not UUID:
+            raise TypeError("source budget attempt_id must be a UUID")
+        with self._lock:
+            if attempt_id in self._attempt_ids:
+                raise ValueError("source budget attempt_id has already been started")
+            self._attempt_ids.add(attempt_id)
+            baseline = _source_usage_snapshot(
+                self._usage,
+                _elapsed_milliseconds_since(self._started_nanoseconds),
+            )
+        return PostgresSourceBudgetAttempt(self, attempt_id, baseline, time.monotonic_ns())
+
+    def snapshot(self) -> PostgresSourceUsageSnapshot:
+        with self._lock:
+            return _source_usage_snapshot(
+                self._usage,
+                _elapsed_milliseconds_since(self._started_nanoseconds),
+            )
+
+    def remaining(self) -> PostgresSourceCapacitySnapshot:
+        with self._lock:
+            return PostgresSourceCapacitySnapshot(
+                queries=max(0, self._budgets.max_queries - self._usage.queries),
+                fetched_records=max(
+                    0,
+                    self._budgets.max_fetched_records - self._usage.fetched_records,
+                ),
+                result_bytes=max(
+                    0,
+                    self._budgets.max_application_result_bytes - self._usage.result_bytes,
+                ),
+                reference_full_scans=max(
+                    0,
+                    self._budgets.max_full_scans_per_side - self._usage.reference_full_scans,
+                ),
+                target_full_scans=max(
+                    0,
+                    self._budgets.max_full_scans_per_side - self._usage.target_full_scans,
+                ),
+                deadline_nanoseconds=self._deadline_nanoseconds,
+            )
+
+    def dispatch_query(
+        self,
+        direction: PostgresSourceDirection,
+        full_scans: int,
+    ) -> "PostgresSourceQueryCharge":
+        if not isinstance(cast(object, direction), PostgresSourceDirection):
+            raise TypeError("source query direction must be PostgresSourceDirection")
+        _validate_nonnegative_integer(full_scans, "source query full_scans")
+        with self._lock:
+            _require_source_deadline(self._deadline_nanoseconds, "source query dispatch")
+            if self._usage.queries >= self._budgets.max_queries:
+                raise PostgresSourceBudgetExceededError(
+                    "next source query exceeds immutable whole-run max_queries"
+                )
+            if direction is PostgresSourceDirection.REFERENCE:
+                if (
+                    self._usage.reference_full_scans + full_scans
+                    > self._budgets.max_full_scans_per_side
+                ):
+                    raise PostgresSourceBudgetExceededError(
+                        "next reference source query exceeds immutable whole-run "
+                        "max_full_scans_per_side"
+                    )
+                self._usage.reference_full_scans += full_scans
+            else:
+                if (
+                    self._usage.target_full_scans + full_scans
+                    > self._budgets.max_full_scans_per_side
+                ):
+                    raise PostgresSourceBudgetExceededError(
+                        "next target source query exceeds immutable whole-run "
+                        "max_full_scans_per_side"
+                    )
+                self._usage.target_full_scans += full_scans
+            self._usage.queries += 1
+        return PostgresSourceQueryCharge(self)
+
+    def consume_record(self, record_bytes: int) -> None:
+        self.consume_records((record_bytes,))
+
+    def consume_records(self, record_bytes: tuple[int, ...]) -> None:
+        if type(record_bytes) is not tuple:
+            raise TypeError("source result record bytes must be an immutable tuple")
+        for value in record_bytes:
+            _validate_nonnegative_integer(value, "source result record_bytes")
+        with self._lock:
+            self._usage.fetched_records += len(record_bytes)
+            self._usage.result_bytes += sum(record_bytes)
+            if time.monotonic_ns() >= self._deadline_nanoseconds:
+                raise PostgresReadDeadlineExceededError(
+                    "PostgreSQL source work exceeded the immutable whole-run deadline "
+                    "while receiving a result"
+                )
+            if self._usage.fetched_records > self._budgets.max_fetched_records:
+                raise PostgresSourceBudgetExceededError(
+                    "source reads exceeded immutable whole-run max_fetched_records"
+                )
+            if self._usage.result_bytes > self._budgets.max_application_result_bytes:
+                raise PostgresSourceBudgetExceededError(
+                    "source reads exceeded immutable whole-run max_application_result_bytes"
+                )
+
+    def require_result_fetch_deadline(self) -> None:
+        with self._lock:
+            _require_source_deadline(self._deadline_nanoseconds, "source result fetch")
+
+    def effective_statement_timeout_milliseconds(self) -> int:
+        remaining_nanoseconds = self._deadline_nanoseconds - time.monotonic_ns()
+        if remaining_nanoseconds <= 0:
+            raise PostgresReadDeadlineExceededError(
+                "PostgreSQL source work exceeded the immutable whole-run deadline"
+            )
+        remaining_milliseconds = max(1, remaining_nanoseconds // 1_000_000)
+        return min(self._budgets.statement_timeout_milliseconds, remaining_milliseconds)
+
+
+class PostgresSourceBudgetAttempt:
+    """Attempt-scoped view over a run-owned source budget ledger."""
+
+    def __init__(
+        self,
+        ledger: PostgresSourceBudgetLedger,
+        attempt_id: UUID,
+        baseline: PostgresSourceUsageSnapshot,
+        started_nanoseconds: int,
+    ) -> None:
+        self._ledger = ledger
+        self._attempt_id = attempt_id
+        self._baseline = baseline
+        self._started_nanoseconds = started_nanoseconds
+
+    @property
+    def attempt_id(self) -> UUID:
+        return self._attempt_id
+
+    def dispatch_query(
+        self,
+        direction: PostgresSourceDirection,
+        full_scans: int,
+    ) -> "PostgresSourceQueryCharge":
+        return self._ledger.dispatch_query(direction, full_scans)
+
+    def snapshot(self) -> PostgresSourceUsageSnapshot:
+        current = self._ledger.snapshot()
+        return PostgresSourceUsageSnapshot(
+            queries=current.queries - self._baseline.queries,
+            fetched_records=current.fetched_records - self._baseline.fetched_records,
+            result_bytes=current.result_bytes - self._baseline.result_bytes,
+            reference_full_scans=(
+                current.reference_full_scans - self._baseline.reference_full_scans
+            ),
+            target_full_scans=current.target_full_scans - self._baseline.target_full_scans,
+            elapsed_milliseconds=_elapsed_milliseconds_since(self._started_nanoseconds),
+        )
+
+    def overall_snapshot(self) -> PostgresSourceUsageSnapshot:
+        return self._ledger.snapshot()
+
+    def remaining(self) -> PostgresSourceCapacitySnapshot:
+        return self._ledger.remaining()
+
+    def read_deadline(self, statement_timeout_milliseconds: int) -> PostgresReadDeadline:
+        _validate_positive_integer(
+            statement_timeout_milliseconds,
+            "source statement_timeout_milliseconds",
+        )
+        return PostgresReadDeadline(
+            statement_timeout_milliseconds=statement_timeout_milliseconds,
+            deadline_nanoseconds=self._ledger.deadline_nanoseconds,
+        )
+
+    def effective_statement_timeout_milliseconds(self) -> int:
+        return self._ledger.effective_statement_timeout_milliseconds()
+
+
+class PostgresSourceQueryCharge:
+    """A dispatched source query whose returned records are charged as they arrive."""
+
+    def __init__(self, ledger: PostgresSourceBudgetLedger) -> None:
+        self._ledger = ledger
+
+    def consume_record(self, record_bytes: int) -> None:
+        self._ledger.consume_record(record_bytes)
+
+    def consume_records(self, record_bytes: tuple[int, ...]) -> None:
+        self._ledger.consume_records(record_bytes)
+
+    def require_fetch_deadline(self) -> None:
+        self._ledger.require_result_fetch_deadline()
+
+
+def _source_usage_snapshot(
+    usage: _PostgresSourceUsage,
+    elapsed_milliseconds: int,
+) -> PostgresSourceUsageSnapshot:
+    return PostgresSourceUsageSnapshot(
+        queries=usage.queries,
+        fetched_records=usage.fetched_records,
+        result_bytes=usage.result_bytes,
+        reference_full_scans=usage.reference_full_scans,
+        target_full_scans=usage.target_full_scans,
+        elapsed_milliseconds=elapsed_milliseconds,
+    )
+
+
+def _elapsed_milliseconds_since(started_nanoseconds: int) -> int:
+    return max(0, (time.monotonic_ns() - started_nanoseconds) // 1_000_000)
+
+
+def _require_source_deadline(deadline_nanoseconds: int, operation: str) -> None:
+    if time.monotonic_ns() >= deadline_nanoseconds:
+        raise PostgresReadDeadlineExceededError(
+            f"PostgreSQL {operation} exceeded the immutable whole-run source deadline"
+        )
+
+
+@dataclass(frozen=True, slots=True)
 class PostgresIntegerKeySummary:
     row_count: int
     null_key_count: int
@@ -356,18 +655,23 @@ class PostgresRangeFingerprintRead:
     metrics: PostgresReadMetrics
 
 
-@dataclass(frozen=True, slots=True)
+@dataclass(frozen=True, slots=True, repr=False)
 class PostgresIntegerExactRow:
     segment_id: str
     key_value: int
     key_envelope: bytes
     row_envelope: bytes
+    values: tuple[DecodedValue | None, ...]
 
     def __post_init__(self) -> None:
         _require_text(self.segment_id, "segment_id")
         _require_bounded_integer(self.key_value, "key_value", -(1 << 63), INT64_MAX)
         if type(self.key_envelope) is not bytes or type(self.row_envelope) is not bytes:
             raise PostgresDataValidationError("PostgreSQL exact comparison envelopes must be bytes")
+        if type(self.values) is not tuple:
+            raise PostgresDataValidationError(
+                "PostgreSQL exact comparison values must be an immutable tuple"
+            )
 
 
 @dataclass(frozen=True, slots=True)
@@ -416,7 +720,7 @@ class ReadContextState(StrEnum):
 
 
 type DatabaseRow = tuple[object, ...]
-type ExecutableSql = sql.SQL | sql.Composed
+type ExecutableSql = LiteralString | sql.SQL | sql.Composed
 
 
 @dataclass(frozen=True, slots=True)
@@ -437,11 +741,19 @@ class PostgresReadContext:
         profile: PostgresServerProfile,
         evidence: PostgresReadContextEvidence,
         statement_timeout_milliseconds: int,
+        source_budget: PostgresSourceBudgetAttempt,
+        direction: PostgresSourceDirection,
     ) -> None:
         self._connection = connection
         self._profile = profile
         self._evidence = evidence
         self._statement_timeout_milliseconds = statement_timeout_milliseconds
+        if not isinstance(cast(object, source_budget), PostgresSourceBudgetAttempt):
+            raise TypeError("PostgreSQL read context requires a source budget attempt")
+        if not isinstance(cast(object, direction), PostgresSourceDirection):
+            raise TypeError("PostgreSQL read context requires a source direction")
+        self._source_budget = source_budget
+        self._direction = direction
         self._state = ReadContextState.ACTIVE
         self._query_lock = Lock()
 
@@ -457,6 +769,14 @@ class PostgresReadContext:
     def state(self) -> ReadContextState:
         return self._state
 
+    @property
+    def source_budget(self) -> PostgresSourceBudgetAttempt:
+        return self._source_budget
+
+    @property
+    def source_direction(self) -> PostgresSourceDirection:
+        return self._direction
+
     def read_scalar_integer(
         self,
         statement: ExecutableSql,
@@ -470,6 +790,7 @@ class PostgresReadContext:
             1,
             max_record_bytes,
             max_total_bytes,
+            0,
         )
         if len(rows) != 1 or len(rows[0]) != 1:
             raise PostgresDataValidationError(
@@ -524,6 +845,7 @@ class PostgresReadContext:
                 len(column_names),
                 max_metadata_record_bytes,
                 max_metadata_total_bytes,
+                0,
             )
             if len(rows) != len(column_names):
                 raise PostgresMetadataError(
@@ -575,6 +897,7 @@ class PostgresReadContext:
             max_records,
             max_record_bytes,
             max_total_bytes,
+            1,
         )
         return tuple(_canonical_row_from_database(row, query) for row in rows)
 
@@ -591,6 +914,7 @@ class PostgresReadContext:
             1,
             max_record_bytes,
             max_total_bytes,
+            1,
         )
         if len(rows) != 1 or len(rows[0]) != 12:
             raise PostgresDataValidationError(
@@ -649,6 +973,7 @@ class PostgresReadContext:
         max_record_bytes: int,
         max_total_bytes: int,
         deadline: PostgresReadDeadline,
+        full_scans: int,
     ) -> PostgresIntegerKeySummaryRead:
         _validate_postgres_query(query)
         self._require_query_context(query)
@@ -659,6 +984,7 @@ class PostgresReadContext:
             max_record_bytes,
             max_total_bytes,
             deadline,
+            full_scans,
         )
         if len(rows) != 1:
             raise PostgresDataValidationError(
@@ -676,6 +1002,7 @@ class PostgresReadContext:
         max_record_bytes: int,
         max_total_bytes: int,
         deadline: PostgresReadDeadline,
+        full_scans: int,
     ) -> PostgresRangeFingerprintRead:
         _validate_postgres_query(query)
         self._require_query_context(query)
@@ -686,6 +1013,7 @@ class PostgresReadContext:
             max_record_bytes,
             max_total_bytes,
             deadline,
+            full_scans,
         )
         parsed = _range_fingerprints_from_database(rows, ranges, query, deadline)
         return PostgresRangeFingerprintRead(
@@ -702,6 +1030,7 @@ class PostgresReadContext:
         max_record_bytes: int,
         max_total_bytes: int,
         deadline: PostgresReadDeadline,
+        full_scans: int,
     ) -> PostgresIntegerExactRowsRead:
         _validate_postgres_query(query)
         self._require_query_context(query)
@@ -712,6 +1041,7 @@ class PostgresReadContext:
             max_record_bytes,
             max_total_bytes,
             deadline,
+            full_scans,
         )
         parsed = _integer_exact_rows_from_database(
             rows,
@@ -757,6 +1087,7 @@ class PostgresReadContext:
             try:
                 self._restore_session_invariants()
                 with self._connection.cursor(name=cursor_name) as cursor:
+                    self._source_budget.dispatch_query(self._direction, 0)
                     cursor.execute(statement)
                     row_type_oid = _origin_type_oid(
                         cursor.description,
@@ -796,6 +1127,7 @@ class PostgresReadContext:
             1,
             max_record_bytes,
             max_total_bytes,
+            0,
         )
         if not rows:
             raise PostgresMetadataError(
@@ -836,6 +1168,7 @@ class PostgresReadContext:
         max_records: int,
         max_record_bytes: int,
         max_total_bytes: int,
+        full_scans: int,
     ) -> tuple[DatabaseRow, ...]:
         _validate_result_limits(max_records, max_record_bytes, max_total_bytes)
         database_failure: str | None = None
@@ -846,12 +1179,14 @@ class PostgresReadContext:
             try:
                 self._restore_session_invariants()
                 with self._connection.cursor(name=cursor_name) as cursor:
+                    charge = self._source_budget.dispatch_query(self._direction, full_scans)
                     cursor.execute(statement, parameters)
                     records = _fetch_bounded_rows(
                         cursor,
                         max_records,
                         max_record_bytes,
                         max_total_bytes,
+                        charge,
                     )
             except psycopg.Error as error:
                 self._state = ReadContextState.LOST
@@ -869,6 +1204,7 @@ class PostgresReadContext:
         max_records: int,
         max_record_bytes: int,
         max_total_bytes: int,
+        full_scans: int,
     ) -> tuple[DatabaseRow, ...]:
         _validate_result_limits(max_records, max_record_bytes, max_total_bytes)
         database_failure: str | None = None
@@ -879,6 +1215,7 @@ class PostgresReadContext:
             try:
                 self._restore_session_invariants()
                 with self._connection.cursor(name=cursor_name) as cursor:
+                    charge = self._source_budget.dispatch_query(self._direction, full_scans)
                     cursor.execute(
                         _executable_statement(query.statement),
                         query.parameters,
@@ -892,6 +1229,7 @@ class PostgresReadContext:
                         max_records,
                         max_record_bytes,
                         max_total_bytes,
+                        charge,
                     )
             except psycopg.Error as error:
                 self._state = ReadContextState.LOST
@@ -910,6 +1248,7 @@ class PostgresReadContext:
         max_record_bytes: int,
         max_total_bytes: int,
         deadline: PostgresReadDeadline,
+        full_scans: int,
     ) -> tuple[DatabaseRow, ...]:
         _validate_result_limits(max_records, max_record_bytes, max_total_bytes)
         _require_postgres_read_deadline(deadline, "compiled comparison query")
@@ -919,9 +1258,12 @@ class PostgresReadContext:
             self._require_active()
             cursor_name = f"dfe_{uuid4().hex}"
             try:
-                self._restore_session_invariants()
-                self._apply_read_deadline(deadline, "compiled comparison query")
+                self._restore_session_invariants_before_deadline(
+                    deadline,
+                    "compiled comparison query",
+                )
                 with self._connection.cursor(name=cursor_name) as cursor:
+                    charge = self._source_budget.dispatch_query(self._direction, full_scans)
                     cursor.execute(
                         _executable_statement(query.statement),
                         query.parameters,
@@ -936,6 +1278,7 @@ class PostgresReadContext:
                         max_record_bytes,
                         max_total_bytes,
                         deadline,
+                        charge,
                     )
             except psycopg.Error as error:
                 self._state = ReadContextState.LOST
@@ -959,38 +1302,49 @@ class PostgresReadContext:
         max_record_bytes: int,
         max_total_bytes: int,
         deadline: PostgresReadDeadline,
+        charge: PostgresSourceQueryCharge,
     ) -> tuple[DatabaseRow, ...]:
         records: list[DatabaseRow] = []
         total_bytes = 0
         while True:
-            self._apply_read_deadline(deadline, "comparison portal fetch")
+            _require_postgres_read_deadline(deadline, "comparison portal fetch")
+            charge.require_fetch_deadline()
             remaining = max_records + 1 - len(records)
             fetch_records = min(_CURSOR_FETCH_RECORDS, remaining)
             batch = cursor.fetchmany(fetch_records)
             if not batch:
                 break
-            for row in batch:
-                if len(records) == max_records:
-                    raise PostgresResultLimitError(
-                        "PostgreSQL query exceeded the reserved record budget: "
-                        f"max_records={max_records}"
-                    )
-                record_bytes = _database_row_bytes(row)
-                if record_bytes > max_record_bytes:
-                    raise PostgresResultLimitError(
-                        "PostgreSQL query returned a record above the byte budget: "
-                        f"record_bytes={record_bytes}, max_record_bytes={max_record_bytes}"
-                    )
-                total_bytes += record_bytes
-                if total_bytes > max_total_bytes:
-                    raise PostgresResultLimitError(
-                        "PostgreSQL query exceeded the total byte budget: "
-                        f"observed_bytes={total_bytes}, max_total_bytes={max_total_bytes}"
-                    )
-                records.append(row)
+            batch_bytes = tuple(_database_row_bytes(row) for row in batch)
+            charge.consume_records(batch_bytes)
+            _require_postgres_read_deadline(deadline, "comparison portal fetch")
+            observed_records = len(records) + len(batch)
+            observed_bytes = total_bytes + sum(batch_bytes)
+            if observed_records > max_records:
+                raise PostgresResultLimitError(
+                    "PostgreSQL query exceeded the reserved record budget: "
+                    f"max_records={max_records}"
+                )
+            oversized_record = next(
+                (value for value in batch_bytes if value > max_record_bytes),
+                None,
+            )
+            if oversized_record is not None:
+                raise PostgresResultLimitError(
+                    "PostgreSQL query returned a record above the byte budget: "
+                    f"record_bytes={oversized_record}, max_record_bytes={max_record_bytes}"
+                )
+            if observed_bytes > max_total_bytes:
+                raise PostgresResultLimitError(
+                    "PostgreSQL query exceeded the total byte budget: "
+                    f"observed_bytes={observed_bytes}, max_total_bytes={max_total_bytes}"
+                )
+            total_bytes = observed_bytes
+            records.extend(batch)
+            if len(batch) < fetch_records:
+                break
         return tuple(records)
 
-    def _apply_read_deadline(
+    def _restore_session_invariants_before_deadline(
         self,
         deadline: PostgresReadDeadline,
         operation: str,
@@ -1000,9 +1354,16 @@ class PostgresReadContext:
             deadline,
             operation,
         )
-        self._connection.execute(
-            "SELECT pg_catalog.set_config('statement_timeout', %s, true)",
+        _execute_source_command(
+            self._connection,
+            "SELECT pg_catalog.set_config('search_path', 'pg_catalog', true), "
+            "pg_catalog.set_config('row_security', 'off', true), "
+            "pg_catalog.set_config('TimeZone', 'UTC', true), "
+            "pg_catalog.set_config('DateStyle', 'ISO, YMD', true), "
+            "pg_catalog.set_config('statement_timeout', %s, true)",
             (str(timeout_milliseconds),),
+            self._source_budget,
+            self._direction,
         )
 
     def _execute_origin_checked_query(
@@ -1023,6 +1384,7 @@ class PostgresReadContext:
             try:
                 self._restore_session_invariants()
                 with self._connection.cursor(name=cursor_name) as cursor:
+                    charge = self._source_budget.dispatch_query(self._direction, 0)
                     cursor.execute(statement, parameters)
                     _require_relation_manifest_description(
                         cursor.description,
@@ -1033,6 +1395,7 @@ class PostgresReadContext:
                         max_records,
                         max_record_bytes,
                         max_total_bytes,
+                        charge,
                     )
             except psycopg.Error as error:
                 self._state = ReadContextState.LOST
@@ -1048,14 +1411,28 @@ class PostgresReadContext:
         return records
 
     def _restore_session_invariants(self) -> None:
-        self._connection.execute("SET LOCAL search_path TO pg_catalog")
-        self._connection.execute("SET LOCAL row_security TO off")
-        self._connection.execute("SET LOCAL TIME ZONE 'UTC'")
-        self._connection.execute("SET LOCAL DateStyle TO 'ISO, YMD'")
-        self._connection.execute(
-            "SELECT pg_catalog.set_config('statement_timeout', %s, true)",
-            (str(self._statement_timeout_milliseconds),),
+        _execute_source_command(
+            self._connection,
+            "SELECT pg_catalog.set_config('search_path', 'pg_catalog', true), "
+            "pg_catalog.set_config('row_security', 'off', true), "
+            "pg_catalog.set_config('TimeZone', 'UTC', true), "
+            "pg_catalog.set_config('DateStyle', 'ISO, YMD', true), "
+            "pg_catalog.set_config('statement_timeout', %s, true)",
+            (str(self._effective_statement_timeout_milliseconds()),),
+            self._source_budget,
+            self._direction,
         )
+
+    def _effective_statement_timeout_milliseconds(self) -> int:
+        remaining_nanoseconds = (
+            self._source_budget.remaining().deadline_nanoseconds - time.monotonic_ns()
+        )
+        if remaining_nanoseconds <= 0:
+            raise PostgresReadDeadlineExceededError(
+                "PostgreSQL session setup exceeded the immutable whole-run source deadline"
+            )
+        remaining_milliseconds = max(1, remaining_nanoseconds // 1_000_000)
+        return min(self._statement_timeout_milliseconds, remaining_milliseconds)
 
     def _require_query_context(self, query: PostgresQuery) -> None:
         if query.inspected_relation.context_id != self._evidence.context_id:
@@ -1111,6 +1488,14 @@ class PostgresProtectedReadContext:
     def state(self) -> ReadContextState:
         return self._read_context.state
 
+    @property
+    def source_budget(self) -> PostgresSourceBudgetAttempt:
+        return self._read_context.source_budget
+
+    @property
+    def source_direction(self) -> PostgresSourceDirection:
+        return self._read_context.source_direction
+
     def read_canonical_rows(
         self,
         protected_relation: PostgresProtectedRelationInspection,
@@ -1160,6 +1545,7 @@ class PostgresProtectedReadContext:
         max_record_bytes: int,
         max_total_bytes: int,
         deadline: PostgresReadDeadline,
+        full_scans: int,
     ) -> PostgresIntegerKeySummaryRead:
         self._require_protected_relation(protected_relation)
         query = build_postgres_integer_key_summary_query(
@@ -1174,6 +1560,7 @@ class PostgresProtectedReadContext:
             max_record_bytes,
             max_total_bytes,
             deadline,
+            full_scans,
         )
 
     def read_integer_range_fingerprints(
@@ -1186,6 +1573,7 @@ class PostgresProtectedReadContext:
         max_record_bytes: int,
         max_total_bytes: int,
         deadline: PostgresReadDeadline,
+        full_scans: int,
     ) -> PostgresRangeFingerprintRead:
         self._require_protected_relation(protected_relation)
         query = build_postgres_integer_range_fingerprint_query(
@@ -1202,6 +1590,7 @@ class PostgresProtectedReadContext:
             max_record_bytes,
             max_total_bytes,
             deadline,
+            full_scans,
         )
 
     def read_integer_range_rows(
@@ -1215,6 +1604,7 @@ class PostgresProtectedReadContext:
         max_record_bytes: int,
         max_total_bytes: int,
         deadline: PostgresReadDeadline,
+        full_scans: int,
     ) -> PostgresIntegerExactRowsRead:
         self._require_protected_relation(protected_relation)
         query = build_postgres_integer_range_rows_query(
@@ -1233,6 +1623,7 @@ class PostgresProtectedReadContext:
             max_record_bytes,
             max_total_bytes,
             deadline,
+            full_scans,
         )
 
     def read_relation_manifest(
@@ -1445,11 +1836,13 @@ def _validate_protected_context_closure(
 def open_postgres_read_context(
     settings: PostgresConnectionSettings,
     retry_policy: PostgresRetryPolicy,
+    source_budget: PostgresSourceBudgetAttempt,
+    direction: PostgresSourceDirection,
 ) -> PostgresReadContext:
     failure_message: str | None = None
     for attempt in range(1, retry_policy.max_attempts + 1):
         try:
-            return _open_once(settings)
+            return _open_once(settings, source_budget, direction)
         except psycopg.OperationalError as error:
             failure_message = _connection_error_message(settings, attempt, error)
             LOGGER.warning(
@@ -1482,6 +1875,8 @@ def open_postgres_protected_read_context(
     retry_policy: PostgresRetryPolicy,
     acquisitions: tuple[PostgresRelationAcquisition, ...],
     lock_timeout_milliseconds: int,
+    source_budget: PostgresSourceBudgetAttempt,
+    direction: PostgresSourceDirection,
 ) -> PostgresProtectedReadContext:
     ordered_acquisitions = _validate_and_order_acquisitions(acquisitions)
     _validate_protected_lock_timeout(
@@ -1489,13 +1884,15 @@ def open_postgres_protected_read_context(
         settings.statement_timeout_milliseconds,
     )
     for acquisition_attempt in range(1, retry_policy.max_attempts + 1):
-        connection = _connect_protected(settings, retry_policy)
+        connection = _connect_protected(settings, retry_policy, source_budget)
         try:
             return _open_protected_once(
                 connection,
                 settings,
                 ordered_acquisitions,
                 lock_timeout_milliseconds,
+                source_budget,
+                direction,
             )
         except PostgresAcquisitionRaceError as error:
             LOGGER.warning(
@@ -1530,6 +1927,7 @@ def open_postgres_protected_read_context(
 def _connect_protected(
     settings: PostgresConnectionSettings,
     retry_policy: PostgresRetryPolicy,
+    source_budget: PostgresSourceBudgetAttempt,
 ) -> psycopg.Connection[DatabaseRow]:
     failure_message: str | None = None
     for attempt in range(1, retry_policy.max_attempts + 1):
@@ -1543,7 +1941,10 @@ def _connect_protected(
                 sslmode=settings.sslmode.value,
                 connect_timeout=settings.connect_timeout_seconds,
                 application_name=settings.application_name,
-                options=f"-c statement_timeout={settings.statement_timeout_milliseconds}",
+                options=(
+                    "-c statement_timeout="
+                    f"{min(settings.statement_timeout_milliseconds, source_budget.effective_statement_timeout_milliseconds())}"
+                ),
                 autocommit=True,
                 row_factory=tuple_row,
             )
@@ -1575,7 +1976,11 @@ def _connect_protected(
     raise PostgresConnectionError(failure_message)
 
 
-def _open_once(settings: PostgresConnectionSettings) -> PostgresReadContext:
+def _open_once(
+    settings: PostgresConnectionSettings,
+    source_budget: PostgresSourceBudgetAttempt,
+    direction: PostgresSourceDirection,
+) -> PostgresReadContext:
     connection = psycopg.connect(
         host=settings.host,
         port=settings.port,
@@ -1590,16 +1995,26 @@ def _open_once(settings: PostgresConnectionSettings) -> PostgresReadContext:
     )
     started_at = datetime.now(UTC)
     try:
-        connection.execute("BEGIN ISOLATION LEVEL REPEATABLE READ READ ONLY")
-        connection.execute("SET LOCAL search_path TO pg_catalog")
-        connection.execute("SET LOCAL row_security TO off")
-        connection.execute("SET LOCAL TIME ZONE 'UTC'")
-        connection.execute("SET LOCAL DateStyle TO 'ISO, YMD'")
-        connection.execute(
-            "SELECT pg_catalog.set_config('statement_timeout', %s, true)",
-            (str(settings.statement_timeout_milliseconds),),
+        _execute_source_command(
+            connection,
+            "BEGIN ISOLATION LEVEL REPEATABLE READ READ ONLY",
+            (),
+            source_budget,
+            direction,
         )
-        row = connection.execute(
+        _execute_source_command(
+            connection,
+            "SELECT pg_catalog.set_config('search_path', 'pg_catalog', true), "
+            "pg_catalog.set_config('row_security', 'off', true), "
+            "pg_catalog.set_config('TimeZone', 'UTC', true), "
+            "pg_catalog.set_config('DateStyle', 'ISO, YMD', true), "
+            "pg_catalog.set_config('statement_timeout', %s, true)",
+            (str(source_budget.effective_statement_timeout_milliseconds()),),
+            source_budget,
+            direction,
+        )
+        rows = _execute_setup_bounded(
+            connection,
             "SELECT pg_catalog.current_setting('server_version'), "
             "pg_catalog.current_setting('server_version_num')::integer, "
             "pg_catalog.current_setting('server_encoding'), "
@@ -1609,10 +2024,17 @@ def _open_once(settings: PostgresConnectionSettings) -> PostgresReadContext:
             "pg_catalog.current_setting('max_identifier_length')::integer, "
             "pg_catalog.pg_backend_pid(), pg_catalog.pg_current_snapshot()::text, "
             "pg_catalog.current_setting('transaction_isolation'), "
-            "pg_catalog.current_setting('transaction_read_only') = 'on'"
-        ).fetchone()
-        if row is None:
+            "pg_catalog.current_setting('transaction_read_only') = 'on'",
+            (),
+            1,
+            4096,
+            4096,
+            source_budget,
+            direction,
+        )
+        if not rows:
             raise PostgresDataValidationError("PostgreSQL capability probe returned no row")
+        row = rows[0]
         profile, evidence = _profile_and_evidence(row, started_at)
         _validate_profile(profile, row)
     except psycopg.Error:
@@ -1626,6 +2048,8 @@ def _open_once(settings: PostgresConnectionSettings) -> PostgresReadContext:
         profile,
         evidence,
         settings.statement_timeout_milliseconds,
+        source_budget,
+        direction,
     )
 
 
@@ -1634,29 +2058,56 @@ def _open_protected_once(
     settings: PostgresConnectionSettings,
     acquisitions: tuple[PostgresRelationAcquisition, ...],
     lock_timeout_milliseconds: int,
+    source_budget: PostgresSourceBudgetAttempt,
+    direction: PostgresSourceDirection,
 ) -> PostgresProtectedReadContext:
     succeeded = False
     try:
         candidates = tuple(
-            _discover_relation_candidate(connection, acquisition) for acquisition in acquisitions
+            _discover_relation_candidate(connection, acquisition, source_budget, direction)
+            for acquisition in acquisitions
         )
         lock_candidates = _unique_lock_candidates(candidates)
         started_at = datetime.now(UTC)
-        connection.execute("BEGIN ISOLATION LEVEL REPEATABLE READ READ ONLY")
-        _configure_protected_transaction(
+        _execute_source_command(
             connection,
-            settings.statement_timeout_milliseconds,
-            lock_timeout_milliseconds,
+            "BEGIN ISOLATION LEVEL REPEATABLE READ READ ONLY",
+            (),
+            source_budget,
+            direction,
         )
         for candidate in lock_candidates:
-            _lock_candidate_relation(connection, candidate)
+            _configure_protected_lock_timeouts(
+                connection,
+                settings.statement_timeout_milliseconds,
+                lock_timeout_milliseconds,
+                source_budget,
+                direction,
+            )
+            _lock_candidate_relation(connection, candidate, source_budget, direction)
+        _configure_protected_statement_timeout(
+            connection,
+            settings.statement_timeout_milliseconds,
+            source_budget,
+            direction,
+        )
+        _configure_protected_snapshot_invariants(connection, source_budget, direction)
         profile, evidence = _capture_protected_snapshot(
             connection,
             lock_candidates,
             started_at,
+            source_budget,
+            direction,
         )
         protected_relations = tuple(
-            _inspect_protected_candidate(connection, candidate, profile, evidence)
+            _inspect_protected_candidate(
+                connection,
+                candidate,
+                profile,
+                evidence,
+                source_budget,
+                direction,
+            )
             for candidate in candidates
         )
         read_context = PostgresReadContext(
@@ -1664,6 +2115,8 @@ def _open_protected_once(
             profile,
             evidence,
             settings.statement_timeout_milliseconds,
+            source_budget,
+            direction,
         )
         acquisition_receipt = _ProtectedAcquisitionReceipt(
             read_context=read_context,
@@ -1717,6 +2170,8 @@ def _validate_protected_lock_timeout(
 def _discover_relation_candidate(
     connection: psycopg.Connection[DatabaseRow],
     acquisition: PostgresRelationAcquisition,
+    source_budget: PostgresSourceBudgetAttempt,
+    direction: PostgresSourceDirection,
 ) -> _PostgresRelationCandidate:
     statement = sql.SQL(
         "SELECT c.oid::bigint, c.reltype::bigint, n.oid::bigint, n.nspname, c.relname, "
@@ -1728,7 +2183,15 @@ def _discover_relation_candidate(
         "JOIN pg_catalog.pg_namespace AS n ON n.oid = c.relnamespace "
         "WHERE n.nspname = %s AND c.relname = %s"
     )
-    rows = connection.execute(statement, acquisition.relation.components).fetchall()
+    rows = _execute_pretransaction_candidate_bounded(
+        connection,
+        statement,
+        acquisition.relation.components,
+        acquisition.max_metadata_record_bytes,
+        acquisition.max_metadata_total_bytes,
+        source_budget,
+        direction,
+    )
     if not rows:
         raise PostgresMetadataError(
             "PostgreSQL protected relation is missing or inaccessible during candidate "
@@ -1844,36 +2307,79 @@ def _unique_lock_candidates(
     return tuple(unique)
 
 
-def _configure_protected_transaction(
+def _configure_protected_lock_timeouts(
     connection: psycopg.Connection[DatabaseRow],
     statement_timeout_milliseconds: int,
     lock_timeout_milliseconds: int,
+    source_budget: PostgresSourceBudgetAttempt,
+    direction: PostgresSourceDirection,
 ) -> None:
-    connection.execute("SET LOCAL search_path TO pg_catalog")
-    connection.execute("SET LOCAL row_security TO off")
-    connection.execute("SET LOCAL TIME ZONE 'UTC'")
-    connection.execute("SET LOCAL DateStyle TO 'ISO, YMD'")
-    connection.execute(
-        sql.SQL("SET LOCAL statement_timeout TO {}").format(
-            sql.Literal(f"{statement_timeout_milliseconds}ms")
-        )
+    effective_statement_timeout = _configure_protected_statement_timeout(
+        connection,
+        statement_timeout_milliseconds,
+        source_budget,
+        direction,
     )
-    connection.execute(
-        sql.SQL("SET LOCAL lock_timeout TO {}").format(
-            sql.Literal(f"{lock_timeout_milliseconds}ms")
-        )
+    effective_lock_timeout = min(lock_timeout_milliseconds, effective_statement_timeout)
+    _execute_source_command(
+        connection,
+        sql.SQL("SET LOCAL lock_timeout = {}").format(sql.Literal(f"{effective_lock_timeout}ms")),
+        (),
+        source_budget,
+        direction,
+    )
+
+
+def _configure_protected_statement_timeout(
+    connection: psycopg.Connection[DatabaseRow],
+    statement_timeout_milliseconds: int,
+    source_budget: PostgresSourceBudgetAttempt,
+    direction: PostgresSourceDirection,
+) -> int:
+    effective_statement_timeout = min(
+        statement_timeout_milliseconds,
+        source_budget.effective_statement_timeout_milliseconds(),
+    )
+    _execute_source_command(
+        connection,
+        sql.SQL("SET LOCAL statement_timeout = {}").format(
+            sql.Literal(f"{effective_statement_timeout}ms")
+        ),
+        (),
+        source_budget,
+        direction,
+    )
+    return effective_statement_timeout
+
+
+def _configure_protected_snapshot_invariants(
+    connection: psycopg.Connection[DatabaseRow],
+    source_budget: PostgresSourceBudgetAttempt,
+    direction: PostgresSourceDirection,
+) -> None:
+    _execute_source_command(
+        connection,
+        "SELECT pg_catalog.set_config('search_path', 'pg_catalog', true), "
+        "pg_catalog.set_config('row_security', 'off', true), "
+        "pg_catalog.set_config('TimeZone', 'UTC', true), "
+        "pg_catalog.set_config('DateStyle', 'ISO, YMD', true)",
+        (),
+        source_budget,
+        direction,
     )
 
 
 def _lock_candidate_relation(
     connection: psycopg.Connection[DatabaseRow],
     candidate: _PostgresRelationCandidate,
+    source_budget: PostgresSourceBudgetAttempt,
+    direction: PostgresSourceDirection,
 ) -> None:
     statement = sql.SQL("LOCK TABLE ONLY {} IN ACCESS SHARE MODE").format(
         sql.Identifier(*candidate.acquisition.relation.components)
     )
     try:
-        connection.execute(statement)
+        _execute_source_command(connection, statement, (), source_budget, direction)
     except (
         psycopg.errors.UndefinedTable,
         psycopg.errors.InvalidSchemaName,
@@ -1892,6 +2398,8 @@ def _capture_protected_snapshot(
     connection: psycopg.Connection[DatabaseRow],
     lock_candidates: tuple[_PostgresRelationCandidate, ...],
     started_at: datetime,
+    source_budget: PostgresSourceBudgetAttempt,
+    direction: PostgresSourceDirection,
 ) -> tuple[PostgresServerProfile, PostgresProtectedReadContextEvidence]:
     lock_checks = sql.SQL(", ").join(
         sql.SQL(
@@ -1918,11 +2426,27 @@ def _capture_protected_snapshot(
     parameters: tuple[PostgresParameter, ...] = tuple(
         candidate.relation_oid for candidate in lock_candidates
     )
-    row = connection.execute(statement, parameters).fetchone()
-    if row is None:
+    max_record_bytes = max(
+        candidate.acquisition.max_metadata_record_bytes for candidate in lock_candidates
+    )
+    max_total_bytes = max(
+        candidate.acquisition.max_metadata_total_bytes for candidate in lock_candidates
+    )
+    rows = _execute_setup_bounded(
+        connection,
+        statement,
+        parameters,
+        1,
+        max_record_bytes,
+        max_total_bytes,
+        source_budget,
+        direction,
+    )
+    if not rows:
         raise PostgresDataValidationError(
             "PostgreSQL protected snapshot and lock probe returned no row"
         )
+    row = rows[0]
     expected_fields = 11 + len(lock_candidates)
     if len(row) != expected_fields:
         raise PostgresDataValidationError(
@@ -1968,6 +2492,8 @@ def _inspect_protected_candidate(
     candidate: _PostgresRelationCandidate,
     profile: PostgresServerProfile,
     evidence: PostgresProtectedReadContextEvidence,
+    source_budget: PostgresSourceBudgetAttempt,
+    direction: PostgresSourceDirection,
 ) -> PostgresProtectedRelationInspection:
     acquisition = candidate.acquisition
     statement = sql.SQL(
@@ -1986,6 +2512,8 @@ def _inspect_protected_candidate(
         1,
         acquisition.max_metadata_record_bytes,
         acquisition.max_metadata_total_bytes,
+        source_budget,
+        direction,
     )
     if not identity_rows:
         raise PostgresAcquisitionRaceError(
@@ -2066,6 +2594,8 @@ def _inspect_protected_candidate(
             len(acquisition.column_names),
             acquisition.max_metadata_record_bytes,
             acquisition.max_metadata_total_bytes,
+            source_budget,
+            direction,
         )
         if len(metadata_rows) != len(acquisition.column_names):
             raise PostgresMetadataError(
@@ -2109,17 +2639,94 @@ def _execute_setup_bounded(
     max_records: int,
     max_record_bytes: int,
     max_total_bytes: int,
+    source_budget: PostgresSourceBudgetAttempt,
+    direction: PostgresSourceDirection,
 ) -> tuple[DatabaseRow, ...]:
     _validate_result_limits(max_records, max_record_bytes, max_total_bytes)
+    _set_source_statement_timeout(connection, source_budget, direction)
     cursor_name = f"dfe_{uuid4().hex}"
     with connection.cursor(name=cursor_name) as cursor:
+        charge = source_budget.dispatch_query(direction, 0)
         cursor.execute(statement, parameters)
         return _fetch_bounded_rows(
             cursor,
             max_records,
             max_record_bytes,
             max_total_bytes,
+            charge,
         )
+
+
+def _execute_pretransaction_candidate_bounded(
+    connection: psycopg.Connection[DatabaseRow],
+    statement: ExecutableSql,
+    parameters: tuple[PostgresParameter, ...],
+    max_record_bytes: int,
+    max_total_bytes: int,
+    source_budget: PostgresSourceBudgetAttempt,
+    direction: PostgresSourceDirection,
+) -> tuple[DatabaseRow, ...]:
+    _validate_result_limits(1, max_record_bytes, max_total_bytes)
+    _set_source_statement_timeout(connection, source_budget, direction)
+    charge = source_budget.dispatch_query(direction, 0)
+    with connection.cursor() as cursor:
+        cursor.execute(statement, parameters)
+        charge.require_fetch_deadline()
+        rows = tuple(cursor.fetchall())
+    row_bytes = tuple(_database_row_bytes(row) for row in rows)
+    charge.consume_records(row_bytes)
+    if len(rows) > 1:
+        raise PostgresResultLimitError(
+            "PostgreSQL pretransaction candidate query exceeded max_records=1"
+        )
+    oversized_record = next(
+        (value for value in row_bytes if value > max_record_bytes),
+        None,
+    )
+    if oversized_record is not None:
+        raise PostgresResultLimitError(
+            "PostgreSQL pretransaction candidate query returned a record above the byte budget: "
+            f"record_bytes={oversized_record}, max_record_bytes={max_record_bytes}"
+        )
+    observed_bytes = sum(row_bytes)
+    if observed_bytes > max_total_bytes:
+        raise PostgresResultLimitError(
+            "PostgreSQL pretransaction candidate query exceeded the total byte budget: "
+            f"observed_bytes={observed_bytes}, max_total_bytes={max_total_bytes}"
+        )
+    return rows
+
+
+def _execute_source_command(
+    connection: psycopg.Connection[DatabaseRow],
+    statement: ExecutableSql,
+    parameters: tuple[PostgresParameter, ...],
+    source_budget: PostgresSourceBudgetAttempt,
+    direction: PostgresSourceDirection,
+) -> None:
+    charge = source_budget.dispatch_query(direction, 0)
+    with connection.cursor() as cursor:
+        cursor.execute(statement, parameters)
+        if cursor.description is None:
+            return
+        charge.require_fetch_deadline()
+        rows = cursor.fetchall()
+        charge.consume_records(tuple(_database_row_bytes(row) for row in rows))
+
+
+def _set_source_statement_timeout(
+    connection: psycopg.Connection[DatabaseRow],
+    source_budget: PostgresSourceBudgetAttempt,
+    direction: PostgresSourceDirection,
+) -> None:
+    timeout_milliseconds = source_budget.effective_statement_timeout_milliseconds()
+    _execute_source_command(
+        connection,
+        "SELECT pg_catalog.set_config('statement_timeout', %s, false)",
+        (str(timeout_milliseconds),),
+        source_budget,
+        direction,
+    )
 
 
 def _validate_materialized_row_budget(
@@ -2748,6 +3355,7 @@ def _integer_exact_rows_from_database(
                 key_value=key_value,
                 key_envelope=key_envelope,
                 row_envelope=row_envelope,
+                values=row_values,
             )
         )
     _require_postgres_read_deadline(deadline, "exact-row decoding")
@@ -2865,34 +3473,43 @@ def _fetch_bounded_rows(
     max_records: int,
     max_record_bytes: int,
     max_total_bytes: int,
+    charge: PostgresSourceQueryCharge,
 ) -> tuple[DatabaseRow, ...]:
     records: list[DatabaseRow] = []
     total_bytes = 0
     while True:
+        charge.require_fetch_deadline()
         remaining = max_records + 1 - len(records)
         fetch_records = min(_CURSOR_FETCH_RECORDS, remaining)
         batch = cursor.fetchmany(fetch_records)
         if not batch:
             break
-        for row in batch:
-            if len(records) == max_records:
-                raise PostgresResultLimitError(
-                    "PostgreSQL query exceeded the reserved record budget: "
-                    f"max_records={max_records}"
-                )
-            record_bytes = _database_row_bytes(row)
-            if record_bytes > max_record_bytes:
-                raise PostgresResultLimitError(
-                    "PostgreSQL query returned a record above the byte budget: "
-                    f"record_bytes={record_bytes}, max_record_bytes={max_record_bytes}"
-                )
-            total_bytes += record_bytes
-            if total_bytes > max_total_bytes:
-                raise PostgresResultLimitError(
-                    "PostgreSQL query exceeded the total byte budget: "
-                    f"observed_bytes={total_bytes}, max_total_bytes={max_total_bytes}"
-                )
-            records.append(row)
+        batch_bytes = tuple(_database_row_bytes(row) for row in batch)
+        charge.consume_records(batch_bytes)
+        observed_records = len(records) + len(batch)
+        observed_bytes = total_bytes + sum(batch_bytes)
+        if observed_records > max_records:
+            raise PostgresResultLimitError(
+                f"PostgreSQL query exceeded the reserved record budget: max_records={max_records}"
+            )
+        oversized_record = next(
+            (value for value in batch_bytes if value > max_record_bytes),
+            None,
+        )
+        if oversized_record is not None:
+            raise PostgresResultLimitError(
+                "PostgreSQL query returned a record above the byte budget: "
+                f"record_bytes={oversized_record}, max_record_bytes={max_record_bytes}"
+            )
+        if observed_bytes > max_total_bytes:
+            raise PostgresResultLimitError(
+                "PostgreSQL query exceeded the total byte budget: "
+                f"observed_bytes={observed_bytes}, max_total_bytes={max_total_bytes}"
+            )
+        total_bytes = observed_bytes
+        records.extend(batch)
+        if len(batch) < fetch_records:
+            break
     return tuple(records)
 
 

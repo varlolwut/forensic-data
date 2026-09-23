@@ -9,6 +9,7 @@ _MIGRATION_RESOURCES: Final[tuple[tuple[int, str], ...]] = (
     (1, "0001_initial.sql"),
     (2, "0002_run_lifecycle.sql"),
     (3, "0003_completed_comparisons.sql"),
+    (4, "0004_retained_anomalies.sql"),
 )
 
 

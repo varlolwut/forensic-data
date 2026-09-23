@@ -29,6 +29,10 @@ from forensic_data.canonical import (
     Normalization,
     TimestampParameters,
 )
+from forensic_data.comparison import (
+    CompletedComparisonArtifact,
+    execute_postgres_integer_key_comparison,
+)
 from forensic_data.contracts import load_contract_config
 from forensic_data.contracts.model import (
     EvidenceDefinition,
@@ -47,8 +51,10 @@ from forensic_data.persistence.errors import (
     InputCutMismatchError,
     LifecycleOperationConflictError,
     LifecycleTransactionError,
+    RunInvocationContinuationError,
     RunLifecycleStateError,
     RunRequestConflictError,
+    StoredLifecycleIntegrityError,
 )
 from forensic_data.persistence.lifecycle import (
     AlignedInputCutPersistence,
@@ -61,8 +67,10 @@ from forensic_data.persistence.lifecycle import (
     RunAttemptRecord,
     claim_postgres_run,
     close_postgres_read_context,
+    completed_comparison_persistence_from_artifact,
     persist_postgres_aligned_input_cut,
     persist_postgres_read_context,
+    publish_postgres_completed_comparison,
     publish_postgres_terminal_error_attempt,
     read_postgres_history,
     record_postgres_retryable_incomplete_attempt,
@@ -82,6 +90,9 @@ from forensic_data.postgres import (
     PostgresProtectedRelationInspection,
     PostgresRelationAcquisition,
     PostgresRetryPolicy,
+    PostgresSourceBudgetAttempt,
+    PostgresSourceBudgetLedger,
+    PostgresSourceDirection,
     open_postgres_protected_read_context,
 )
 from forensic_data.postgres_sql import PostgresRelation
@@ -118,6 +129,7 @@ def test_postgres_lifecycle_reconciles_fences_cuts_and_terminal_publication() ->
     with disposable_metadata_database(requested) as settings:
         migrate_postgres_metadata(settings.migrator, _NO_RETRY, 5_000)
         config = load_contract_config(_CONTRACT_PATH)
+        execution = replace(config.execution, max_queries=500)
         check = config.checks[0]
         registration = register_postgres_metadata(
             settings.writer,
@@ -131,7 +143,7 @@ def test_postgres_lifecycle_reconciles_fences_cuts_and_terminal_publication() ->
             request_id,
             registration,
             check,
-            config.execution,
+            execution,
             config.evidence,
         )
 
@@ -162,7 +174,7 @@ def test_postgres_lifecycle_reconciles_fences_cuts_and_terminal_publication() ->
             scope=scope,
             reference_expected_batch_id=_REFERENCE_BATCH,
             target_expected_batch_id="different-target-batch",
-            execution_policy=config.execution,
+            execution_policy=execution,
             evidence_policy=config.evidence,
         )
         with pytest.raises(RunRequestConflictError):
@@ -185,7 +197,7 @@ def test_postgres_lifecycle_reconciles_fences_cuts_and_terminal_publication() ->
             first_start_operation,
             first_owner,
             first_expiry,
-            config.execution,
+            execution,
         )
         with pytest.raises(ActiveRunAttemptError):
             start_postgres_run_attempt(
@@ -196,7 +208,7 @@ def test_postgres_lifecycle_reconciles_fences_cuts_and_terminal_publication() ->
                 uuid4(),
                 uuid4(),
                 first_expiry,
-                config.execution,
+                execution,
             )
         first_renewal_operation = uuid4()
         first_renewed = renew_postgres_run_attempt(
@@ -222,7 +234,7 @@ def test_postgres_lifecycle_reconciles_fences_cuts_and_terminal_publication() ->
             first_start_operation,
             first_owner,
             first_expiry,
-            config.execution,
+            execution,
         )
         assert start_replay.lease_revision == 2
         old_renewal_replay = renew_postgres_run_attempt(
@@ -242,12 +254,15 @@ def test_postgres_lifecycle_reconciles_fences_cuts_and_terminal_publication() ->
                 first_expiry + timedelta(minutes=3),
             )
 
+        source_budget_ledger = PostgresSourceBudgetLedger(execution)
+        first_source_budget = source_budget_ledger.start_attempt(first.attempt_id)
         first_reference = _acquire_side(
             settings.writer,
             check,
             PlanDirection.REFERENCE,
             scope.scope_digest,
             _REFERENCE_BATCH,
+            first_source_budget,
         )
         first_target = _acquire_side(
             settings.writer,
@@ -255,6 +270,7 @@ def test_postgres_lifecycle_reconciles_fences_cuts_and_terminal_publication() ->
             PlanDirection.TARGET,
             scope.scope_digest,
             _TARGET_BATCH,
+            first_source_budget,
         )
         cut_binding_operation = uuid4()
         try:
@@ -375,6 +391,7 @@ def test_postgres_lifecycle_reconciles_fences_cuts_and_terminal_publication() ->
             PlanDirection.REFERENCE,
             scope.scope_digest,
             _REFERENCE_BATCH,
+            first_source_budget,
         )
         unpersisted_definition = _context_definition(
             registration.reference_dataset,
@@ -389,6 +406,18 @@ def test_postgres_lifecycle_reconciles_fences_cuts_and_terminal_publication() ->
                 twice_renewed,
                 unpersisted_definition,
             )
+        first_remaining = source_budget_ledger.remaining()
+        first_usage = first_source_budget.overall_snapshot()
+        assert first_usage.queries > 0
+        assert first_remaining.queries == execution.max_queries - first_usage.queries
+        assert (
+            first_remaining.fetched_records
+            == execution.max_fetched_records - first_usage.fetched_records
+        )
+        assert (
+            first_remaining.result_bytes
+            == execution.max_application_result_bytes - first_usage.result_bytes
+        )
 
         retryable = record_postgres_retryable_incomplete_attempt(
             settings.writer,
@@ -401,8 +430,22 @@ def test_postgres_lifecycle_reconciles_fences_cuts_and_terminal_publication() ->
         assert retryable.status is AttemptStatus.INCOMPLETE
 
         second_start_operation = uuid4()
-        second_owner = uuid4()
+        second_owner = first_owner
         second_expiry = datetime.now(UTC) + timedelta(minutes=5)
+        with pytest.raises(
+            RunInvocationContinuationError,
+            match="inspect durable history and use a new request UUID",
+        ):
+            start_postgres_run_attempt(
+                settings.writer,
+                _NO_RETRY,
+                run,
+                uuid4(),
+                uuid4(),
+                uuid4(),
+                second_expiry,
+                execution,
+            )
         second = start_postgres_run_attempt(
             settings.writer,
             _NO_RETRY,
@@ -411,8 +454,10 @@ def test_postgres_lifecycle_reconciles_fences_cuts_and_terminal_publication() ->
             second_start_operation,
             second_owner,
             second_expiry,
-            config.execution,
+            execution,
         )
+        with connect_writer(settings.admin) as connection:
+            connection.execute("UPDATE dfe_demo.target_orders SET amount = 11.00")
         active_history = read_postgres_history(
             settings.reader,
             _NO_RETRY,
@@ -432,12 +477,14 @@ def test_postgres_lifecycle_reconciles_fences_cuts_and_terminal_publication() ->
             is StoredResultAvailability.NOT_CREATED
         )
         assert active_by_attempt[second.attempt_id].stored_result is None
+        second_source_budget = source_budget_ledger.start_attempt(second.attempt_id)
         second_reference = _acquire_side(
             settings.writer,
             check,
             PlanDirection.REFERENCE,
             scope.scope_digest,
             _REFERENCE_BATCH,
+            second_source_budget,
         )
         second_target = _acquire_side(
             settings.writer,
@@ -445,6 +492,7 @@ def test_postgres_lifecycle_reconciles_fences_cuts_and_terminal_publication() ->
             PlanDirection.TARGET,
             scope.scope_digest,
             _TARGET_BATCH,
+            second_source_budget,
         )
         try:
             second_reference_context = persist_postgres_read_context(
@@ -499,6 +547,43 @@ def test_postgres_lifecycle_reconciles_fences_cuts_and_terminal_publication() ->
                 ),
             )
             assert same_cut.input_cut.input_cut_digest == cut.input_cut_digest
+            comparison_artifact = execute_postgres_integer_key_comparison(
+                second_reference.context,
+                second_reference.dataset_relation,
+                second_target.context,
+                second_target.dataset_relation,
+                check,
+                scope,
+                second_cut,
+                execution,
+                config.evidence,
+                second_source_budget,
+            )
+            assert isinstance(comparison_artifact, CompletedComparisonArtifact)
+            second_remaining = source_budget_ledger.remaining()
+            assert comparison_artifact.metrics.queries > 0
+            assert comparison_artifact.metrics.fetched_records > 0
+            assert comparison_artifact.metrics.result_bytes > 0
+            assert (
+                second_remaining.queries
+                == first_remaining.queries - comparison_artifact.metrics.queries
+            )
+            assert (
+                second_remaining.fetched_records
+                == first_remaining.fetched_records - comparison_artifact.metrics.fetched_records
+            )
+            assert (
+                second_remaining.result_bytes
+                == first_remaining.result_bytes - comparison_artifact.metrics.result_bytes
+            )
+            assert (
+                second_remaining.reference_full_scans
+                == first_remaining.reference_full_scans - comparison_artifact.reference_full_scans
+            )
+            assert (
+                second_remaining.target_full_scans
+                == first_remaining.target_full_scans - comparison_artifact.target_full_scans
+            )
             close_postgres_read_context(
                 settings.writer,
                 _NO_RETRY,
@@ -518,6 +603,37 @@ def test_postgres_lifecycle_reconciles_fences_cuts_and_terminal_publication() ->
         finally:
             second_reference.context.close()
             second_target.context.close()
+
+        mixed_cut = replace(
+            same_cut,
+            observation_ids=(
+                first_persisted_cut.observation_ids[0],
+                same_cut.observation_ids[1],
+            ),
+        )
+        mixed_definition, mixed_segments, mixed_anomalies = (
+            completed_comparison_persistence_from_artifact(
+                second,
+                mixed_cut,
+                comparison_artifact,
+            )
+        )
+        assert len(mixed_anomalies) == 1
+        with pytest.raises(
+            StoredLifecycleIntegrityError,
+            match="observation differs from its bound context, cut, or scope",
+        ):
+            publish_postgres_completed_comparison(
+                settings.writer,
+                _NO_RETRY,
+                second,
+                uuid4(),
+                mixed_definition,
+                mixed_segments,
+                mixed_anomalies,
+                datetime.now(UTC),
+            )
+        _assert_attempt_has_no_comparison(settings, second.attempt_id)
 
         terminal_operation = uuid4()
         terminal_reason = _reason(
@@ -541,7 +657,7 @@ def test_postgres_lifecycle_reconciles_fences_cuts_and_terminal_publication() ->
                 competing_start_operation_id,
                 competing_owner,
                 competing_expiry,
-                config.execution,
+                execution,
             )
 
         def publish_failure() -> AttemptOutcomeRecord:
@@ -570,7 +686,7 @@ def test_postgres_lifecycle_reconciles_fences_cuts_and_terminal_publication() ->
             second_start_operation,
             second_owner,
             second_expiry,
-            config.execution,
+            execution,
         )
         assert final_replay.status is AttemptStatus.ERROR
         assert final_replay.run.selected_terminal_attempt_id == second.attempt_id
@@ -1086,6 +1202,26 @@ def _assert_terminal_receipt_absent(
     assert receipt_row == (0,)
 
 
+def _assert_attempt_has_no_comparison(
+    settings: MetadataDatabaseSettings,
+    attempt_id: UUID,
+) -> None:
+    with connect_writer(settings.reader) as connection:
+        connection.execute("SET ROLE dfe_metadata_reader")
+        row = connection.execute(
+            "SELECT status, "
+            "(SELECT pg_catalog.count(*) FROM dfe_metadata.check_results "
+            "WHERE attempt_id = %s), "
+            "(SELECT pg_catalog.count(*) FROM dfe_metadata.segment_fingerprints "
+            "WHERE attempt_id = %s), "
+            "(SELECT pg_catalog.count(*) FROM dfe_metadata.anomalies "
+            "WHERE attempt_id = %s) "
+            "FROM dfe_metadata.run_attempts WHERE attempt_id = %s",
+            (attempt_id, attempt_id, attempt_id, attempt_id),
+        ).fetchone()
+    assert row == ("running", 0, 0, 0)
+
+
 def _context_definition(
     dataset: DatasetVersionRecord,
     direction: PlanDirection,
@@ -1169,6 +1305,7 @@ def _acquire_side(
     direction: PlanDirection,
     scope_digest: str,
     batch_id: str,
+    source_budget: PostgresSourceBudgetAttempt,
 ) -> _AcquiredSide:
     dataset = check.reference if direction is PlanDirection.REFERENCE else check.target
     consistency = check.consistency.datasets[0 if direction is PlanDirection.REFERENCE else 1]
@@ -1191,6 +1328,8 @@ def _acquire_side(
             _acquisition(_manifest_schema(), readiness_relation, readiness.columns.values()),
         ),
         2_000,
+        source_budget,
+        PostgresSourceDirection(direction.value),
     )
     protected = context.protected_relations
     dataset_protected = _protected_relation(protected, dataset_relation)
@@ -1364,11 +1503,11 @@ def _create_source_relations(
         connection.execute("CREATE SCHEMA dfe_control")
         connection.execute(
             "CREATE TABLE dfe_demo.reference_orders ("
-            "order_id bigint NOT NULL, business_date date NOT NULL, amount numeric(18,2))"
+            "order_id bigint PRIMARY KEY, business_date date NOT NULL, amount numeric(18,2))"
         )
         connection.execute(
             "CREATE TABLE dfe_demo.target_orders ("
-            "order_id bigint NOT NULL, business_date date NOT NULL, amount numeric(18,2))"
+            "order_id bigint PRIMARY KEY, business_date date NOT NULL, amount numeric(18,2))"
         )
         connection.execute(
             "CREATE TABLE dfe_control.batch_manifest ("
