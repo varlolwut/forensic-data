@@ -187,12 +187,13 @@ and decoded coordinator data, not a measurement of process RSS or allocator peak
 
 - Python 3.12
 - [uv](https://docs.astral.sh/uv/) 0.12.18
-- Docker with Compose for PostgreSQL integration tests
+- Docker with Compose for PostgreSQL and SQL Server integration tests
 
-The locked drivers are C extensions built from source. A direct host installation therefore needs
-a C toolchain plus `pg_config` and matching libpq development headers. The production Docker build
-provides the reproducible path: it builds Psycopg 3.3.6 and Psycopg2 2.9.13 against the same pinned
-libpq 17.11 and excludes compilers and headers from the runtime image.
+The locked PostgreSQL drivers are C extensions built from source. A direct host installation
+therefore needs a C toolchain plus `pg_config` and matching libpq development headers. The
+production Docker build provides the reproducible path: it builds Psycopg 3.3.6 and Psycopg2
+2.9.13 against the same pinned libpq 17.11, installs the pinned Microsoft ODBC Driver
+18.7.1.1-1 runtime for pyodbc 5.3.0, and excludes compilers and headers from the runtime image.
 
 Install the locked development environment:
 
@@ -457,38 +458,46 @@ change a fixture password, update the matching password in its DSN too.
 # POSIX
 cp tests/fixtures/postgres/.env.example tests/fixtures/postgres/.env
 cp tests/fixtures/postgres-legacy/.env.example tests/fixtures/postgres-legacy/.env
+cp tests/fixtures/mssql-2022/.env.example tests/fixtures/mssql-2022/.env
 
 # PowerShell
 Copy-Item tests/fixtures/postgres/.env.example tests/fixtures/postgres/.env
 Copy-Item tests/fixtures/postgres-legacy/.env.example tests/fixtures/postgres-legacy/.env
+Copy-Item tests/fixtures/mssql-2022/.env.example tests/fixtures/mssql-2022/.env
 ```
 
-Start the pinned PostgreSQL 17.11 fixture plus the exact PostgreSQL 9.6.24 source-to-17.11
-fixture, then run the full gate:
+Start the pinned PostgreSQL fixtures and the SQL Server fixture, configure SQL Server through its
+separate setup identities, then run the full gate. The host running pytest must have Microsoft ODBC
+Driver 18.7.1.1 installed; CI and the production image install the exact package automatically.
 
 ```console
 docker compose --env-file tests/fixtures/postgres/.env --file tests/fixtures/postgres/compose.yaml up --detach --wait
 docker compose --env-file tests/fixtures/postgres-legacy/.env --file tests/fixtures/postgres-legacy/compose.yaml up --detach --wait
+docker compose --env-file tests/fixtures/mssql-2022/.env --file tests/fixtures/mssql-2022/compose.yaml up --detach --wait sqlserver
+docker compose --env-file tests/fixtures/mssql-2022/.env --file tests/fixtures/mssql-2022/compose.yaml run --rm setup-admin
+docker compose --env-file tests/fixtures/mssql-2022/.env --file tests/fixtures/mssql-2022/compose.yaml run --rm setup-writer
+docker compose --env-file tests/fixtures/mssql-2022/.env --file tests/fixtures/mssql-2022/compose.yaml run --rm verify
 uv run ruff check .
 uv run ruff format --check .
 uv run pyright
-uv run --env-file tests/fixtures/postgres/.env --env-file tests/fixtures/postgres-legacy/.env pytest
+uv run --env-file tests/fixtures/postgres/.env --env-file tests/fixtures/postgres-legacy/.env --env-file tests/fixtures/mssql-2022/.env pytest
 ```
 
 PostgreSQL applies these credentials only when its data volume is initialized. If the fixture was
 previously started with different values, run the cleanup command below before starting it again.
 
-The protocol/result tests can run without Docker, but this does not verify PostgreSQL support:
+The protocol/result tests can run without Docker, but this does not verify database support:
 
 ```console
-uv run pytest --ignore=tests/test_postgres_integration.py --ignore=tests/test_postgres_metadata_integration.py --ignore=tests/test_postgres_protected_integration.py --ignore=tests/test_postgres_lifecycle_schema_integration.py --ignore=tests/test_postgres_lifecycle_integration.py --ignore=tests/test_postgres_comparison_integration.py --ignore=tests/test_postgres_legacy_integration.py
+uv run pytest --ignore=tests/test_mssql_integration.py --ignore=tests/test_postgres_integration.py --ignore=tests/test_postgres_metadata_integration.py --ignore=tests/test_postgres_protected_integration.py --ignore=tests/test_postgres_lifecycle_schema_integration.py --ignore=tests/test_postgres_lifecycle_integration.py --ignore=tests/test_postgres_comparison_integration.py --ignore=tests/test_postgres_legacy_integration.py
 ```
 
-Stop and remove only this disposable fixture and its data volume:
+Stop and remove only these disposable fixtures and their data volumes:
 
 ```console
 docker compose --env-file tests/fixtures/postgres/.env --file tests/fixtures/postgres/compose.yaml down --volumes
 docker compose --env-file tests/fixtures/postgres-legacy/.env --file tests/fixtures/postgres-legacy/compose.yaml down --volumes
+docker compose --env-file tests/fixtures/mssql-2022/.env --file tests/fixtures/mssql-2022/compose.yaml down --volumes --remove-orphans
 ```
 
 The integration suite exercises real catalog inspection, canonical row/hash equivalence, bounded
@@ -509,6 +518,19 @@ The development fixture pins the official SQL Server 2022 Developer CU27 Ubuntu 
 digest. It requires Linux/amd64 Docker and reserves a 3 GiB container limit with 2 GiB available to
 SQL Server. Copy the development-only environment and start the engine:
 
+The selected Python client is pyodbc 5.3.0 over Microsoft ODBC Driver 18.7.1.1-1. External
+connections must use encrypted transport with certificate validation
+(`Encrypt=Mandatory;TrustServerCertificate=No`) and a least-privilege login. The localhost fixture
+alone uses `TrustServerCertificate=Yes` because its disposable endpoint has no trusted certificate;
+that fixture exception is not a production trust policy.
+
+SQL Server `datetime2(7)` must be projected as deterministic ISO-126 text and validated as text:
+Python `datetime` preserves only six fractional digits. Decimal values remain `Decimal` and
+`nvarchar` remains Unicode. `fetchmany(batch_size)` bounds the number of materialized rows, but it
+does not bound one `varchar(max)`, `nvarchar(max)`, or `varbinary(max)` value; queries must separately
+bound or reject oversized values. The transport separately caps a declared value, row, transient
+batch, and retained result; those decoded-payload limits are not a measurement of process RSS.
+
 ```console
 # POSIX
 cp tests/fixtures/mssql-2022/.env.example tests/fixtures/mssql-2022/.env
@@ -526,6 +548,15 @@ the restricted reader:
 docker compose --env-file tests/fixtures/mssql-2022/.env --file tests/fixtures/mssql-2022/compose.yaml run --rm setup-admin
 docker compose --env-file tests/fixtures/mssql-2022/.env --file tests/fixtures/mssql-2022/compose.yaml run --rm setup-writer
 docker compose --env-file tests/fixtures/mssql-2022/.env --file tests/fixtures/mssql-2022/compose.yaml run --rm verify
+```
+
+Run the SQL Server integration tests with the fixture-only port, reader password, and disposable
+administrator password. The administrator connection only observes the in-flight cancellation
+probe; product reads still use the least-privilege reader. The tests construct fixed localhost
+connections and their explicit test-only certificate exception:
+
+```console
+uv run --env-file tests/fixtures/mssql-2022/.env pytest tests/test_mssql_integration.py
 ```
 
 The bootstrap recreates only the fixture database and its two fixture logins. Verification requires

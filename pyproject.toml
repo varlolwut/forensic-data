@@ -12,6 +12,7 @@ dependencies = [
     "psycopg[c]==3.3.6",
     "psycopg2==2.9.13",
     "pydantic>=2.13.5,<3",
+    "pyodbc==5.3.0",
     "pyyaml>=6.0.3,<7",
 ]
 
@@ -39,6 +40,7 @@ typeCheckingMode = "strict"
 addopts = ["--strict-config", "--strict-markers", "-ra"]
 markers = [
     "integration: tests that require a real external service",
+    "mssql: tests that require a real Microsoft SQL Server service",
     "postgres: tests that require a real PostgreSQL service",
 ]
 testpaths = ["tests"]

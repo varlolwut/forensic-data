@@ -54,6 +54,19 @@ jobs:
           cache-dependency-glob: uv.lock
           enable-cache: true
           version: "0.12.18"
+      - name: Install Microsoft ODBC Driver 18.7.1.1
+        run: |
+          curl --fail --location --silent --show-error \
+            --output /tmp/msodbcsql18_18.7.1.1-1_amd64.deb \
+            https://packages.microsoft.com/ubuntu/24.04/prod/pool/main/m/msodbcsql18/msodbcsql18_18.7.1.1-1_amd64.deb
+          echo "f506cb3de8b34cd94e9014d247b39e9dfd7effad79edad3ab67096dc3c1b6b0e  /tmp/msodbcsql18_18.7.1.1-1_amd64.deb" \
+            | sha256sum --check --strict
+          sudo apt-get update
+          sudo env ACCEPT_EULA=Y DEBIAN_FRONTEND=noninteractive \
+            apt-get install --yes --no-install-recommends \
+            /tmp/msodbcsql18_18.7.1.1-1_amd64.deb
+          test "$(dpkg-query --show --showformat='${Version}' msodbcsql18)" = "18.7.1.1-1"
+          rm /tmp/msodbcsql18_18.7.1.1-1_amd64.deb
       - name: Install locked dependencies
         run: uv sync --frozen --all-groups
       - name: Lint
