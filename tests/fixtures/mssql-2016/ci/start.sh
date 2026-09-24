@@ -68,7 +68,7 @@ download_verified() {
         fail "downloaded media size mismatch for $(basename -- "$destination"): expected=$expected_bytes actual=$actual_bytes"
     actual_sha256="$(sha256sum -- "$partial_path" | cut -d ' ' -f 1)"
     [[ "$actual_sha256" == "$expected_sha256" ]] ||
-        fail "downloaded media SHA-256 mismatch for $(basename -- "$destination")"
+        fail "downloaded media SHA-256 mismatch for $(basename -- "$destination"): expected=$expected_sha256 actual=$actual_sha256"
     mv -- "$partial_path" "$destination"
 }
 
