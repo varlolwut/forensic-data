@@ -41,11 +41,14 @@ writes machine JSON to `.local/docker-quickstart/output/{check,history,diff}.jso
 | Verified database/version | Source | Target |
 |---|---|---|
 | PostgreSQL 17.11 | Verified | Verified |
-| PostgreSQL 9.6.24 | Verified | Not yet implemented or verified |
+| PostgreSQL 9.6.24 | Verified | Not yet verified |
 | SQL Server 2022 Developer CU27 `16.0.4295.3` | Verified | Not yet implemented or verified |
 
-Other PostgreSQL majors and PostgreSQL 9.6 patches are not verified. SQL Server 2016/2017/2019 are
-not implemented or verified, and there is no silent profile fallback.
+This matrix records tested configurations, not a version allowlist. Database connections are not
+rejected solely because their server version, edition, or driver patch is untested. The selected
+adapter strategy must still satisfy its SQL, encoding, type, and read-consistency requirements.
+The legacy PostgreSQL strategy can be selected for either comparison side. SQL Server
+2016/2017/2019 are not yet verified; there is no silent profile fallback.
 
 Runtime capability admission is wider than an exact verified conformance point and does not certify
 untested builds, editions, operating systems, or driver patches. See the

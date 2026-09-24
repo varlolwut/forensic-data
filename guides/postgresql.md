@@ -7,18 +7,23 @@ This guide records the verified modern and legacy PostgreSQL profiles, protected
 ## Verified PostgreSQL scope
 
 The modern PostgreSQL path is verified against PostgreSQL 17.11 on Linux/amd64 with Psycopg 3.3.6
-and the explicit `psycopg` / `postgresql_17` driver-profile pair. Modern source, target, and metadata
-connections require PostgreSQL 17.x, UTF-8 server/client encodings, integer datetimes, UTC, and a
-read-only Repeatable Read transaction for source data.
+and the explicit `psycopg` / `postgresql_17` driver-profile pair. The profile name identifies a SQL
+and driver strategy, not an allowed server version. Other versions, including PostgreSQL 18, may
+use it without a version-number rejection. Source and target reads require UTF-8 server/client
+encodings, integer datetimes, UTC, and a read-only Repeatable Read transaction. Required SQL and
+catalog capabilities must be present; incompatible operations fail explicitly. An untested version
+is not certified by a successful connection alone.
 
-An additional source-only path is verified against the exact PostgreSQL 9.6.24 official
+An additional legacy path is source-verified against the exact PostgreSQL 9.6.24 official
 Linux/amd64 image with Psycopg2 2.9.13 and the explicit `psycopg2` / `postgresql_9_6` pair. Its
-target and metadata connections must remain on the modern profile. The legacy source must use
-UTF-8, integer datetimes, UTC, and read-only Repeatable Read, and must already have pgcrypto 1.3 in
+strategy can be selected for either source or target; the target direction remains unverified.
+The Docker box uses its separate modern PostgreSQL metadata store. The legacy endpoint must use
+UTF-8, integer datetimes, UTC, and read-only Repeatable Read, and must already have pgcrypto in
 schema `dfe_ext`; the reader needs `USAGE` on that schema and `EXECUTE` on
 `dfe_ext.digest(bytea,text)`. Runtime validates these capabilities and the canonical SHA-256 result;
-it never installs the extension or silently changes drivers. Other PostgreSQL 9.6 patches, other
-PostgreSQL majors, and other legacy PostgreSQL profiles are not verified by the current code.
+it never installs the extension or silently changes drivers. The observed server version is retained
+as evidence, not checked against a version allowlist. Other PostgreSQL versions remain unverified
+until their real integration gates have run.
 
 PostgreSQL relations must be given as an exact `(schema, table)` pair and select one explicit scope. The
 default `physical_only` scope reads one permanent regular table with `FROM ONLY`: ordinary

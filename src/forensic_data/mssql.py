@@ -2614,12 +2614,6 @@ def _server_profile_from_row(
 
 def _validate_server_profile(profile: MssqlServerProfile) -> None:
     failures: list[str] = []
-    if profile.product_major_version != 16:
-        failures.append(f"product_major_version={profile.product_major_version}, required=16")
-    if profile.engine_edition not in (2, 3, 4):
-        failures.append(f"engine_edition={profile.engine_edition}, required one of 2,3,4")
-    if profile.compatibility_level != 160:
-        failures.append(f"compatibility_level={profile.compatibility_level}, required=160")
     if (
         profile.snapshot_isolation_state != 1
         or profile.snapshot_isolation_state_description != "ON"
@@ -2649,7 +2643,8 @@ def _validate_server_profile(profile: MssqlServerProfile) -> None:
         )
     if failures:
         raise UnsupportedMssqlProfileError(
-            "SQL Server 2022 capability profile is unsupported: "
+            "SQL Server capability profile is unsupported: "
+            f"server_version={profile.product_version!r}, "
             f"database={profile.database_name!r}, database_id={profile.database_id}; "
             + "; ".join(failures)
         )

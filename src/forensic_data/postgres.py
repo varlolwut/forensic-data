@@ -3410,8 +3410,6 @@ def _validate_profile(profile: PostgresServerProfile, row: DatabaseRow) -> None:
     isolation = _require_text(row[9], "transaction_isolation")
     read_only = _require_boolean(row[10], "transaction_read_only")
     failures: list[str] = []
-    if not 170000 <= profile.server_version_number < 180000:
-        failures.append(f"server_version_num={profile.server_version_number}, required=17.x")
     if profile.server_encoding != "UTF8":
         failures.append(f"server_encoding={profile.server_encoding!r}, required='UTF8'")
     if profile.client_encoding != "UTF8":
@@ -3426,7 +3424,9 @@ def _validate_profile(profile: PostgresServerProfile, row: DatabaseRow) -> None:
         failures.append("transaction_read_only=off, required=on")
     if failures:
         raise UnsupportedPostgresProfileError(
-            "PostgreSQL 17 capability profile is unsupported: " + "; ".join(failures)
+            "PostgreSQL capability profile is unsupported: "
+            f"server_version={profile.server_version!r}, "
+            f"server_version_num={profile.server_version_number}; " + "; ".join(failures)
         )
 
 

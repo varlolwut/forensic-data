@@ -2,13 +2,14 @@
 
 [README](../README.md) · [Docker quickstart](docker-quickstart.md) · [CLI and contracts](cli-and-contracts.md) · [PostgreSQL](postgresql.md) · [SQL Server](sql-server.md) · [Development](development.md)
 
-SQL Server support is source-only. SQL Server 2022 is the current verified profile; SQL Server 2016 remains unimplemented and unverified.
+SQL Server support is source-only. SQL Server 2022 is the current verified configuration;
+other server versions remain unverified and are not rejected solely by their version number.
 
 ## Verified source role
 
 A source-only SQL Server path is verified against the exact SQL Server 2022 Developer CU27 build
 `16.0.4295.3` on Linux/amd64 with pyodbc 5.3.0, Microsoft ODBC Driver 18.7.1.1-1, and the explicit
-`pyodbc` / `mssql_2022` pair. Its target and metadata connections remain on PostgreSQL 17.11. The
+`pyodbc` / `mssql_2022` pair. Its target and metadata connections use PostgreSQL. The
 current cross-engine executor requires one `physical_only` table, relation-manifest readiness, and
 a non-null logical INT64 key with a confirmed leading, non-partial access path on both sides. The
 exact verified fixture and the broader runtime-admission boundary are distinguished below. SQL
@@ -23,8 +24,8 @@ from the wider capability boundary admitted by the runtime:
 | Status | Profile | Direction and boundary |
 |---|---|---|
 | Verified | SQL Server 2022 Developer CU27 `16.0.4295.3`, `pyodbc` / `mssql_2022` | Reference/source only; target and metadata remain PostgreSQL 17.11. |
-| Runtime-admitted, not verified | Product major 16, EngineEdition `2`, `3`, or `4`, compatibility level 160, `ALLOW_SNAPSHOT_ISOLATION=ON`, canonical UTF-8 code page 65001, database `VIEW DEFINITION`, and matching driver/server version probes | Reference/source only. Other SQL Server 2022 builds, editions, operating systems, and driver patches can pass these capability checks but are not verified conformance points. |
-| Rejected or unimplemented | SQL Server 2016/2017/2019; any pair other than `pyodbc` / `mssql_2022`; SQL Server target or metadata roles | No fallback or silent profile substitution. SQL Server 2016 is not implemented and not verified. |
+| Runtime-admitted, not verified | `ALLOW_SNAPSHOT_ISOLATION=ON`, canonical UTF-8 code page 65001, database `VIEW DEFINITION`, matching driver/server identity, and the SQL/catalog operations required by the selected strategy | Reference/source only. Server versions, editions, compatibility levels, and driver patches are not numeric allowlists. Actual operations, including the `GENERATE_SERIES` snapshot witness, must succeed. |
+| Unimplemented | Any driver/profile pair other than `pyodbc` / `mssql_2022`; SQL Server target or metadata roles | No fallback or silent profile substitution. A separate legacy SQL strategy is not yet implemented or verified. |
 
 The verified fixture is exact:
 
@@ -38,9 +39,10 @@ The verified fixture is exact:
 | Reader | Least-privilege SELECT-only relation access; `VIEW DEFINITION` and fixture-hardening grant `VIEW SECURITY DEFINITION`; no enabled row-level security |
 | Transport | `Encrypt=Mandatory`; production uses `TrustServerCertificate=No`; only the disposable localhost fixture uses the explicit trust exception |
 
-The runtime records the exact build, edition text, server/database collations, database updateability,
-RCSI state, pyodbc version, ODBC library, and ODBC version as evidence. It does not turn the fixture's
-exact patch, edition text, operating system, or client patch into broader compatibility claims.
+The profile name selects a SQL and driver strategy, not an allowed server version. The runtime
+records the exact build, edition text, compatibility level, server/database collations, database
+updateability, RCSI state, pyodbc version, ODBC library, and ODBC version as evidence. Missing SQL
+or catalog capabilities fail explicitly. A successful connection does not verify an untested version.
 
 The canonical comparison type matrix is:
 

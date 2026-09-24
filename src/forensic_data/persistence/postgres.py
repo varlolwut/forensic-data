@@ -58,7 +58,6 @@ METADATA_MIGRATION_ADVISORY_LOCK_KEYS: Final[tuple[int, int]] = (
     1_145_455_922,
     -661_538_192,
 )
-_METADATA_MAJOR_VERSION: Final[int] = 17
 _MIGRATOR_ROLE: Final[str] = "dfe_metadata_migrator"
 _WRITER_ROLE: Final[str] = "dfe_metadata_writer"
 _READER_ROLE: Final[str] = "dfe_metadata_reader"
@@ -239,15 +238,11 @@ def _validate_metadata_profile(connection: psycopg.Connection[DatabaseRow]) -> N
     version_number = _row_integer(row[0], "server version number")
     version_text = _row_text(row[1], "server version")
     encoding = _row_text(row[2], "server encoding")
-    major_version = version_number // 10_000
-    if major_version != _METADATA_MAJOR_VERSION:
-        raise MetadataProfileError(
-            "PostgreSQL metadata store requires the PostgreSQL 17 profile: "
-            f"server_version={version_text!r}, server_version_number={version_number}"
-        )
     if encoding != "UTF8":
         raise MetadataProfileError(
-            f"PostgreSQL metadata store requires UTF8 server encoding: actual={encoding!r}"
+            "PostgreSQL metadata store requires UTF8 server encoding: "
+            f"server_version={version_text!r}, server_version_number={version_number}, "
+            f"actual={encoding!r}"
         )
 
 

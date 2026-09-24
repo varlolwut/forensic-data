@@ -205,7 +205,6 @@ __all__ = (
 
 LOGGER = logging.getLogger(__name__)
 
-_METADATA_MAJOR_VERSION: Final[int] = 17
 _WRITER_ROLE: Final[str] = "dfe_metadata_writer"
 _READER_ROLE: Final[str] = "dfe_metadata_reader"
 _CANONICAL_PROTOCOL: Final[str] = "dfe_canon_v1"
@@ -9523,9 +9522,9 @@ def _validate_metadata_profile(connection: psycopg.Connection[DatabaseRow]) -> N
         raise LifecyclePersistenceError("metadata profile probe returned an invalid row")
     version_number = _row_integer(row[0], "metadata server version number")
     encoding = _row_text(row[1], "metadata server encoding")
-    if version_number // 10_000 != _METADATA_MAJOR_VERSION or encoding != "UTF8":
+    if encoding != "UTF8":
         raise LifecyclePersistenceError(
-            "lifecycle persistence requires PostgreSQL 17 with UTF8 encoding: "
+            "lifecycle persistence requires PostgreSQL with UTF8 encoding: "
             f"server_version_number={version_number}, encoding={encoding!r}"
         )
 

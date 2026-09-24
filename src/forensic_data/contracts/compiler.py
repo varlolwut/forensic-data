@@ -210,13 +210,6 @@ def _compile_connection(source: ConnectionSource) -> ConnectionDefinition:
                 f"connection {connection_id!r} contains duplicate role {role.value!r}"
             )
         roles.append(role)
-    if match_postgres_runtime_profile(
-        driver, profile
-    ) is PostgresRuntimeProfile.POSTGRES_9_6 and roles != [ConnectionRole.SOURCE]:
-        raise UnsupportedContractError(
-            f"connection {connection_id!r} profile 'postgresql_9_6' is source-only and "
-            "must declare exactly role 'source'"
-        )
     if adapter is Adapter.MSSQL:
         if match_mssql_runtime_profile(driver, profile) is not MssqlRuntimeProfile.MSSQL_2022:
             raise UnsupportedContractError(

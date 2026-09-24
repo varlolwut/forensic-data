@@ -81,8 +81,6 @@ from forensic_data.postgres_sql import (
 )
 
 LOGGER = logging.getLogger(__name__)
-_POSTGRES_9_6_VERSION_NUMBER = 90624
-_PGCRYPTO_EXTENSION_VERSION = "1.3"
 _PGCRYPTO_SCHEMA = "dfe_ext"
 _SHA256_ABC = "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad"
 _PSYCOPG2_VERSION = version("psycopg2")
@@ -523,6 +521,7 @@ def _open_legacy_protected_once(
         )
         _validate_legacy_pgcrypto(
             transport,
+            profile,
             acquisitions,
             source_budget,
             direction,
@@ -764,7 +763,7 @@ def _capture_legacy_protected_snapshot(
         limitations=(
             *base_evidence.limitations,
             "snapshot locator uses PostgreSQL 9.6 txid_current_snapshot",
-            "SHA-256 requires preinstalled pgcrypto 1.3 in schema dfe_ext",
+            "SHA-256 requires preinstalled pgcrypto in schema dfe_ext",
             "every discovered physical relation holds AccessShareLock before the snapshot",
             "only pre-acquired regular members contribute rows through explicit ONLY scans",
         ),
@@ -783,8 +782,6 @@ def _validate_legacy_profile(
     isolation = _require_text(row[9], "transaction_isolation")
     read_only = _require_boolean(row[10], "transaction_read_only")
     failures: list[str] = []
-    if profile.server_version_number != _POSTGRES_9_6_VERSION_NUMBER:
-        failures.append(f"server_version_num={profile.server_version_number}, required=90624")
     if profile.server_encoding != "UTF8":
         failures.append(f"server_encoding={profile.server_encoding!r}, required='UTF8'")
     if profile.client_encoding != "UTF8":
@@ -799,12 +796,15 @@ def _validate_legacy_profile(
         failures.append("transaction_read_only=off, required=on")
     if failures:
         raise UnsupportedPostgresProfileError(
-            "PostgreSQL 9.6.24 source capability profile is unsupported: " + "; ".join(failures)
+            "PostgreSQL legacy capability profile is unsupported: "
+            f"server_version={profile.server_version!r}, "
+            f"server_version_num={profile.server_version_number}; " + "; ".join(failures)
         )
 
 
 def _validate_legacy_pgcrypto(
     connection: psycopg.Connection[DatabaseRow],
+    profile: PostgresServerProfile,
     acquisitions: tuple[PostgresRelationAcquisition, ...],
     source_budget: PostgresSourceBudgetAttempt,
     direction: PostgresSourceDirection,
@@ -842,11 +842,8 @@ def _validate_legacy_pgcrypto(
             raise PostgresDataValidationError(
                 "PostgreSQL 9.6 pgcrypto capability probe returned an unexpected field count"
             )
-        extension_version = _require_text(row[0], "pgcrypto extension version")
         extension_schema = _require_text(row[1], "pgcrypto extension schema")
         function_oid = row[3]
-        if extension_version != _PGCRYPTO_EXTENSION_VERSION:
-            failures.append(f"pgcrypto_version={extension_version!r}, required='1.3'")
         if extension_schema != _PGCRYPTO_SCHEMA:
             failures.append(f"pgcrypto_schema={extension_schema!r}, required='dfe_ext'")
         if not _require_boolean(row[2], "pgcrypto schema USAGE privilege"):
@@ -866,7 +863,9 @@ def _validate_legacy_pgcrypto(
             failures.append("pgcrypto digest(bytea,text) does not return bytea")
     if failures:
         raise UnsupportedPostgresProfileError(
-            "PostgreSQL 9.6.24 source pgcrypto capability is unsupported: " + "; ".join(failures)
+            "PostgreSQL legacy pgcrypto capability is unsupported: "
+            f"server_version={profile.server_version!r}, "
+            f"server_version_num={profile.server_version_number}; " + "; ".join(failures)
         )
     digest_rows = _execute_setup_bounded(
         connection,
@@ -894,7 +893,10 @@ def _validate_legacy_pgcrypto(
         != 32
     ):
         raise UnsupportedPostgresProfileError(
-            "PostgreSQL 9.6.24 source pgcrypto SHA-256 canonical probe failed"
+            "PostgreSQL legacy pgcrypto SHA-256 canonical probe failed: "
+            f"server_version={profile.server_version!r}, "
+            f"server_version_num={profile.server_version_number}; "
+            "required dfe_ext.digest(bytea,text) to return the canonical SHA-256 bytes"
         )
 
 

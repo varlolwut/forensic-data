@@ -1065,10 +1065,7 @@ def _open_postgres_side(
             source_budget,
             PostgresSourceDirection(direction.value),
         )
-    elif (
-        runtime_profile is PostgresRuntimeProfile.POSTGRES_9_6
-        and direction is PlanDirection.REFERENCE
-    ):
+    elif runtime_profile is PostgresRuntimeProfile.POSTGRES_9_6:
         context = open_postgres_9_6_protected_read_context(
             settings,
             retry_policy,
@@ -1076,10 +1073,6 @@ def _open_postgres_side(
             services.protected_lock_timeout_milliseconds,
             source_budget,
             PostgresSourceDirection(direction.value),
-        )
-    elif runtime_profile is PostgresRuntimeProfile.POSTGRES_9_6:
-        raise UnsupportedPostgresProfileError(
-            "PostgreSQL 9.6.24 profile is source-only and cannot be used as a target"
         )
     else:
         raise UnsupportedPostgresProfileError(
@@ -2783,11 +2776,11 @@ def _validate_runtime_profiles(
     target = check.target.connection
     if (
         target.adapter is not Adapter.POSTGRESQL
-        or match_postgres_runtime_profile(target.driver, target.profile)
-        is not PostgresRuntimeProfile.POSTGRES_17
+        or match_postgres_runtime_profile(target.driver, target.profile) is None
     ):
         raise UnsupportedPostgresProfileError(
-            "PostgreSQL target requires driver='psycopg' and profile='postgresql_17'"
+            "PostgreSQL target requires an explicit supported driver/profile pair: "
+            "('psycopg', 'postgresql_17') or ('psycopg2', 'postgresql_9_6')"
         )
     metadata = config.metadata.connection
     if (
