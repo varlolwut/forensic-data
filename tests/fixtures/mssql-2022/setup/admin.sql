@@ -41,6 +41,7 @@ WITH PASSWORD = N'$(DFE_MSSQL_SETUP_WRITER_PASSWORD)',
     DEFAULT_DATABASE = [master];
 
 CREATE DATABASE [dfe_fixture] COLLATE Latin1_General_100_CI_AS_SC;
+ALTER DATABASE [dfe_fixture] SET COMPATIBILITY_LEVEL = 160;
 ALTER DATABASE [dfe_fixture] SET ALLOW_SNAPSHOT_ISOLATION ON;
 ALTER DATABASE [dfe_fixture] SET READ_COMMITTED_SNAPSHOT OFF;
 ALTER LOGIN [dfe_fixture_reader] WITH DEFAULT_DATABASE = [dfe_fixture];
@@ -60,6 +61,28 @@ CREATE TABLE [dfe_fixture].[snapshot_probe]
     [amount] decimal(38, 3) NOT NULL,
     [observed_at] datetime2(7) NOT NULL,
     CONSTRAINT [PK_dfe_fixture_snapshot_probe] PRIMARY KEY ([record_id])
+);
+
+CREATE TABLE [dfe_fixture].[canonical_probe]
+(
+    [record_id] bigint NOT NULL,
+    [amount] decimal(38, 7) NOT NULL,
+    [observed_value] nvarchar(4000) NULL,
+    [observed_at] datetime2(7) NOT NULL,
+    CONSTRAINT [PK_dfe_fixture_canonical_probe] PRIMARY KEY ([record_id])
+);
+
+CREATE TABLE [dfe_fixture].[canonical_common_types]
+(
+    [probe_id] int NOT NULL,
+    [id] bigint NOT NULL,
+    [amount] decimal(38, 3) NOT NULL,
+    [active] bit NOT NULL,
+    [label] nvarchar(128) NOT NULL,
+    [business_date] date NOT NULL,
+    [local_time] datetime2(7) NOT NULL,
+    [instant_time] datetimeoffset(7) NOT NULL,
+    CONSTRAINT [PK_dfe_fixture_canonical_common_types] PRIMARY KEY ([probe_id])
 );
 
 CREATE USER [dfe_fixture_reader]
@@ -94,15 +117,19 @@ IF NOT EXISTS
     WHERE [name] = N'dfe_fixture'
       AND [snapshot_isolation_state_desc] = N'ON'
       AND [is_read_committed_snapshot_on] = 0
+      AND [compatibility_level] = 160
 )
 BEGIN
-    THROW 51000, N'Fixture requires SNAPSHOT ON and READ_COMMITTED_SNAPSHOT OFF.', 1;
+    THROW 51000,
+        N'Fixture requires compatibility level 160, SNAPSHOT ON, and READ_COMMITTED_SNAPSHOT OFF.',
+        1;
 END;
 
 SELECT
     CONVERT(nvarchar(128), SERVERPROPERTY(N'ProductVersion')) AS [product_version],
     CONVERT(nvarchar(128), SERVERPROPERTY(N'ProductUpdateLevel')) AS [update_level],
     [snapshot_isolation_state_desc],
-    [is_read_committed_snapshot_on]
+    [is_read_committed_snapshot_on],
+    [compatibility_level]
 FROM sys.databases
 WHERE [name] = N'dfe_fixture';

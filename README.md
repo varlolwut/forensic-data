@@ -531,6 +531,15 @@ does not bound one `varchar(max)`, `nvarchar(max)`, or `varbinary(max)` value; q
 bound or reject oversized values. The transport separately caps a declared value, row, transient
 batch, and retained result; those decoded-payload limits are not a measurement of process RSS.
 
+The SQL Server 2022 canonical profile requires database compatibility level 160. Its Unicode path
+normalizes to `nvarchar(max)`, converts through `Latin1_General_100_BIN2_UTF8`, and uses
+`GENERATE_SERIES` with binary `SUBSTRING` to reject U+0000 without collation-dependent character
+searches. Canonical frames introduce a MAX operand before concatenation, including rows whose
+encoded envelope exceeds 8,000 bytes; SHA-256 remains internal, counts use `COUNT_BIG`, and every
+digest limb is widened to `decimal(38,0)` before `SUM`. SQL Server 2016 has neither this UTF-8
+collation nor `GENERATE_SERIES`; it requires a separate profile, which is not implemented or
+verified yet, rather than a silent fallback.
+
 ```console
 # POSIX
 cp tests/fixtures/mssql-2022/.env.example tests/fixtures/mssql-2022/.env
@@ -556,11 +565,12 @@ probe; product reads still use the least-privilege reader. The tests construct f
 connections and their explicit test-only certificate exception:
 
 ```console
-uv run --env-file tests/fixtures/mssql-2022/.env pytest tests/test_mssql_integration.py
+uv run --env-file tests/fixtures/mssql-2022/.env pytest tests/test_mssql_integration.py tests/test_mssql_canonical_integration.py
 ```
 
 The bootstrap recreates only the fixture database and its two fixture logins. Verification requires
-the exact `16.0.4295.3` Developer build, `ALLOW_SNAPSHOT_ISOLATION=ON`,
+the exact `16.0.4295.3` Developer build, database compatibility level 160,
+`ALLOW_SNAPSHOT_ISOLATION=ON`,
 `READ_COMMITTED_SNAPSHOT=OFF`, an actual reader data access inside a transaction-level `SNAPSHOT`,
 and denied reader DML and DDL. The reader and setup-writer services never receive the `sa`
 credential. This fixture proves the P03-01 environment boundary, not a completed MSSQL adapter or
