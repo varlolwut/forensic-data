@@ -2275,7 +2275,7 @@ def open_mssql_protected_read_context(
                 source_direction,
                 _mssql_source_deadline(source_budget),
             )
-    except (MssqlMetadataError, MssqlLoweringError) as error:
+    except MssqlLoweringError as error:
         context.close()
         message = str(error).strip()
         if not message:
@@ -2856,50 +2856,57 @@ def _validated_relation_metadata(
     has_column_update = _require_boolean(row[20], "has_column_update")
     can_view_definition = _require_boolean(row[21], "can_view_definition")
     has_enabled_security_policy = _require_boolean(row[22], "has_enabled_security_policy")
-    failures: list[str] = []
+    provenance_failures: list[str] = []
+    capability_failures: list[str] = []
     if database_id != profile.database_id or database_name != profile.database_name:
-        failures.append(
+        provenance_failures.append(
             "database identity differs from the active read context: "
             f"actual=({database_id}, {database_name!r}), "
             f"expected=({profile.database_id}, {profile.database_name!r})"
         )
     if schema_name != relation.schema_name or table_name != relation.table_name:
-        failures.append(
+        provenance_failures.append(
             "resolved relation name differs from the requested exact identifiers: "
             f"actual=({schema_name!r}, {table_name!r})"
         )
     if table_type != "U" or is_ms_shipped:
-        failures.append(
+        capability_failures.append(
             f"relation is not an unshipped user table: type={table_type!r}, "
             f"is_ms_shipped={is_ms_shipped}"
         )
     if is_memory_optimized or temporal_type != 0 or is_external or ledger_type != 0:
-        failures.append(
+        capability_failures.append(
             "relation storage profile is unsupported: "
             f"memory_optimized={is_memory_optimized}, temporal_type={temporal_type}, "
             f"external={is_external}, ledger_type={ledger_type}"
         )
     if is_node or is_edge:
-        failures.append(f"graph relation is unsupported: node={is_node}, edge={is_edge}")
+        capability_failures.append(f"graph relation is unsupported: node={is_node}, edge={is_edge}")
     if permissions != (1, 0, 0, 0, 0, 0):
-        failures.append(
+        capability_failures.append(
             "reader permissions must be SELECT-only for the resolved relation: "
             f"select={permissions[0]}, insert={permissions[1]}, update={permissions[2]}, "
             f"delete={permissions[3]}, alter={permissions[4]}, control={permissions[5]}"
         )
     if has_column_update:
-        failures.append("reader has UPDATE permission on at least one physical column")
+        capability_failures.append("reader has UPDATE permission on at least one physical column")
     if not can_view_definition:
-        failures.append(
+        provenance_failures.append(
             "reader lost database VIEW DEFINITION required to enumerate security policies"
         )
     if has_enabled_security_policy:
-        failures.append("relation has an enabled row-level security policy")
-    if failures:
+        capability_failures.append("relation has an enabled row-level security policy")
+    if provenance_failures:
         raise MssqlMetadataError(
+            "SQL Server relation inspection lost physical provenance: "
+            f"schema={relation.schema_name!r}, table={relation.table_name!r}; "
+            + "; ".join(provenance_failures)
+        )
+    if capability_failures:
+        raise UnsupportedMssqlRelationError(
             "SQL Server relation inspection rejected the physical source: "
             f"schema={relation.schema_name!r}, table={relation.table_name!r}; "
-            + "; ".join(failures)
+            + "; ".join(capability_failures)
         )
     return database_id, schema_id, object_id
 
@@ -3017,19 +3024,19 @@ def _binding_from_metadata_row(
         or is_assembly_type
         or is_table_type
     ):
-        raise MssqlMetadataError(
+        raise UnsupportedMssqlRelationError(
             "SQL Server requested column must use a direct built-in sys type: "
             f"column_index={index}, column_name={column_name!r}, "
             f"type={type_schema_name}.{type_name}, system_type_id={system_type_id}, "
             f"user_type_id={user_type_id}"
         )
     if is_computed or generated_always_type != 0 or encryption_type is not None:
-        raise MssqlMetadataError(
+        raise UnsupportedMssqlRelationError(
             "SQL Server requested column uses unsupported computed/generated/encrypted "
             f"semantics: column_index={index}, column_name={column_name!r}"
         )
     if is_hidden or is_masked:
-        raise MssqlMetadataError(
+        raise UnsupportedMssqlRelationError(
             "SQL Server requested column is hidden or masked: "
             f"column_index={index}, column_name={column_name!r}"
         )
