@@ -1,0 +1,8 @@
+*
+!.gitignore
+!greengage/
+!original-greenplum/
+greengage/*
+!greengage/.dockerignore
+original-greenplum/*
+!original-greenplum/.dockerignore

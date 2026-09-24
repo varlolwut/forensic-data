@@ -1,0 +1,10 @@
+ARRAY_NAME="DFE Phase04 Greengage fixture"
+MACHINE_LIST_FILE=/home/gpadmin/hostfile
+SEG_PREFIX=ggseg
+PORT_BASE=6000
+declare -a DATA_DIRECTORY=(/data/primary1 /data/primary2)
+COORDINATOR_HOSTNAME=greengage
+COORDINATOR_DIRECTORY=/data/coordinator
+COORDINATOR_PORT=5432
+TRUSTED_SHELL=ssh
+ENCODING=UNICODE

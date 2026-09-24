@@ -1,0 +1,16 @@
+**
+!greengage/
+!greengage/Dockerfile
+!greengage/entrypoint.sh
+!greengage/gpadmin-limits.conf
+!greengage/gpinitsystem_config
+!greengage/healthcheck.sh
+!greengage/ubuntu-snapshot.list
+!greengage/verify.sh
+!original-greenplum/
+!original-greenplum/Dockerfile
+!original-greenplum/centos-vault.repo
+!original-greenplum/entrypoint.sh
+!original-greenplum/gpadmin-limits.conf
+!original-greenplum/healthcheck.sh
+!original-greenplum/verify.sh

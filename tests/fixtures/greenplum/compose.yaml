@@ -1,0 +1,70 @@
+name: forensic-data-phase04-greenplum
+
+x-greenplum-runtime: &greenplum-runtime
+  platform: linux/amd64
+  cpus: 4.0
+  mem_limit: 4g
+  shm_size: 1gb
+  init: true
+  restart: "no"
+  stop_grace_period: 420s
+  sysctls:
+    kernel.sem: "500 1024000 200 4096"
+  ulimits:
+    nofile:
+      soft: 65536
+      hard: 65536
+    nproc:
+      soft: 131072
+      hard: 131072
+
+services:
+  greengage:
+    <<: *greenplum-runtime
+    hostname: greengage
+    build:
+      context: .
+      dockerfile: greengage/Dockerfile
+      additional_contexts:
+        artifacts: ./artifacts/greengage
+    volumes:
+      - greengage-data:/data
+    healthcheck:
+      test:
+        - CMD
+        - runuser
+        - --user
+        - gpadmin
+        - --
+        - /usr/local/bin/dfe-greengage-healthcheck
+      interval: 3s
+      timeout: 10s
+      retries: 80
+      start_period: 45s
+
+  original-greenplum:
+    <<: *greenplum-runtime
+    hostname: original-gp
+    build:
+      context: .
+      dockerfile: original-greenplum/Dockerfile
+      additional_contexts:
+        source: ./artifacts/original-greenplum
+    volumes:
+      - original-greenplum-data:/home/gpadmin/gpdemo-data
+    healthcheck:
+      test:
+        - CMD
+        - runuser
+        - --user
+        - gpadmin
+        - --
+        - /usr/local/bin/dfe-original-greenplum-healthcheck
+      interval: 3s
+      timeout: 10s
+      retries: 80
+      start_period: 45s
+
+volumes:
+  greengage-data:
+  original-greenplum-data:

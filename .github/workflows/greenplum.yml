@@ -1,0 +1,59 @@
+name: Greenplum family artifact fixture
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: greenplum-family-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  artifact-fixture:
+    name: Original Greenplum and Greengage
+    runs-on: ubuntu-24.04
+    timeout-minutes: 90
+    steps:
+      - name: Check out source
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - name: Acquire exact artifacts
+        shell: bash
+        run: bash tests/fixtures/greenplum/prepare-artifacts.sh
+      - name: Validate Compose model
+        run: docker compose --file tests/fixtures/greenplum/compose.yaml config --quiet
+      - name: Build paired fixture
+        run: docker compose --file tests/fixtures/greenplum/compose.yaml build
+      - name: Start paired fixture
+        run: docker compose --file tests/fixtures/greenplum/compose.yaml up --detach --wait
+      - name: Verify identities, topology, distribution, and isolation
+        shell: bash
+        run: bash tests/fixtures/greenplum/verify.sh
+      - name: Prove clean stop and persisted fixture recreation
+        shell: bash
+        run: |
+          sentinel='phase04-volume-persistence'
+          docker compose --file tests/fixtures/greenplum/compose.yaml exec --no-TTY --user gpadmin \
+            greengage sh -c "printf '%s\n' '${sentinel}' > /data/.dfe-restart-sentinel"
+          docker compose --file tests/fixtures/greenplum/compose.yaml exec --no-TTY --user gpadmin \
+            original-greenplum sh -c "printf '%s\n' '${sentinel}' > /home/gpadmin/gpdemo-data/.dfe-restart-sentinel"
+          greengage_id="$(docker compose --file tests/fixtures/greenplum/compose.yaml ps --quiet greengage)"
+          original_greenplum_id="$(docker compose --file tests/fixtures/greenplum/compose.yaml ps --quiet original-greenplum)"
+          docker compose --file tests/fixtures/greenplum/compose.yaml stop
+          docker logs "${greengage_id}" > greengage-stop.log 2>&1
+          docker logs "${original_greenplum_id}" > original-greenplum-stop.log 2>&1
+          cat greengage-stop.log
+          cat original-greenplum-stop.log
+          test "$(docker inspect --format '{{.State.ExitCode}}' "${greengage_id}")" = 0
+          test "$(docker inspect --format '{{.State.ExitCode}}' "${original_greenplum_id}")" = 0
+          docker compose --file tests/fixtures/greenplum/compose.yaml rm --force
+          docker compose --file tests/fixtures/greenplum/compose.yaml up --detach --wait
+          test "$(docker compose --file tests/fixtures/greenplum/compose.yaml exec --no-TTY --user gpadmin greengage cat /data/.dfe-restart-sentinel)" = "${sentinel}"
+          test "$(docker compose --file tests/fixtures/greenplum/compose.yaml exec --no-TTY --user gpadmin original-greenplum cat /home/gpadmin/gpdemo-data/.dfe-restart-sentinel)" = "${sentinel}"
+      - name: Verify restarted fixture
+        shell: bash
+        run: bash tests/fixtures/greenplum/verify.sh
+      - name: Stop paired fixture
+        if: always()
+        run: docker compose --file tests/fixtures/greenplum/compose.yaml down --volumes --remove-orphans

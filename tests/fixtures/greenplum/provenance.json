@@ -1,0 +1,81 @@
+{
+  "schema_version": 1,
+  "artifacts": [
+    {
+      "product": "Original Greenplum",
+      "role": "historical source",
+      "repository": "greenplum-db/gpdb-archive",
+      "commit": "62378f1767f22217f7f0474260abfeeb5c2615b9",
+      "commit_timestamp": "2016-12-30T23:41:45Z",
+      "url": "https://codeload.github.com/greenplum-db/gpdb-archive/tar.gz/62378f1767f22217f7f0474260abfeeb5c2615b9",
+      "size_bytes": 76390954,
+      "sha256": "c171f871d36183da659cf2d41363a98f31a12ac2e1ef066688005d3c1d3a94ef",
+      "source_identity": "4.3.99.00 build dev",
+      "classification": "development snapshot, not a Greenplum 4.3 GA release",
+      "build_input_derivation": {
+        "tool": "Python 3.12 standard-library tarfile with GNU tar output",
+        "recipe": "validate the single expected source root and safe entry types; sort entries by name; preserve modes and links; normalize uid, gid, owner names, and mtime; exclude exact top-level CI roots",
+        "normalized_mtime": "2016-12-30T23:41:45Z",
+        "excluded_paths": [
+          "ci/",
+          "concourse/"
+        ],
+        "archive": "gpdb-sanitized-62378f1767f22217f7f0474260abfeeb5c2615b9.tar",
+        "format": "uncompressed GNU tar",
+        "size_bytes": 418805760,
+        "sha256": "f654c454e0c6a5b8a9d2631888392cee6af5cb68da51d1b5dc773c7e8a4a73af"
+      }
+    },
+    {
+      "product": "Greengage",
+      "role": "modern family target artifact",
+      "release": "7.5.0",
+      "source_commit": "677398e45766110a32e318266f186cf0cbe720a5",
+      "annotated_tag_object": "33f8790021285667670c5d23aa51d9597e6380f8",
+      "url": "https://github.com/GreengageDB/greengage/releases/download/7.5.0/greengage7_7.5.0.ubuntu22.04_amd64.deb",
+      "size_bytes": 25807136,
+      "sha256": "2ca71f84f4fbb6175de77e193f4b1fa5732f0439f2e6f7458cb7b4cade34d0a0",
+      "package_identity": "greengage7=7.5.0",
+      "classification": "separate product; not an original Greenplum release"
+    }
+  ],
+  "base_images": [
+    {
+      "fixture": "original-greenplum",
+      "image": "centos",
+      "platform": "linux/amd64",
+      "manifest_digest": "sha256:dead07b4d8ed7e29e98de0f4504d87e8880d4347859d839686a31da35a3b532f"
+    },
+    {
+      "fixture": "greengage",
+      "image": "ubuntu",
+      "platform": "linux/amd64",
+      "manifest_digest": "sha256:281c5745f657873d78e5531fc5ba8575f46ab7769b94550ac99543f122679986"
+    }
+  ],
+  "build_tooling": {
+    "dockerfile_frontend": "docker/dockerfile:1.7@sha256:a57df69d0ea827fb7266491f2813635de6f17269be881f696fbfdf2d83dda33e",
+    "minimum_compose_version": "2.17"
+  },
+  "historical_dependency_evidence": {
+    "centos_vault_mirror": "https://archive.kernel.org/centos-vault/7.9.2009/",
+    "epel_7_key_sha256": "028b9accc59bab1d21f2f3f544df5469910581e728a64fd8c411a725a82300c2",
+    "epel_7_key_fingerprint": "91E97D7C4A5E96F17F3E888F6A2FAEA2352C64E5",
+    "python2_psutil_url": "https://archives.fedoraproject.org/pub/archive/epel/7/x86_64/Packages/p/python2-psutil-5.6.7-1.el7.x86_64.rpm",
+    "python2_psutil_sha256": "7a87617ec8033a4a2b34f4abd0e1c747507a9ef4d032acadcf2abd1834593390",
+    "python2_psutil_signing_key_id": "352c64e5"
+  },
+  "modern_dependency_evidence": {
+    "ubuntu_archive_snapshot": "20260924T000000Z",
+    "ubuntu_snapshot_service": "https://snapshot.ubuntu.com/",
+    "ubuntu_archive_keyring_sha256": "1a4dd63e5c76728960a2edddae22e2e0fc53df8e8b87806deb971030ac704eb0",
+    "tls_bootstrap_package": {
+      "package": "ca-certificates",
+      "version": "20260601~22.04.1",
+      "architecture": "all",
+      "url": "https://snapshot.ubuntu.com/ubuntu/20260924T000000Z/pool/main/c/ca-certificates/ca-certificates_20260601~22.04.1_all.deb",
+      "size_bytes": 140666,
+      "sha256": "6e8cdcc8c86103acd4fc14649eac62ff2037108389074a7b167567af33c32245"
+    }
+  }
+}

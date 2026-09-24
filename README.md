@@ -53,6 +53,11 @@ The legacy PostgreSQL strategy can be selected for either comparison side. SQL S
 strategies are selected explicitly as `mssql_2016` or `mssql_2022`; there is no silent profile
 fallback. SQL Server 2017 and 2019 have not been verified.
 
+The manual [Greenplum-family artifact fixture](guides/greenplum.md) separately proves a real
+source-built original Greenplum `4.3.99.00 build dev` distributed cluster and an official Greengage
+7.5.0 distributed cluster. That is artifact and fixture evidence only; runtime source and target
+support for these products is not yet implemented or listed in this matrix.
+
 Runtime capability admission is wider than an exact verified conformance point and does not certify
 untested builds, editions, operating systems, or driver patches. See the
 [PostgreSQL guide](guides/postgresql.md) and [SQL Server guide](guides/sql-server.md) for relation,
@@ -84,6 +89,8 @@ match exits `0`, a completed mismatch exits `1`, an error exits `2`, and an inco
 - [SQL Server source profiles](guides/sql-server.md) — the exact SQL Server 2016 and 2022
   conformance points, explicit strategies, owner-installed legacy helper, protected reads,
   fixtures, and resource limits.
+- [Greenplum-family artifact boundary](guides/greenplum.md) — exact original Greenplum and
+  Greengage provenance, real distributed fixtures, and the boundary before runtime support.
 - [Development and verification](guides/development.md) — locked environment, real fixtures,
   required checks, cleanup, and package/container builds.
 
