@@ -1508,7 +1508,10 @@ def _assert_common_completed_result(
     assert result.check_id == check.check_id
     assert result.contract_digest == check.contract_digest
     assert result.scope_digest == scope.scope_digest
-    assert result.execution_status is ExecutionStatus.COMPLETED
+    assert result.execution_status is ExecutionStatus.COMPLETED, (
+        result.reasons,
+        result.metrics,
+    )
     assert result.consistency.stable_reads is ConsistencyLevel.VERIFIED
     assert result.consistency.cut_alignment is ConsistencyLevel.VERIFIED
     assert len(result.consistency.read_context_ids) == 2

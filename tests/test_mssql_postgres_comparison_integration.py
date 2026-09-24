@@ -155,9 +155,12 @@ def _execution_services(
     target: pg_comparison._SourceDatabaseSettings,
     check: RowCheckDefinition,
 ) -> MssqlPostgresExecutionServices:
+    reference_settings = required_reader_settings("dfe-mssql-postgres-reference").model_copy(
+        update={"query_timeout_seconds": 60}
+    )
     return MssqlPostgresExecutionServices(
         reference_connection_id=check.reference.connection.connection_id,
-        reference_settings=required_reader_settings("dfe-mssql-postgres-reference"),
+        reference_settings=reference_settings,
         target_connection_id=check.target.connection.connection_id,
         target_settings=target.reader,
         metadata_connection_id="metadata_pg",

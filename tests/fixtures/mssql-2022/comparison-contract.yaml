@@ -120,7 +120,7 @@ execution:
   max_coordinator_memory_bytes: 8388608
   max_depth: 8
   max_full_scans_per_side: 5
-  statement_timeout_milliseconds: 30000
+  statement_timeout_milliseconds: 60000
   run_timeout_milliseconds: 300000
   max_attempts: 2
   max_checks_concurrency: 2
