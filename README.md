@@ -15,7 +15,8 @@ database or prove readiness, capability, schema presence, or data equality.
 ## First run
 
 The primary delivery is a one-shot, non-root DFE container plus a dedicated PostgreSQL 17.11
-metadata store. Start with the [complete Docker quickstart](guides/docker-quickstart.md), which
+database that stores runs, results, and retained evidence for comparisons across all source systems.
+Start with the [complete Docker quickstart](guides/docker-quickstart.md), which
 includes the required Linux and Docker Desktop credential-generation steps. After generating those
 local secrets, the common first-run path is:
 
@@ -37,11 +38,11 @@ writes machine JSON to `.local/docker-quickstart/output/{check,history,diff}.jso
 
 ## Verified matrix
 
-| Verified database/version | Source | Target | Metadata store |
-|---|---|---|---|
-| PostgreSQL 17.11 | Verified | Verified | Verified |
-| PostgreSQL 9.6.24 | Verified source-only profile | Not supported | Not supported |
-| SQL Server 2022 Developer CU27 `16.0.4295.3` | Verified source-only profile | Not supported | Not supported |
+| Verified database/version | Source | Target |
+|---|---|---|
+| PostgreSQL 17.11 | Verified | Verified |
+| PostgreSQL 9.6.24 | Verified | Not yet implemented or verified |
+| SQL Server 2022 Developer CU27 `16.0.4295.3` | Verified | Not yet implemented or verified |
 
 Other PostgreSQL majors and PostgreSQL 9.6 patches are not verified. SQL Server 2016/2017/2019 are
 not implemented or verified, and there is no silent profile fallback.
