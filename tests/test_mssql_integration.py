@@ -182,9 +182,9 @@ def test_mssql_cancel_discards_result_and_confirms_same_session() -> None:
         future = executor.submit(_execute_long_query, query_id, transport_queue)
         transport = _required_worker_transport(transport_queue, future)
         _wait_for_active_query(transport, query_id)
-        _wait_for_server_request(transport.evidence.session_id, query_id)
         with pytest.raises(MssqlWrongQueryIdError, match="does not match"):
             transport.cancel(uuid4())
+        _wait_for_server_request(transport.evidence.session_id, query_id)
 
         cancellation_started = time.monotonic()
         transport.cancel(query_id)
@@ -270,7 +270,10 @@ def _wait_for_server_request(session_id: int, query_id: UUID) -> None:
                     statement=(
                         "SELECT CONVERT(int, 1) FROM [sys].[dm_exec_requests] AS [request] "
                         "CROSS APPLY [sys].[dm_exec_sql_text]([request].[sql_handle]) AS [batch] "
-                        "WHERE [request].[session_id] = ? AND [batch].[text] LIKE ?"
+                        "WHERE [request].[session_id] = ? AND [batch].[text] LIKE ? "
+                        "AND [request].[status] = N'suspended' "
+                        "AND [request].[command] = N'WAITFOR' "
+                        "AND [request].[wait_type] = N'WAITFOR'"
                     ),
                     parameters=(session_id, f"%dfe_query_id={query_id}%"),
                 ),
