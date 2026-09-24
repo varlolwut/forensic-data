@@ -1,5 +1,7 @@
 from dataclasses import dataclass
+from enum import StrEnum
 from typing import cast, final
+from uuid import UUID
 
 from forensic_data.canonical.model import (
     CanonicalSchema,
@@ -99,12 +101,21 @@ class MssqlRelation:
 @dataclass(frozen=True, slots=True)
 class MssqlFieldBinding:
     field_name: str
+    column_id: int
     column_name: str
+    is_nullable: bool
     physical: MssqlPhysicalField
 
     def __post_init__(self) -> None:
         _validate_scalar_text(self.field_name, "SQL Server logical field name")
+        _validate_positive_integer(
+            self.column_id,
+            "SQL Server column ID",
+            INT32_MAX,
+        )
         _validate_identifier(self.column_name, "SQL Server column name")
+        if type(self.is_nullable) is not bool:
+            raise MssqlLoweringError("SQL Server column nullability must be boolean")
         if type(self.physical) is not MssqlPhysicalField:
             raise MssqlLoweringError(
                 "SQL Server field binding physical provenance must be MssqlPhysicalField"
@@ -113,13 +124,74 @@ class MssqlFieldBinding:
 
 @final
 @dataclass(frozen=True, slots=True)
+class MssqlInspectedRelation:
+    context_id: UUID
+    database_id: int
+    schema_id: int
+    object_id: int
+    relation: MssqlRelation
+    bindings: tuple[MssqlFieldBinding, ...]
+
+    def __post_init__(self) -> None:
+        if type(self.context_id) is not UUID:
+            raise MssqlLoweringError("SQL Server inspection context ID must be a UUID")
+        _validate_positive_integer(
+            self.database_id,
+            "SQL Server inspection database ID",
+            INT32_MAX,
+        )
+        _validate_positive_integer(
+            self.schema_id,
+            "SQL Server inspection schema ID",
+            INT32_MAX,
+        )
+        _validate_positive_integer(
+            self.object_id,
+            "SQL Server inspection object ID",
+            INT32_MAX,
+        )
+        if type(self.relation) is not MssqlRelation:
+            raise MssqlLoweringError("SQL Server inspection relation must be MssqlRelation")
+        if type(self.bindings) is not tuple:
+            raise MssqlLoweringError("SQL Server inspection bindings must be an immutable tuple")
+        seen_column_ids: set[int] = set()
+        seen_column_names: set[str] = set()
+        for index, binding in enumerate(self.bindings):
+            if type(binding) is not MssqlFieldBinding:
+                raise MssqlLoweringError(
+                    "SQL Server inspection bindings must contain MssqlFieldBinding values: "
+                    f"field_index={index}"
+                )
+            if binding.column_id in seen_column_ids:
+                raise MssqlLoweringError(
+                    "SQL Server inspection contains a duplicate column ID: "
+                    f"column_id={binding.column_id}"
+                )
+            if binding.column_name in seen_column_names:
+                raise MssqlLoweringError(
+                    "SQL Server inspection contains a duplicate column name: "
+                    f"column_name={binding.column_name!r}"
+                )
+            seen_column_ids.add(binding.column_id)
+            seen_column_names.add(binding.column_name)
+
+
+class MssqlCanonicalResultKind(StrEnum):
+    ROWS = "rows"
+    FINGERPRINT = "fingerprint"
+    KEY_SUMMARY = "key_summary"
+
+
+@final
+@dataclass(frozen=True, slots=True)
 class MssqlCanonicalQuery:
     statement: str
     parameters: tuple[str, ...]
+    schema: CanonicalSchema
     context: CanonicalEnvelopeContext
-    relation: MssqlRelation
-    bindings: tuple[MssqlFieldBinding, ...]
+    inspection: MssqlInspectedRelation
     max_encoded_envelope_bytes: int
+    result_kind: MssqlCanonicalResultKind
 
     def __post_init__(self) -> None:
         _validate_scalar_text(self.statement, "SQL Server canonical statement")
@@ -135,14 +207,26 @@ class MssqlCanonicalQuery:
             raise MssqlLoweringError(
                 "SQL Server canonical query context must be a CanonicalEnvelopeContext"
             )
-        if type(self.relation) is not MssqlRelation:
-            raise MssqlLoweringError("SQL Server canonical query relation must be MssqlRelation")
-        _validate_bindings(self.context.schema, self.bindings)
+        if not isinstance(cast(object, self.schema), CanonicalSchema):
+            raise MssqlLoweringError("SQL Server canonical query schema must be a CanonicalSchema")
+        validate_mssql_inspection(self.schema, self.inspection)
         _validate_positive_integer(
             self.max_encoded_envelope_bytes,
             "SQL Server maximum encoded envelope bytes",
             _MAX_LOB_BYTES,
         )
+        if type(self.result_kind) is not MssqlCanonicalResultKind:
+            raise MssqlLoweringError(
+                "SQL Server canonical result kind must be MssqlCanonicalResultKind"
+            )
+
+    @property
+    def relation(self) -> MssqlRelation:
+        return self.inspection.relation
+
+    @property
+    def bindings(self) -> tuple[MssqlFieldBinding, ...]:
+        return self.inspection.bindings
 
 
 @final
@@ -162,40 +246,46 @@ class _RowSource:
 
 def build_mssql_row_envelope_query(
     schema: CanonicalSchema,
-    relation: MssqlRelation,
-    bindings: tuple[MssqlFieldBinding, ...],
+    inspection: MssqlInspectedRelation,
     max_encoded_envelope_bytes: int,
 ) -> MssqlCanonicalQuery:
-    _validate_canonical_inputs(schema, relation, bindings, max_encoded_envelope_bytes)
+    _validate_canonical_inputs(schema, inspection, max_encoded_envelope_bytes)
     if max_encoded_envelope_bytes > _MAX_BOUNDED_VARCHAR_BYTES:
         raise MssqlLoweringError(
             "SQL Server row-envelope output cannot declare more than 8000 bytes; "
             "use the row-hash query for larger envelopes"
         )
-    source = _row_source(schema, relation, bindings, max_encoded_envelope_bytes)
+    source = _row_source(schema, inspection, max_encoded_envelope_bytes)
+    provenance = _provenance_projection("dfe_hash", inspection)
     statement = (
         f"{source.statement} "
-        "SELECT "
+        f"SELECT {provenance}, "
         f"CONVERT(varchar({max_encoded_envelope_bytes}), [dfe_hash].[envelope]) "
         "AS [envelope], "
         "LOWER(CONVERT(char(64), [dfe_hash].[row_hash], 2)) AS [row_hash_hex], "
         "[dfe_hash].[invalid_row], [dfe_hash].[oversized_row] "
         "FROM [dfe_hash]"
     )
-    return _canonical_query(source, relation, bindings, max_encoded_envelope_bytes, statement)
+    return _canonical_query(
+        source,
+        inspection,
+        max_encoded_envelope_bytes,
+        MssqlCanonicalResultKind.ROWS,
+        statement,
+    )
 
 
 def build_mssql_row_hash_query(
     schema: CanonicalSchema,
-    relation: MssqlRelation,
-    bindings: tuple[MssqlFieldBinding, ...],
+    inspection: MssqlInspectedRelation,
     max_encoded_envelope_bytes: int,
 ) -> MssqlCanonicalQuery:
-    _validate_canonical_inputs(schema, relation, bindings, max_encoded_envelope_bytes)
-    source = _row_source(schema, relation, bindings, max_encoded_envelope_bytes)
+    _validate_canonical_inputs(schema, inspection, max_encoded_envelope_bytes)
+    source = _row_source(schema, inspection, max_encoded_envelope_bytes)
+    provenance = _provenance_projection("dfe_hash", inspection)
     statement = (
         f"{source.statement} "
-        "SELECT [dfe_hash].[envelope_bytes], "
+        f"SELECT {provenance}, [dfe_hash].[envelope_bytes], "
         "LOWER(CONVERT(char(64), [dfe_hash].[row_hash], 2)) AS [row_hash_hex], "
         "CASE WHEN [dfe_hash].[envelope_bytes] <= 8000 "
         "THEN CONVERT(varchar(8000), [dfe_hash].[envelope]) "
@@ -203,21 +293,27 @@ def build_mssql_row_hash_query(
         "[dfe_hash].[invalid_row], [dfe_hash].[oversized_row] "
         "FROM [dfe_hash]"
     )
-    return _canonical_query(source, relation, bindings, max_encoded_envelope_bytes, statement)
+    return _canonical_query(
+        source,
+        inspection,
+        max_encoded_envelope_bytes,
+        MssqlCanonicalResultKind.ROWS,
+        statement,
+    )
 
 
 def build_mssql_fingerprint_query(
     schema: CanonicalSchema,
-    relation: MssqlRelation,
-    bindings: tuple[MssqlFieldBinding, ...],
+    inspection: MssqlInspectedRelation,
     max_encoded_envelope_bytes: int,
 ) -> MssqlCanonicalQuery:
-    _validate_canonical_inputs(schema, relation, bindings, max_encoded_envelope_bytes)
-    source = _row_source(schema, relation, bindings, max_encoded_envelope_bytes)
+    _validate_canonical_inputs(schema, inspection, max_encoded_envelope_bytes)
+    source = _row_source(schema, inspection, max_encoded_envelope_bytes)
     limb_sums = ", ".join(_limb_sum_expression(index) for index in range(8))
+    provenance = _aggregate_provenance_projection("dfe_hash", inspection)
     statement = (
         f"{source.statement} "
-        "SELECT "
+        f"SELECT {provenance}, "
         "COUNT_BIG(CASE WHEN [dfe_hash].[row_hash] IS NOT NULL THEN 1 END) "
         "AS [valid_row_count], "
         f"{limb_sums}, "
@@ -227,68 +323,171 @@ def build_mssql_fingerprint_query(
         "AS [oversized_row_count] "
         "FROM [dfe_hash]"
     )
-    return _canonical_query(source, relation, bindings, max_encoded_envelope_bytes, statement)
+    return _canonical_query(
+        source,
+        inspection,
+        max_encoded_envelope_bytes,
+        MssqlCanonicalResultKind.FINGERPRINT,
+        statement,
+    )
+
+
+def build_mssql_key_summary_query(
+    schema: CanonicalSchema,
+    inspection: MssqlInspectedRelation,
+    key_field_indexes: tuple[int, ...],
+    max_encoded_key_bytes: int,
+) -> MssqlCanonicalQuery:
+    _validate_canonical_inputs(schema, inspection, max_encoded_key_bytes)
+    _validate_key_field_indexes(schema, key_field_indexes)
+    if max_encoded_key_bytes > _MAX_BOUNDED_VARCHAR_BYTES:
+        raise MssqlLoweringError("SQL Server canonical key envelope cannot exceed 8000 bytes")
+    key_fields = tuple(schema.fields[index] for index in key_field_indexes)
+    key_schema = CanonicalSchema(protocol=schema.protocol, fields=key_fields)
+    context = prepare_envelope_context(key_schema)
+    payloads = tuple(
+        _payload_lowering(schema.fields[index], inspection.bindings[index], index)
+        for index in key_field_indexes
+    )
+    payload_clause = _payload_clause(payloads)
+    has_null = _key_has_null_expression(key_field_indexes)
+    fields_valid = _key_fields_valid_expression(key_field_indexes, payloads)
+    payload_bytes = _key_payload_bytes_expression(key_field_indexes, payloads)
+    frames = _key_frames_expression(key_fields, key_field_indexes, payloads)
+    fixed_bytes = _ROW_HEADER_BYTES + (_FIELD_FRAME_BYTES * len(key_field_indexes))
+    origin = _origin_cte(inspection)
+    relation_source = _relation_source(inspection)
+    origin_identity = _identity_projection("dfe_origin", inspection)
+    aggregate_provenance = _aggregate_provenance_projection("dfe_keys", inspection)
+    statement = (
+        f"WITH {origin}, [dfe_keys] AS ("
+        f"SELECT {origin_identity}, "
+        "CASE WHEN [dfe_source].[dfe_has_data] IS NULL THEN CONVERT(bit, 0) "
+        "ELSE CONVERT(bit, 1) END AS [dfe_has_data], "
+        "[dfe_key].[key_envelope], [dfe_key].[null_key], "
+        "[dfe_key].[invalid_key], [dfe_key].[oversized_key] "
+        "FROM [dfe_origin] "
+        f"LEFT JOIN ({relation_source}) AS [dfe_source] ON 1 = 1 "
+        f"{payload_clause} "
+        "CROSS APPLY (SELECT "
+        f"CASE WHEN {has_null} THEN CONVERT(bit, 1) ELSE CONVERT(bit, 0) END "
+        "AS [null_key], "
+        f"CASE WHEN NOT ({has_null}) AND NOT ({fields_valid}) "
+        "THEN CONVERT(bit, 1) ELSE CONVERT(bit, 0) END AS [invalid_key], "
+        f"CONVERT(bigint, {fixed_bytes}) + "
+        f"(CONVERT(bigint, 2) * ({payload_bytes})) AS [key_envelope_bytes]"
+        ") AS [dfe_validation] "
+        "CROSS APPLY (SELECT "
+        "CASE WHEN [dfe_source].[dfe_has_data] IS NULL "
+        "OR [dfe_validation].[null_key] = CONVERT(bit, 1) "
+        "OR [dfe_validation].[invalid_key] = CONVERT(bit, 1) "
+        f"OR [dfe_validation].[key_envelope_bytes] > CONVERT(bigint, {max_encoded_key_bytes}) "
+        "THEN CONVERT(varbinary(8000), NULL) "
+        f"ELSE CONVERT(varbinary(8000), CONVERT(varchar(max), ?) + {frames}) END "
+        "AS [key_envelope], [dfe_validation].[null_key], "
+        "[dfe_validation].[invalid_key], "
+        "CASE WHEN [dfe_source].[dfe_has_data] IS NOT NULL "
+        "AND [dfe_validation].[null_key] = CONVERT(bit, 0) "
+        "AND [dfe_validation].[invalid_key] = CONVERT(bit, 0) "
+        f"AND [dfe_validation].[key_envelope_bytes] > CONVERT(bigint, {max_encoded_key_bytes}) "
+        "THEN CONVERT(bit, 1) ELSE CONVERT(bit, 0) END AS [oversized_key]"
+        ") AS [dfe_key]"
+        ") "
+        f"SELECT {aggregate_provenance}, "
+        "COUNT_BIG(CASE WHEN [dfe_keys].[dfe_has_data] = CONVERT(bit, 1) THEN 1 END) "
+        "AS [row_count], "
+        "COUNT_BIG(CASE WHEN [dfe_keys].[dfe_has_data] = CONVERT(bit, 1) "
+        "AND [dfe_keys].[null_key] = CONVERT(bit, 1) THEN 1 END) AS [null_key_count], "
+        "COUNT_BIG(CASE WHEN [dfe_keys].[dfe_has_data] = CONVERT(bit, 1) "
+        "AND [dfe_keys].[invalid_key] = CONVERT(bit, 1) THEN 1 END) "
+        "AS [invalid_key_count], "
+        "COUNT_BIG(CASE WHEN [dfe_keys].[dfe_has_data] = CONVERT(bit, 1) "
+        "AND [dfe_keys].[oversized_key] = CONVERT(bit, 1) THEN 1 END) "
+        "AS [oversized_key_count], "
+        "COUNT_BIG([dfe_keys].[key_envelope]) AS [valid_key_count], "
+        "COUNT_BIG(DISTINCT [dfe_keys].[key_envelope]) AS [distinct_key_count] "
+        "FROM [dfe_keys]"
+    )
+    return MssqlCanonicalQuery(
+        statement=statement,
+        parameters=(context.key_header,),
+        schema=schema,
+        context=context,
+        inspection=inspection,
+        max_encoded_envelope_bytes=max_encoded_key_bytes,
+        result_kind=MssqlCanonicalResultKind.KEY_SUMMARY,
+    )
 
 
 def _canonical_query(
     source: _RowSource,
-    relation: MssqlRelation,
-    bindings: tuple[MssqlFieldBinding, ...],
+    inspection: MssqlInspectedRelation,
     max_encoded_envelope_bytes: int,
+    result_kind: MssqlCanonicalResultKind,
     statement: str,
 ) -> MssqlCanonicalQuery:
     return MssqlCanonicalQuery(
         statement=statement,
         parameters=source.parameters,
+        schema=source.context.schema,
         context=source.context,
-        relation=relation,
-        bindings=bindings,
+        inspection=inspection,
         max_encoded_envelope_bytes=max_encoded_envelope_bytes,
+        result_kind=result_kind,
     )
 
 
 def _row_source(
     schema: CanonicalSchema,
-    relation: MssqlRelation,
-    bindings: tuple[MssqlFieldBinding, ...],
+    inspection: MssqlInspectedRelation,
     max_encoded_envelope_bytes: int,
 ) -> _RowSource:
+    bindings = inspection.bindings
     context = prepare_envelope_context(schema)
     payloads = tuple(
-        _payload_lowering(field, binding)
-        for field, binding in zip(schema.fields, bindings, strict=True)
+        _payload_lowering(field, binding, index)
+        for index, (field, binding) in enumerate(zip(schema.fields, bindings, strict=True))
     )
     payload_clause = _payload_clause(payloads)
     fields_valid = _fields_valid_expression(schema, bindings, payloads)
     payload_bytes = _payload_bytes_expression(bindings, payloads)
     frames = _frames_expression(schema, bindings, payloads)
     fixed_bytes = _ROW_HEADER_BYTES + (_FIELD_FRAME_BYTES * len(schema.fields))
-    relation_sql = (
-        f"{_quote_identifier(relation.schema_name)}.{_quote_identifier(relation.table_name)}"
-    )
+    origin = _origin_cte(inspection)
+    relation_source = _relation_source(inspection)
+    origin_identity = _identity_projection("dfe_origin", inspection)
+    row_provenance = _provenance_projection("dfe_rows", inspection)
     statement = (
-        "WITH [dfe_rows] AS ("
-        "SELECT [dfe_row].[envelope], [dfe_validation].[envelope_bytes], "
+        f"WITH {origin}, [dfe_rows] AS ("
+        f"SELECT {origin_identity}, "
+        "CASE WHEN [dfe_source].[dfe_has_data] IS NULL THEN CONVERT(bit, 0) "
+        "ELSE CONVERT(bit, 1) END AS [dfe_has_data], "
+        "[dfe_row].[envelope], "
+        "[dfe_validation].[envelope_bytes], "
         "[dfe_validation].[invalid_row], [dfe_row].[oversized_row] "
-        f"FROM {relation_sql} AS [dfe_source] "
+        "FROM [dfe_origin] "
+        f"LEFT JOIN ({relation_source}) AS [dfe_source] ON 1 = 1 "
         f"{payload_clause} "
         "CROSS APPLY (SELECT "
-        f"CASE WHEN {fields_valid} THEN CONVERT(bit, 0) ELSE CONVERT(bit, 1) END "
+        "CASE WHEN [dfe_source].[dfe_has_data] IS NULL THEN CONVERT(bit, 0) "
+        f"WHEN {fields_valid} THEN CONVERT(bit, 0) ELSE CONVERT(bit, 1) END "
         "AS [invalid_row], "
         f"CONVERT(bigint, {fixed_bytes}) + "
         f"(CONVERT(bigint, 2) * ({payload_bytes})) AS [envelope_bytes]"
         ") AS [dfe_validation] "
         "CROSS APPLY (SELECT "
-        "CASE WHEN [dfe_validation].[invalid_row] = CONVERT(bit, 1) "
+        "CASE WHEN [dfe_source].[dfe_has_data] IS NULL "
+        "OR [dfe_validation].[invalid_row] = CONVERT(bit, 1) "
         f"OR [dfe_validation].[envelope_bytes] > CONVERT(bigint, {max_encoded_envelope_bytes}) "
         "THEN CONVERT(varchar(max), NULL) "
         f"ELSE CONVERT(varchar(max), ?) + {frames} END AS [envelope], "
-        "CASE WHEN [dfe_validation].[invalid_row] = CONVERT(bit, 0) "
+        "CASE WHEN [dfe_source].[dfe_has_data] IS NOT NULL "
+        "AND [dfe_validation].[invalid_row] = CONVERT(bit, 0) "
         f"AND [dfe_validation].[envelope_bytes] > CONVERT(bigint, {max_encoded_envelope_bytes}) "
         "THEN CONVERT(bit, 1) ELSE CONVERT(bit, 0) END AS [oversized_row]"
         ") AS [dfe_row]"
         "), [dfe_hash] AS ("
-        "SELECT [dfe_rows].[envelope], [dfe_rows].[envelope_bytes], "
+        f"SELECT {row_provenance}, [dfe_rows].[envelope], [dfe_rows].[envelope_bytes], "
         "CASE WHEN [dfe_rows].[envelope] IS NULL THEN CONVERT(varbinary(32), NULL) "
         "ELSE CONVERT(varbinary(32), HASHBYTES('SHA2_256', "
         "CONVERT(varbinary(max), [dfe_rows].[envelope]))) END AS [row_hash], "
@@ -301,6 +500,169 @@ def _row_source(
         context=context,
         parameters=(context.row_header,),
     )
+
+
+def _origin_cte(inspection: MssqlInspectedRelation) -> str:
+    relation = inspection.relation
+    relation_name = _qualified_relation_name(relation)
+    column_validation = _column_validation_predicate(inspection)
+    column_ids = ", ".join(
+        "CONVERT(int, COLUMNPROPERTY([dfe_table].[object_id], "
+        f"{_quote_unicode_literal(binding.column_name)}, N'ColumnId')) "
+        f"AS {_quote_identifier(f'dfe_column_id_{index}')}"
+        for index, binding in enumerate(inspection.bindings)
+    )
+    column_projection = f", {column_ids}" if column_ids else ""
+    return (
+        "[dfe_origin] AS (SELECT CONVERT(int, DB_ID()) AS [dfe_database_id], "
+        "CONVERT(int, SCHEMA_ID("
+        f"{_quote_unicode_literal(relation.schema_name)})) AS [dfe_schema_id], "
+        "CONVERT(int, OBJECT_ID("
+        f"{_quote_unicode_literal(relation_name)}, N'U')) AS [dfe_object_id]"
+        f"{column_projection} "
+        "FROM sys.tables AS [dfe_table] "
+        "JOIN sys.schemas AS [dfe_schema] "
+        "ON [dfe_schema].[schema_id] = [dfe_table].[schema_id] "
+        f"WHERE DB_ID() = {inspection.database_id} "
+        f"AND [dfe_schema].[schema_id] = {inspection.schema_id} "
+        f"AND [dfe_table].[object_id] = {inspection.object_id} "
+        "AND CONVERT(varbinary(256), [dfe_schema].[name]) = "
+        f"CONVERT(varbinary(256), {_quote_unicode_literal(relation.schema_name)}) "
+        "AND CONVERT(varbinary(256), [dfe_table].[name]) = "
+        f"CONVERT(varbinary(256), {_quote_unicode_literal(relation.table_name)}) "
+        "AND [dfe_table].[type] = 'U' AND [dfe_table].[is_ms_shipped] = 0 "
+        "AND [dfe_table].[is_memory_optimized] = 0 "
+        "AND [dfe_table].[temporal_type] = 0 "
+        "AND [dfe_table].[is_external] = 0 "
+        "AND [dfe_table].[ledger_type] = 0 "
+        "AND [dfe_table].[is_node] = 0 AND [dfe_table].[is_edge] = 0 "
+        "AND HAS_PERMS_BY_NAME(DB_NAME(), N'DATABASE', N'VIEW DEFINITION') = 1 "
+        f"AND HAS_PERMS_BY_NAME({_quote_unicode_literal(relation_name)}, "
+        "N'OBJECT', N'SELECT') = 1 "
+        f"AND HAS_PERMS_BY_NAME({_quote_unicode_literal(relation_name)}, "
+        "N'OBJECT', N'INSERT') = 0 "
+        f"AND HAS_PERMS_BY_NAME({_quote_unicode_literal(relation_name)}, "
+        "N'OBJECT', N'UPDATE') = 0 "
+        "AND NOT EXISTS (SELECT 1 FROM sys.columns AS [dfe_writable_column] "
+        "WHERE [dfe_writable_column].[object_id] = [dfe_table].[object_id] "
+        f"AND HAS_PERMS_BY_NAME({_quote_unicode_literal(relation_name)}, "
+        "N'OBJECT', N'UPDATE', [dfe_writable_column].[name], N'COLUMN') = 1) "
+        f"AND HAS_PERMS_BY_NAME({_quote_unicode_literal(relation_name)}, "
+        "N'OBJECT', N'DELETE') = 0 "
+        f"AND HAS_PERMS_BY_NAME({_quote_unicode_literal(relation_name)}, "
+        "N'OBJECT', N'ALTER') = 0 "
+        f"AND HAS_PERMS_BY_NAME({_quote_unicode_literal(relation_name)}, "
+        "N'OBJECT', N'CONTROL') = 0 "
+        "AND NOT EXISTS (SELECT 1 FROM sys.security_predicates AS [dfe_predicate] "
+        "JOIN sys.security_policies AS [dfe_policy] "
+        "ON [dfe_policy].[object_id] = [dfe_predicate].[object_id] "
+        "WHERE [dfe_predicate].[target_object_id] = [dfe_table].[object_id] "
+        "AND [dfe_policy].[is_enabled] = 1) "
+        f"{column_validation})"
+    )
+
+
+def _column_validation_predicate(inspection: MssqlInspectedRelation) -> str:
+    if not inspection.bindings:
+        return ""
+    rows = ", ".join(
+        "("
+        f"{binding.column_id}, {_quote_unicode_literal(binding.column_name)}, "
+        f"{_quote_unicode_literal(binding.physical.system_type_name)}, "
+        f"{binding.physical.system_type_id}, {binding.physical.user_type_id}, "
+        f"{binding.physical.max_length}, {binding.physical.precision}, "
+        f"{binding.physical.scale}, {_optional_unicode_literal(binding.physical.collation_name)}, "
+        f"{1 if binding.is_nullable else 0}"
+        ")"
+        for binding in inspection.bindings
+    )
+    return (
+        "AND NOT EXISTS (SELECT 1 FROM (VALUES "
+        f"{rows}) AS [dfe_expected]([column_id], [column_name], [system_type_name], "
+        "[system_type_id], [user_type_id], [max_length], [precision], [scale], "
+        "[collation_name], [is_nullable]) "
+        "LEFT JOIN sys.columns AS [dfe_column] "
+        "ON [dfe_column].[object_id] = [dfe_table].[object_id] "
+        "AND [dfe_column].[column_id] = [dfe_expected].[column_id] "
+        "LEFT JOIN sys.types AS [dfe_type] "
+        "ON [dfe_type].[user_type_id] = [dfe_column].[system_type_id] "
+        "AND [dfe_type].[system_type_id] = [dfe_column].[system_type_id] "
+        "WHERE [dfe_column].[column_id] IS NULL "
+        "OR CONVERT(varbinary(256), [dfe_column].[name]) <> "
+        "CONVERT(varbinary(256), [dfe_expected].[column_name]) "
+        "OR CONVERT(varbinary(256), [dfe_type].[name]) <> "
+        "CONVERT(varbinary(256), [dfe_expected].[system_type_name]) "
+        "OR [dfe_column].[system_type_id] <> [dfe_expected].[system_type_id] "
+        "OR [dfe_column].[user_type_id] <> [dfe_expected].[user_type_id] "
+        "OR [dfe_column].[max_length] <> [dfe_expected].[max_length] "
+        "OR [dfe_column].[precision] <> [dfe_expected].[precision] "
+        "OR [dfe_column].[scale] <> [dfe_expected].[scale] "
+        "OR ([dfe_column].[collation_name] IS NULL "
+        "AND [dfe_expected].[collation_name] IS NOT NULL) "
+        "OR ([dfe_column].[collation_name] IS NOT NULL "
+        "AND [dfe_expected].[collation_name] IS NULL) "
+        "OR CONVERT(varbinary(256), [dfe_column].[collation_name]) <> "
+        "CONVERT(varbinary(256), [dfe_expected].[collation_name]) "
+        "OR [dfe_column].[is_nullable] <> [dfe_expected].[is_nullable] "
+        "OR [dfe_column].[is_computed] <> 0 "
+        "OR [dfe_column].[is_hidden] <> 0 "
+        "OR [dfe_column].[is_masked] <> 0 "
+        "OR [dfe_column].[generated_always_type] <> 0 "
+        "OR [dfe_column].[encryption_type] IS NOT NULL) "
+    )
+
+
+def _relation_source(inspection: MssqlInspectedRelation) -> str:
+    columns = ", ".join(
+        f"[dfe_physical].{_quote_identifier(binding.column_name)} "
+        f"AS {_quote_identifier(f'dfe_field_{index}')}"
+        for index, binding in enumerate(inspection.bindings)
+    )
+    column_projection = f", {columns}" if columns else ""
+    return (
+        "SELECT CONVERT(bit, 1) AS [dfe_has_data]"
+        f"{column_projection} FROM {_qualified_relation_name(inspection.relation)} "
+        "AS [dfe_physical]"
+    )
+
+
+def _identity_projection(alias: str, inspection: MssqlInspectedRelation) -> str:
+    _validate_identifier(alias, "SQL Server internal provenance alias")
+    columns = (
+        "dfe_database_id",
+        "dfe_schema_id",
+        "dfe_object_id",
+        *(f"dfe_column_id_{index}" for index, _binding in enumerate(inspection.bindings)),
+    )
+    return ", ".join(
+        f"{_quote_identifier(alias)}.{_quote_identifier(column)}" for column in columns
+    )
+
+
+def _provenance_projection(alias: str, inspection: MssqlInspectedRelation) -> str:
+    return f"{_identity_projection(alias, inspection)}, [{alias}].[dfe_has_data]"
+
+
+def _aggregate_provenance_projection(
+    alias: str,
+    inspection: MssqlInspectedRelation,
+) -> str:
+    _validate_identifier(alias, "SQL Server internal provenance alias")
+    columns = (
+        "dfe_database_id",
+        "dfe_schema_id",
+        "dfe_object_id",
+        *(f"dfe_column_id_{index}" for index, _binding in enumerate(inspection.bindings)),
+    )
+    aggregates = [
+        f"MAX([{alias}].{_quote_identifier(column)}) AS {_quote_identifier(column)}"
+        for column in columns
+    ]
+    aggregates.append(
+        "CONVERT(bit, COALESCE(MAX(CONVERT(tinyint, "
+        f"[{alias}].[dfe_has_data])), 0)) AS [dfe_has_data]"
+    )
+    return ", ".join(aggregates)
 
 
 def _payload_clause(payloads: tuple[_PayloadLowering, ...]) -> str:
@@ -327,10 +689,10 @@ def _fields_valid_expression(
     if not schema.fields:
         return "1 = 1"
     conditions: list[str] = []
-    for index, (field, binding, _) in enumerate(
+    for index, (field, _binding, _) in enumerate(
         zip(schema.fields, bindings, payloads, strict=True)
     ):
-        column = _qualified_column(binding.column_name)
+        column = _qualified_column(index)
         payload_valid = f"[dfe_payload].{_quote_identifier(f'valid_{index}')} = CONVERT(bit, 1)"
         if field.nullable:
             conditions.append(f"({column} IS NULL OR {payload_valid})")
@@ -346,8 +708,8 @@ def _payload_bytes_expression(
     if not payloads:
         return "CONVERT(bigint, 0)"
     terms: list[str] = []
-    for index, binding in enumerate(bindings):
-        column = _qualified_column(binding.column_name)
+    for index, _binding in enumerate(bindings):
+        column = _qualified_column(index)
         valid = f"[dfe_payload].{_quote_identifier(f'valid_{index}')}"
         payload = f"[dfe_payload].{_quote_identifier(f'payload_{index}')}"
         terms.append(
@@ -366,10 +728,10 @@ def _frames_expression(
     if not schema.fields:
         return "CONVERT(varchar(max), '')"
     frames: list[str] = []
-    for index, (field, binding, _) in enumerate(
+    for index, (field, _binding, _) in enumerate(
         zip(schema.fields, bindings, payloads, strict=True)
     ):
-        column = _qualified_column(binding.column_name)
+        column = _qualified_column(index)
         payload = f"[dfe_payload].{_quote_identifier(f'payload_{index}')}"
         tag = _type_tag(field.logical_type)
         null_frame = f"'{tag}0{'0' * 16}'"
@@ -386,8 +748,73 @@ def _frames_expression(
     return " + ".join(frames)
 
 
-def _payload_lowering(field: FieldSchema, binding: MssqlFieldBinding) -> _PayloadLowering:
-    column = _qualified_column(binding.column_name)
+def _key_has_null_expression(key_field_indexes: tuple[int, ...]) -> str:
+    return " OR ".join(
+        f"{_qualified_column(field_index)} IS NULL" for field_index in key_field_indexes
+    )
+
+
+def _key_fields_valid_expression(
+    key_field_indexes: tuple[int, ...],
+    payloads: tuple[_PayloadLowering, ...],
+) -> str:
+    return " AND ".join(
+        f"{_qualified_column(field_index)} IS NOT NULL AND "
+        f"[dfe_payload].{_quote_identifier(f'valid_{payload_index}')} = CONVERT(bit, 1)"
+        for payload_index, (field_index, _payload) in enumerate(
+            zip(key_field_indexes, payloads, strict=True)
+        )
+    )
+
+
+def _key_payload_bytes_expression(
+    key_field_indexes: tuple[int, ...],
+    payloads: tuple[_PayloadLowering, ...],
+) -> str:
+    return " + ".join(
+        "CASE WHEN "
+        f"{_qualified_column(field_index)} IS NULL OR "
+        f"[dfe_payload].{_quote_identifier(f'valid_{payload_index}')} = CONVERT(bit, 0) "
+        "THEN CONVERT(bigint, 0) ELSE DATALENGTH("
+        f"[dfe_payload].{_quote_identifier(f'payload_{payload_index}')}) END"
+        for payload_index, (field_index, _payload) in enumerate(
+            zip(key_field_indexes, payloads, strict=True)
+        )
+    )
+
+
+def _key_frames_expression(
+    key_fields: tuple[FieldSchema, ...],
+    key_field_indexes: tuple[int, ...],
+    payloads: tuple[_PayloadLowering, ...],
+) -> str:
+    frames: list[str] = []
+    for payload_index, (field, field_index, _payload) in enumerate(
+        zip(key_fields, key_field_indexes, payloads, strict=True)
+    ):
+        column = _qualified_column(field_index)
+        payload = f"[dfe_payload].{_quote_identifier(f'payload_{payload_index}')}"
+        tag = _type_tag(field.logical_type)
+        null_frame = f"'{tag}0{'0' * 16}'"
+        present_frame = (
+            f"CONVERT(varchar(max), '{tag}1') + "
+            "LOWER(CONVERT(char(16), CONVERT(binary(8), "
+            f"CONVERT(bigint, DATALENGTH({payload}))), 2)) + "
+            f"LOWER(CONVERT(varchar(max), {payload}, 2))"
+        )
+        frames.append(
+            f"CASE WHEN {column} IS NULL THEN CONVERT(varchar(max), {null_frame}) "
+            f"ELSE {present_frame} END"
+        )
+    return " + ".join(frames)
+
+
+def _payload_lowering(
+    field: FieldSchema,
+    binding: MssqlFieldBinding,
+    field_index: int,
+) -> _PayloadLowering:
+    column = _qualified_column(field_index)
     logical_type = field.logical_type
     if logical_type is LogicalType.INT64:
         _require_no_parameters(field)
@@ -569,15 +996,12 @@ def _limb_sum_expression(index: int) -> str:
 
 def _validate_canonical_inputs(
     schema: CanonicalSchema,
-    relation: MssqlRelation,
-    bindings: tuple[MssqlFieldBinding, ...],
+    inspection: MssqlInspectedRelation,
     max_encoded_envelope_bytes: int,
 ) -> None:
     if not isinstance(cast(object, schema), CanonicalSchema):
         raise MssqlLoweringError("schema must be a CanonicalSchema")
-    if type(relation) is not MssqlRelation:
-        raise MssqlLoweringError("relation must be MssqlRelation")
-    _validate_bindings(schema, bindings)
+    validate_mssql_inspection(schema, inspection)
     _validate_positive_integer(
         max_encoded_envelope_bytes,
         "SQL Server maximum encoded envelope bytes",
@@ -585,10 +1009,15 @@ def _validate_canonical_inputs(
     )
 
 
-def _validate_bindings(
+def validate_mssql_inspection(
     schema: CanonicalSchema,
-    bindings: tuple[MssqlFieldBinding, ...],
+    inspection: MssqlInspectedRelation,
 ) -> None:
+    if not isinstance(cast(object, schema), CanonicalSchema):
+        raise MssqlLoweringError("schema must be a CanonicalSchema")
+    if type(inspection) is not MssqlInspectedRelation:
+        raise MssqlLoweringError("inspection must be MssqlInspectedRelation")
+    bindings = inspection.bindings
     if type(bindings) is not tuple:
         raise MssqlLoweringError("SQL Server field bindings must be an immutable tuple")
     if len(bindings) > MAX_COMPILED_RELATION_MEMBERS:
@@ -612,6 +1041,33 @@ def _validate_bindings(
                 f"index={index}, expected={field.name!r}, actual={binding.field_name!r}"
             )
         _validate_physical_mapping(field, binding.physical, index)
+
+
+def _validate_key_field_indexes(
+    schema: CanonicalSchema,
+    key_field_indexes: tuple[int, ...],
+) -> None:
+    if type(key_field_indexes) is not tuple or not key_field_indexes:
+        raise MssqlLoweringError("SQL Server key field indexes must be a non-empty immutable tuple")
+    seen: set[int] = set()
+    for key_ordinal, field_index in enumerate(key_field_indexes):
+        if type(field_index) is not int or not 0 <= field_index < len(schema.fields):
+            raise MssqlLoweringError(
+                "SQL Server key field index must identify a logical schema field: "
+                f"key_ordinal={key_ordinal}, field_index={field_index!r}"
+            )
+        if field_index in seen:
+            raise MssqlLoweringError(
+                "SQL Server key field indexes must not contain duplicates: "
+                f"field_index={field_index}"
+            )
+        if schema.fields[field_index].nullable:
+            raise MssqlLoweringError(
+                "SQL Server key field must be logically non-nullable: "
+                f"key_ordinal={key_ordinal}, field_index={field_index}, "
+                f"field_name={schema.fields[field_index].name!r}"
+            )
+        seen.add(field_index)
 
 
 def _validate_physical_mapping(
@@ -726,12 +1182,32 @@ def _type_tag(logical_type: LogicalType) -> str:
         raise MssqlLoweringError(f"unsupported logical type {logical_type!r}") from None
 
 
-def _qualified_column(column_name: str) -> str:
-    return f"[dfe_source].{_quote_identifier(column_name)}"
+def _qualified_column(field_index: int) -> str:
+    _validate_nonnegative_integer(
+        field_index,
+        "SQL Server internal field index",
+        MAX_COMPILED_RELATION_MEMBERS,
+    )
+    return f"[dfe_source].{_quote_identifier(f'dfe_field_{field_index}')}"
+
+
+def _qualified_relation_name(relation: MssqlRelation) -> str:
+    return f"{_quote_identifier(relation.schema_name)}.{_quote_identifier(relation.table_name)}"
 
 
 def _quote_identifier(value: str) -> str:
     return "[" + value.replace("]", "]]") + "]"
+
+
+def _quote_unicode_literal(value: str) -> str:
+    _validate_scalar_text(value, "SQL Server Unicode literal")
+    return "N'" + value.replace("'", "''") + "'"
+
+
+def _optional_unicode_literal(value: str | None) -> str:
+    if value is None:
+        return "CONVERT(nvarchar(128), NULL)"
+    return _quote_unicode_literal(value)
 
 
 def _validate_identifier(value: object, context: str) -> None:

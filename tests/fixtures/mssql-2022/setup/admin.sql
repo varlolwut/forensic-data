@@ -18,6 +18,12 @@ BEGIN
     DROP DATABASE [dfe_fixture];
 END;
 
+IF DB_ID(N'dfe_rcsi_fixture') IS NOT NULL
+BEGIN
+    ALTER DATABASE [dfe_rcsi_fixture] SET SINGLE_USER WITH ROLLBACK IMMEDIATE;
+    DROP DATABASE [dfe_rcsi_fixture];
+END;
+
 IF SUSER_ID(N'dfe_fixture_reader') IS NOT NULL
 BEGIN
     DROP LOGIN [dfe_fixture_reader];
@@ -44,6 +50,10 @@ CREATE DATABASE [dfe_fixture] COLLATE Latin1_General_100_CI_AS_SC;
 ALTER DATABASE [dfe_fixture] SET COMPATIBILITY_LEVEL = 160;
 ALTER DATABASE [dfe_fixture] SET ALLOW_SNAPSHOT_ISOLATION ON;
 ALTER DATABASE [dfe_fixture] SET READ_COMMITTED_SNAPSHOT OFF;
+CREATE DATABASE [dfe_rcsi_fixture] COLLATE Latin1_General_100_CI_AS_SC;
+ALTER DATABASE [dfe_rcsi_fixture] SET COMPATIBILITY_LEVEL = 160;
+ALTER DATABASE [dfe_rcsi_fixture] SET ALLOW_SNAPSHOT_ISOLATION OFF;
+ALTER DATABASE [dfe_rcsi_fixture] SET READ_COMMITTED_SNAPSHOT ON;
 ALTER LOGIN [dfe_fixture_reader] WITH DEFAULT_DATABASE = [dfe_fixture];
 ALTER LOGIN [dfe_fixture_setup_writer] WITH DEFAULT_DATABASE = [dfe_fixture];
 GO
@@ -85,6 +95,44 @@ CREATE TABLE [dfe_fixture].[canonical_common_types]
     CONSTRAINT [PK_dfe_fixture_canonical_common_types] PRIMARY KEY ([probe_id])
 );
 
+CREATE TABLE [dfe_fixture].[canonical_key_probe]
+(
+    [probe_id] int NOT NULL,
+    [text_key] nvarchar(32) COLLATE Latin1_General_100_CI_AS_SC NULL,
+    [numeric_key] decimal(38, 7) NULL,
+    CONSTRAINT [PK_dfe_fixture_canonical_key_probe] PRIMARY KEY ([probe_id])
+);
+
+CREATE TABLE [dfe_fixture].[rls_probe]
+(
+    [record_id] bigint NOT NULL,
+    [visible_to_reader] bit NOT NULL,
+    [observed_value] nvarchar(64) NOT NULL,
+    CONSTRAINT [PK_dfe_fixture_rls_probe] PRIMARY KEY ([record_id])
+);
+GO
+
+CREATE FUNCTION [dfe_fixture].[rls_probe_filter]
+(
+    @visible_to_reader bit
+)
+RETURNS TABLE
+WITH SCHEMABINDING
+AS
+RETURN
+(
+    SELECT 1 AS [allowed]
+    WHERE USER_NAME() <> N'dfe_fixture_reader'
+       OR @visible_to_reader = CONVERT(bit, 1)
+);
+GO
+
+CREATE SECURITY POLICY [dfe_fixture].[rls_probe_policy]
+ADD FILTER PREDICATE [dfe_fixture].[rls_probe_filter]([visible_to_reader])
+ON [dfe_fixture].[rls_probe]
+WITH (STATE = ON, SCHEMABINDING = ON);
+GO
+
 CREATE USER [dfe_fixture_reader]
 FOR LOGIN [dfe_fixture_reader]
 WITH DEFAULT_SCHEMA = [dfe_fixture];
@@ -101,6 +149,9 @@ ALTER ROLE [dfe_fixture_setup_writer_role] ADD MEMBER [dfe_fixture_setup_writer]
 
 GRANT CONNECT TO [dfe_fixture_reader];
 GRANT CONNECT TO [dfe_fixture_setup_writer];
+GRANT VIEW SECURITY DEFINITION TO [dfe_fixture_reader_role];
+GRANT VIEW DEFINITION TO [dfe_fixture_reader_role];
+GRANT VIEW DEFINITION TO [dfe_fixture_setup_writer_role];
 GRANT SELECT ON SCHEMA::[dfe_fixture] TO [dfe_fixture_reader_role];
 GRANT SELECT, INSERT, UPDATE, DELETE ON SCHEMA::[dfe_fixture]
 TO [dfe_fixture_setup_writer_role];
@@ -109,6 +160,22 @@ DENY INSERT, UPDATE, DELETE ON SCHEMA::[dfe_fixture]
 TO [dfe_fixture_reader_role];
 DENY CREATE TABLE, CREATE VIEW, CREATE PROCEDURE, CREATE FUNCTION
 TO [dfe_fixture_reader];
+
+USE [dfe_rcsi_fixture];
+GO
+
+CREATE USER [dfe_fixture_reader]
+FOR LOGIN [dfe_fixture_reader]
+WITH DEFAULT_SCHEMA = [dbo];
+
+GRANT CONNECT TO [dfe_fixture_reader];
+GRANT VIEW SECURITY DEFINITION TO [dfe_fixture_reader];
+GRANT VIEW DEFINITION TO [dfe_fixture_reader];
+DENY CREATE TABLE, CREATE VIEW, CREATE PROCEDURE, CREATE FUNCTION
+TO [dfe_fixture_reader];
+
+USE [dfe_fixture];
+GO
 
 IF NOT EXISTS
 (
@@ -125,11 +192,28 @@ BEGIN
         1;
 END;
 
+IF NOT EXISTS
+(
+    SELECT 1
+    FROM sys.databases
+    WHERE [name] = N'dfe_rcsi_fixture'
+      AND [snapshot_isolation_state_desc] = N'OFF'
+      AND [is_read_committed_snapshot_on] = 1
+      AND [compatibility_level] = 160
+)
+BEGIN
+    THROW 51000,
+        N'RCSI-only fixture requires compatibility level 160, SNAPSHOT OFF, and READ_COMMITTED_SNAPSHOT ON.',
+        1;
+END;
+
 SELECT
+    [name] AS [database_name],
     CONVERT(nvarchar(128), SERVERPROPERTY(N'ProductVersion')) AS [product_version],
     CONVERT(nvarchar(128), SERVERPROPERTY(N'ProductUpdateLevel')) AS [update_level],
     [snapshot_isolation_state_desc],
     [is_read_committed_snapshot_on],
     [compatibility_level]
 FROM sys.databases
-WHERE [name] = N'dfe_fixture';
+WHERE [name] IN (N'dfe_fixture', N'dfe_rcsi_fixture')
+ORDER BY [name];

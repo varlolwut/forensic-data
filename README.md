@@ -489,7 +489,7 @@ previously started with different values, run the cleanup command below before s
 The protocol/result tests can run without Docker, but this does not verify database support:
 
 ```console
-uv run pytest --ignore=tests/test_mssql_integration.py --ignore=tests/test_postgres_integration.py --ignore=tests/test_postgres_metadata_integration.py --ignore=tests/test_postgres_protected_integration.py --ignore=tests/test_postgres_lifecycle_schema_integration.py --ignore=tests/test_postgres_lifecycle_integration.py --ignore=tests/test_postgres_comparison_integration.py --ignore=tests/test_postgres_legacy_integration.py
+uv run pytest --ignore=tests/test_mssql_integration.py --ignore=tests/test_mssql_canonical_integration.py --ignore=tests/test_postgres_integration.py --ignore=tests/test_postgres_frozen_union_integration.py --ignore=tests/test_postgres_metadata_integration.py --ignore=tests/test_postgres_protected_integration.py --ignore=tests/test_postgres_lifecycle_schema_integration.py --ignore=tests/test_postgres_lifecycle_integration.py --ignore=tests/test_postgres_comparison_integration.py --ignore=tests/test_postgres_legacy_integration.py
 ```
 
 Stop and remove only these disposable fixtures and their data volumes:
@@ -537,8 +537,26 @@ normalizes to `nvarchar(max)`, converts through `Latin1_General_100_BIN2_UTF8`, 
 searches. Canonical frames introduce a MAX operand before concatenation, including rows whose
 encoded envelope exceeds 8,000 bytes; SHA-256 remains internal, counts use `COUNT_BIG`, and every
 digest limb is widened to `decimal(38,0)` before `SUM`. SQL Server 2016 has neither this UTF-8
-collation nor `GENERATE_SERIES`; it requires a separate profile, which is not implemented or
-verified yet, rather than a silent fallback.
+collation nor `GENERATE_SERIES`; its separate legacy encoding/driver profile is not yet implemented
+or verified and must not be replaced by a silent fallback.
+
+The protected SQL Server 2022 read context selects transaction-level `SNAPSHOT` through the ODBC
+connection attribute before its first protected query, then proves the same session has
+`@@TRANCOUNT=1`, `XACT_STATE()=1`, and isolation level 5. Contexts are sequential and rollback-only.
+`READ_COMMITTED_SNAPSHOT` is recorded but never substitutes for `ALLOW_SNAPSHOT_ISOLATION=ON`; the
+separate RCSI-only fixture is rejected before relation inspection.
+
+The fixture grants `VIEW DEFINITION` and `VIEW SECURITY DEFINITION` so catalog and security-policy
+metadata are visible. Relation inspection requires exact SELECT-only permissions, including the
+absence of column-level update grants, resolves direct built-in type and
+database/schema/object/column identity, and rejects enabled row-level security. Every canonical
+query rechecks that provenance in the same statement and loses the context on missing or changed
+metadata rather than silently rebinding.
+
+Key summaries encode the complete, possibly composite, key with canonical v1 framing and use
+`COUNT_BIG` to report null, invalid, oversized, valid, and distinct `varbinary` envelopes. They do
+not use source-collation equality, so case, trailing-space, and Unicode-normalization adversaries
+remain distinct whenever their canonical bytes differ.
 
 ```console
 # POSIX
@@ -559,22 +577,21 @@ docker compose --env-file tests/fixtures/mssql-2022/.env --file tests/fixtures/m
 docker compose --env-file tests/fixtures/mssql-2022/.env --file tests/fixtures/mssql-2022/compose.yaml run --rm verify
 ```
 
-Run the SQL Server integration tests with the fixture-only port, reader password, and disposable
-administrator password. The administrator connection only observes the in-flight cancellation
-probe; product reads still use the least-privilege reader. The tests construct fixed localhost
-connections and their explicit test-only certificate exception:
+Run the SQL Server integration tests with the fixture-only port, reader password, setup-writer
+password, and disposable administrator password. Administrator and setup-writer connections are
+fixture orchestration only; product reads still use the least-privilege reader. The tests construct
+fixed localhost connections and their explicit test-only certificate exception:
 
 ```console
 uv run --env-file tests/fixtures/mssql-2022/.env pytest tests/test_mssql_integration.py tests/test_mssql_canonical_integration.py
 ```
 
-The bootstrap recreates only the fixture database and its two fixture logins. Verification requires
-the exact `16.0.4295.3` Developer build, database compatibility level 160,
-`ALLOW_SNAPSHOT_ISOLATION=ON`,
-`READ_COMMITTED_SNAPSHOT=OFF`, an actual reader data access inside a transaction-level `SNAPSHOT`,
-and denied reader DML and DDL. The reader and setup-writer services never receive the `sa`
-credential. This fixture proves the P03-01 environment boundary, not a completed MSSQL adapter or
-cross-engine comparison.
+The bootstrap recreates the main and RCSI-only fixture databases and their two fixture logins.
+Verification requires the exact `16.0.4295.3` Developer build, compatibility level 160,
+`ALLOW_SNAPSHOT_ISOLATION=ON` for the main database, `SNAPSHOT=OFF` plus RCSI ON for the negative
+fixture, and denied reader DML and DDL. The reader and setup-writer services never receive the `sa`
+credential. The MSSQL-to-PostgreSQL endpoint, historical evidence, and real SQL Server 2016 source
+profile are not yet implemented or verified.
 
 The `sa` password is persisted in the SQL Server system databases. If you change it in the ignored
 environment file, remove only this disposable fixture and its owned volume before starting again:

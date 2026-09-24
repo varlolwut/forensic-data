@@ -72,4 +72,4 @@ expect_reader_denial \
 run_reader_query \
   "SET NOCOUNT ON; IF EXISTS (SELECT 1 FROM [dfe_fixture].[snapshot_probe] WHERE [record_id] = 1 AND [observed_value] = N'forbidden') THROW 51000, N'Reader changed fixture data.', 1; IF OBJECT_ID(N'dfe_fixture.reader_should_not_create', N'U') IS NOT NULL THROW 51000, N'Reader created a table.', 1;"
 
-echo "SQL Server 2022 CU27 SNAPSHOT and least-privilege fixture verification passed."
+echo "SQL Server 2022 CU27 SNAPSHOT, RCSI-only, canonical-key, RLS, and least-privilege fixture verification passed."

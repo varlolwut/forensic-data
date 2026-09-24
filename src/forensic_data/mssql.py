@@ -2,20 +2,36 @@ import logging
 import math
 import time
 from dataclasses import dataclass
-from datetime import date, datetime
+from datetime import UTC, date, datetime
 from datetime import time as datetime_time
 from decimal import Decimal
 from enum import StrEnum
 from threading import Condition, Lock, get_ident
-from typing import cast
-from uuid import UUID
+from typing import NoReturn, cast
+from uuid import UUID, uuid4
 
 import pyodbc
 from pydantic import BaseModel, ConfigDict, Field, SecretStr, field_validator
 
+from forensic_data.canonical.model import CanonicalSchema
+from forensic_data.mssql_sql import (
+    INT32_MAX,
+    MAX_COMPILED_RELATION_MEMBERS,
+    MssqlCanonicalQuery,
+    MssqlCanonicalResultKind,
+    MssqlFieldBinding,
+    MssqlInspectedRelation,
+    MssqlPhysicalField,
+    MssqlRelation,
+    validate_mssql_inspection,
+)
+
 LOGGER = logging.getLogger(__name__)
 _DRIVER_NAME = "ODBC Driver 18 for SQL Server"
 _CONFIRMATION_SENTINEL = 1
+_SQL_COPT_SS_TXN_ISOLATION = 1_227
+_SQL_TXN_SS_SNAPSHOT = 32
+_CANONICAL_UTF8_COLLATION = "Latin1_General_100_BIN2_UTF8"
 
 type MssqlParameter = str | int | Decimal | bytes
 type MssqlValue = bool | int | Decimal | str | bytes | None
@@ -120,6 +136,26 @@ class MssqlThreadOwnershipError(MssqlTransportError):
 
 class MssqlQueryTimeoutError(MssqlQueryError):
     """ODBC timed out a statement and same-session completion was confirmed."""
+
+
+class UnsupportedMssqlProfileError(MssqlTransportError):
+    """The server, database, or transaction cannot satisfy the SQL Server profile."""
+
+
+class MssqlMetadataError(MssqlDataValidationError):
+    """SQL Server catalog provenance is absent, unsupported, or changed."""
+
+
+class MssqlQueryContextError(MssqlTransportError):
+    """A compiled SQL Server query belongs to another read context."""
+
+
+class MssqlContextClosedError(MssqlTransportClosedError):
+    """A closed SQL Server read context cannot execute another operation."""
+
+
+class MssqlContextLostError(MssqlTransportError):
+    """A failed SQL Server read context cannot be resumed."""
 
 
 class MssqlTlsVerification(StrEnum):
@@ -242,6 +278,54 @@ class MssqlDriverEvidence:
 
 
 @dataclass(frozen=True, slots=True)
+class MssqlServerProfile:
+    driver: MssqlDriverEvidence
+    product_version: str
+    product_major_version: int
+    product_build: str
+    engine_edition: int
+    edition: str
+    product_level: str
+    product_update_level: str | None
+    product_update_reference: str | None
+    server_collation: str
+    database_id: int
+    database_name: str
+    compatibility_level: int
+    database_collation: str
+    snapshot_isolation_state: int
+    snapshot_isolation_state_description: str
+    read_committed_snapshot: bool
+    database_read_only: bool
+    database_updateability: str
+    canonical_utf8_code_page: int
+    can_view_definition: bool
+
+
+@dataclass(frozen=True, slots=True)
+class MssqlReadContextEvidence:
+    context_id: UUID
+    engine: str
+    server_version: str
+    strategy: str
+    snapshot_locator: None
+    started_at: datetime
+    session_id: int
+    database_id: int
+    transaction_count: int
+    transaction_state: int
+    transaction_isolation_level: int
+    allowed_concurrency: int
+    limitations: tuple[str, ...]
+
+
+class MssqlReadContextState(StrEnum):
+    ACTIVE = "active"
+    LOST = "lost"
+    CLOSED = "closed"
+
+
+@dataclass(frozen=True, slots=True)
 class MssqlReadMetrics:
     fetched_records: int
     fetched_bytes: int
@@ -252,6 +336,46 @@ class MssqlReadMetrics:
 @dataclass(frozen=True, slots=True)
 class MssqlReadResult:
     rows: tuple[MssqlRow, ...]
+    metrics: MssqlReadMetrics
+
+
+@dataclass(frozen=True, slots=True)
+class MssqlKeySummary:
+    row_count: int
+    null_key_count: int
+    invalid_key_count: int
+    oversized_key_count: int
+    valid_key_count: int
+    distinct_key_count: int
+
+    def __post_init__(self) -> None:
+        for field_name, value in (
+            ("row_count", self.row_count),
+            ("null_key_count", self.null_key_count),
+            ("invalid_key_count", self.invalid_key_count),
+            ("oversized_key_count", self.oversized_key_count),
+            ("valid_key_count", self.valid_key_count),
+            ("distinct_key_count", self.distinct_key_count),
+        ):
+            _require_bounded_integer(value, field_name, 0, (1 << 63) - 1)
+        if self.row_count != (
+            self.null_key_count
+            + self.invalid_key_count
+            + self.oversized_key_count
+            + self.valid_key_count
+        ):
+            raise MssqlDataValidationError(
+                "SQL Server key-summary counts do not partition the source rows"
+            )
+        if self.distinct_key_count > self.valid_key_count:
+            raise MssqlDataValidationError(
+                "SQL Server distinct canonical-key count exceeds the valid key count"
+            )
+
+
+@dataclass(frozen=True, slots=True)
+class MssqlKeySummaryRead:
+    summary: MssqlKeySummary
     metrics: MssqlReadMetrics
 
 
@@ -302,6 +426,46 @@ class MssqlTransport:
     def active_query_id(self) -> UUID | None:
         with self._state_changed:
             return self._active_query_id
+
+    def configure_snapshot_transaction(self) -> None:
+        self._require_owner_thread()
+        self._require_open()
+        with self._state_changed:
+            if self._active_query_id is not None:
+                raise MssqlTransportError(
+                    "SQL Server transport cannot configure SNAPSHOT while a query is active"
+                )
+        try:
+            self._connection.rollback()
+            self._connection.autocommit = True
+            self._connection.set_attr(
+                _SQL_COPT_SS_TXN_ISOLATION,
+                _SQL_TXN_SS_SNAPSHOT,
+            )
+            self._connection.autocommit = False
+        except pyodbc.Error as error:
+            self._retire_after_setup_error()
+            raise MssqlConnectionError(
+                "SQL Server ODBC SNAPSHOT transaction configuration failed: "
+                f"session_id={self._evidence.session_id}, sqlstate={_sqlstate(error)!r}"
+            ) from None
+
+    def rollback(self) -> None:
+        self._require_owner_thread()
+        self._require_open()
+        with self._state_changed:
+            if self._active_query_id is not None:
+                raise MssqlTransportError(
+                    "SQL Server transport cannot roll back while a query is active: "
+                    f"query_id={self._active_query_id}"
+                )
+        try:
+            self._connection.rollback()
+        except pyodbc.Error:
+            self._retire_after_setup_error()
+            raise MssqlCloseError(
+                f"SQL Server transaction rollback failed: session_id={self._evidence.session_id}"
+            ) from None
 
     def execute_bounded(
         self,
@@ -751,6 +915,19 @@ class MssqlTransport:
         self._active_cursor = None
         self._cancel_requested = False
 
+    def _retire_after_setup_error(self) -> None:
+        with self._state_changed:
+            self._clear_active_query_locked()
+            self._closed = True
+            self._state_changed.notify_all()
+        try:
+            self._connection.close()
+        except pyodbc.Error:
+            LOGGER.warning(
+                "SQL Server connection close failed during setup retirement",
+                extra={"session_id": self._evidence.session_id},
+            )
+
     def _wait_for_cancellation_acknowledgement_locked(
         self,
         query_id: UUID,
@@ -788,6 +965,375 @@ class MssqlTransport:
                 raise MssqlTransportClosedError("SQL Server transport is already closed")
 
 
+class MssqlReadContext:
+    """One sequential SQL Server transaction-level SNAPSHOT read context."""
+
+    def __init__(
+        self,
+        transport: MssqlTransport,
+        profile: MssqlServerProfile,
+        evidence: MssqlReadContextEvidence,
+    ) -> None:
+        self._transport = transport
+        self._profile = profile
+        self._evidence = evidence
+        self._state = MssqlReadContextState.ACTIVE
+
+    @property
+    def profile(self) -> MssqlServerProfile:
+        return self._profile
+
+    @property
+    def evidence(self) -> MssqlReadContextEvidence:
+        return self._evidence
+
+    @property
+    def state(self) -> MssqlReadContextState:
+        return self._state
+
+    @property
+    def active_query_id(self) -> UUID | None:
+        return self._transport.active_query_id
+
+    def cancel(self, query_id: UUID) -> None:
+        self._transport.cancel(query_id)
+
+    def inspect_relation(
+        self,
+        schema: CanonicalSchema,
+        relation: MssqlRelation,
+        column_names: tuple[str, ...],
+        max_metadata_record_bytes: int,
+        max_metadata_total_bytes: int,
+    ) -> MssqlInspectedRelation:
+        self._require_active()
+        _validate_inspection_request(
+            schema,
+            relation,
+            column_names,
+            max_metadata_record_bytes,
+            max_metadata_total_bytes,
+        )
+        relation_rows = self._execute_metadata(
+            _relation_metadata_query(relation),
+            1,
+            max_metadata_record_bytes,
+            max_metadata_total_bytes,
+        )
+        if len(relation_rows) != 1:
+            raise MssqlMetadataError(
+                "SQL Server relation is missing or not visible to the reader: "
+                f"schema={relation.schema_name!r}, table={relation.table_name!r}"
+            )
+        database_id, schema_id, object_id = _validated_relation_metadata(
+            relation_rows[0],
+            relation,
+            self._profile,
+        )
+        if column_names:
+            column_rows = self._execute_metadata(
+                _column_metadata_query(object_id, column_names),
+                len(column_names),
+                max_metadata_record_bytes,
+                max_metadata_total_bytes,
+            )
+            if len(column_rows) != len(column_names):
+                raise MssqlMetadataError(
+                    "SQL Server catalog did not return one row per requested column: "
+                    f"expected={len(column_names)}, actual={len(column_rows)}"
+                )
+            bindings = tuple(
+                _binding_from_metadata_row(field.name, column_name, index, row)
+                for index, (field, column_name, row) in enumerate(
+                    zip(schema.fields, column_names, column_rows, strict=True)
+                )
+            )
+        else:
+            bindings = ()
+        inspection = MssqlInspectedRelation(
+            context_id=self._evidence.context_id,
+            database_id=database_id,
+            schema_id=schema_id,
+            object_id=object_id,
+            relation=relation,
+            bindings=bindings,
+        )
+        validate_mssql_inspection(schema, inspection)
+        return inspection
+
+    def read_canonical_rows(
+        self,
+        query: MssqlCanonicalQuery,
+        limits: MssqlFetchLimits,
+    ) -> MssqlReadResult:
+        self._require_query(query, MssqlCanonicalResultKind.ROWS)
+        raw_result = self._execute_compiled(query, _row_transport_limits(query, limits))
+        witnessed_rows = self._validated_witness_rows(query, raw_result.rows)
+        if any(not has_data for has_data, _payload in witnessed_rows):
+            if len(witnessed_rows) != 1 or witnessed_rows[0][0]:
+                self._lose_for_metadata_error(
+                    "SQL Server row query returned a malformed empty-relation witness"
+                )
+            payload_rows: tuple[MssqlRow, ...] = ()
+        else:
+            payload_rows = tuple(payload for _has_data, payload in witnessed_rows)
+        _validate_logical_rows(payload_rows, limits)
+        return MssqlReadResult(
+            rows=payload_rows,
+            metrics=_logical_read_metrics(raw_result.metrics, payload_rows),
+        )
+
+    def read_fingerprint(
+        self,
+        query: MssqlCanonicalQuery,
+        limits: MssqlFetchLimits,
+    ) -> MssqlReadResult:
+        self._require_query(query, MssqlCanonicalResultKind.FINGERPRINT)
+        raw_result = self._execute_compiled(query, _summary_transport_limits(query, limits))
+        witnessed_rows = self._validated_witness_rows(query, raw_result.rows)
+        if len(witnessed_rows) != 1:
+            self._lose_for_metadata_error(
+                "SQL Server fingerprint query must return exactly one provenance row"
+            )
+        payload_rows = (witnessed_rows[0][1],)
+        _validate_logical_rows(payload_rows, limits)
+        return MssqlReadResult(
+            rows=payload_rows,
+            metrics=_logical_read_metrics(raw_result.metrics, payload_rows),
+        )
+
+    def read_key_summary(
+        self,
+        query: MssqlCanonicalQuery,
+        limits: MssqlFetchLimits,
+    ) -> MssqlKeySummaryRead:
+        self._require_query(query, MssqlCanonicalResultKind.KEY_SUMMARY)
+        raw_result = self._execute_compiled(query, _summary_transport_limits(query, limits))
+        witnessed_rows = self._validated_witness_rows(query, raw_result.rows)
+        if len(witnessed_rows) != 1:
+            self._lose_for_metadata_error(
+                "SQL Server key-summary query must return exactly one provenance row"
+            )
+        payload = witnessed_rows[0][1]
+        if len(payload) != 6:
+            self._lose_for_metadata_error(
+                "SQL Server key-summary query returned an unexpected payload shape"
+            )
+        counts = tuple(
+            _require_bounded_integer(value, field_name, 0, (1 << 63) - 1)
+            for value, field_name in zip(
+                payload,
+                (
+                    "row_count",
+                    "null_key_count",
+                    "invalid_key_count",
+                    "oversized_key_count",
+                    "valid_key_count",
+                    "distinct_key_count",
+                ),
+                strict=True,
+            )
+        )
+        summary = MssqlKeySummary(
+            row_count=counts[0],
+            null_key_count=counts[1],
+            invalid_key_count=counts[2],
+            oversized_key_count=counts[3],
+            valid_key_count=counts[4],
+            distinct_key_count=counts[5],
+        )
+        payload_rows = (payload,)
+        _validate_logical_rows(payload_rows, limits)
+        return MssqlKeySummaryRead(
+            summary=summary,
+            metrics=_logical_read_metrics(raw_result.metrics, payload_rows),
+        )
+
+    def close(self) -> None:
+        if self._state is MssqlReadContextState.CLOSED:
+            return
+        try:
+            if not self._transport.closed:
+                self._transport.rollback()
+                self._transport.close()
+        except MssqlTransportError:
+            self._state = MssqlReadContextState.LOST
+            raise
+        self._state = MssqlReadContextState.CLOSED
+
+    def _execute_metadata(
+        self,
+        query: MssqlQuery,
+        max_records: int,
+        max_record_bytes: int,
+        max_total_bytes: int,
+    ) -> tuple[MssqlRow, ...]:
+        limits = MssqlFetchLimits(
+            fetch_batch_records=1,
+            max_records=max_records,
+            max_value_bytes=max_record_bytes,
+            max_record_bytes=max_record_bytes,
+            max_total_bytes=max_total_bytes,
+        )
+        try:
+            return self._transport.execute_bounded(query, limits).rows
+        except MssqlTransportError:
+            self._state = MssqlReadContextState.LOST
+            raise
+
+    def _execute_compiled(
+        self,
+        query: MssqlCanonicalQuery,
+        limits: MssqlFetchLimits,
+    ) -> MssqlReadResult:
+        try:
+            return self._transport.execute_bounded(
+                MssqlQuery(
+                    query_id=uuid4(),
+                    statement=query.statement,
+                    parameters=query.parameters,
+                ),
+                limits,
+            )
+        except MssqlTransportError:
+            self._state = MssqlReadContextState.LOST
+            raise
+
+    def _validated_witness_rows(
+        self,
+        query: MssqlCanonicalQuery,
+        rows: tuple[MssqlRow, ...],
+    ) -> tuple[tuple[bool, MssqlRow], ...]:
+        if not rows:
+            self._lose_for_metadata_error(
+                "SQL Server compiled query returned no physical provenance witness"
+            )
+        inspection = query.inspection
+        expected_identity = (
+            inspection.database_id,
+            inspection.schema_id,
+            inspection.object_id,
+            *(binding.column_id for binding in inspection.bindings),
+        )
+        prefix_fields = len(expected_identity) + 1
+        witnessed: list[tuple[bool, MssqlRow]] = []
+        for row_index, row in enumerate(rows):
+            if len(row) < prefix_fields:
+                self._lose_for_metadata_error(
+                    "SQL Server compiled query omitted physical provenance fields: "
+                    f"row_index={row_index}"
+                )
+            identity = row[: len(expected_identity)]
+            has_data = row[len(expected_identity)]
+            if identity != expected_identity:
+                self._lose_for_metadata_error(
+                    "SQL Server compiled query physical provenance changed: "
+                    f"row_index={row_index}, expected_identity={expected_identity!r}, "
+                    f"actual_identity={identity!r}"
+                )
+            if type(has_data) is not bool:
+                self._lose_for_metadata_error(
+                    "SQL Server compiled query returned an invalid data-presence witness: "
+                    f"row_index={row_index}, actual_type={type(has_data).__name__}"
+                )
+            witnessed.append((has_data, row[prefix_fields:]))
+        return tuple(witnessed)
+
+    def _require_query(
+        self,
+        query: MssqlCanonicalQuery,
+        expected_kind: MssqlCanonicalResultKind,
+    ) -> None:
+        self._require_active()
+        if type(query) is not MssqlCanonicalQuery:
+            raise TypeError("query must be MssqlCanonicalQuery")
+        if query.result_kind is not expected_kind:
+            raise MssqlQueryContextError(
+                "SQL Server compiled query has the wrong result kind: "
+                f"expected={expected_kind.value!r}, actual={query.result_kind.value!r}"
+            )
+        if query.inspection.context_id != self._evidence.context_id:
+            raise MssqlQueryContextError(
+                "SQL Server compiled query belongs to a different read context: "
+                f"query_context_id={query.inspection.context_id}, "
+                f"active_context_id={self._evidence.context_id}"
+            )
+
+    def _require_active(self) -> None:
+        if self._state is MssqlReadContextState.CLOSED:
+            raise MssqlContextClosedError("SQL Server read context is already closed")
+        if self._state is MssqlReadContextState.LOST:
+            raise MssqlContextLostError("SQL Server read context was lost and cannot be reused")
+
+    def _lose_for_metadata_error(self, message: str) -> NoReturn:
+        self._state = MssqlReadContextState.LOST
+        if not self._transport.closed:
+            self._transport.rollback()
+            self._transport.close()
+        raise MssqlMetadataError(message)
+
+
+def open_mssql_read_context(
+    settings: MssqlConnectionSettings,
+    retry_policy: MssqlRetryPolicy,
+) -> MssqlReadContext:
+    if type(settings) is not MssqlConnectionSettings:
+        raise TypeError("settings must be MssqlConnectionSettings")
+    if type(retry_policy) is not MssqlRetryPolicy:
+        raise TypeError("retry_policy must be MssqlRetryPolicy")
+    transport = open_mssql_transport(settings, retry_policy)
+    try:
+        profile_result = transport.execute_bounded(
+            MssqlQuery(
+                query_id=uuid4(),
+                statement=_profile_query(),
+                parameters=(),
+            ),
+            MssqlFetchLimits(
+                fetch_batch_records=1,
+                max_records=1,
+                max_value_bytes=1_024,
+                max_record_bytes=8_192,
+                max_total_bytes=8_192,
+            ),
+        )
+        if len(profile_result.rows) != 1:
+            raise MssqlDataValidationError(
+                "SQL Server capability probe must return exactly one row"
+            )
+        profile = _server_profile_from_row(transport.evidence, profile_result.rows[0])
+        _validate_server_profile(profile)
+        started_at = datetime.now(UTC)
+        transport.configure_snapshot_transaction()
+        snapshot_result = transport.execute_bounded(
+            MssqlQuery(
+                query_id=uuid4(),
+                statement=_snapshot_transaction_query(),
+                parameters=(),
+            ),
+            MssqlFetchLimits(
+                fetch_batch_records=1,
+                max_records=1,
+                max_value_bytes=64,
+                max_record_bytes=1_024,
+                max_total_bytes=1_024,
+            ),
+        )
+        if len(snapshot_result.rows) != 1:
+            raise MssqlDataValidationError(
+                "SQL Server SNAPSHOT transaction probe must return exactly one row"
+            )
+        evidence = _read_context_evidence_from_row(
+            profile,
+            snapshot_result.rows[0],
+            started_at,
+        )
+    except MssqlTransportError:
+        _close_opening_transport(transport)
+        raise
+    return MssqlReadContext(transport, profile, evidence)
+
+
 def open_mssql_transport(
     settings: MssqlConnectionSettings,
     retry_policy: MssqlRetryPolicy,
@@ -821,6 +1367,532 @@ def open_mssql_transport(
     if last_error is None:
         raise AssertionError("SQL Server connection retry loop did not execute")
     raise last_error
+
+
+def _profile_query() -> str:
+    return (
+        "SELECT CONVERT(nvarchar(128), SERVERPROPERTY(N'ProductVersion')), "
+        "TRY_CONVERT(int, SERVERPROPERTY(N'ProductMajorVersion')), "
+        "CONVERT(nvarchar(128), SERVERPROPERTY(N'ProductBuild')), "
+        "TRY_CONVERT(int, SERVERPROPERTY(N'EngineEdition')), "
+        "CONVERT(nvarchar(128), SERVERPROPERTY(N'Edition')), "
+        "CONVERT(nvarchar(128), SERVERPROPERTY(N'ProductLevel')), "
+        "CONVERT(nvarchar(128), SERVERPROPERTY(N'ProductUpdateLevel')), "
+        "CONVERT(nvarchar(128), SERVERPROPERTY(N'ProductUpdateReference')), "
+        "CONVERT(nvarchar(128), SERVERPROPERTY(N'Collation')), "
+        "CONVERT(int, DB_ID()), CONVERT(nvarchar(128), DB_NAME()), "
+        "CONVERT(int, [dfe_database].[compatibility_level]), "
+        "CONVERT(nvarchar(128), [dfe_database].[collation_name]), "
+        "CONVERT(int, [dfe_database].[snapshot_isolation_state]), "
+        "CONVERT(nvarchar(60), [dfe_database].[snapshot_isolation_state_desc]), "
+        "CONVERT(bit, [dfe_database].[is_read_committed_snapshot_on]), "
+        "CONVERT(bit, [dfe_database].[is_read_only]), "
+        "CONVERT(nvarchar(128), DATABASEPROPERTYEX(DB_NAME(), N'Updateability')), "
+        "TRY_CONVERT(int, COLLATIONPROPERTY("
+        f"N'{_CANONICAL_UTF8_COLLATION}', N'CodePage')), "
+        "CONVERT(bit, HAS_PERMS_BY_NAME(DB_NAME(), N'DATABASE', N'VIEW DEFINITION')) "
+        "FROM sys.databases AS [dfe_database] "
+        "WHERE [dfe_database].[database_id] = DB_ID()"
+    )
+
+
+def _snapshot_transaction_query() -> str:
+    return (
+        "SELECT CONVERT(int, DB_ID()), "
+        "CONVERT(int, [dfe_database].[compatibility_level]), "
+        "CONVERT(int, [dfe_database].[snapshot_isolation_state]), "
+        "CONVERT(bit, [dfe_database].[is_read_committed_snapshot_on]), "
+        "CONVERT(int, @@SPID), CONVERT(int, @@TRANCOUNT), "
+        "CONVERT(int, XACT_STATE()), "
+        "CONVERT(int, [dfe_session].[transaction_isolation_level]), "
+        "CONVERT(int, [dfe_session].[open_transaction_count]), "
+        "(SELECT COUNT_BIG(*) FROM GENERATE_SERIES("
+        "CONVERT(bigint, 1), CONVERT(bigint, 1), CONVERT(bigint, 1))) "
+        "FROM sys.databases AS [dfe_database] "
+        "JOIN sys.dm_exec_sessions AS [dfe_session] "
+        "ON [dfe_session].[session_id] = @@SPID "
+        "WHERE [dfe_database].[database_id] = DB_ID()"
+    )
+
+
+def _server_profile_from_row(
+    driver: MssqlDriverEvidence,
+    row: MssqlRow,
+) -> MssqlServerProfile:
+    if len(row) != 20:
+        raise MssqlDataValidationError(
+            "SQL Server capability probe returned an unexpected field count: "
+            f"expected=20, actual={len(row)}"
+        )
+    return MssqlServerProfile(
+        driver=driver,
+        product_version=_require_text(row[0], "product_version"),
+        product_major_version=_require_bounded_integer(
+            row[1], "product_major_version", 1, INT32_MAX
+        ),
+        product_build=_require_text(row[2], "product_build"),
+        engine_edition=_require_bounded_integer(row[3], "engine_edition", 1, INT32_MAX),
+        edition=_require_text(row[4], "edition"),
+        product_level=_require_text(row[5], "product_level"),
+        product_update_level=_require_optional_text(row[6], "product_update_level"),
+        product_update_reference=_require_optional_text(row[7], "product_update_reference"),
+        server_collation=_require_text(row[8], "server_collation"),
+        database_id=_require_bounded_integer(row[9], "database_id", 1, INT32_MAX),
+        database_name=_require_text(row[10], "database_name"),
+        compatibility_level=_require_bounded_integer(row[11], "compatibility_level", 1, INT32_MAX),
+        database_collation=_require_text(row[12], "database_collation"),
+        snapshot_isolation_state=_require_bounded_integer(
+            row[13], "snapshot_isolation_state", 0, 3
+        ),
+        snapshot_isolation_state_description=_require_text(
+            row[14], "snapshot_isolation_state_desc"
+        ),
+        read_committed_snapshot=_require_boolean(row[15], "is_read_committed_snapshot_on"),
+        database_read_only=_require_boolean(row[16], "is_read_only"),
+        database_updateability=_require_text(row[17], "database_updateability"),
+        canonical_utf8_code_page=_require_bounded_integer(
+            row[18], "canonical_utf8_code_page", 1, INT32_MAX
+        ),
+        can_view_definition=_require_boolean(row[19], "can_view_definition"),
+    )
+
+
+def _validate_server_profile(profile: MssqlServerProfile) -> None:
+    failures: list[str] = []
+    if profile.product_major_version != 16:
+        failures.append(f"product_major_version={profile.product_major_version}, required=16")
+    if profile.engine_edition not in (2, 3, 4):
+        failures.append(f"engine_edition={profile.engine_edition}, required one of 2,3,4")
+    if profile.compatibility_level != 160:
+        failures.append(f"compatibility_level={profile.compatibility_level}, required=160")
+    if (
+        profile.snapshot_isolation_state != 1
+        or profile.snapshot_isolation_state_description != "ON"
+    ):
+        failures.append(
+            "ALLOW_SNAPSHOT_ISOLATION is not ON: "
+            f"snapshot_isolation_state={profile.snapshot_isolation_state}, "
+            f"snapshot_isolation_state_desc="
+            f"{profile.snapshot_isolation_state_description!r}, "
+            f"read_committed_snapshot={profile.read_committed_snapshot}"
+        )
+    if profile.canonical_utf8_code_page != 65_001:
+        failures.append(
+            "canonical UTF-8 collation is unavailable: "
+            f"code_page={profile.canonical_utf8_code_page}, required=65001"
+        )
+    if not profile.can_view_definition:
+        failures.append(
+            "reader lacks database VIEW DEFINITION required to prove complete "
+            "row-level-security absence"
+        )
+    if profile.product_version != profile.driver.server_version:
+        failures.append(
+            "driver and capability probes disagree on server version: "
+            f"driver={profile.driver.server_version!r}, "
+            f"capability={profile.product_version!r}"
+        )
+    if failures:
+        raise UnsupportedMssqlProfileError(
+            "SQL Server 2022 capability profile is unsupported: "
+            f"database={profile.database_name!r}, database_id={profile.database_id}; "
+            + "; ".join(failures)
+        )
+
+
+def _read_context_evidence_from_row(
+    profile: MssqlServerProfile,
+    row: MssqlRow,
+    started_at: datetime,
+) -> MssqlReadContextEvidence:
+    if len(row) != 10:
+        raise MssqlDataValidationError(
+            "SQL Server SNAPSHOT transaction probe returned an unexpected field count: "
+            f"expected=10, actual={len(row)}"
+        )
+    database_id = _require_bounded_integer(row[0], "database_id", 1, INT32_MAX)
+    compatibility_level = _require_bounded_integer(row[1], "compatibility_level", 1, INT32_MAX)
+    snapshot_isolation_state = _require_bounded_integer(row[2], "snapshot_isolation_state", 0, 3)
+    read_committed_snapshot = _require_boolean(row[3], "is_read_committed_snapshot_on")
+    session_id = _require_bounded_integer(row[4], "session_id", 1, INT32_MAX)
+    transaction_count = _require_bounded_integer(row[5], "transaction_count", 0, INT32_MAX)
+    transaction_state = _require_integer(row[6], "transaction_state")
+    transaction_isolation_level = _require_bounded_integer(
+        row[7], "transaction_isolation_level", 0, 5
+    )
+    open_transaction_count = _require_bounded_integer(
+        row[8], "open_transaction_count", 0, INT32_MAX
+    )
+    generated_count = _require_bounded_integer(row[9], "GENERATE_SERIES count", 0, (1 << 63) - 1)
+    failures: list[str] = []
+    if database_id != profile.database_id:
+        failures.append(f"database_id={database_id}, profiled_database_id={profile.database_id}")
+    if compatibility_level != profile.compatibility_level:
+        failures.append(
+            "compatibility level changed before SNAPSHOT: "
+            f"profiled={profile.compatibility_level}, active={compatibility_level}"
+        )
+    if snapshot_isolation_state != 1:
+        failures.append(f"snapshot_isolation_state={snapshot_isolation_state}, required=1")
+    if read_committed_snapshot != profile.read_committed_snapshot:
+        failures.append(
+            "RCSI setting changed before SNAPSHOT: "
+            f"profiled={profile.read_committed_snapshot}, active={read_committed_snapshot}"
+        )
+    if session_id != profile.driver.session_id:
+        failures.append(f"session_id={session_id}, expected={profile.driver.session_id}")
+    if transaction_count != 1:
+        failures.append(f"transaction_count={transaction_count}, required=1")
+    if transaction_state != 1:
+        failures.append(f"transaction_state={transaction_state}, required=1")
+    if transaction_isolation_level != 5:
+        failures.append(f"transaction_isolation_level={transaction_isolation_level}, required=5")
+    if open_transaction_count < 1:
+        failures.append(f"open_transaction_count={open_transaction_count}, required>=1")
+    if generated_count != 1:
+        failures.append(f"GENERATE_SERIES count={generated_count}, required=1")
+    if failures:
+        raise UnsupportedMssqlProfileError(
+            "SQL Server transaction-level SNAPSHOT proof failed: " + "; ".join(failures)
+        )
+    return MssqlReadContextEvidence(
+        context_id=uuid4(),
+        engine="mssql",
+        server_version=profile.product_version,
+        strategy="transaction_snapshot",
+        snapshot_locator=None,
+        started_at=started_at,
+        session_id=session_id,
+        database_id=database_id,
+        transaction_count=transaction_count,
+        transaction_state=transaction_state,
+        transaction_isolation_level=transaction_isolation_level,
+        allowed_concurrency=1,
+        limitations=(
+            "the SNAPSHOT transaction cannot be reopened after this context closes",
+            "restricted readers do not require server-state DMV privileges",
+            "SQL Server metadata is not versioned and any provenance drift fails the context",
+            "one active query is allowed on this connection",
+        ),
+    )
+
+
+def _close_opening_transport(transport: MssqlTransport) -> None:
+    if transport.closed:
+        return
+    transport.rollback()
+    transport.close()
+
+
+def _validate_inspection_request(
+    schema: CanonicalSchema,
+    relation: MssqlRelation,
+    column_names: tuple[str, ...],
+    max_metadata_record_bytes: int,
+    max_metadata_total_bytes: int,
+) -> None:
+    if not isinstance(cast(object, schema), CanonicalSchema):
+        raise TypeError("schema must be CanonicalSchema")
+    if type(relation) is not MssqlRelation:
+        raise TypeError("relation must be MssqlRelation")
+    if type(column_names) is not tuple or not all(
+        type(column_name) is str for column_name in column_names
+    ):
+        raise TypeError("column_names must be an immutable tuple of text values")
+    if len(column_names) != len(schema.fields):
+        raise MssqlMetadataError(
+            "SQL Server requested column count does not match the logical schema: "
+            f"columns={len(column_names)}, fields={len(schema.fields)}"
+        )
+    if len(column_names) > MAX_COMPILED_RELATION_MEMBERS:
+        raise MssqlMetadataError(
+            "SQL Server requested column count exceeds the executable profile limit: "
+            f"columns={len(column_names)}, maximum={MAX_COMPILED_RELATION_MEMBERS}"
+        )
+    if len(set(column_names)) != len(column_names):
+        raise MssqlMetadataError("SQL Server requested column names must be unique")
+    for index, column_name in enumerate(column_names):
+        _validate_catalog_identifier(column_name, f"column_names[{index}]")
+    if type(max_metadata_record_bytes) is not int or max_metadata_record_bytes < 1:
+        raise ValueError("max_metadata_record_bytes must be a positive integer")
+    if type(max_metadata_total_bytes) is not int or max_metadata_total_bytes < 1:
+        raise ValueError("max_metadata_total_bytes must be a positive integer")
+    if max_metadata_record_bytes > max_metadata_total_bytes:
+        raise ValueError("max_metadata_record_bytes must not exceed max_metadata_total_bytes")
+
+
+def _relation_metadata_query(relation: MssqlRelation) -> MssqlQuery:
+    securable = "QUOTENAME([dfe_schema].[name]) + N'.' + QUOTENAME([dfe_table].[name])"
+    statement = (
+        "SELECT CONVERT(int, DB_ID()), CONVERT(nvarchar(128), DB_NAME()), "
+        "CONVERT(int, [dfe_schema].[schema_id]), "
+        "CONVERT(nvarchar(128), [dfe_schema].[name]), "
+        "CONVERT(int, [dfe_table].[object_id]), "
+        "CONVERT(nvarchar(128), [dfe_table].[name]), "
+        "CONVERT(nvarchar(2), RTRIM([dfe_table].[type])), "
+        "CONVERT(bit, [dfe_table].[is_ms_shipped]), "
+        "CONVERT(bit, [dfe_table].[is_memory_optimized]), "
+        "CONVERT(int, [dfe_table].[temporal_type]), "
+        "CONVERT(bit, [dfe_table].[is_external]), "
+        "CONVERT(int, [dfe_table].[ledger_type]), "
+        "CONVERT(bit, [dfe_table].[is_node]), CONVERT(bit, [dfe_table].[is_edge]), "
+        f"CONVERT(int, HAS_PERMS_BY_NAME({securable}, N'OBJECT', N'SELECT')), "
+        f"CONVERT(int, HAS_PERMS_BY_NAME({securable}, N'OBJECT', N'INSERT')), "
+        f"CONVERT(int, HAS_PERMS_BY_NAME({securable}, N'OBJECT', N'UPDATE')), "
+        f"CONVERT(int, HAS_PERMS_BY_NAME({securable}, N'OBJECT', N'DELETE')), "
+        f"CONVERT(int, HAS_PERMS_BY_NAME({securable}, N'OBJECT', N'ALTER')), "
+        f"CONVERT(int, HAS_PERMS_BY_NAME({securable}, N'OBJECT', N'CONTROL')), "
+        "CONVERT(bit, CASE WHEN EXISTS ("
+        "SELECT 1 FROM sys.columns AS [dfe_writable_column] "
+        "WHERE [dfe_writable_column].[object_id] = [dfe_table].[object_id] "
+        f"AND HAS_PERMS_BY_NAME({securable}, N'OBJECT', N'UPDATE', "
+        "[dfe_writable_column].[name], N'COLUMN') = 1) THEN 1 ELSE 0 END), "
+        "CONVERT(bit, HAS_PERMS_BY_NAME(DB_NAME(), N'DATABASE', N'VIEW DEFINITION')), "
+        "CONVERT(bit, CASE WHEN EXISTS ("
+        "SELECT 1 FROM sys.security_predicates AS [dfe_predicate] "
+        "JOIN sys.security_policies AS [dfe_policy] "
+        "ON [dfe_policy].[object_id] = [dfe_predicate].[object_id] "
+        "WHERE [dfe_predicate].[target_object_id] = [dfe_table].[object_id] "
+        "AND [dfe_policy].[is_enabled] = 1) THEN 1 ELSE 0 END) "
+        "FROM sys.schemas AS [dfe_schema] "
+        "JOIN sys.tables AS [dfe_table] "
+        "ON [dfe_table].[schema_id] = [dfe_schema].[schema_id] "
+        "WHERE [dfe_schema].[name] = ? AND [dfe_table].[name] = ?"
+    )
+    return MssqlQuery(
+        query_id=uuid4(),
+        statement=statement,
+        parameters=(relation.schema_name, relation.table_name),
+    )
+
+
+def _validated_relation_metadata(
+    row: MssqlRow,
+    relation: MssqlRelation,
+    profile: MssqlServerProfile,
+) -> tuple[int, int, int]:
+    if len(row) != 23:
+        raise MssqlDataValidationError(
+            "SQL Server relation catalog probe returned an unexpected field count: "
+            f"expected=23, actual={len(row)}"
+        )
+    database_id = _require_bounded_integer(row[0], "database_id", 1, INT32_MAX)
+    database_name = _require_text(row[1], "database_name")
+    schema_id = _require_bounded_integer(row[2], "schema_id", 1, INT32_MAX)
+    schema_name = _require_text(row[3], "schema_name")
+    object_id = _require_bounded_integer(row[4], "object_id", 1, INT32_MAX)
+    table_name = _require_text(row[5], "table_name")
+    table_type = _require_text(row[6], "table_type")
+    is_ms_shipped = _require_boolean(row[7], "is_ms_shipped")
+    is_memory_optimized = _require_boolean(row[8], "is_memory_optimized")
+    temporal_type = _require_bounded_integer(row[9], "temporal_type", 0, INT32_MAX)
+    is_external = _require_boolean(row[10], "is_external")
+    ledger_type = _require_bounded_integer(row[11], "ledger_type", 0, INT32_MAX)
+    is_node = _require_boolean(row[12], "is_node")
+    is_edge = _require_boolean(row[13], "is_edge")
+    permissions = tuple(
+        _require_bounded_integer(value, name, 0, 1)
+        for value, name in zip(
+            row[14:20],
+            ("SELECT", "INSERT", "UPDATE", "DELETE", "ALTER", "CONTROL"),
+            strict=True,
+        )
+    )
+    has_column_update = _require_boolean(row[20], "has_column_update")
+    can_view_definition = _require_boolean(row[21], "can_view_definition")
+    has_enabled_security_policy = _require_boolean(row[22], "has_enabled_security_policy")
+    failures: list[str] = []
+    if database_id != profile.database_id or database_name != profile.database_name:
+        failures.append(
+            "database identity differs from the active read context: "
+            f"actual=({database_id}, {database_name!r}), "
+            f"expected=({profile.database_id}, {profile.database_name!r})"
+        )
+    if schema_name != relation.schema_name or table_name != relation.table_name:
+        failures.append(
+            "resolved relation name differs from the requested exact identifiers: "
+            f"actual=({schema_name!r}, {table_name!r})"
+        )
+    if table_type != "U" or is_ms_shipped:
+        failures.append(
+            f"relation is not an unshipped user table: type={table_type!r}, "
+            f"is_ms_shipped={is_ms_shipped}"
+        )
+    if is_memory_optimized or temporal_type != 0 or is_external or ledger_type != 0:
+        failures.append(
+            "relation storage profile is unsupported: "
+            f"memory_optimized={is_memory_optimized}, temporal_type={temporal_type}, "
+            f"external={is_external}, ledger_type={ledger_type}"
+        )
+    if is_node or is_edge:
+        failures.append(f"graph relation is unsupported: node={is_node}, edge={is_edge}")
+    if permissions != (1, 0, 0, 0, 0, 0):
+        failures.append(
+            "reader permissions must be SELECT-only for the resolved relation: "
+            f"select={permissions[0]}, insert={permissions[1]}, update={permissions[2]}, "
+            f"delete={permissions[3]}, alter={permissions[4]}, control={permissions[5]}"
+        )
+    if has_column_update:
+        failures.append("reader has UPDATE permission on at least one physical column")
+    if not can_view_definition:
+        failures.append(
+            "reader lost database VIEW DEFINITION required to enumerate security policies"
+        )
+    if has_enabled_security_policy:
+        failures.append("relation has an enabled row-level security policy")
+    if failures:
+        raise MssqlMetadataError(
+            "SQL Server relation inspection rejected the physical source: "
+            f"schema={relation.schema_name!r}, table={relation.table_name!r}; "
+            + "; ".join(failures)
+        )
+    return database_id, schema_id, object_id
+
+
+def _column_metadata_query(
+    object_id: int,
+    column_names: tuple[str, ...],
+) -> MssqlQuery:
+    requested_rows = ", ".join("(?, ?)" for _column_name in column_names)
+    statement = (
+        "SELECT CONVERT(int, [dfe_requested].[request_ordinal]), "
+        "CONVERT(nvarchar(128), [dfe_requested].[column_name]), "
+        "CONVERT(int, [dfe_column].[column_id]), "
+        "CONVERT(nvarchar(128), [dfe_column].[name]), "
+        "CONVERT(int, [dfe_column].[system_type_id]), "
+        "CONVERT(int, [dfe_column].[user_type_id]), "
+        "CONVERT(nvarchar(128), [dfe_type].[name]), "
+        "CONVERT(nvarchar(128), [dfe_type_schema].[name]), "
+        "CONVERT(int, [dfe_type].[system_type_id]), "
+        "CONVERT(int, [dfe_type].[user_type_id]), "
+        "CONVERT(bit, [dfe_type].[is_user_defined]), "
+        "CONVERT(bit, [dfe_type].[is_assembly_type]), "
+        "CONVERT(bit, [dfe_type].[is_table_type]), "
+        "CONVERT(int, [dfe_column].[max_length]), "
+        "CONVERT(int, [dfe_column].[precision]), "
+        "CONVERT(int, [dfe_column].[scale]), "
+        "CONVERT(nvarchar(128), [dfe_column].[collation_name]), "
+        "CONVERT(bit, [dfe_column].[is_nullable]), "
+        "CONVERT(bit, [dfe_column].[is_identity]), "
+        "CONVERT(bit, [dfe_column].[is_computed]), "
+        "CONVERT(int, [dfe_column].[generated_always_type]), "
+        "CONVERT(int, [dfe_column].[encryption_type]), "
+        "CONVERT(bit, [dfe_column].[is_hidden]), "
+        "CONVERT(bit, [dfe_column].[is_masked]) "
+        f"FROM (VALUES {requested_rows}) "
+        "AS [dfe_requested]([request_ordinal], [column_name]) "
+        "LEFT JOIN sys.columns AS [dfe_column] "
+        "ON [dfe_column].[object_id] = ? "
+        "AND [dfe_column].[name] = [dfe_requested].[column_name] "
+        "LEFT JOIN sys.types AS [dfe_type] "
+        "ON [dfe_type].[user_type_id] = [dfe_column].[user_type_id] "
+        "LEFT JOIN sys.schemas AS [dfe_type_schema] "
+        "ON [dfe_type_schema].[schema_id] = [dfe_type].[schema_id] "
+        "ORDER BY [dfe_requested].[request_ordinal]"
+    )
+    parameters: list[MssqlParameter] = []
+    for index, column_name in enumerate(column_names, start=1):
+        parameters.extend((index, column_name))
+    parameters.append(object_id)
+    return MssqlQuery(
+        query_id=uuid4(),
+        statement=statement,
+        parameters=tuple(parameters),
+    )
+
+
+def _binding_from_metadata_row(
+    field_name: str,
+    column_name: str,
+    index: int,
+    row: MssqlRow,
+) -> MssqlFieldBinding:
+    if len(row) != 24:
+        raise MssqlDataValidationError(
+            "SQL Server column catalog probe returned an unexpected field count: "
+            f"expected=24, actual={len(row)}"
+        )
+    ordinal = _require_bounded_integer(row[0], "requested column ordinal", 1, INT32_MAX)
+    requested_name = _require_text(row[1], "requested column name")
+    if ordinal != index + 1 or requested_name != column_name:
+        raise MssqlDataValidationError(
+            "SQL Server column catalog probe changed the requested column order or name: "
+            f"column_index={index}"
+        )
+    if row[2] is None:
+        raise MssqlMetadataError(
+            "SQL Server requested column is missing or not visible: "
+            f"column_index={index}, column_name={column_name!r}"
+        )
+    column_id = _require_bounded_integer(row[2], "column_id", 1, INT32_MAX)
+    actual_name = _require_text(row[3], "column_name")
+    if actual_name != column_name:
+        raise MssqlDataValidationError(
+            "SQL Server catalog resolved a different exact column identifier: "
+            f"column_index={index}, expected={column_name!r}, actual={actual_name!r}"
+        )
+    system_type_id = _require_bounded_integer(row[4], "column system_type_id", 1, 255)
+    user_type_id = _require_bounded_integer(row[5], "column user_type_id", 1, INT32_MAX)
+    type_name = _require_text(row[6], "declared type name")
+    type_schema_name = _require_text(row[7], "declared type schema name")
+    declared_system_type_id = _require_bounded_integer(row[8], "declared system_type_id", 1, 255)
+    declared_user_type_id = _require_bounded_integer(row[9], "declared user_type_id", 1, INT32_MAX)
+    is_user_defined = _require_boolean(row[10], "type is_user_defined")
+    is_assembly_type = _require_boolean(row[11], "type is_assembly_type")
+    is_table_type = _require_boolean(row[12], "type is_table_type")
+    max_length = _require_integer(row[13], "column max_length")
+    precision = _require_bounded_integer(row[14], "column precision", 0, 38)
+    scale = _require_bounded_integer(row[15], "column scale", 0, 38)
+    collation_name = _require_optional_text(row[16], "column collation_name")
+    is_nullable = _require_boolean(row[17], "column is_nullable")
+    _require_boolean(row[18], "column is_identity")
+    is_computed = _require_boolean(row[19], "column is_computed")
+    generated_always_type = _require_bounded_integer(
+        row[20], "column generated_always_type", 0, INT32_MAX
+    )
+    encryption_type = _require_optional_integer(row[21], "column encryption_type")
+    is_hidden = _require_boolean(row[22], "column is_hidden")
+    is_masked = _require_boolean(row[23], "column is_masked")
+    if (
+        user_type_id != system_type_id
+        or declared_system_type_id != system_type_id
+        or declared_user_type_id != user_type_id
+        or type_schema_name != "sys"
+        or is_user_defined
+        or is_assembly_type
+        or is_table_type
+    ):
+        raise MssqlMetadataError(
+            "SQL Server requested column must use a direct built-in sys type: "
+            f"column_index={index}, column_name={column_name!r}, "
+            f"type={type_schema_name}.{type_name}, system_type_id={system_type_id}, "
+            f"user_type_id={user_type_id}"
+        )
+    if is_computed or generated_always_type != 0 or encryption_type is not None:
+        raise MssqlMetadataError(
+            "SQL Server requested column uses unsupported computed/generated/encrypted "
+            f"semantics: column_index={index}, column_name={column_name!r}"
+        )
+    if is_hidden or is_masked:
+        raise MssqlMetadataError(
+            "SQL Server requested column is hidden or masked: "
+            f"column_index={index}, column_name={column_name!r}"
+        )
+    return MssqlFieldBinding(
+        field_name=field_name,
+        column_id=column_id,
+        column_name=column_name,
+        is_nullable=is_nullable,
+        physical=MssqlPhysicalField(
+            system_type_name=type_name,
+            system_type_id=system_type_id,
+            user_type_id=user_type_id,
+            max_length=max_length,
+            precision=precision,
+            scale=scale,
+            collation_name=collation_name,
+        ),
+    )
 
 
 def _open_mssql_transport_once(settings: MssqlConnectionSettings) -> MssqlTransport:
@@ -930,6 +2002,151 @@ def _odbc_braced(value: str) -> str:
 def _required_driver_text(value: object, field_name: str) -> str:
     if type(value) is not str or not value:
         raise MssqlDataValidationError(f"ODBC returned an invalid {field_name}")
+    return value
+
+
+def _provenance_record_bytes(query: MssqlCanonicalQuery) -> int:
+    return (11 * (3 + len(query.inspection.bindings))) + 1
+
+
+def _row_transport_limits(
+    query: MssqlCanonicalQuery,
+    limits: MssqlFetchLimits,
+) -> MssqlFetchLimits:
+    overhead = _provenance_record_bytes(query)
+    return MssqlFetchLimits(
+        fetch_batch_records=limits.fetch_batch_records,
+        max_records=limits.max_records + 1,
+        max_value_bytes=max(limits.max_value_bytes, 11),
+        max_record_bytes=limits.max_record_bytes + overhead,
+        max_total_bytes=limits.max_total_bytes
+        + (max(limits.max_records + 1, limits.fetch_batch_records) * overhead),
+    )
+
+
+def _summary_transport_limits(
+    query: MssqlCanonicalQuery,
+    limits: MssqlFetchLimits,
+) -> MssqlFetchLimits:
+    overhead = _provenance_record_bytes(query)
+    return MssqlFetchLimits(
+        fetch_batch_records=limits.fetch_batch_records,
+        max_records=limits.max_records,
+        max_value_bytes=max(limits.max_value_bytes, 11),
+        max_record_bytes=limits.max_record_bytes + overhead,
+        max_total_bytes=limits.max_total_bytes
+        + (max(limits.max_records, limits.fetch_batch_records) * overhead),
+    )
+
+
+def _validate_logical_rows(
+    rows: tuple[MssqlRow, ...],
+    limits: MssqlFetchLimits,
+) -> None:
+    if len(rows) > limits.max_records:
+        raise MssqlResultLimitError(
+            "SQL Server logical result exceeded max_records after provenance removal: "
+            f"observed={len(rows)}, max_records={limits.max_records}"
+        )
+    total_bytes = 0
+    for row_index, row in enumerate(rows):
+        record_bytes = sum(
+            _validated_driver_value(value, column_index)[1]
+            for column_index, value in enumerate(row)
+        )
+        if record_bytes > limits.max_record_bytes:
+            raise MssqlResultLimitError(
+                "SQL Server logical row exceeded max_record_bytes after provenance removal: "
+                f"row_index={row_index}, observed={record_bytes}, "
+                f"max_record_bytes={limits.max_record_bytes}"
+            )
+        total_bytes += record_bytes
+    if total_bytes > limits.max_total_bytes:
+        raise MssqlResultLimitError(
+            "SQL Server logical result exceeded max_total_bytes after provenance removal: "
+            f"observed={total_bytes}, max_total_bytes={limits.max_total_bytes}"
+        )
+
+
+def _logical_read_metrics(
+    physical: MssqlReadMetrics,
+    rows: tuple[MssqlRow, ...],
+) -> MssqlReadMetrics:
+    fetched_bytes = sum(
+        _validated_driver_value(value, column_index)[1]
+        for row in rows
+        for column_index, value in enumerate(row)
+    )
+    return MssqlReadMetrics(
+        fetched_records=len(rows),
+        fetched_bytes=fetched_bytes,
+        fetch_calls=physical.fetch_calls,
+        largest_batch_records=min(physical.largest_batch_records, len(rows)),
+    )
+
+
+def _validate_catalog_identifier(value: str, field_name: str) -> None:
+    _validate_odbc_text_scalar(value, field_name)
+    if not value:
+        raise ValueError(f"{field_name} must not be empty")
+    if len(value.encode("utf-16-le")) // 2 > 128:
+        raise ValueError(f"{field_name} exceeds the SQL Server 128-character limit")
+
+
+def _require_text(value: object, field_name: str) -> str:
+    if type(value) is not str or not value:
+        raise MssqlDataValidationError(
+            f"SQL Server returned an invalid non-empty text field: field={field_name!r}"
+        )
+    try:
+        _validate_odbc_text_scalar(value, field_name)
+    except ValueError as error:
+        raise MssqlDataValidationError(
+            f"SQL Server returned invalid scalar text: field={field_name!r}, reason={error}"
+        ) from None
+    return value
+
+
+def _require_optional_text(value: object, field_name: str) -> str | None:
+    if value is None:
+        return None
+    return _require_text(value, field_name)
+
+
+def _require_integer(value: object, field_name: str) -> int:
+    if type(value) is not int:
+        raise MssqlDataValidationError(
+            f"SQL Server returned a non-integer field: field={field_name!r}"
+        )
+    return value
+
+
+def _require_optional_integer(value: object, field_name: str) -> int | None:
+    if value is None:
+        return None
+    return _require_integer(value, field_name)
+
+
+def _require_bounded_integer(
+    value: object,
+    field_name: str,
+    minimum: int,
+    maximum: int,
+) -> int:
+    integer = _require_integer(value, field_name)
+    if not minimum <= integer <= maximum:
+        raise MssqlDataValidationError(
+            "SQL Server returned an out-of-range integer field: "
+            f"field={field_name!r}, value={integer}, minimum={minimum}, maximum={maximum}"
+        )
+    return integer
+
+
+def _require_boolean(value: object, field_name: str) -> bool:
+    if type(value) is not bool:
+        raise MssqlDataValidationError(
+            f"SQL Server returned a non-boolean field: field={field_name!r}"
+        )
     return value
 
 
