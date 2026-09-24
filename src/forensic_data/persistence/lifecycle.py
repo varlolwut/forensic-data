@@ -23,6 +23,7 @@ from forensic_data.acquisition import (
     run_request_semantic_value,
 )
 from forensic_data.canonical import (
+    CanonicalSchema,
     DecimalParameters,
     FieldSchema,
     Fingerprint,
@@ -60,6 +61,13 @@ from forensic_data.contracts.semantics import (
     semantic_digest_hex,
     semantic_value_from_json,
 )
+from forensic_data.mssql import MssqlProtectedReadContext, MssqlReadContextState
+from forensic_data.mssql_sql import (
+    MssqlFieldBinding,
+    MssqlInspectedRelation,
+    MssqlPhysicalField,
+    validate_mssql_inspection,
+)
 from forensic_data.persistence.errors import (
     ActiveRunAttemptError,
     AttemptFenceError,
@@ -95,6 +103,7 @@ from forensic_data.postgres import (
     PostgresRelationKind,
     PostgresRelationPersistence,
     PostgresRetryPolicy,
+    PostgresSourceDirection,
     ReadContextState,
 )
 from forensic_data.postgres_sql import (
@@ -201,6 +210,8 @@ _WRITER_ROLE: Final[str] = "dfe_metadata_writer"
 _READER_ROLE: Final[str] = "dfe_metadata_reader"
 _CANONICAL_PROTOCOL: Final[str] = "dfe_canon_v1"
 _FINGERPRINT_PROTOCOL: Final[str] = "sha256_sum32_v1"
+type _ProtectedReadContext = PostgresProtectedReadContext | MssqlProtectedReadContext
+type _ProtectedRelationInspection = PostgresProtectedRelationInspection | MssqlInspectedRelation
 _STRUCTURAL_SUMMARY_PARAMETER_NAMES: Final[tuple[str, ...]] = (
     "reference_row_count",
     "reference_null_key_count",
@@ -529,26 +540,29 @@ class ReadContextPersistence:
     acquisition_operation_id: UUID
     dataset: DatasetVersionRecord
     direction: PlanDirection
-    protected_context: PostgresProtectedReadContext
+    protected_context: _ProtectedReadContext
 
     def __post_init__(self) -> None:
         _require_uuid(self.acquisition_operation_id, "context acquisition operation id")
         _require_instance(self.dataset, DatasetVersionRecord, "context dataset")
         _require_instance(self.direction, PlanDirection, "context direction")
-        _require_instance(
+        context = _require_supported_read_context(
             self.protected_context,
-            PostgresProtectedReadContext,
             "protected read context",
         )
-        evidence = self.protected_context.evidence
-        if _protected_context_lock_closure(self.protected_context) != (
-            evidence.locked_relation_oids
-        ):
-            raise ValueError(
-                "protected context relations must exactly match its locked relation evidence"
-            )
-        if self.protected_context.state is not ReadContextState.ACTIVE:
-            raise ValueError("only an active protected context can be persisted")
+        _require_context_direction(context, self.direction, "protected read context")
+        if isinstance(context, PostgresProtectedReadContext):
+            evidence = context.evidence
+            if _protected_context_lock_closure(context) != evidence.locked_relation_oids:
+                raise ValueError(
+                    "protected context relations must exactly match its locked relation evidence"
+                )
+            if context.state is not ReadContextState.ACTIVE:
+                raise ValueError("only an active protected context can be persisted")
+        else:
+            _mssql_context_relations(context)
+            if context.state is not MssqlReadContextState.ACTIVE:
+                raise ValueError("only an active protected context can be persisted")
 
 
 @final
@@ -584,9 +598,9 @@ class RelationManifestObservationPersistence:
     dataset: DatasetVersionRecord
     direction: PlanDirection
     readiness: RelationManifestEvidence
-    protected_context: PostgresProtectedReadContext
-    dataset_relation: PostgresProtectedRelationInspection
-    readiness_relation: PostgresProtectedRelationInspection
+    protected_context: _ProtectedReadContext
+    dataset_relation: _ProtectedRelationInspection
+    readiness_relation: _ProtectedRelationInspection
     projection_code_artifact: CodeArtifactRecord | None
     observed_at: datetime
 
@@ -600,19 +614,19 @@ class RelationManifestObservationPersistence:
             RelationManifestEvidence,
             "observation readiness evidence",
         )
-        _require_instance(
+        context = _require_supported_read_context(
             self.protected_context,
-            PostgresProtectedReadContext,
             "observation protected context",
         )
-        _require_instance(
+        _require_context_direction(context, self.direction, "observation protected context")
+        dataset_relation = _require_context_relation(
+            context,
             self.dataset_relation,
-            PostgresProtectedRelationInspection,
             "observation dataset relation",
         )
-        _require_instance(
+        readiness_relation = _require_context_relation(
+            context,
             self.readiness_relation,
-            PostgresProtectedRelationInspection,
             "observation readiness relation",
         )
         if self.projection_code_artifact is not None:
@@ -630,29 +644,23 @@ class RelationManifestObservationPersistence:
             raise ValueError("relation-manifest lifecycle supports only relation datasets")
         if self.projection_code_artifact is not None:
             raise ValueError("relation datasets cannot persist a projection code capture")
-        if (
-            self.dataset_relation.inspection.context_id
-            != self.readiness_relation.inspection.context_id
-        ):
+        if _relation_context_id(dataset_relation) != _relation_context_id(readiness_relation):
             raise ValueError(
                 "observation dataset and readiness relations must share one protected context"
             )
-        if self.protected_context.evidence.context_id != (
-            self.dataset_relation.inspection.context_id
-        ):
+        if context.evidence.context_id != _relation_context_id(dataset_relation):
             raise ValueError("observation relations must belong to its protected context")
-        protected_relations = self.protected_context.protected_relations
-        if self.protected_context.state is not ReadContextState.ACTIVE:
+        protected_relations = _context_relations(context)
+        if not _context_is_active(context):
             raise ValueError("observation protected context must still be active")
-        if not any(item is self.dataset_relation for item in protected_relations) or not any(
-            item is self.readiness_relation for item in protected_relations
+        if not any(item is dataset_relation for item in protected_relations) or not any(
+            item is readiness_relation for item in protected_relations
         ):
             raise ValueError(
                 "observation relations must be the exact sealed protected-context objects"
             )
-        if (
-            self.dataset_relation.inspection.relation_oid
-            == self.readiness_relation.inspection.relation_oid
+        if _relation_physical_identity(dataset_relation) == _relation_physical_identity(
+            readiness_relation
         ):
             raise ValueError(
                 "observation dataset and readiness relations must be distinct relations"
@@ -776,6 +784,15 @@ class _ContextExpectation:
     definition: ReadContextPersistence
     limitations_json: str
     acquisition_evidence_json: str
+
+
+@final
+@dataclass(frozen=True, slots=True)
+class _ContextStorageIdentity:
+    driver_version: str
+    server_version: str
+    server_version_number: int
+    backend_process_id: int | None
 
 
 @final
@@ -2221,7 +2238,7 @@ def _persist_context_once(
         expected.definition.direction,
     )
     evidence = expected.definition.protected_context.evidence
-    profile = expected.definition.protected_context.profile
+    storage_identity = _context_storage_identity(expected.definition.protected_context)
     cursor = connection.execute(
         "INSERT INTO dfe_metadata.attempt_read_contexts ("
         "read_context_id, run_id, attempt_id, dataset_version_id, direction, "
@@ -2246,12 +2263,12 @@ def _persist_context_once(
             expected.definition.acquisition_operation_id,
             bytes.fromhex(expected.attempt.run.request.scope.scope_digest),
             evidence.engine,
-            profile.driver_version,
-            profile.server_version,
-            profile.server_version_number,
+            storage_identity.driver_version,
+            storage_identity.server_version,
+            storage_identity.server_version_number,
             evidence.strategy,
             evidence.snapshot_locator,
-            evidence.backend_process_id,
+            storage_identity.backend_process_id,
             evidence.allowed_concurrency,
             expected.limitations_json,
             expected.acquisition_evidence_json,
@@ -2482,7 +2499,7 @@ def _persist_observation(
         raise LifecycleOperationConflictError(
             "observation UUID is already bound to another observation operation"
         )
-    context_id = definition.dataset_relation.inspection.context_id
+    context_id = _relation_context_id(definition.dataset_relation)
     context_row = connection.execute(
         "SELECT state, run_id, attempt_id, dataset_version_id, direction, scope_digest "
         ", acquisition_evidence::text "
@@ -3784,9 +3801,7 @@ def _observation_expectation(
     return _ObservationExpectation(
         definition=definition,
         readiness_json=readiness_json,
-        physical_schema_digest=bytes.fromhex(
-            schema_digest_hex(definition.dataset_relation.acquisition.schema)
-        ),
+        physical_schema_digest=bytes.fromhex(_observation_schema_digest(definition)),
         physical_binding_json=physical_binding_json,
         physical_binding_digest=bytes.fromhex(semantic_digest_hex(physical_binding_value)),
     )
@@ -4747,15 +4762,202 @@ def _validate_context_definition(
 ) -> None:
     if attempt.status is not AttemptStatus.RUNNING:
         raise ValueError("new read contexts require a running attempt record")
-    evidence = definition.protected_context.evidence
-    profile = definition.protected_context.profile
-    if evidence.server_version != profile.server_version:
-        raise ValueError("read context evidence and server profile versions must match")
-    if evidence.engine != "postgresql":
-        raise ValueError("initial lifecycle read contexts require engine='postgresql'")
+    context = definition.protected_context
+    if isinstance(context, PostgresProtectedReadContext):
+        evidence = context.evidence
+        if evidence.server_version != context.profile.server_version:
+            raise ValueError("read context evidence and server profile versions must match")
+        if evidence.engine != "postgresql":
+            raise ValueError("initial lifecycle read contexts require engine='postgresql'")
+    else:
+        evidence = context.evidence
+        profile = context.profile
+        driver = profile.driver
+        if (
+            evidence.server_version != profile.product_version
+            or profile.product_version != driver.server_version
+        ):
+            raise ValueError("read context evidence and server profile versions must match")
+        if evidence.engine != "mssql":
+            raise ValueError("SQL Server lifecycle read contexts require engine='mssql'")
+        if evidence.strategy != "transaction_snapshot" or evidence.snapshot_locator is not None:
+            raise ValueError(
+                "SQL Server lifecycle read context must be a live SNAPSHOT transaction"
+            )
+        if (
+            evidence.session_id != driver.session_id
+            or evidence.database_id != profile.database_id
+            or evidence.transaction_count != 1
+            or evidence.transaction_state != 1
+            or evidence.transaction_isolation_level != 5
+            or evidence.allowed_concurrency != 1
+        ):
+            raise ValueError(
+                "SQL Server lifecycle read context evidence differs from its proven session"
+            )
+    if definition.dataset.definition.adapter.value != context.evidence.engine:
+        raise ValueError("read context engine differs from the registered dataset adapter")
     expected_dataset_id = _expected_batch(attempt.run.request, definition.direction).dataset_id
     if definition.dataset.definition.dataset_id != expected_dataset_id:
         raise ValueError("read context dataset is outside the run request direction closure")
+
+
+def _context_storage_identity(context: _ProtectedReadContext) -> _ContextStorageIdentity:
+    if isinstance(context, PostgresProtectedReadContext):
+        profile = context.profile
+        return _ContextStorageIdentity(
+            driver_version=profile.driver_version,
+            server_version=profile.server_version,
+            server_version_number=profile.server_version_number,
+            backend_process_id=context.evidence.backend_process_id,
+        )
+    profile = context.profile
+    return _ContextStorageIdentity(
+        driver_version=profile.driver.pyodbc_version,
+        server_version=profile.product_version,
+        server_version_number=profile.product_major_version,
+        backend_process_id=context.evidence.session_id,
+    )
+
+
+def _require_supported_read_context(value: object, context: str) -> _ProtectedReadContext:
+    if isinstance(value, (PostgresProtectedReadContext, MssqlProtectedReadContext)):
+        return value
+    raise TypeError(f"{context} must be PostgresProtectedReadContext or MssqlProtectedReadContext")
+
+
+def _require_context_direction(
+    context: _ProtectedReadContext,
+    direction: PlanDirection,
+    label: str,
+) -> None:
+    expected = PostgresSourceDirection(direction.value)
+    if context.source_direction is not expected:
+        raise ValueError(
+            f"{label} source direction differs from its persistence direction: "
+            f"expected={expected.value!r}, actual={context.source_direction.value!r}"
+        )
+
+
+def _require_context_relation(
+    context: _ProtectedReadContext,
+    value: object,
+    label: str,
+) -> _ProtectedRelationInspection:
+    if isinstance(context, PostgresProtectedReadContext):
+        return _require_instance(value, PostgresProtectedRelationInspection, label)
+    return _require_instance(value, MssqlInspectedRelation, label)
+
+
+def _mssql_context_relations(
+    context: MssqlProtectedReadContext,
+) -> tuple[MssqlInspectedRelation, ...]:
+    relations = context.protected_relations
+    if type(relations) is not tuple or not relations:
+        raise ValueError("SQL Server protected context must contain inspected relations")
+    evidence = context.evidence
+    seen_identities: set[tuple[int, int]] = set()
+    for index, relation in enumerate(relations):
+        if type(relation) is not MssqlInspectedRelation:
+            raise TypeError(
+                "SQL Server protected context relations must contain "
+                f"MssqlInspectedRelation values: relation_index={index}"
+            )
+        if relation.context_id != evidence.context_id:
+            raise ValueError(
+                "SQL Server protected relation belongs to a different read context: "
+                f"relation_index={index}"
+            )
+        if relation.database_id != evidence.database_id:
+            raise ValueError(
+                "SQL Server protected relation belongs to a different database: "
+                f"relation_index={index}"
+            )
+        identity = (relation.database_id, relation.object_id)
+        if identity in seen_identities:
+            raise ValueError(
+                "SQL Server protected context contains a duplicate physical relation: "
+                f"database_id={relation.database_id}, object_id={relation.object_id}"
+            )
+        seen_identities.add(identity)
+    return relations
+
+
+def _context_relations(
+    context: _ProtectedReadContext,
+) -> tuple[_ProtectedRelationInspection, ...]:
+    if isinstance(context, PostgresProtectedReadContext):
+        return context.protected_relations
+    return _mssql_context_relations(context)
+
+
+def _context_is_active(context: _ProtectedReadContext) -> bool:
+    if isinstance(context, PostgresProtectedReadContext):
+        return context.state is ReadContextState.ACTIVE
+    return context.state is MssqlReadContextState.ACTIVE
+
+
+def _relation_context_id(relation: _ProtectedRelationInspection) -> UUID:
+    if isinstance(relation, PostgresProtectedRelationInspection):
+        return relation.inspection.context_id
+    return relation.context_id
+
+
+def _relation_physical_identity(
+    relation: _ProtectedRelationInspection,
+) -> tuple[str, int, int]:
+    if isinstance(relation, PostgresProtectedRelationInspection):
+        return ("postgresql", 0, relation.inspection.relation_oid)
+    return ("mssql", relation.database_id, relation.object_id)
+
+
+def _relation_components(relation: _ProtectedRelationInspection) -> tuple[str, str]:
+    if isinstance(relation, PostgresProtectedRelationInspection):
+        components = relation.acquisition.relation.components
+        if len(components) != 2:
+            raise ValueError("protected PostgreSQL relation must have schema and relation names")
+        return (components[0], components[1])
+    return (relation.relation.schema_name, relation.relation.table_name)
+
+
+def _relation_column_names(relation: _ProtectedRelationInspection) -> tuple[str, ...]:
+    if isinstance(relation, PostgresProtectedRelationInspection):
+        return relation.acquisition.column_names
+    return tuple(binding.column_name for binding in relation.bindings)
+
+
+def _observation_schema_digest(
+    definition: RelationManifestObservationPersistence,
+) -> str:
+    relation = definition.dataset_relation
+    if isinstance(relation, PostgresProtectedRelationInspection):
+        return schema_digest_hex(relation.acquisition.schema)
+    schema = _dataset_canonical_schema(definition.dataset)
+    validate_mssql_inspection(schema, relation)
+    return schema_digest_hex(schema)
+
+
+def _dataset_canonical_schema(dataset: DatasetVersionRecord) -> CanonicalSchema:
+    resolved = _semantic_object(
+        semantic_value_from_json(dataset.definition.resolved_definition_json),
+        "dataset resolved definition",
+    )
+    schema_json = canonical_semantic_json(resolved.get("logical_schema"))
+    try:
+        schema = schema_from_metadata_json(schema_json)
+    except ValueError as error:
+        raise StoredLifecycleIntegrityError(
+            f"stored dataset logical schema is invalid: reason={error}"
+        ) from None
+    if schema_digest_hex(schema) != dataset.definition.logical_schema_digest:
+        raise StoredLifecycleIntegrityError(
+            "stored dataset logical schema differs from its immutable digest"
+        )
+    if canonical_schema_json(schema) != schema_json:
+        raise StoredLifecycleIntegrityError(
+            "stored dataset logical schema contains unsupported fields"
+        )
+    return schema
 
 
 def _protected_context_lock_closure(
@@ -4808,13 +5010,21 @@ def _protected_context_lock_closure(
     )
 
 
-def _require_protected_context_active(context: PostgresProtectedReadContext) -> None:
-    evidence = context.evidence
-    if _protected_context_lock_closure(context) != evidence.locked_relation_oids:
-        raise RunLifecycleStateError(
-            "protected source context relation closure changed before persistence"
-        )
-    if context.state is not ReadContextState.ACTIVE:
+def _require_protected_context_active(context: _ProtectedReadContext) -> None:
+    if isinstance(context, PostgresProtectedReadContext):
+        evidence = context.evidence
+        if _protected_context_lock_closure(context) != evidence.locked_relation_oids:
+            raise RunLifecycleStateError(
+                "protected source context relation closure changed before persistence"
+            )
+    else:
+        try:
+            _mssql_context_relations(context)
+        except (TypeError, ValueError) as error:
+            raise RunLifecycleStateError(
+                f"protected source context relation closure is invalid: reason={error}"
+            ) from None
+    if not _context_is_active(context):
         raise RunLifecycleStateError(
             "new lifecycle evidence requires an active protected source context"
         )
@@ -4836,10 +5046,10 @@ def _require_observation_definition(
     )
     if batch_value != expected_batch.batch_id:
         raise ValueError("observation readiness batch differs from the requested batch")
-    context_id = definition.dataset_relation.inspection.context_id
-    if definition.readiness_relation.inspection.context_id != context_id:
+    context_id = _relation_context_id(definition.dataset_relation)
+    if _relation_context_id(definition.readiness_relation) != context_id:
         raise ValueError("observation protected relations must share one context")
-    dataset_schema_digest = schema_digest_hex(definition.dataset_relation.acquisition.schema)
+    dataset_schema_digest = _observation_schema_digest(definition)
     if dataset_schema_digest != definition.dataset.definition.logical_schema_digest:
         raise ValueError("observation physical schema differs from the dataset definition")
     _require_dataset_relation_closure(definition.dataset, definition.dataset_relation)
@@ -4847,7 +5057,7 @@ def _require_observation_definition(
 
 def _require_dataset_relation_closure(
     dataset: DatasetVersionRecord,
-    protected: PostgresProtectedRelationInspection,
+    protected: _ProtectedRelationInspection,
 ) -> None:
     payload = _semantic_object(
         semantic_value_from_json(dataset.definition.semantic_payload_json),
@@ -4859,10 +5069,16 @@ def _require_dataset_relation_closure(
         _semantic_text(locator.get("schema"), "dataset relation schema"),
         _semantic_text(locator.get("name"), "dataset relation name"),
     )
-    if protected.acquisition.relation.components != expected_relation:
+    if _relation_components(protected) != expected_relation:
         raise ValueError("protected dataset relation differs from the registered locator")
     expected_scope = dataset.definition.relation_scope
-    if expected_scope is None or protected.acquisition.relation_scope is not expected_scope:
+    if expected_scope is None:
+        raise ValueError("registered relation dataset must declare a relation scope")
+    if isinstance(protected, PostgresProtectedRelationInspection):
+        actual_scope = protected.acquisition.relation_scope
+    else:
+        actual_scope = RelationScope.PHYSICAL_ONLY
+    if actual_scope is not expected_scope:
         raise ValueError(
             "protected dataset relation scope differs from the immutable dataset definition"
         )
@@ -4874,7 +5090,7 @@ def _require_dataset_relation_closure(
         )
         for item in projection
     )
-    if protected.acquisition.column_names != expected_columns:
+    if _relation_column_names(protected) != expected_columns:
         raise ValueError("protected dataset columns differ from the registered projection")
 
 
@@ -4979,7 +5195,7 @@ def _require_readiness_relation_closure(
         _semantic_text(relation.get("schema"), "readiness relation schema"),
         _semantic_text(relation.get("name"), "readiness relation name"),
     )
-    if definition.readiness_relation.acquisition.relation.components != expected_relation:
+    if _relation_components(definition.readiness_relation) != expected_relation:
         raise ValueError("protected readiness relation differs from the contract provider")
     columns = _semantic_object(readiness.get("columns"), "readiness columns")
     expected_columns = tuple(
@@ -4995,7 +5211,7 @@ def _require_readiness_relation_closure(
             "completed_at",
         )
     )
-    if definition.readiness_relation.acquisition.column_names != expected_columns:
+    if _relation_column_names(definition.readiness_relation) != expected_columns:
         raise ValueError("protected readiness columns differ from the contract mapping")
 
 
@@ -5006,22 +5222,30 @@ def _require_stable_read_context(
     row = connection.execute(
         "SELECT strategy, snapshot_locator, acquisition_evidence::text "
         "FROM dfe_metadata.attempt_read_contexts WHERE read_context_id = %s",
-        (definition.dataset_relation.inspection.context_id,),
+        (_relation_context_id(definition.dataset_relation),),
     ).fetchone()
     if row is None:
         raise RunLifecycleStateError("readiness evidence context is missing")
-    if _row_text(row[0], "readiness context strategy") != ("protected_read_only_repeatable_read"):
-        raise ValueError("readiness context does not provide the contract transaction snapshot")
+    strategy = _row_text(row[0], "readiness context strategy")
     snapshot_locator = _row_optional_text(row[1], "readiness snapshot locator")
-    if snapshot_locator is None or not snapshot_locator.strip():
-        raise ValueError("readiness context lacks a transaction snapshot locator")
+    context = definition.protected_context
+    if isinstance(context, PostgresProtectedReadContext):
+        if strategy != "protected_read_only_repeatable_read":
+            raise ValueError("readiness context does not provide the contract transaction snapshot")
+        if snapshot_locator is None or not snapshot_locator.strip():
+            raise ValueError("readiness context lacks a transaction snapshot locator")
+        expected_kind = "postgresql_protected_relations"
+    else:
+        if strategy != "transaction_snapshot":
+            raise ValueError("readiness context does not provide the contract transaction snapshot")
+        if snapshot_locator is not None:
+            raise ValueError("SQL Server readiness context has an unexpected snapshot locator")
+        expected_kind = "mssql_snapshot_relations"
     evidence = _semantic_object(
         semantic_value_from_json(_row_text(row[2], "readiness acquisition evidence")),
         "readiness acquisition evidence",
     )
-    if _semantic_text(evidence.get("kind"), "readiness acquisition kind") != (
-        "postgresql_protected_relations"
-    ):
+    if _semantic_text(evidence.get("kind"), "readiness acquisition kind") != expected_kind:
         raise ValueError("readiness context lacks verified protected-relation evidence")
 
 
@@ -5041,8 +5265,8 @@ def _require_context_contains_observation_relations(
         "context acquisition relations",
     )
     expected = (
-        _protected_relation_semantic_value(definition.dataset_relation),
-        _protected_relation_semantic_value(definition.readiness_relation),
+        _relation_semantic_value(definition.dataset_relation),
+        _relation_semantic_value(definition.readiness_relation),
     )
     for relation in expected:
         if relation not in relations:
@@ -5054,7 +5278,22 @@ def _require_context_contains_observation_relations(
 def _acquisition_evidence_semantic_value(
     definition: ReadContextPersistence,
 ) -> dict[str, SemanticValue]:
-    evidence = definition.protected_context.evidence
+    context = definition.protected_context
+    if isinstance(context, MssqlProtectedReadContext):
+        return {
+            "evidence_version": 1,
+            "kind": "mssql_snapshot_relations",
+            "payload": {
+                "context": _mssql_context_semantic_value(context),
+                "driver": _mssql_driver_semantic_value(context),
+                "profile": _mssql_profile_semantic_value(context),
+                "relations": [
+                    _mssql_relation_semantic_value(item)
+                    for item in _mssql_context_relations(context)
+                ],
+            },
+        }
+    evidence = context.evidence
     return {
         "evidence_version": 1,
         "kind": "postgresql_protected_relations",
@@ -5064,8 +5303,7 @@ def _acquisition_evidence_semantic_value(
             "locked_relation_oids": list(evidence.locked_relation_oids),
             "relation_persistence": evidence.relation_persistence.value,
             "relations": [
-                _protected_relation_semantic_value(item)
-                for item in definition.protected_context.protected_relations
+                _protected_relation_semantic_value(item) for item in context.protected_relations
             ],
         },
     }
@@ -5074,14 +5312,55 @@ def _acquisition_evidence_semantic_value(
 def _physical_binding_semantic_value(
     definition: RelationManifestObservationPersistence,
 ) -> dict[str, SemanticValue]:
+    context = definition.protected_context
+    if isinstance(context, MssqlProtectedReadContext):
+        dataset_relation = _require_instance(
+            definition.dataset_relation,
+            MssqlInspectedRelation,
+            "SQL Server dataset relation",
+        )
+        readiness_relation = _require_instance(
+            definition.readiness_relation,
+            MssqlInspectedRelation,
+            "SQL Server readiness relation",
+        )
+        return {
+            "binding_version": 1,
+            "engine": "mssql",
+            "payload": {
+                "context": _mssql_context_semantic_value(context),
+                "driver": _mssql_driver_semantic_value(context),
+                "profile": _mssql_profile_semantic_value(context),
+                "dataset_relation": _mssql_relation_semantic_value(dataset_relation),
+                "readiness_relation": _mssql_relation_semantic_value(readiness_relation),
+            },
+        }
+    dataset_relation = _require_instance(
+        definition.dataset_relation,
+        PostgresProtectedRelationInspection,
+        "PostgreSQL dataset relation",
+    )
+    readiness_relation = _require_instance(
+        definition.readiness_relation,
+        PostgresProtectedRelationInspection,
+        "PostgreSQL readiness relation",
+    )
     return {
         "binding_version": 1,
         "engine": "postgresql",
         "payload": {
-            "dataset_relation": _protected_relation_semantic_value(definition.dataset_relation),
-            "readiness_relation": _protected_relation_semantic_value(definition.readiness_relation),
+            "dataset_relation": _protected_relation_semantic_value(dataset_relation),
+            "readiness_relation": _protected_relation_semantic_value(readiness_relation),
         },
     }
+
+
+def _relation_semantic_value(
+    relation: _ProtectedRelationInspection,
+) -> dict[str, SemanticValue]:
+    if isinstance(relation, PostgresProtectedRelationInspection):
+        return _protected_relation_semantic_value(relation)
+    return _mssql_relation_semantic_value(relation)
 
 
 def _protected_relation_semantic_value(
@@ -5174,6 +5453,105 @@ def _type_identity_semantic_value(identity: PostgresTypeIdentity) -> dict[str, S
         "oid": identity.oid,
         "schema_name": identity.schema_name,
         "type_name": identity.type_name,
+    }
+
+
+def _mssql_context_semantic_value(
+    context: MssqlProtectedReadContext,
+) -> dict[str, SemanticValue]:
+    evidence = context.evidence
+    return {
+        "allowed_concurrency": evidence.allowed_concurrency,
+        "context_id": str(evidence.context_id),
+        "database_id": evidence.database_id,
+        "engine": evidence.engine,
+        "limitations": list(evidence.limitations),
+        "server_version": evidence.server_version,
+        "session_id": evidence.session_id,
+        "snapshot_locator": evidence.snapshot_locator,
+        "started_at": evidence.started_at.astimezone(UTC).isoformat(),
+        "strategy": evidence.strategy,
+        "transaction_count": evidence.transaction_count,
+        "transaction_isolation_level": evidence.transaction_isolation_level,
+        "transaction_state": evidence.transaction_state,
+    }
+
+
+def _mssql_driver_semantic_value(
+    context: MssqlProtectedReadContext,
+) -> dict[str, SemanticValue]:
+    driver = context.profile.driver
+    return {
+        "driver_name": driver.driver_name,
+        "driver_version": driver.driver_version,
+        "pyodbc_version": driver.pyodbc_version,
+        "server_version": driver.server_version,
+        "session_id": driver.session_id,
+    }
+
+
+def _mssql_profile_semantic_value(
+    context: MssqlProtectedReadContext,
+) -> dict[str, SemanticValue]:
+    profile = context.profile
+    return {
+        "can_view_definition": profile.can_view_definition,
+        "canonical_utf8_code_page": profile.canonical_utf8_code_page,
+        "compatibility_level": profile.compatibility_level,
+        "database_collation": profile.database_collation,
+        "database_id": profile.database_id,
+        "database_name": profile.database_name,
+        "database_read_only": profile.database_read_only,
+        "database_updateability": profile.database_updateability,
+        "edition": profile.edition,
+        "engine_edition": profile.engine_edition,
+        "product_build": profile.product_build,
+        "product_level": profile.product_level,
+        "product_major_version": profile.product_major_version,
+        "product_update_level": profile.product_update_level,
+        "product_update_reference": profile.product_update_reference,
+        "product_version": profile.product_version,
+        "read_committed_snapshot": profile.read_committed_snapshot,
+        "server_collation": profile.server_collation,
+        "snapshot_isolation_state": profile.snapshot_isolation_state,
+        "snapshot_isolation_state_description": (profile.snapshot_isolation_state_description),
+    }
+
+
+def _mssql_relation_semantic_value(
+    relation: MssqlInspectedRelation,
+) -> dict[str, SemanticValue]:
+    return {
+        "columns": [_mssql_binding_semantic_value(binding) for binding in relation.bindings],
+        "context_id": str(relation.context_id),
+        "database_id": relation.database_id,
+        "object_id": relation.object_id,
+        "relation": [relation.relation.schema_name, relation.relation.table_name],
+        "schema_id": relation.schema_id,
+    }
+
+
+def _mssql_binding_semantic_value(binding: MssqlFieldBinding) -> dict[str, SemanticValue]:
+    return {
+        "column_id": binding.column_id,
+        "column_name": binding.column_name,
+        "field_name": binding.field_name,
+        "is_nullable": binding.is_nullable,
+        "physical": _mssql_physical_field_semantic_value(binding.physical),
+    }
+
+
+def _mssql_physical_field_semantic_value(
+    field: MssqlPhysicalField,
+) -> dict[str, SemanticValue]:
+    return {
+        "collation_name": field.collation_name,
+        "max_length": field.max_length,
+        "precision": field.precision,
+        "scale": field.scale,
+        "system_type_id": field.system_type_id,
+        "system_type_name": field.system_type_name,
+        "user_type_id": field.user_type_id,
     }
 
 
@@ -5772,7 +6150,7 @@ def _persisted_context_from_row(
 ) -> PersistedReadContext:
     definition = expected.definition
     evidence = definition.protected_context.evidence
-    profile = definition.protected_context.profile
+    storage_identity = _context_storage_identity(definition.protected_context)
     immutable_actual = (
         _row_uuid(row[0], "read context id"),
         _row_uuid(row[1], "read context run id"),
@@ -5802,12 +6180,12 @@ def _persisted_context_from_row(
         definition.acquisition_operation_id,
         bytes.fromhex(expected.attempt.run.request.scope.scope_digest),
         evidence.engine,
-        profile.driver_version,
-        profile.server_version,
-        profile.server_version_number,
+        storage_identity.driver_version,
+        storage_identity.server_version,
+        storage_identity.server_version_number,
         evidence.strategy,
         evidence.snapshot_locator,
-        evidence.backend_process_id,
+        storage_identity.backend_process_id,
         evidence.allowed_concurrency,
         expected.limitations_json,
         expected.acquisition_evidence_json,
@@ -5869,7 +6247,7 @@ def _require_observation_row(
         definition.observation_operation_id,
         cut.attempt.run.run_id,
         cut.attempt.attempt_id,
-        definition.dataset_relation.inspection.context_id,
+        _relation_context_id(definition.dataset_relation),
         definition.dataset.dataset_version_id,
         definition.direction.value,
         bytes.fromhex(cut.attempt.run.request.scope.scope_digest),

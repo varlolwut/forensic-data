@@ -11,6 +11,7 @@ from forensic_data.contracts.errors import ContractValidationError
 
 class Adapter(StrEnum):
     POSTGRESQL = "postgresql"
+    MSSQL = "mssql"
 
 
 class ConnectionRole(StrEnum):
@@ -237,9 +238,7 @@ class RelationManifestReadiness:
         _require_logical_text(self.connection_id, "readiness manifest connection id")
         _require_instance(self.relation, RelationLocator, "readiness manifest relation")
         if self.relation.catalog is not None:
-            raise ContractValidationError(
-                "PostgreSQL readiness manifest relation catalog must be null"
-            )
+            raise ContractValidationError("readiness manifest relation catalog must be null")
         if self.relation.relation_scope is not RelationScope.PHYSICAL_ONLY:
             raise ContractValidationError(
                 "readiness manifest relation requires physical_only relation scope"
@@ -276,12 +275,8 @@ class DatasetDefinition:
         _require_logical_text(self.dataset_id, "dataset id")
         _require_instance(self.connection, ConnectionDefinition, "dataset connection")
         _require_locator(self.locator)
-        if (
-            isinstance(self.locator, RelationLocator)
-            and self.connection.adapter is Adapter.POSTGRESQL
-            and self.locator.catalog is not None
-        ):
-            raise ContractValidationError("PostgreSQL dataset relation catalog must be null")
+        if isinstance(self.locator, RelationLocator) and self.locator.catalog is not None:
+            raise ContractValidationError("dataset relation catalog must be null")
         _require_instance(
             self.logical_schema,
             LogicalSchemaDefinition,

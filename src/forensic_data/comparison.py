@@ -19,6 +19,7 @@ from forensic_data.canonical import (
     TimestampParameters,
 )
 from forensic_data.contracts.model import (
+    Adapter,
     AssurancePolicy,
     DatasetDefinition,
     EvidenceAction,
@@ -32,6 +33,22 @@ from forensic_data.contracts.model import (
     StableReadKind,
 )
 from forensic_data.contracts.semantics import semantic_value_from_json
+from forensic_data.mssql import (
+    MssqlCancellationConfirmedError,
+    MssqlCancellationUnconfirmedError,
+    MssqlContextClosedError,
+    MssqlContextLostError,
+    MssqlDataValidationError,
+    MssqlInspectedRelation,
+    MssqlMetadataError,
+    MssqlProtectedReadContext,
+    MssqlQueryContextError,
+    MssqlQueryTimeoutError,
+    MssqlReadContextState,
+    MssqlResultLimitError,
+    MssqlTransportError,
+    UnsupportedMssqlProfileError,
+)
 from forensic_data.planning import ResolvedScope
 from forensic_data.postgres import (
     PostgresAcquisitionRaceError,
@@ -96,6 +113,7 @@ _EXACT_STATUS_BYTES = 2
 _MAX_ROW_TYPE_OID_BYTES = 10
 _HAS_DATA_BYTES = 1
 _DEADLINE_CHECK_RECORDS = 64
+_MAX_MSSQL_INTEGER_RANGES = 524
 _POINTER_BYTES = getsizeof((None,)) - getsizeof(())
 _EMPTY_TUPLE_BYTES = getsizeof(())
 _EMPTY_LIST_BYTES = getsizeof([])
@@ -107,6 +125,9 @@ _DECODE_ENVELOPE_EXPANSION = 6
 _DECODE_FIELD_RESERVATION_BYTES = (
     (6 * _POINTER_BYTES) + _ASCII_TEXT_HEADER_BYTES + _BYTES_HEADER_BYTES + getsizeof(Decimal(0))
 )
+
+type ComparisonReadContext = PostgresProtectedReadContext | MssqlProtectedReadContext
+type ComparisonRelation = PostgresProtectedRelationInspection | MssqlInspectedRelation
 
 
 class ComparisonExecutionError(RuntimeError):
@@ -502,7 +523,9 @@ class PartialComparisonArtifact:
         _require_nonnegative_integer(self.target_full_scans, "target_full_scans")
 
 
-type ComparisonInterruptionCause = ComparisonExecutionError | PostgresConnectorError
+type ComparisonInterruptionCause = (
+    ComparisonExecutionError | PostgresConnectorError | MssqlTransportError
+)
 
 
 class ComparisonInterruptedError(ComparisonExecutionError):
@@ -746,6 +769,8 @@ class _ValidatedInputs:
     max_encoded_row_bytes: int
     reference_member_count: int
     target_member_count: int
+    reference_aggregate_presence_bytes: int
+    target_aggregate_presence_bytes: int
     reference_physical_scan_count: int
     target_physical_scan_count: int
 
@@ -898,11 +923,11 @@ def _initial_comparison_progress(
     )
 
 
-def execute_postgres_integer_key_comparison(
-    reference_context: PostgresProtectedReadContext,
-    reference_relation: PostgresProtectedRelationInspection,
-    target_context: PostgresProtectedReadContext,
-    target_relation: PostgresProtectedRelationInspection,
+def execute_integer_key_comparison(
+    reference_context: ComparisonReadContext,
+    reference_relation: ComparisonRelation,
+    target_context: ComparisonReadContext,
+    target_relation: ComparisonRelation,
     check: RowCheckDefinition,
     scope: ResolvedScope,
     input_cut: InputCutDefinition,
@@ -910,26 +935,14 @@ def execute_postgres_integer_key_comparison(
     evidence_policy: EvidenceDefinition,
     source_budget: PostgresSourceBudgetAttempt,
 ) -> CompletedComparisonArtifact | CompletedStructuralComparisonArtifact:
-    reference_context = _require_instance(
-        reference_context,
-        PostgresProtectedReadContext,
-        "reference protected context",
+    reference_context = _require_comparison_context(
+        reference_context, "reference protected context"
     )
-    reference_relation = _require_instance(
-        reference_relation,
-        PostgresProtectedRelationInspection,
-        "reference protected relation",
+    reference_relation = _require_comparison_relation(
+        reference_relation, "reference protected relation"
     )
-    target_context = _require_instance(
-        target_context,
-        PostgresProtectedReadContext,
-        "target protected context",
-    )
-    target_relation = _require_instance(
-        target_relation,
-        PostgresProtectedRelationInspection,
-        "target protected relation",
-    )
+    target_context = _require_comparison_context(target_context, "target protected context")
+    target_relation = _require_comparison_relation(target_relation, "target protected relation")
     check = _require_instance(check, RowCheckDefinition, "row check")
     scope = _require_instance(scope, ResolvedScope, "resolved scope")
     input_cut = _require_instance(input_cut, InputCutDefinition, "aligned input cut")
@@ -979,7 +992,7 @@ def execute_postgres_integer_key_comparison(
                     CompletedComparisonArtifact | CompletedStructuralComparisonArtifact,
                     completed.value,
                 )
-    except (ComparisonExecutionError, PostgresConnectorError) as cause:
+    except (ComparisonExecutionError, PostgresConnectorError, MssqlTransportError) as cause:
         artifact = _partial_comparison_artifact(
             check,
             scope,
@@ -993,11 +1006,37 @@ def execute_postgres_integer_key_comparison(
         raise ComparisonInterruptedError(cause, artifact) from cause
 
 
-def _execute_postgres_integer_key_comparison(
+def execute_postgres_integer_key_comparison(
     reference_context: PostgresProtectedReadContext,
     reference_relation: PostgresProtectedRelationInspection,
     target_context: PostgresProtectedReadContext,
     target_relation: PostgresProtectedRelationInspection,
+    check: RowCheckDefinition,
+    scope: ResolvedScope,
+    input_cut: InputCutDefinition,
+    budgets: ExecutionBudgets,
+    evidence_policy: EvidenceDefinition,
+    source_budget: PostgresSourceBudgetAttempt,
+) -> CompletedComparisonArtifact | CompletedStructuralComparisonArtifact:
+    return execute_integer_key_comparison(
+        reference_context,
+        reference_relation,
+        target_context,
+        target_relation,
+        check,
+        scope,
+        input_cut,
+        budgets,
+        evidence_policy,
+        source_budget,
+    )
+
+
+def _execute_postgres_integer_key_comparison(
+    reference_context: ComparisonReadContext,
+    reference_relation: ComparisonRelation,
+    target_context: ComparisonReadContext,
+    target_relation: ComparisonRelation,
     check: RowCheckDefinition,
     scope: ResolvedScope,
     input_cut: InputCutDefinition,
@@ -1023,14 +1062,22 @@ def _execute_postgres_integer_key_comparison(
     )
     usage = progress.usage
     _require_deadline(read_deadline.deadline_nanoseconds)
-    reference_summary_bytes = _SUMMARY_RECORD_BYTES + _provenance_bytes(
-        validated.reference_member_count
+    reference_summary_bytes = (
+        _SUMMARY_RECORD_BYTES
+        + _provenance_bytes(validated.reference_member_count)
+        + validated.reference_aggregate_presence_bytes
     )
-    target_summary_bytes = _SUMMARY_RECORD_BYTES + _provenance_bytes(validated.target_member_count)
+    target_summary_bytes = (
+        _SUMMARY_RECORD_BYTES
+        + _provenance_bytes(validated.target_member_count)
+        + validated.target_aggregate_presence_bytes
+    )
     summary_coordinator_peak = _summary_phase_memory_bytes(
         budgets,
         validated.reference_member_count,
         validated.target_member_count,
+        validated.reference_aggregate_presence_bytes,
+        validated.target_aggregate_presence_bytes,
         reference_summary_bytes,
         target_summary_bytes,
     )
@@ -1055,7 +1102,8 @@ def _execute_postgres_integer_key_comparison(
         ),
         coordinator_bytes=summary_coordinator_peak,
     )
-    reference_summary_read = reference_context.read_integer_key_summary(
+    reference_summary_read = _read_integer_key_summary(
+        reference_context,
         reference_relation,
         validated.key_field_index,
         validated.reference_scope,
@@ -1066,7 +1114,8 @@ def _execute_postgres_integer_key_comparison(
         validated.reference_physical_scan_count,
     )
     _require_deadline(read_deadline.deadline_nanoseconds)
-    target_summary_read = target_context.read_integer_key_summary(
+    target_summary_read = _read_integer_key_summary(
+        target_context,
         target_relation,
         validated.key_field_index,
         validated.target_scope,
@@ -1139,12 +1188,19 @@ def _execute_postgres_integer_key_comparison(
     pending: tuple[_PendingSegment, ...] = (root,)
 
     while pending:
+        _require_mssql_range_batch_capacity(
+            pending,
+            reference_relation,
+            target_relation,
+        )
         fingerprint_plan = _plan_fingerprint_level(
             pending,
             usage,
             budgets,
             validated.reference_member_count,
             validated.target_member_count,
+            validated.reference_aggregate_presence_bytes,
+            validated.target_aggregate_presence_bytes,
             validated.reference_physical_scan_count,
             validated.target_physical_scan_count,
         )
@@ -1413,8 +1469,8 @@ def _partial_comparison_artifact(
     check: RowCheckDefinition,
     scope: ResolvedScope,
     input_cut: InputCutDefinition,
-    reference_context: PostgresProtectedReadContext,
-    target_context: PostgresProtectedReadContext,
+    reference_context: ComparisonReadContext,
+    target_context: ComparisonReadContext,
     source_budget: PostgresSourceBudgetAttempt,
     progress: _ComparisonProgress,
     cause: ComparisonInterruptionCause,
@@ -1624,17 +1680,38 @@ def _interruption_reason_code(cause: ComparisonInterruptionCause) -> ReasonCode:
         cause,
         (
             ComparisonBudgetExceededError,
+            MssqlQueryTimeoutError,
             PostgresReadDeadlineExceededError,
             PostgresResultLimitError,
             PostgresSourceBudgetExceededError,
+            MssqlResultLimitError,
         ),
     ):
         return ReasonCode.BUDGET_EXHAUSTED
-    if isinstance(cause, (PostgresContextLostError, PostgresAcquisitionRaceError)):
+    if isinstance(cause, MssqlCancellationConfirmedError):
+        return ReasonCode.CANCELLED
+    if isinstance(cause, MssqlCancellationUnconfirmedError):
+        return ReasonCode.CANCELLATION_UNCONFIRMED
+    if isinstance(
+        cause,
+        (
+            PostgresContextLostError,
+            PostgresAcquisitionRaceError,
+            MssqlContextLostError,
+            MssqlMetadataError,
+        ),
+    ):
         return ReasonCode.SNAPSHOT_LOST
     if isinstance(cause, ComparisonKeyMappingError):
         return ReasonCode.LOSSY_TRANSPORT
-    if isinstance(cause, (UnsupportedComparisonError, UnsupportedPostgresProfileError)):
+    if isinstance(
+        cause,
+        (
+            UnsupportedComparisonError,
+            UnsupportedPostgresProfileError,
+            UnsupportedMssqlProfileError,
+        ),
+    ):
         return ReasonCode.UNSUPPORTED_CAPABILITY
     if isinstance(
         cause,
@@ -1643,10 +1720,13 @@ def _interruption_reason_code(cause: ComparisonInterruptionCause) -> ReasonCode:
             PostgresContextClosedError,
             PostgresDataValidationError,
             PostgresQueryContextError,
+            MssqlContextClosedError,
+            MssqlDataValidationError,
+            MssqlQueryContextError,
         ),
     ):
         return ReasonCode.PROTOCOL_VIOLATION
-    if isinstance(cause, PostgresConnectorError):
+    if isinstance(cause, (PostgresConnectorError, MssqlTransportError)):
         return ReasonCode.QUERY_ERROR
     raise AssertionError(f"unhandled comparison interruption {type(cause).__name__}")
 
@@ -1679,10 +1759,10 @@ def _without_mismatch_witness(
 
 
 def _validate_inputs(
-    reference_context: PostgresProtectedReadContext,
-    reference_relation: PostgresProtectedRelationInspection,
-    target_context: PostgresProtectedReadContext,
-    target_relation: PostgresProtectedRelationInspection,
+    reference_context: ComparisonReadContext,
+    reference_relation: ComparisonRelation,
+    target_context: ComparisonReadContext,
+    target_relation: ComparisonRelation,
     check: RowCheckDefinition,
     scope: ResolvedScope,
     input_cut: InputCutDefinition,
@@ -1712,9 +1792,9 @@ def _validate_inputs(
         raise UnsupportedComparisonError(
             "integer-range comparison requires the key to equal both dataset grains"
         )
-    if reference_context.state is not ReadContextState.ACTIVE:
+    if not _comparison_context_is_active(reference_context):
         raise ComparisonProtocolError("reference protected read context must be active")
-    if target_context.state is not ReadContextState.ACTIVE:
+    if not _comparison_context_is_active(target_context):
         raise ComparisonProtocolError("target protected read context must be active")
     if not any(item is reference_relation for item in reference_context.protected_relations):
         raise ComparisonProtocolError(
@@ -1732,10 +1812,12 @@ def _validate_inputs(
         )
     _validate_dataset_relation(check.reference, reference_relation, "reference")
     _validate_dataset_relation(check.target, target_relation, "target")
-    reference_member_count = len(reference_relation.query_relations())
-    target_member_count = len(target_relation.query_relations())
-    reference_physical_scan_count = reference_relation.physical_scan_count()
-    target_physical_scan_count = target_relation.physical_scan_count()
+    reference_member_count = _relation_member_count(reference_relation)
+    target_member_count = _relation_member_count(target_relation)
+    reference_aggregate_presence_bytes = _aggregate_presence_bytes(reference_relation)
+    target_aggregate_presence_bytes = _aggregate_presence_bytes(target_relation)
+    reference_physical_scan_count = _relation_physical_scan_count(reference_relation)
+    target_physical_scan_count = _relation_physical_scan_count(target_relation)
     required_summary_scans = max(
         reference_physical_scan_count,
         target_physical_scan_count,
@@ -1794,6 +1876,8 @@ def _validate_inputs(
         max_encoded_row_bytes=max_encoded_row_bytes,
         reference_member_count=reference_member_count,
         target_member_count=target_member_count,
+        reference_aggregate_presence_bytes=reference_aggregate_presence_bytes,
+        target_aggregate_presence_bytes=target_aggregate_presence_bytes,
         reference_physical_scan_count=reference_physical_scan_count,
         target_physical_scan_count=target_physical_scan_count,
     )
@@ -1801,7 +1885,7 @@ def _validate_inputs(
 
 def _validate_dataset_relation(
     dataset: DatasetDefinition,
-    relation: PostgresProtectedRelationInspection,
+    relation: ComparisonRelation,
     direction: str,
 ) -> None:
     if not isinstance(dataset.locator, RelationLocator):
@@ -1814,6 +1898,38 @@ def _validate_dataset_relation(
     ):
         raise UnsupportedComparisonError(
             f"{direction} integer-range comparison has an unsupported relation scope"
+        )
+    if isinstance(relation, MssqlInspectedRelation):
+        if dataset.connection.adapter is not Adapter.MSSQL:
+            raise ComparisonProtocolError(
+                f"{direction} SQL Server inspection is bound to a non-MSSQL dataset"
+            )
+        if dataset.locator.relation_scope is not RelationScope.PHYSICAL_ONLY:
+            raise UnsupportedComparisonError(
+                f"{direction} SQL Server comparison requires physical_only relation scope"
+            )
+        expected_relation = (dataset.locator.schema, dataset.locator.name)
+        actual_relation = (relation.relation.schema_name, relation.relation.table_name)
+        if actual_relation != expected_relation:
+            raise ComparisonProtocolError(
+                f"{direction} SQL Server inspection resolved outside the contract relation"
+            )
+        expected_columns = tuple(item.column_name for item in dataset.projection)
+        actual_columns = tuple(item.column_name for item in relation.bindings)
+        if actual_columns != expected_columns:
+            raise ComparisonProtocolError(
+                f"{direction} SQL Server inspection projection does not match the dataset"
+            )
+        expected_fields = tuple(field.name for field in dataset.logical_schema.schema.fields)
+        actual_fields = tuple(item.field_name for item in relation.bindings)
+        if actual_fields != expected_fields:
+            raise ComparisonProtocolError(
+                f"{direction} SQL Server inspection schema does not match the dataset"
+            )
+        return
+    if dataset.connection.adapter is not Adapter.POSTGRESQL:
+        raise ComparisonProtocolError(
+            f"{direction} PostgreSQL inspection is bound to a non-PostgreSQL dataset"
         )
     if relation.acquisition.relation_scope is not dataset.locator.relation_scope:
         raise ComparisonProtocolError(
@@ -1921,8 +2037,8 @@ def _completed_structural_artifact(
     check: RowCheckDefinition,
     scope: ResolvedScope,
     input_cut: InputCutDefinition,
-    reference_context: PostgresProtectedReadContext,
-    target_context: PostgresProtectedReadContext,
+    reference_context: ComparisonReadContext,
+    target_context: ComparisonReadContext,
     reference_summary: PostgresIntegerKeySummary,
     target_summary: PostgresIntegerKeySummary,
     usage: _Usage,
@@ -2117,6 +2233,8 @@ def _plan_fingerprint_level(
     budgets: ExecutionBudgets,
     reference_member_count: int,
     target_member_count: int,
+    reference_aggregate_presence_bytes: int,
+    target_aggregate_presence_bytes: int,
     reference_physical_scan_count: int,
     target_physical_scan_count: int,
 ) -> _FingerprintLevelPlan:
@@ -2127,8 +2245,12 @@ def _plan_fingerprint_level(
     requests = tuple(_range_request(item) for item in pending)
     base_result_bytes = sum(_fingerprint_record_bytes(item.segment_id) for item in requests)
     base_record_bytes = max(_fingerprint_record_bytes(item.segment_id) for item in requests)
-    reference_provenance_bytes = _provenance_bytes(reference_member_count)
-    target_provenance_bytes = _provenance_bytes(target_member_count)
+    reference_provenance_bytes = (
+        _provenance_bytes(reference_member_count) + reference_aggregate_presence_bytes
+    )
+    target_provenance_bytes = (
+        _provenance_bytes(target_member_count) + target_aggregate_presence_bytes
+    )
     reference_result_bytes = base_result_bytes + (len(requests) * reference_provenance_bytes)
     target_result_bytes = base_result_bytes + (len(requests) * target_provenance_bytes)
     return _FingerprintLevelPlan(
@@ -2146,18 +2268,80 @@ def _plan_fingerprint_level(
             budgets,
             reference_member_count,
             target_member_count,
+            reference_aggregate_presence_bytes,
+            target_aggregate_presence_bytes,
             reference_result_bytes,
             target_result_bytes,
         ),
     )
 
 
+def _require_mssql_range_batch_capacity(
+    pending: tuple[_PendingSegment, ...],
+    reference_relation: ComparisonRelation,
+    target_relation: ComparisonRelation,
+) -> None:
+    if len(pending) <= _MAX_MSSQL_INTEGER_RANGES:
+        return
+    if not isinstance(reference_relation, MssqlInspectedRelation) and not isinstance(
+        target_relation,
+        MssqlInspectedRelation,
+    ):
+        return
+    raise ComparisonBudgetExceededError(
+        "SQL Server fingerprint level exceeds the safe 2,100-parameter batch bound: "
+        f"observed_ranges={len(pending)}, maximum_ranges={_MAX_MSSQL_INTEGER_RANGES}"
+    )
+
+
+def _read_integer_key_summary(
+    context: ComparisonReadContext,
+    relation: ComparisonRelation,
+    key_field_index: int,
+    scope: PostgresScopePredicate | None,
+    max_encoded_envelope_bytes: int,
+    max_record_bytes: int,
+    max_total_bytes: int,
+    deadline: PostgresReadDeadline,
+    full_scans: int,
+) -> PostgresIntegerKeySummaryRead:
+    if isinstance(context, PostgresProtectedReadContext):
+        if not isinstance(relation, PostgresProtectedRelationInspection):
+            raise ComparisonProtocolError(
+                "PostgreSQL comparison context received a SQL Server relation"
+            )
+        return context.read_integer_key_summary(
+            relation,
+            key_field_index,
+            scope,
+            max_encoded_envelope_bytes,
+            max_record_bytes,
+            max_total_bytes,
+            deadline,
+            full_scans,
+        )
+    if not isinstance(relation, MssqlInspectedRelation):
+        raise ComparisonProtocolError(
+            "SQL Server comparison context received a PostgreSQL relation"
+        )
+    return context.read_integer_key_summary(
+        relation,
+        key_field_index,
+        scope,
+        max_encoded_envelope_bytes,
+        max_record_bytes,
+        max_total_bytes,
+        deadline,
+        full_scans,
+    )
+
+
 def _read_fingerprint_level(
-    reference_context: PostgresProtectedReadContext,
-    reference_relation: PostgresProtectedRelationInspection,
+    reference_context: ComparisonReadContext,
+    reference_relation: ComparisonRelation,
     reference_scope: PostgresScopePredicate | None,
-    target_context: PostgresProtectedReadContext,
-    target_relation: PostgresProtectedRelationInspection,
+    target_context: ComparisonReadContext,
+    target_relation: ComparisonRelation,
     target_scope: PostgresScopePredicate | None,
     key_field_index: int,
     max_encoded_row_bytes: int,
@@ -2186,7 +2370,8 @@ def _read_fingerprint_level(
         coordinator_bytes=plan.coordinator_peak_bytes,
     )
     _require_deadline(read_deadline.deadline_nanoseconds)
-    reference_read = reference_context.read_integer_range_fingerprints(
+    reference_read = _read_integer_range_fingerprints(
+        reference_context,
         reference_relation,
         key_field_index,
         reference_scope,
@@ -2198,7 +2383,8 @@ def _read_fingerprint_level(
         plan.reference_full_scans,
     )
     _require_deadline(read_deadline.deadline_nanoseconds)
-    target_read = target_context.read_integer_range_fingerprints(
+    target_read = _read_integer_range_fingerprints(
+        target_context,
         target_relation,
         key_field_index,
         target_scope,
@@ -2216,6 +2402,51 @@ def _read_fingerprint_level(
         coordinator_peak_bytes=plan.coordinator_peak_bytes,
     )
     return reference_read, target_read, next_usage
+
+
+def _read_integer_range_fingerprints(
+    context: ComparisonReadContext,
+    relation: ComparisonRelation,
+    key_field_index: int,
+    scope: PostgresScopePredicate | None,
+    ranges: tuple[PostgresIntegerRangeRequest, ...],
+    max_encoded_envelope_bytes: int,
+    max_record_bytes: int,
+    max_total_bytes: int,
+    deadline: PostgresReadDeadline,
+    full_scans: int,
+) -> PostgresRangeFingerprintRead:
+    if isinstance(context, PostgresProtectedReadContext):
+        if not isinstance(relation, PostgresProtectedRelationInspection):
+            raise ComparisonProtocolError(
+                "PostgreSQL comparison context received a SQL Server relation"
+            )
+        return context.read_integer_range_fingerprints(
+            relation,
+            key_field_index,
+            scope,
+            ranges,
+            max_encoded_envelope_bytes,
+            max_record_bytes,
+            max_total_bytes,
+            deadline,
+            full_scans,
+        )
+    if not isinstance(relation, MssqlInspectedRelation):
+        raise ComparisonProtocolError(
+            "SQL Server comparison context received a PostgreSQL relation"
+        )
+    return context.read_integer_range_fingerprints(
+        relation,
+        key_field_index,
+        scope,
+        ranges,
+        max_encoded_envelope_bytes,
+        max_record_bytes,
+        max_total_bytes,
+        deadline,
+        full_scans,
+    )
 
 
 def _fingerprint_nodes(
@@ -2289,11 +2520,11 @@ def _exact_frontier_fits(
 
 
 def _read_exact_frontier(
-    reference_context: PostgresProtectedReadContext,
-    reference_relation: PostgresProtectedRelationInspection,
+    reference_context: ComparisonReadContext,
+    reference_relation: ComparisonRelation,
     reference_scope: PostgresScopePredicate | None,
-    target_context: PostgresProtectedReadContext,
-    target_relation: PostgresProtectedRelationInspection,
+    target_context: ComparisonReadContext,
+    target_relation: ComparisonRelation,
     target_scope: PostgresScopePredicate | None,
     key_field_index: int,
     max_encoded_row_bytes: int,
@@ -2331,7 +2562,8 @@ def _read_exact_frontier(
         + _EXACT_STATUS_BYTES
     )
     _require_deadline(read_deadline.deadline_nanoseconds)
-    reference_read = reference_context.read_integer_range_rows(
+    reference_read = _read_integer_range_rows(
+        reference_context,
         reference_relation,
         key_field_index,
         reference_scope,
@@ -2344,7 +2576,8 @@ def _read_exact_frontier(
         reservation.reference.full_scans,
     )
     _require_deadline(read_deadline.deadline_nanoseconds)
-    target_read = target_context.read_integer_range_rows(
+    target_read = _read_integer_range_rows(
+        target_context,
         target_relation,
         key_field_index,
         target_scope,
@@ -2380,6 +2613,54 @@ def _read_exact_frontier(
         coordinator_peak_bytes=reservation.coordinator_peak_bytes,
     )
     return reference_read, target_read, next_usage
+
+
+def _read_integer_range_rows(
+    context: ComparisonReadContext,
+    relation: ComparisonRelation,
+    key_field_index: int,
+    scope: PostgresScopePredicate | None,
+    ranges: tuple[PostgresIntegerRangeRequest, ...],
+    max_encoded_envelope_bytes: int,
+    max_records: int,
+    max_record_bytes: int,
+    max_total_bytes: int,
+    deadline: PostgresReadDeadline,
+    full_scans: int,
+) -> PostgresIntegerExactRowsRead:
+    if isinstance(context, PostgresProtectedReadContext):
+        if not isinstance(relation, PostgresProtectedRelationInspection):
+            raise ComparisonProtocolError(
+                "PostgreSQL comparison context received a SQL Server relation"
+            )
+        return context.read_integer_range_rows(
+            relation,
+            key_field_index,
+            scope,
+            ranges,
+            max_encoded_envelope_bytes,
+            max_records,
+            max_record_bytes,
+            max_total_bytes,
+            deadline,
+            full_scans,
+        )
+    if not isinstance(relation, MssqlInspectedRelation):
+        raise ComparisonProtocolError(
+            "SQL Server comparison context received a PostgreSQL relation"
+        )
+    return context.read_integer_range_rows(
+        relation,
+        key_field_index,
+        scope,
+        ranges,
+        max_encoded_envelope_bytes,
+        max_records,
+        max_record_bytes,
+        max_total_bytes,
+        deadline,
+        full_scans,
+    )
 
 
 def _group_exact_frontier_rows(
@@ -2931,13 +3212,15 @@ def _summary_phase_memory_bytes(
     budgets: ExecutionBudgets,
     reference_member_count: int,
     target_member_count: int,
+    reference_aggregate_presence_bytes: int,
+    target_aggregate_presence_bytes: int,
     reference_result_bytes: int,
     target_result_bytes: int,
 ) -> int:
     parsed_side = _summary_parsed_side_memory_bytes(budgets)
     reference_raw = _raw_rows_memory_bytes(
         record_count=1,
-        field_count=reference_member_count + 8,
+        field_count=(reference_member_count + 8 + reference_aggregate_presence_bytes),
         ascii_value_count=7,
         integer_value_count=reference_member_count,
         result_bytes=reference_result_bytes,
@@ -2945,7 +3228,7 @@ def _summary_phase_memory_bytes(
     )
     target_raw = _raw_rows_memory_bytes(
         record_count=1,
-        field_count=target_member_count + 8,
+        field_count=target_member_count + 8 + target_aggregate_presence_bytes,
         ascii_value_count=7,
         integer_value_count=target_member_count,
         result_bytes=target_result_bytes,
@@ -3030,13 +3313,15 @@ def _fingerprint_phase_memory_bytes(
     budgets: ExecutionBudgets,
     reference_member_count: int,
     target_member_count: int,
+    reference_aggregate_presence_bytes: int,
+    target_aggregate_presence_bytes: int,
     reference_result_bytes: int,
     target_result_bytes: int,
 ) -> int:
     parsed_side = _fingerprint_parsed_side_memory_bytes(requests, budgets)
     reference_raw = _raw_rows_memory_bytes(
         record_count=len(requests),
-        field_count=reference_member_count + 14,
+        field_count=(reference_member_count + 14 + reference_aggregate_presence_bytes),
         ascii_value_count=14 * len(requests),
         integer_value_count=reference_member_count * len(requests),
         result_bytes=reference_result_bytes,
@@ -3044,7 +3329,7 @@ def _fingerprint_phase_memory_bytes(
     )
     target_raw = _raw_rows_memory_bytes(
         record_count=len(requests),
-        field_count=target_member_count + 14,
+        field_count=target_member_count + 14 + target_aggregate_presence_bytes,
         ascii_value_count=14 * len(requests),
         integer_value_count=target_member_count * len(requests),
         result_bytes=target_result_bytes,
@@ -3497,6 +3782,52 @@ def _validate_partial_totals(artifact: PartialComparisonArtifact) -> None:
         and artifact.verdict is not Verdict.MISMATCH
     ):
         raise ValueError("positive partial difference lower bound requires mismatch verdict")
+
+
+def _require_comparison_context(
+    value: object,
+    context: str,
+) -> ComparisonReadContext:
+    if not isinstance(value, (PostgresProtectedReadContext, MssqlProtectedReadContext)):
+        raise TypeError(
+            f"{context} must be a PostgresProtectedReadContext or MssqlProtectedReadContext"
+        )
+    return value
+
+
+def _require_comparison_relation(
+    value: object,
+    context: str,
+) -> ComparisonRelation:
+    if not isinstance(value, (PostgresProtectedRelationInspection, MssqlInspectedRelation)):
+        raise TypeError(
+            f"{context} must be a PostgresProtectedRelationInspection or MssqlInspectedRelation"
+        )
+    return value
+
+
+def _comparison_context_is_active(context: ComparisonReadContext) -> bool:
+    if isinstance(context, PostgresProtectedReadContext):
+        return context.state is ReadContextState.ACTIVE
+    return context.state is MssqlReadContextState.ACTIVE
+
+
+def _relation_member_count(relation: ComparisonRelation) -> int:
+    if isinstance(relation, PostgresProtectedRelationInspection):
+        return len(relation.query_relations())
+    return 3 + len(relation.bindings)
+
+
+def _aggregate_presence_bytes(relation: ComparisonRelation) -> int:
+    if isinstance(relation, PostgresProtectedRelationInspection):
+        return 0
+    return _HAS_DATA_BYTES
+
+
+def _relation_physical_scan_count(relation: ComparisonRelation) -> int:
+    if isinstance(relation, PostgresProtectedRelationInspection):
+        return relation.physical_scan_count()
+    return 1
 
 
 def _require_instance[ValueT](

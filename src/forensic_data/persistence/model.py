@@ -206,8 +206,9 @@ class DatasetVersionDefinition:
         _require_protocols(self.semantic_protocol, self.canonical_protocol)
         _require_sha256(self.logical_schema_digest, "dataset logical schema digest")
         _require_nonblank_text(self.connection_id, "dataset connection id")
-        if self.adapter is not Adapter.POSTGRESQL:
-            raise ValueError("initial metadata persistence supports only PostgreSQL datasets")
+        _require_enum(self.adapter, Adapter, "dataset adapter")
+        if self.adapter not in (Adapter.POSTGRESQL, Adapter.MSSQL):
+            raise ValueError(f"dataset adapter is unsupported: adapter={self.adapter.value!r}")
         _require_nonblank_text(self.driver, "dataset driver")
         _require_nonblank_text(self.profile, "dataset profile")
         _require_enum(self.locator_kind, DatasetLocatorKind, "dataset locator kind")
@@ -222,6 +223,11 @@ class DatasetVersionDefinition:
                 )
         elif self.relation_scope is not None:
             raise ValueError("SQL dataset cannot have a relation scope")
+        if self.adapter is Adapter.MSSQL and (
+            self.locator_kind is not DatasetLocatorKind.RELATION
+            or self.relation_scope is not RelationScope.PHYSICAL_ONLY
+        ):
+            raise ValueError("MSSQL datasets require a physical_only relation locator")
         _require_canonical_object_json(self.semantic_payload_json, "dataset semantic payload")
         _require_digest_matches_json(
             self.semantic_digest,
@@ -804,9 +810,8 @@ def _require_dataset_body_shape(
         ("adapter", "connection_id", "driver", "profile"),
         f"{context} connection",
     )
-    _require_semantic_match(
+    adapter = _require_dataset_adapter(
         connection["adapter"],
-        Adapter.POSTGRESQL.value,
         f"{context} connection adapter",
     )
     for key in ("connection_id", "driver", "profile"):
@@ -839,8 +844,12 @@ def _require_dataset_body_shape(
     locator = _semantic_object(body["locator"], f"{context} locator")
     locator_kind = _semantic_text(locator.get("kind"), f"{context} locator kind")
     if locator_kind == DatasetLocatorKind.RELATION.value:
-        _require_dataset_relation_locator(locator, f"{context} locator")
+        relation_scope = _require_dataset_relation_locator(locator, f"{context} locator")
+        if adapter is Adapter.MSSQL and relation_scope is not RelationScope.PHYSICAL_ONLY:
+            raise ValueError(f"{context} MSSQL relation requires physical_only scope")
     elif locator_kind == DatasetLocatorKind.SQL.value:
+        if adapter is Adapter.MSSQL:
+            raise ValueError(f"{context} MSSQL dataset requires a relation locator")
         _sql_artifact_identity(locator, f"{context} locator")
     else:
         raise ValueError(f"{context} locator kind is unsupported")
@@ -1050,7 +1059,7 @@ def _require_relation_locator(
     )
     catalog = locator["catalog"]
     if catalog is not None:
-        raise ValueError("PostgreSQL relation locator catalog must be null")
+        raise ValueError("relation locator catalog must be null")
     _semantic_nonempty_text(locator["schema"], "relation locator schema")
     _semantic_nonempty_text(locator["name"], "relation locator name")
 
@@ -1058,7 +1067,7 @@ def _require_relation_locator(
 def _require_dataset_relation_locator(
     locator: dict[str, SemanticValue],
     context: str,
-) -> None:
+) -> RelationScope:
     relation_scope_text = _semantic_text(
         locator.get("relation_scope"),
         f"{context} relation scope",
@@ -1077,6 +1086,7 @@ def _require_dataset_relation_locator(
             f"{context} relation scope is unsupported: relation_scope={relation_scope_text!r}"
         )
     _require_relation_locator(locator, relation_scope)
+    return relation_scope
 
 
 def _contract_direction_bodies(
@@ -1158,11 +1168,17 @@ def _contract_readiness_identities(
         raise ValueError("contract consistency must contain reference and target datasets")
     direction_bodies = _contract_direction_bodies(contract)
     expected_connections = tuple(
-        _semantic_text(
-            _semantic_object(body["connection"], f"contract {direction} connection")[
-                "connection_id"
-            ],
-            f"contract {direction} connection id",
+        (
+            _semantic_text(
+                _semantic_object(body["connection"], f"contract {direction} connection")[
+                    "connection_id"
+                ],
+                f"contract {direction} connection id",
+            ),
+            _require_dataset_adapter(
+                _semantic_object(body["connection"], f"contract {direction} connection")["adapter"],
+                f"contract {direction} connection adapter",
+            ),
         )
         for direction, body in zip(
             ("reference", "target"),
@@ -1171,7 +1187,7 @@ def _contract_readiness_identities(
         )
     )
     identities: list[_SqlArtifactIdentity | None] = []
-    for index, (value, expected_dataset_id, expected_connection_id) in enumerate(
+    for index, (value, expected_dataset_id, connection) in enumerate(
         zip(
             datasets,
             (contract.reference_dataset_id, contract.target_dataset_id),
@@ -1179,6 +1195,7 @@ def _contract_readiness_identities(
             strict=True,
         )
     ):
+        expected_connection_id, expected_adapter = connection
         context = f"contract consistency dataset {index}"
         dataset = _semantic_object(value, context)
         _require_exact_semantic_keys(
@@ -1201,6 +1218,7 @@ def _contract_readiness_identities(
             _readiness_artifact_identity(
                 readiness,
                 expected_connection_id,
+                expected_adapter,
                 f"{context} readiness",
             )
         )
@@ -1210,10 +1228,13 @@ def _contract_readiness_identities(
 def _readiness_artifact_identity(
     readiness: dict[str, SemanticValue],
     expected_connection_id: str,
+    expected_adapter: Adapter,
     context: str,
 ) -> _SqlArtifactIdentity | None:
     kind = _semantic_text(readiness.get("kind"), f"{context} kind")
     if kind == _SQL_ARTIFACT_KIND:
+        if expected_adapter is Adapter.MSSQL:
+            raise ValueError(f"{context} MSSQL readiness requires a relation manifest")
         return _sql_artifact_identity(readiness, context)
     if kind != "relation_manifest":
         raise ValueError(f"{context} kind is unsupported")
@@ -1375,6 +1396,17 @@ def _semantic_nonempty_text(value: SemanticValue, context: str) -> str:
     if type(value) is not str or value == "":
         raise ValueError(f"{context} must be nonempty text")
     return value
+
+
+def _require_dataset_adapter(value: SemanticValue, context: str) -> Adapter:
+    adapter_text = _semantic_text(value, context)
+    try:
+        adapter = Adapter(adapter_text)
+    except ValueError:
+        raise ValueError(f"{context} is unsupported: adapter={adapter_text!r}") from None
+    if adapter not in (Adapter.POSTGRESQL, Adapter.MSSQL):
+        raise ValueError(f"{context} is unsupported: adapter={adapter_text!r}")
+    return adapter
 
 
 def _semantic_integer(value: SemanticValue, context: str) -> int:

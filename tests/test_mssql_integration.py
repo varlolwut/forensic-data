@@ -60,6 +60,8 @@ def test_mssql_transport_is_lossless_and_bounded() -> None:
                 max_value_bytes=512,
                 max_record_bytes=1_024,
                 max_total_bytes=1_024,
+                max_declared_value_bytes=512,
+                max_declared_record_bytes=1_024,
             ),
         )
         expected_high_precision = Decimal("99999999999999999999999999999999999.999")
@@ -92,6 +94,8 @@ def test_mssql_transport_is_lossless_and_bounded() -> None:
                 max_value_bytes=64,
                 max_record_bytes=64,
                 max_total_bytes=1_024,
+                max_declared_value_bytes=64,
+                max_declared_record_bytes=64,
             ),
         )
         assert streamed.rows == tuple((value,) for value in range(1, 24))
@@ -117,6 +121,8 @@ def test_mssql_transport_is_lossless_and_bounded() -> None:
                     max_value_bytes=64,
                     max_record_bytes=64,
                     max_total_bytes=1_024,
+                    max_declared_value_bytes=64,
+                    max_declared_record_bytes=64,
                 ),
             )
         assert record_limited_transport.closed
@@ -145,6 +151,8 @@ def test_mssql_transport_is_lossless_and_bounded() -> None:
                     max_value_bytes=128,
                     max_record_bytes=128,
                     max_total_bytes=128,
+                    max_declared_value_bytes=128,
+                    max_declared_record_bytes=128,
                 ),
             )
         assert lossy_transport.closed
@@ -167,6 +175,8 @@ def test_mssql_transport_is_lossless_and_bounded() -> None:
                     max_value_bytes=32,
                     max_record_bytes=32,
                     max_total_bytes=32,
+                    max_declared_value_bytes=32,
+                    max_declared_record_bytes=32,
                 ),
             )
         assert oversized_transport.closed
@@ -228,6 +238,8 @@ def _execute_long_query(
                 max_value_bytes=32,
                 max_record_bytes=32,
                 max_total_bytes=32,
+                max_declared_value_bytes=32,
+                max_declared_record_bytes=32,
             ),
         )
     finally:
@@ -283,6 +295,8 @@ def _wait_for_server_request(session_id: int, query_id: UUID) -> None:
                     max_value_bytes=32,
                     max_record_bytes=32,
                     max_total_bytes=32,
+                    max_declared_value_bytes=32,
+                    max_declared_record_bytes=32,
                 ),
             )
             if observed.rows == ((1,),):

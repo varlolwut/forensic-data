@@ -198,6 +198,8 @@ def test_mssql_canonical_hash_and_fingerprint_match_independent_oracle() -> None
                 max_value_bytes=32_000,
                 max_record_bytes=32_512,
                 max_total_bytes=65_024,
+                max_declared_value_bytes=32_000,
+                max_declared_record_bytes=32_512,
             ),
         )
         assert len(row_result.rows) == 2
@@ -238,6 +240,8 @@ def test_mssql_canonical_hash_and_fingerprint_match_independent_oracle() -> None
                 max_value_bytes=2_048,
                 max_record_bytes=2_400,
                 max_total_bytes=4_800,
+                max_declared_value_bytes=2_048,
+                max_declared_record_bytes=2_400,
             ),
         )
         assert set(common_row_result.rows) == {
@@ -551,6 +555,8 @@ def _single_row_limits() -> MssqlFetchLimits:
         max_value_bytes=2_048,
         max_record_bytes=2_400,
         max_total_bytes=2_400,
+        max_declared_value_bytes=2_048,
+        max_declared_record_bytes=2_400,
     )
 
 
@@ -561,6 +567,8 @@ def _summary_limits() -> MssqlFetchLimits:
         max_value_bytes=64,
         max_record_bytes=512,
         max_total_bytes=512,
+        max_declared_value_bytes=64,
+        max_declared_record_bytes=512,
     )
 
 
@@ -700,6 +708,8 @@ def _assert_catalog_drift_fails_closed() -> None:
         max_value_bytes=32_000,
         max_record_bytes=32_512,
         max_total_bytes=32_512,
+        max_declared_value_bytes=32_000,
+        max_declared_record_bytes=32_512,
     )
     with ExitStack() as cleanup:
         admin = connect_fixture_admin("dfe-phase03-drift-admin")

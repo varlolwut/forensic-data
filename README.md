@@ -140,9 +140,17 @@ UTF-8, integer datetimes, UTC, and read-only Repeatable Read, and must already h
 schema `dfe_ext`; the reader needs `USAGE` on that schema and `EXECUTE` on
 `dfe_ext.digest(bytea,text)`. Runtime validates these capabilities and the canonical SHA-256 result;
 it never installs the extension or silently changes drivers. Other PostgreSQL 9.6 patches, other
-PostgreSQL majors, and other database engines are not verified by the current code.
+PostgreSQL majors, and other legacy PostgreSQL profiles are not verified by the current code.
 
-Relations must be given as an exact `(schema, table)` pair and select one explicit scope. The
+A source-only SQL Server path is verified against the exact SQL Server 2022 Developer CU27 build
+`16.0.4295.3` on Linux/amd64 with pyodbc 5.3.0, Microsoft ODBC Driver 18.7.1.1-1, and the explicit
+`pyodbc` / `mssql_2022` pair. Its target and metadata connections remain on PostgreSQL 17.11. The
+current cross-engine executor requires one `physical_only` table, relation-manifest readiness, and
+a non-null logical INT64 key with a confirmed leading non-partial B-tree access path on both sides.
+SQL Server is not accepted as a target or metadata store. SQL Server 2016 and other database
+engines are not yet verified.
+
+PostgreSQL relations must be given as an exact `(schema, table)` pair and select one explicit scope. The
 default `physical_only` scope reads one permanent regular table with `FROM ONLY`: ordinary
 inheritance children are excluded, a partition leaf can be addressed directly, and partitioned
 parents and views are rejected. The opt-in `frozen_physical_union` scope resolves the root's full
@@ -228,11 +236,25 @@ cannot be reused for another result.
 
 For every connection a command resolves, the CLI accepts endpoint secrets through an exact
 `env:NAME` or `file:/absolute/path` contract reference. Either source must contain one complete
-PostgreSQL DSN with `host`, `port`, `dbname`, `user`, `password`, `sslmode`, and `connect_timeout`;
-there is no raw-DSN command-line flag or provider fallback. A secret file must be a readable regular
-file of at most 16 KiB containing exactly one non-empty UTF-8 DSN line. Errors never print its path
-or contents. `plan` neither resolves secret references nor opens a connection. `history` and `diff`
-resolve only the metadata connection and never query a source or target endpoint.
+PostgreSQL DSN with `host`, `port`, `dbname`, `user`, `password`, `sslmode`, and `connect_timeout`,
+or one SQL Server DSN with the exact fields shown below. There is no raw-DSN command-line flag or
+provider fallback. A secret file must be a readable regular file of at most 16 KiB containing
+exactly one non-empty UTF-8 DSN line. Errors never print its path or contents. `plan` neither
+resolves secret references nor opens a connection. `history` and `diff` resolve only the metadata
+connection and never query a source or target endpoint.
+
+```text
+host=sql.example.internal port=1433 database=warehouse user=dfe_reader password='replace with secret value' tls_verification=verify-server-certificate login_timeout=5 query_timeout=30 cancellation_acknowledgement_timeout=5
+```
+
+The SQL Server form is a whitespace-separated, shell-style `key=value` record; it is not an ODBC
+semicolon connection string. Quote a password containing spaces or shell metacharacters as one
+shell-style value. Production endpoints use `verify-server-certificate`; the
+`trust-fixture-certificate` value is restricted to the disposable localhost fixture. Put the whole
+record in the environment variable named by `env:NAME`, or in the one-line file named by
+`file:/absolute/path`. The [mixed-engine fixture contract](tests/fixtures/mssql-2022/comparison-contract.yaml)
+shows the SQL Server reference plus PostgreSQL target/metadata wiring and uses the same `forensics
+check` invocation shape shown above.
 
 The metadata login used by `check` or `execute_check` must be a member of both
 `dfe_metadata_writer` and `dfe_metadata_reader`. The login used by `history`, `diff`,
@@ -558,6 +580,19 @@ Key summaries encode the complete, possibly composite, key with canonical v1 fra
 not use source-collation equality, so case, trailing-space, and Unicode-normalization adversaries
 remain distinct whenever their canonical bytes differ.
 
+Integer-range fingerprinting hashes each validated row once into a session-local temporary table
+in `tempdb`, aggregates the compact hash records, and confirms the terminal `DROP` before returning.
+It creates no permanent object and requires no extra reader grant, but it is real temporary storage
+work. On the verified 1,000,000-row fixture, the root range completed in 24.334 seconds under the
+30-second statement limit and allocated 9,104 8 KiB user-object pages (71.125 MiB); 8,936 pages
+remained attributed to the session until its surrounding SNAPSHOT transaction closed. Treat that as
+a measured conformance point rather than a universal sizing formula, and size `tempdb` for the
+expected concurrent source workload. A SQL Server fingerprint level is limited to 524 ranges to
+stay below the 2,100-parameter batch ceiling; a larger pending level fails as budget exhaustion
+before query dispatch. The readiness manifest has six-digit logical timestamp precision: it accepts
+a seventh fractional digit only when it is zero and can be removed losslessly, and rejects a
+non-zero seventh digit rather than rounding it.
+
 ```console
 # POSIX
 cp tests/fixtures/mssql-2022/.env.example tests/fixtures/mssql-2022/.env
@@ -578,20 +613,23 @@ docker compose --env-file tests/fixtures/mssql-2022/.env --file tests/fixtures/m
 ```
 
 Run the SQL Server integration tests with the fixture-only port, reader password, setup-writer
-password, and disposable administrator password. Administrator and setup-writer connections are
-fixture orchestration only; product reads still use the least-privilege reader. The tests construct
-fixed localhost connections and their explicit test-only certificate exception:
+password, and disposable administrator password. Start the PostgreSQL 17 fixture too for the mixed
+endpoint test. Administrator and setup-writer connections are fixture orchestration only; product
+reads still use the least-privilege reader. The tests construct fixed localhost connections and
+their explicit test-only certificate exception:
 
 ```console
-uv run --env-file tests/fixtures/mssql-2022/.env pytest tests/test_mssql_integration.py tests/test_mssql_canonical_integration.py
+uv run --env-file tests/fixtures/postgres/.env --env-file tests/fixtures/mssql-2022/.env pytest tests/test_mssql_integration.py tests/test_mssql_canonical_integration.py tests/test_mssql_postgres_comparison_integration.py
 ```
 
 The bootstrap recreates the main and RCSI-only fixture databases and their two fixture logins.
 Verification requires the exact `16.0.4295.3` Developer build, compatibility level 160,
 `ALLOW_SNAPSHOT_ISOLATION=ON` for the main database, `SNAPSHOT=OFF` plus RCSI ON for the negative
 fixture, and denied reader DML and DDL. The reader and setup-writer services never receive the `sa`
-credential. The MSSQL-to-PostgreSQL endpoint, historical evidence, and real SQL Server 2016 source
-profile are not yet implemented or verified.
+credential. The SQL Server 2022-to-PostgreSQL endpoint verifies the million-row baseline, exact
+`999,967 matched / 21 missing / 4 extra / 12 modified` corruption oracle, 37 retained differences,
+physical provenance, and metadata-only history/diff after later source mutation. The real SQL
+Server 2016 source profile is not yet implemented or verified.
 
 The `sa` password is persisted in the SQL Server system databases. If you change it in the ignored
 environment file, remove only this disposable fixture and its owned volume before starting again:

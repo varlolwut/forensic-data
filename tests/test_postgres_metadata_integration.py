@@ -58,15 +58,15 @@ def test_metadata_migrations_roles_and_immutable_registration() -> None:
             _RETRY_POLICY,
             5_000,
         )
-        assert first_migration.applied_versions == (1, 2, 3, 4, 5)
-        assert first_migration.current_version == 5
+        assert first_migration.applied_versions == (1, 2, 3, 4, 5, 6)
+        assert first_migration.current_version == 6
         repeated_migration = migrate_postgres_metadata(
             settings.migrator,
             _RETRY_POLICY,
             5_000,
         )
         assert repeated_migration.applied_versions == ()
-        assert repeated_migration.current_version == 5
+        assert repeated_migration.current_version == 6
 
         config = load_contract_config(_EXAMPLE_CONTRACT)
         check = config.checks[0]
@@ -226,7 +226,7 @@ def test_metadata_migration_batch_rolls_back_and_lock_serializes() -> None:
             _RETRY_POLICY,
             5_000,
         )
-        assert initial.applied_versions == (1, 2, 3, 4, 5)
+        assert initial.applied_versions == (1, 2, 3, 4, 5, 6)
         lock_connection = connect_writer(lock_settings.migrator)
         try:
             lock_connection.execute("BEGIN")
@@ -246,7 +246,7 @@ def test_metadata_migration_batch_rolls_back_and_lock_serializes() -> None:
                 lock_connection.execute("COMMIT")
                 serialized = future.result(timeout=10)
             assert serialized.applied_versions == ()
-            assert serialized.current_version == 5
+            assert serialized.current_version == 6
         finally:
             lock_connection.close()
 

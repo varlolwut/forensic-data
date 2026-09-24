@@ -9,6 +9,7 @@ from forensic_data.acquisition import (
     EarlyExecutionOutcome,
     InputCutDefinition,
     RelationManifestEvidence,
+    RelationManifestRow,
     build_input_cut_definition,
     build_run_request_definition,
     classify_check_acquisition,
@@ -33,19 +34,46 @@ from forensic_data.comparison import (
     CompletedStructuralComparisonArtifact,
     PartialComparisonArtifact,
     UnsupportedComparisonError,
-    execute_postgres_integer_key_comparison,
+    execute_integer_key_comparison,
     partial_comparison_artifact_from_completed,
 )
 from forensic_data.contracts.errors import ContractReferenceError
 from forensic_data.contracts.model import (
+    Adapter,
     ConsistencyDatasetDefinition,
     DatasetDefinition,
     LoadedContractConfig,
+    ReadinessManifestColumns,
     RelationLocator,
     RelationManifestReadiness,
     RelationScope,
     RowCheckDefinition,
 )
+from forensic_data.mssql import (
+    MssqlCancellationConfirmedError,
+    MssqlCancellationUnconfirmedError,
+    MssqlCloseError,
+    MssqlConnectionError,
+    MssqlConnectionSettings,
+    MssqlContextClosedError,
+    MssqlContextLostError,
+    MssqlDataValidationError,
+    MssqlInspectedRelation,
+    MssqlMetadataError,
+    MssqlProtectedReadContext,
+    MssqlQueryContextError,
+    MssqlQueryError,
+    MssqlQueryTimeoutError,
+    MssqlReadContextState,
+    MssqlRelationAcquisition,
+    MssqlResultLimitError,
+    MssqlRetryPolicy,
+    MssqlTransportError,
+    UnsupportedMssqlProfileError,
+    open_mssql_protected_read_context,
+)
+from forensic_data.mssql_profile import MssqlRuntimeProfile, match_mssql_runtime_profile
+from forensic_data.mssql_sql import MssqlRelation
 from forensic_data.persistence.definitions import build_metadata_registration_definition
 from forensic_data.persistence.errors import (
     CompletedComparisonNotFoundError,
@@ -156,6 +184,7 @@ __all__: Final[tuple[str, ...]] = (
     "DiffRequest",
     "ExecuteCheckRequest",
     "HistoryRequest",
+    "MssqlPostgresExecutionServices",
     "PlanCheckRequest",
     "PostgresExecutionServices",
     "PostgresMetadataServices",
@@ -308,6 +337,60 @@ class PostgresExecutionServices:
 
 @final
 @dataclass(frozen=True, slots=True)
+class MssqlPostgresExecutionServices:
+    reference_connection_id: str
+    reference_settings: MssqlConnectionSettings
+    target_connection_id: str
+    target_settings: PostgresConnectionSettings
+    metadata_connection_id: str
+    metadata_settings: PostgresConnectionSettings
+    reference_retry_policy: MssqlRetryPolicy
+    target_retry_policy: PostgresRetryPolicy
+    metadata_retry_policy: PostgresRetryPolicy
+    protected_lock_timeout_milliseconds: int
+    metadata_record_bytes: int
+    metadata_total_bytes: int
+
+    def __post_init__(self) -> None:
+        for value, context in (
+            (self.reference_connection_id, "reference connection id"),
+            (self.target_connection_id, "target connection id"),
+            (self.metadata_connection_id, "metadata connection id"),
+        ):
+            _require_nonblank(value, context)
+        if not isinstance(cast(object, self.reference_settings), MssqlConnectionSettings):
+            raise TypeError("reference connection settings must be MssqlConnectionSettings")
+        for value, context in (
+            (self.target_settings, "target connection settings"),
+            (self.metadata_settings, "metadata connection settings"),
+        ):
+            if not isinstance(cast(object, value), PostgresConnectionSettings):
+                raise TypeError(f"{context} must be PostgresConnectionSettings")
+        if type(self.reference_retry_policy) is not MssqlRetryPolicy:
+            raise TypeError("reference retry policy must be MssqlRetryPolicy")
+        for value, context in (
+            (self.target_retry_policy, "target retry policy"),
+            (self.metadata_retry_policy, "metadata retry policy"),
+        ):
+            if not isinstance(cast(object, value), PostgresRetryPolicy):
+                raise TypeError(f"{context} must be PostgresRetryPolicy")
+        _require_positive_integer(
+            self.protected_lock_timeout_milliseconds,
+            "protected lock timeout milliseconds",
+        )
+        _require_positive_integer(self.metadata_record_bytes, "metadata record bytes")
+        _require_positive_integer(self.metadata_total_bytes, "metadata total bytes")
+        if self.metadata_record_bytes > self.metadata_total_bytes:
+            raise ValueError("metadata record bytes cannot exceed metadata total bytes")
+
+
+type ExecutionServices = PostgresExecutionServices | MssqlPostgresExecutionServices
+type ProtectedReadContext = PostgresProtectedReadContext | MssqlProtectedReadContext
+type ProtectedRelation = PostgresProtectedRelationInspection | MssqlInspectedRelation
+
+
+@final
+@dataclass(frozen=True, slots=True)
 class PostgresMetadataServices:
     connection_id: str
     settings: PostgresConnectionSettings
@@ -325,9 +408,9 @@ class PostgresMetadataServices:
 @dataclass(frozen=True, slots=True)
 class _ProtectedSide:
     direction: PlanDirection
-    context: PostgresProtectedReadContext
-    dataset_relation: PostgresProtectedRelationInspection
-    readiness_relation: PostgresProtectedRelationInspection
+    context: ProtectedReadContext
+    dataset_relation: ProtectedRelation
+    readiness_relation: ProtectedRelation
 
 
 @final
@@ -406,7 +489,7 @@ def read_diff(
 def execute_check(
     config: LoadedContractConfig,
     request: ExecuteCheckRequest,
-    services: PostgresExecutionServices,
+    services: ExecutionServices,
 ) -> RunResult:
     _require_config(config)
     check = _find_check(config, request.check_id)
@@ -498,7 +581,7 @@ def _start_attempt(
     run: ClaimedRun,
     config: LoadedContractConfig,
     invocation_owner_token: UUID,
-    services: PostgresExecutionServices,
+    services: ExecutionServices,
 ) -> RunAttemptRecord:
     lease_expires_at = datetime.now(UTC) + timedelta(
         milliseconds=config.execution.run_timeout_milliseconds
@@ -521,7 +604,7 @@ def _execute_attempt(
     registration: MetadataRegistration,
     attempt: RunAttemptRecord,
     source_budget: PostgresSourceBudgetAttempt,
-    services: PostgresExecutionServices,
+    services: ExecutionServices,
 ) -> RunResult | _AttemptFailure:
     resources: list[_AttemptResource] = []
     artifact: CompletedComparisonArtifact | CompletedStructuralComparisonArtifact | None = None
@@ -602,7 +685,7 @@ def _execute_attempt(
                             ready_target,
                         ),
                     )
-                    artifact = execute_postgres_integer_key_comparison(
+                    artifact = execute_integer_key_comparison(
                         reference.context,
                         reference.dataset_relation,
                         target.context,
@@ -664,6 +747,13 @@ def _execute_attempt(
             persisted_cut is not None,
             source_budget,
         )
+    except MssqlQueryTimeoutError as error:
+        failure = _failure_from_terminal_source_reason(
+            _mssql_query_timeout_reason(error),
+            resources,
+            persisted_cut is not None,
+            source_budget,
+        )
     except (
         ComparisonBudgetExceededError,
         PostgresReadDeadlineExceededError,
@@ -680,48 +770,73 @@ def _execute_attempt(
             persisted_cut is not None,
             source_budget,
         )
-    except PostgresResultLimitError as error:
+    except MssqlCancellationConfirmedError as error:
+        failure = _failure_from_terminal_source_reason(
+            _mssql_confirmed_cancellation_reason(error),
+            resources,
+            persisted_cut is not None,
+            source_budget,
+        )
+    except MssqlCancellationUnconfirmedError as error:
+        failure = _failure_from_terminal_source_reason(
+            _mssql_unconfirmed_cancellation_reason(error),
+            resources,
+            persisted_cut is not None,
+            source_budget,
+        )
+    except (PostgresResultLimitError, MssqlResultLimitError) as error:
         failure = _failure_from_error(
             ExecutionStatus.INCOMPLETE,
             ReasonCode.BUDGET_EXHAUSTED,
             "read_source",
-            "a bounded PostgreSQL read exceeded its configured result budget",
+            "a bounded source read exceeded its configured result budget",
             error,
             False,
             resources,
             persisted_cut is not None,
             source_budget,
         )
-    except (PostgresContextLostError, PostgresAcquisitionRaceError) as error:
+    except (
+        PostgresContextLostError,
+        PostgresAcquisitionRaceError,
+        MssqlContextLostError,
+        MssqlMetadataError,
+    ) as error:
         failure = _failure_from_error(
             ExecutionStatus.INCOMPLETE,
             ReasonCode.SNAPSHOT_LOST,
             "read_source",
-            "a protected PostgreSQL snapshot was lost before completion",
+            "a protected source snapshot was lost before completion",
             error,
             True,
             resources,
             persisted_cut is not None,
             source_budget,
         )
-    except (PostgresConnectionError, PostgresQueryError, PostgresMetadataError) as error:
+    except (
+        PostgresConnectionError,
+        PostgresQueryError,
+        PostgresMetadataError,
+        MssqlConnectionError,
+        MssqlQueryError,
+    ) as error:
         failure = _failure_from_error(
             ExecutionStatus.ERROR,
             ReasonCode.QUERY_ERROR,
             "read_source",
-            "a PostgreSQL source operation failed",
+            "a source operation failed",
             error,
             True,
             resources,
             persisted_cut is not None,
             source_budget,
         )
-    except UnsupportedPostgresProfileError as error:
+    except (UnsupportedPostgresProfileError, UnsupportedMssqlProfileError) as error:
         failure = _failure_from_error(
             ExecutionStatus.ERROR,
             ReasonCode.UNSUPPORTED_CAPABILITY,
             "open_source",
-            "a PostgreSQL source does not satisfy the required profile",
+            "a source does not satisfy the required runtime profile",
             error,
             False,
             resources,
@@ -734,14 +849,29 @@ def _execute_attempt(
         PostgresContextClosedError,
         PostgresDataValidationError,
         PostgresQueryContextError,
+        MssqlContextClosedError,
+        MssqlDataValidationError,
+        MssqlQueryContextError,
     ) as error:
         failure = _failure_from_error(
             ExecutionStatus.ERROR,
             ReasonCode.PROTOCOL_VIOLATION,
             "execute_check",
-            "source evidence violated the declared PostgreSQL check protocol",
+            "source evidence violated the declared check protocol",
             error,
             False,
+            resources,
+            persisted_cut is not None,
+            source_budget,
+        )
+    except MssqlTransportError as error:
+        failure = _failure_from_error(
+            ExecutionStatus.ERROR,
+            ReasonCode.QUERY_ERROR,
+            "read_source",
+            "a SQL Server source operation failed",
+            error,
+            True,
             resources,
             persisted_cut is not None,
             source_budget,
@@ -808,9 +938,9 @@ def _open_side(
     check: RowCheckDefinition,
     direction: PlanDirection,
     source_budget: PostgresSourceBudgetAttempt,
-    services: PostgresExecutionServices,
+    services: ExecutionServices,
 ) -> _ProtectedSide:
-    dataset, consistency, settings = _side_definitions(check, direction, services)
+    dataset, consistency = _side_definitions(check, direction)
     locator = dataset.locator
     readiness = consistency.readiness
     if not isinstance(locator, RelationLocator) or not isinstance(
@@ -820,19 +950,58 @@ def _open_side(
         raise UnsupportedComparisonError(
             f"{direction.value} execution requires a physical relation and relation manifest"
         )
-    dataset_relation = PostgresRelation(components=(locator.schema, locator.name))
-    readiness_relation = PostgresRelation(
-        components=(readiness.relation.schema, readiness.relation.name)
-    )
-    if dataset_relation == readiness_relation:
+    if (locator.schema, locator.name) == (
+        readiness.relation.schema,
+        readiness.relation.name,
+    ):
         raise UnsupportedComparisonError(
             f"{direction.value} dataset and readiness manifest must use distinct physical relations"
         )
+    if dataset.connection.adapter is Adapter.MSSQL:
+        return _open_mssql_side(
+            dataset,
+            readiness,
+            direction,
+            source_budget,
+            services,
+        )
+    if dataset.connection.adapter is Adapter.POSTGRESQL:
+        return _open_postgres_side(
+            dataset,
+            readiness,
+            direction,
+            source_budget,
+            services,
+        )
+    raise UnsupportedComparisonError(
+        f"{direction.value} dataset uses an unsupported execution adapter: "
+        f"adapter={dataset.connection.adapter.value!r}"
+    )
+
+
+def _open_postgres_side(
+    dataset: DatasetDefinition,
+    readiness: RelationManifestReadiness,
+    direction: PlanDirection,
+    source_budget: PostgresSourceBudgetAttempt,
+    services: ExecutionServices,
+) -> _ProtectedSide:
+    settings = _postgres_settings(services, direction)
+    retry_policy = _postgres_retry_policy(services, direction)
+    dataset_locator = dataset.locator
+    if not isinstance(dataset_locator, RelationLocator):
+        raise UnsupportedComparisonError(
+            f"{direction.value} PostgreSQL execution requires a physical relation"
+        )
+    dataset_relation = PostgresRelation(components=(dataset_locator.schema, dataset_locator.name))
+    readiness_relation = PostgresRelation(
+        components=(readiness.relation.schema, readiness.relation.name)
+    )
     acquisitions = (
         PostgresRelationAcquisition(
             schema=dataset.logical_schema.schema,
             relation=dataset_relation,
-            relation_scope=locator.relation_scope,
+            relation_scope=dataset_locator.relation_scope,
             column_names=tuple(field.column_name for field in dataset.projection),
             max_metadata_record_bytes=services.metadata_record_bytes,
             max_metadata_total_bytes=services.metadata_total_bytes,
@@ -853,7 +1022,7 @@ def _open_side(
     if runtime_profile is PostgresRuntimeProfile.POSTGRES_17:
         context = open_postgres_protected_read_context(
             settings,
-            services.source_retry_policy,
+            retry_policy,
             acquisitions,
             services.protected_lock_timeout_milliseconds,
             source_budget,
@@ -865,7 +1034,7 @@ def _open_side(
     ):
         context = open_postgres_9_6_protected_read_context(
             settings,
-            services.source_retry_policy,
+            retry_policy,
             acquisitions,
             services.protected_lock_timeout_milliseconds,
             source_budget,
@@ -888,11 +1057,81 @@ def _open_side(
     )
 
 
+def _open_mssql_side(
+    dataset: DatasetDefinition,
+    readiness: RelationManifestReadiness,
+    direction: PlanDirection,
+    source_budget: PostgresSourceBudgetAttempt,
+    services: ExecutionServices,
+) -> _ProtectedSide:
+    if direction is not PlanDirection.REFERENCE:
+        raise UnsupportedMssqlProfileError("SQL Server is supported only as a reference source")
+    if not isinstance(services, MssqlPostgresExecutionServices):
+        raise TypeError("SQL Server reference execution requires MssqlPostgresExecutionServices")
+    locator = dataset.locator
+    if not isinstance(locator, RelationLocator):
+        raise UnsupportedComparisonError(
+            "SQL Server reference execution requires a physical relation"
+        )
+    if locator.relation_scope is not RelationScope.PHYSICAL_ONLY:
+        raise UnsupportedComparisonError(
+            "SQL Server reference execution requires physical_only relation scope"
+        )
+    runtime_profile = match_mssql_runtime_profile(
+        dataset.connection.driver,
+        dataset.connection.profile,
+    )
+    if runtime_profile is not MssqlRuntimeProfile.MSSQL_2022:
+        raise UnsupportedMssqlProfileError(
+            "declared SQL Server reference driver/profile is unsupported: "
+            f"driver={dataset.connection.driver!r}, profile={dataset.connection.profile!r}"
+        )
+    dataset_relation = MssqlRelation(
+        schema_name=locator.schema,
+        table_name=locator.name,
+    )
+    readiness_relation = MssqlRelation(
+        schema_name=readiness.relation.schema,
+        table_name=readiness.relation.name,
+    )
+    acquisitions = (
+        MssqlRelationAcquisition(
+            schema=dataset.logical_schema.schema,
+            relation=dataset_relation,
+            relation_scope=locator.relation_scope,
+            column_names=tuple(field.column_name for field in dataset.projection),
+            max_metadata_record_bytes=services.metadata_record_bytes,
+            max_metadata_total_bytes=services.metadata_total_bytes,
+        ),
+        MssqlRelationAcquisition(
+            schema=_manifest_schema(),
+            relation=readiness_relation,
+            relation_scope=RelationScope.PHYSICAL_ONLY,
+            column_names=readiness.columns.values(),
+            max_metadata_record_bytes=services.metadata_record_bytes,
+            max_metadata_total_bytes=services.metadata_total_bytes,
+        ),
+    )
+    context = open_mssql_protected_read_context(
+        services.reference_settings,
+        services.reference_retry_policy,
+        acquisitions,
+        source_budget,
+        PostgresSourceDirection.REFERENCE,
+    )
+    return _ProtectedSide(
+        direction=direction,
+        context=context,
+        dataset_relation=_protected_mssql_relation(context, dataset_relation),
+        readiness_relation=_protected_mssql_relation(context, readiness_relation),
+    )
+
+
 def _persist_context(
     attempt: RunAttemptRecord,
     dataset: DatasetVersionRecord,
     protected: _ProtectedSide,
-    services: PostgresExecutionServices,
+    services: ExecutionServices,
 ) -> PersistedReadContext:
     return persist_postgres_read_context(
         services.metadata_settings,
@@ -912,16 +1151,16 @@ def _read_readiness(
     scope: ResolvedScope,
     protected: _ProtectedSide,
     expected_batch_id: str,
-    services: PostgresExecutionServices,
+    services: ExecutionServices,
 ) -> RelationManifestEvidence | EarlyExecutionOutcome:
-    dataset, consistency, _ = _side_definitions(check, protected.direction, services)
+    dataset, consistency = _side_definitions(check, protected.direction)
     readiness = consistency.readiness
     if not isinstance(readiness, RelationManifestReadiness):
         raise UnsupportedComparisonError(
             f"{protected.direction.value} execution requires relation-manifest readiness"
         )
-    rows = protected.context.read_relation_manifest(
-        protected.readiness_relation,
+    rows = _read_relation_manifest(
+        protected,
         readiness.columns,
         dataset.dataset_id,
         scope.scope_digest,
@@ -937,6 +1176,43 @@ def _read_readiness(
         alignment_fields=check.consistency.alignment_fields,
         minimum_evidence=check.consistency.minimum_evidence,
         late_arrivals=check.consistency.late_arrivals,
+    )
+
+
+def _read_relation_manifest(
+    protected: _ProtectedSide,
+    columns: ReadinessManifestColumns,
+    dataset_id: str,
+    scope_digest: str,
+    max_record_bytes: int,
+    max_total_bytes: int,
+) -> tuple[RelationManifestRow, ...]:
+    context = protected.context
+    relation = protected.readiness_relation
+    if isinstance(context, PostgresProtectedReadContext):
+        if not isinstance(relation, PostgresProtectedRelationInspection):
+            raise ApplicationStateError(
+                "PostgreSQL protected context is paired with a SQL Server readiness relation"
+            )
+        return context.read_relation_manifest(
+            relation,
+            columns,
+            dataset_id,
+            scope_digest,
+            max_record_bytes,
+            max_total_bytes,
+        )
+    if not isinstance(relation, MssqlInspectedRelation):
+        raise ApplicationStateError(
+            "SQL Server protected context is paired with a PostgreSQL readiness relation"
+        )
+    return context.read_relation_manifest(
+        relation,
+        columns,
+        dataset_id,
+        scope_digest,
+        max_record_bytes,
+        max_total_bytes,
     )
 
 
@@ -987,7 +1263,7 @@ def _observation(
 def _close_attempt_resources(
     attempt: RunAttemptRecord,
     resources: tuple[_AttemptResource, ...],
-    services: PostgresExecutionServices,
+    services: ExecutionServices,
 ) -> bool:
     context_lost = False
     persistence_error: LifecyclePersistenceError | None = None
@@ -996,15 +1272,16 @@ def _close_attempt_resources(
         close_failed = False
         try:
             resource.protected.context.close()
-        except PostgresCloseError:
+        except (PostgresCloseError, MssqlCloseError):
             close_failed = True
             context_lost = True
-        if state_before_close is not ReadContextState.ACTIVE:
+        was_active = _protected_context_state_is_active(state_before_close)
+        if not was_active:
             context_lost = True
         if resource.persisted is None:
             continue
         try:
-            if close_failed or state_before_close is not ReadContextState.ACTIVE:
+            if close_failed or not was_active:
                 mark_postgres_read_context_lost(
                     services.metadata_settings,
                     services.metadata_retry_policy,
@@ -1034,9 +1311,15 @@ def _context_loss_reason() -> ResultReason:
     return _reason(
         ReasonCode.SNAPSHOT_LOST,
         "close_read_context",
-        "a protected PostgreSQL snapshot could not be closed cleanly",
+        "a protected source snapshot could not be closed cleanly",
         (),
     )
+
+
+def _protected_context_state_is_active(
+    state: ReadContextState | MssqlReadContextState,
+) -> bool:
+    return state is ReadContextState.ACTIVE or state is MssqlReadContextState.ACTIVE
 
 
 def _failure_with_secondary_context_loss(
@@ -1259,7 +1542,7 @@ def _cleanup_state_parameters(state: _ConsistencyState) -> tuple[SafeParameter, 
 def _record_retryable_failure(
     attempt: RunAttemptRecord,
     failure: _AttemptFailure,
-    services: PostgresExecutionServices,
+    services: ExecutionServices,
 ) -> AttemptOutcomeRecord | RunResult:
     if failure.partial_artifact is not None:
         comparison = _partial_comparison_definition(attempt, failure)
@@ -1302,7 +1585,7 @@ def _record_retryable_failure(
 def _publish_terminal_failure(
     attempt: RunAttemptRecord,
     failure: _AttemptFailure,
-    services: PostgresExecutionServices,
+    services: ExecutionServices,
 ) -> AttemptOutcomeRecord | RunResult:
     if failure.partial_artifact is not None:
         comparison = _partial_comparison_definition(attempt, failure)
@@ -1463,6 +1746,10 @@ def _failure_from_comparison_interruption(
             )
         reason = _reason(ReasonCode.UNSUPPORTED_CAPABILITY, "compare", message, ())
         retryable = False
+    elif isinstance(cause, MssqlQueryTimeoutError):
+        execution_status = ExecutionStatus.INCOMPLETE
+        reason = _mssql_query_timeout_reason(cause)
+        retryable = False
     elif isinstance(
         cause,
         (
@@ -1470,6 +1757,7 @@ def _failure_from_comparison_interruption(
             PostgresReadDeadlineExceededError,
             PostgresResultLimitError,
             PostgresSourceBudgetExceededError,
+            MssqlResultLimitError,
         ),
     ):
         execution_status = ExecutionStatus.INCOMPLETE
@@ -1480,30 +1768,55 @@ def _failure_from_comparison_interruption(
             (SafeParameter(name="error_type", value=type(cause).__name__),),
         )
         retryable = False
-    elif isinstance(cause, (PostgresContextLostError, PostgresAcquisitionRaceError)):
+    elif isinstance(cause, MssqlCancellationConfirmedError):
+        execution_status = ExecutionStatus.INCOMPLETE
+        reason = _mssql_confirmed_cancellation_reason(cause)
+        retryable = False
+    elif isinstance(cause, MssqlCancellationUnconfirmedError):
+        execution_status = ExecutionStatus.INCOMPLETE
+        reason = _mssql_unconfirmed_cancellation_reason(cause)
+        retryable = False
+    elif isinstance(
+        cause,
+        (
+            PostgresContextLostError,
+            PostgresAcquisitionRaceError,
+            MssqlContextLostError,
+            MssqlMetadataError,
+        ),
+    ):
         execution_status = ExecutionStatus.INCOMPLETE
         reason = _reason(
             ReasonCode.SNAPSHOT_LOST,
             "read_source",
-            "a protected PostgreSQL snapshot was lost before completion",
+            "a protected source snapshot was lost before completion",
             (SafeParameter(name="error_type", value=type(cause).__name__),),
         )
         retryable = True
-    elif isinstance(cause, (PostgresConnectionError, PostgresQueryError, PostgresMetadataError)):
+    elif isinstance(
+        cause,
+        (
+            PostgresConnectionError,
+            PostgresQueryError,
+            PostgresMetadataError,
+            MssqlConnectionError,
+            MssqlQueryError,
+        ),
+    ):
         execution_status = ExecutionStatus.ERROR
         reason = _reason(
             ReasonCode.QUERY_ERROR,
             "read_source",
-            "a PostgreSQL source operation failed",
+            "a source operation failed",
             (SafeParameter(name="error_type", value=type(cause).__name__),),
         )
         retryable = True
-    elif isinstance(cause, UnsupportedPostgresProfileError):
+    elif isinstance(cause, (UnsupportedPostgresProfileError, UnsupportedMssqlProfileError)):
         execution_status = ExecutionStatus.ERROR
         reason = _reason(
             ReasonCode.UNSUPPORTED_CAPABILITY,
             "open_source",
-            "a PostgreSQL source does not satisfy the required profile",
+            "a source does not satisfy the required runtime profile",
             (SafeParameter(name="error_type", value=type(cause).__name__),),
         )
         retryable = False
@@ -1515,16 +1828,28 @@ def _failure_from_comparison_interruption(
             PostgresContextClosedError,
             PostgresDataValidationError,
             PostgresQueryContextError,
+            MssqlContextClosedError,
+            MssqlDataValidationError,
+            MssqlQueryContextError,
         ),
     ):
         execution_status = ExecutionStatus.ERROR
         reason = _reason(
             ReasonCode.PROTOCOL_VIOLATION,
             "execute_check",
-            "source evidence violated the declared PostgreSQL check protocol",
+            "source evidence violated the declared check protocol",
             (SafeParameter(name="error_type", value=type(cause).__name__),),
         )
         retryable = False
+    elif isinstance(cause, MssqlTransportError):
+        execution_status = ExecutionStatus.ERROR
+        reason = _reason(
+            ReasonCode.QUERY_ERROR,
+            "read_source",
+            "a SQL Server source operation failed",
+            (SafeParameter(name="error_type", value=type(cause).__name__),),
+        )
+        retryable = True
     else:
         raise AssertionError(f"unhandled comparison interruption cause {type(cause).__name__}")
 
@@ -1615,6 +1940,90 @@ def _failure_from_error(
         metrics=metrics,
         partial_artifact=None,
         persisted_cut=None,
+    )
+
+
+def _failure_from_terminal_source_reason(
+    reason: ResultReason,
+    resources: list[_AttemptResource],
+    cut_aligned: bool,
+    source_budget: PostgresSourceBudgetAttempt,
+) -> _AttemptFailure:
+    state = _ConsistencyState(
+        context_ids=_context_ids(resources),
+        stable_reads=ConsistencyLevel.UNKNOWN,
+        cut_aligned=cut_aligned,
+    )
+    metrics = _result_metrics_from_source_budget(source_budget)
+    return _AttemptFailure(
+        execution_status=ExecutionStatus.INCOMPLETE,
+        verdict=Verdict.INCONCLUSIVE,
+        reason=_reason_with_failure_consistency(reason, state, metrics),
+        additional_reasons=(),
+        retryable=False,
+        context_ids=state.context_ids,
+        stable_reads=state.stable_reads,
+        cut_aligned=state.cut_aligned,
+        comparison_coverage=_empty_comparison_coverage(),
+        evidence_coverage=_empty_evidence_coverage(),
+        metrics=metrics,
+        partial_artifact=None,
+        persisted_cut=None,
+    )
+
+
+def _mssql_query_timeout_reason(error: MssqlQueryTimeoutError) -> ResultReason:
+    return ResultReason(
+        code=ReasonCode.BUDGET_EXHAUSTED,
+        operation="read_source",
+        message="the SQL Server statement reached its immutable query or run timeout",
+        safe_parameters=(
+            SafeParameter(name="error_type", value=type(error).__name__),
+            SafeParameter(name="session_id", value=str(error.session_id)),
+        ),
+        native_error_code=error.sqlstate,
+        query_id=str(error.query_id),
+        redacted_response=None,
+    )
+
+
+def _mssql_confirmed_cancellation_reason(
+    error: MssqlCancellationConfirmedError,
+) -> ResultReason:
+    return ResultReason(
+        code=ReasonCode.CANCELLED,
+        operation="cancel_source_query",
+        message="the SQL Server source query was cancelled and completion was confirmed",
+        safe_parameters=(
+            SafeParameter(name="error_type", value=type(error).__name__),
+            SafeParameter(name="session_id", value=str(error.session_id)),
+            SafeParameter(
+                name="confirmation_session_id",
+                value=str(error.confirmation_session_id),
+            ),
+            SafeParameter(name="confirmation_value", value=str(error.confirmation_value)),
+        ),
+        native_error_code=error.sqlstate,
+        query_id=str(error.query_id),
+        redacted_response=None,
+    )
+
+
+def _mssql_unconfirmed_cancellation_reason(
+    error: MssqlCancellationUnconfirmedError,
+) -> ResultReason:
+    return ResultReason(
+        code=ReasonCode.CANCELLATION_UNCONFIRMED,
+        operation="cancel_source_query",
+        message="SQL Server source-query completion could not be confirmed after cancellation",
+        safe_parameters=(
+            SafeParameter(name="error_type", value=type(error).__name__),
+            SafeParameter(name="session_id", value=str(error.session_id)),
+            SafeParameter(name="confirmation_failure", value=error.reason),
+        ),
+        native_error_code=None,
+        query_id=str(error.query_id),
+        redacted_response=None,
     )
 
 
@@ -2154,16 +2563,32 @@ def _context_ids(resources: list[_AttemptResource]) -> tuple[UUID, ...]:
 def _side_definitions(
     check: RowCheckDefinition,
     direction: PlanDirection,
-    services: PostgresExecutionServices,
-) -> tuple[DatasetDefinition, ConsistencyDatasetDefinition, PostgresConnectionSettings]:
+) -> tuple[DatasetDefinition, ConsistencyDatasetDefinition]:
     index = 0 if direction is PlanDirection.REFERENCE else 1
     dataset = check.reference if direction is PlanDirection.REFERENCE else check.target
-    settings = (
-        services.reference_settings
-        if direction is PlanDirection.REFERENCE
-        else services.target_settings
-    )
-    return dataset, check.consistency.datasets[index], settings
+    return dataset, check.consistency.datasets[index]
+
+
+def _postgres_settings(
+    services: ExecutionServices,
+    direction: PlanDirection,
+) -> PostgresConnectionSettings:
+    if direction is PlanDirection.TARGET:
+        return services.target_settings
+    if isinstance(services, PostgresExecutionServices):
+        return services.reference_settings
+    raise TypeError("mixed-engine execution does not provide PostgreSQL reference settings")
+
+
+def _postgres_retry_policy(
+    services: ExecutionServices,
+    direction: PlanDirection,
+) -> PostgresRetryPolicy:
+    if isinstance(services, PostgresExecutionServices):
+        return services.source_retry_policy
+    if direction is PlanDirection.TARGET:
+        return services.target_retry_policy
+    raise TypeError("mixed-engine execution does not provide a PostgreSQL reference retry policy")
 
 
 def _protected_relation(
@@ -2176,6 +2601,18 @@ def _protected_relation(
     if len(matches) != 1:
         raise PostgresQueryContextError(
             "protected PostgreSQL relation set does not contain exactly one requested relation"
+        )
+    return matches[0]
+
+
+def _protected_mssql_relation(
+    context: MssqlProtectedReadContext,
+    relation: MssqlRelation,
+) -> MssqlInspectedRelation:
+    matches = tuple(item for item in context.protected_relations if item.relation == relation)
+    if len(matches) != 1:
+        raise MssqlQueryContextError(
+            "protected SQL Server relation set does not contain exactly one requested relation"
         )
     return matches[0]
 
@@ -2229,7 +2666,7 @@ def _find_check(config: LoadedContractConfig, check_id: str) -> RowCheckDefiniti
 def _validate_service_closure(
     config: LoadedContractConfig,
     check: RowCheckDefinition,
-    services: PostgresExecutionServices,
+    services: ExecutionServices,
 ) -> None:
     expected = (
         check.reference.connection.connection_id,
@@ -2246,28 +2683,51 @@ def _validate_service_closure(
             "execution service connection identities do not match the selected check closure: "
             f"expected={expected!r}, actual={actual!r}"
         )
+    if check.reference.connection.adapter is Adapter.MSSQL and not isinstance(
+        services, MssqlPostgresExecutionServices
+    ):
+        raise TypeError("SQL Server reference requires MssqlPostgresExecutionServices")
+    if check.reference.connection.adapter is Adapter.POSTGRESQL and not isinstance(
+        services, PostgresExecutionServices
+    ):
+        raise TypeError("PostgreSQL reference requires PostgresExecutionServices")
 
 
 def _validate_runtime_profiles(
     config: LoadedContractConfig,
     check: RowCheckDefinition,
 ) -> None:
-    reference_profile = match_postgres_runtime_profile(
-        check.reference.connection.driver,
-        check.reference.connection.profile,
-    )
-    if reference_profile not in (
-        PostgresRuntimeProfile.POSTGRES_17,
-        PostgresRuntimeProfile.POSTGRES_9_6,
-    ):
-        raise UnsupportedPostgresProfileError(
-            "declared PostgreSQL reference driver/profile is unsupported: "
-            f"driver={check.reference.connection.driver!r}, "
-            f"profile={check.reference.connection.profile!r}"
+    reference = check.reference.connection
+    if reference.adapter is Adapter.MSSQL:
+        if (
+            match_mssql_runtime_profile(reference.driver, reference.profile)
+            is not MssqlRuntimeProfile.MSSQL_2022
+        ):
+            raise UnsupportedMssqlProfileError(
+                "declared SQL Server reference driver/profile is unsupported: "
+                f"driver={reference.driver!r}, profile={reference.profile!r}"
+            )
+    elif reference.adapter is Adapter.POSTGRESQL:
+        reference_profile = match_postgres_runtime_profile(
+            reference.driver,
+            reference.profile,
+        )
+        if reference_profile not in (
+            PostgresRuntimeProfile.POSTGRES_17,
+            PostgresRuntimeProfile.POSTGRES_9_6,
+        ):
+            raise UnsupportedPostgresProfileError(
+                "declared PostgreSQL reference driver/profile is unsupported: "
+                f"driver={reference.driver!r}, profile={reference.profile!r}"
+            )
+    else:
+        raise UnsupportedComparisonError(
+            f"declared reference adapter is unsupported: adapter={reference.adapter.value!r}"
         )
     target = check.target.connection
     if (
-        match_postgres_runtime_profile(target.driver, target.profile)
+        target.adapter is not Adapter.POSTGRESQL
+        or match_postgres_runtime_profile(target.driver, target.profile)
         is not PostgresRuntimeProfile.POSTGRES_17
     ):
         raise UnsupportedPostgresProfileError(
@@ -2275,7 +2735,8 @@ def _validate_runtime_profiles(
         )
     metadata = config.metadata.connection
     if (
-        match_postgres_runtime_profile(metadata.driver, metadata.profile)
+        metadata.adapter is not Adapter.POSTGRESQL
+        or match_postgres_runtime_profile(metadata.driver, metadata.profile)
         is not PostgresRuntimeProfile.POSTGRES_17
     ):
         raise UnsupportedPostgresProfileError(

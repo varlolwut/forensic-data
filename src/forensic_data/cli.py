@@ -1,8 +1,10 @@
 import argparse
 import contextlib
 import json
+import math
 import os
 import re
+import shlex
 import stat
 import sys
 from collections.abc import Mapping, Sequence
@@ -20,6 +22,7 @@ from forensic_data.application import (
     DiffRequest,
     ExecuteCheckRequest,
     HistoryRequest,
+    MssqlPostgresExecutionServices,
     PlanCheckRequest,
     PostgresExecutionServices,
     PostgresMetadataServices,
@@ -39,11 +42,17 @@ from forensic_data.canonical import (
 from forensic_data.contracts.compiler import load_contract_config
 from forensic_data.contracts.errors import ContractError
 from forensic_data.contracts.model import (
+    Adapter,
     ConnectionDefinition,
     DatasetDefinition,
     LoadedContractConfig,
     RelationLocator,
     RowCheckDefinition,
+)
+from forensic_data.mssql import (
+    MssqlConnectionSettings,
+    MssqlRetryPolicy,
+    MssqlTlsVerification,
 )
 from forensic_data.persistence.errors import MetadataError
 from forensic_data.persistence.postgres import migrate_postgres_metadata
@@ -97,6 +106,19 @@ _REQUIRED_DSN_FIELDS: Final[frozenset[str]] = frozenset(
         "password",
         "sslmode",
         "connect_timeout",
+    }
+)
+_REQUIRED_MSSQL_DSN_FIELDS: Final[frozenset[str]] = frozenset(
+    {
+        "host",
+        "port",
+        "database",
+        "user",
+        "password",
+        "tls_verification",
+        "login_timeout",
+        "query_timeout",
+        "cancellation_acknowledgement_timeout",
     }
 )
 _CONNECTION_RETRY_DELAY_SECONDS: Final[float] = 1.0
@@ -660,7 +682,7 @@ def _execution_services(
     reference: ConnectionDefinition,
     target: ConnectionDefinition,
     environment: Mapping[str, str],
-) -> PostgresExecutionServices:
+) -> PostgresExecutionServices | MssqlPostgresExecutionServices:
     statement_timeout = config.execution.statement_timeout_milliseconds
     if statement_timeout < 2:
         raise CliInputError(
@@ -670,6 +692,45 @@ def _execution_services(
         config.execution.max_application_result_bytes,
         config.execution.max_coordinator_memory_bytes,
     )
+    target_settings = _connection_settings(
+        target,
+        environment,
+        statement_timeout,
+        "dfe-cli-check-target",
+    )
+    metadata_settings = _connection_settings(
+        config.metadata.connection,
+        environment,
+        statement_timeout,
+        "dfe-cli-check-metadata",
+    )
+    protected_lock_timeout_milliseconds = min(
+        _MAX_PROTECTED_LOCK_TIMEOUT_MILLISECONDS,
+        statement_timeout - 1,
+    )
+    if reference.adapter is Adapter.MSSQL:
+        return MssqlPostgresExecutionServices(
+            reference_connection_id=reference.connection_id,
+            reference_settings=_mssql_connection_settings(
+                reference,
+                environment,
+                "dfe-cli-check-reference",
+            ),
+            target_connection_id=target.connection_id,
+            target_settings=target_settings,
+            metadata_connection_id=config.metadata.connection.connection_id,
+            metadata_settings=metadata_settings,
+            reference_retry_policy=_mssql_retry_policy(),
+            target_retry_policy=_retry_policy(),
+            metadata_retry_policy=_retry_policy(),
+            protected_lock_timeout_milliseconds=protected_lock_timeout_milliseconds,
+            metadata_record_bytes=metadata_record_bytes,
+            metadata_total_bytes=config.execution.max_coordinator_memory_bytes,
+        )
+    if reference.adapter is not Adapter.POSTGRESQL:
+        raise CliInputError(
+            f"reference connection adapter {reference.adapter.value!r} is unsupported"
+        )
     return PostgresExecutionServices(
         reference_connection_id=reference.connection_id,
         reference_settings=_connection_settings(
@@ -679,25 +740,12 @@ def _execution_services(
             "dfe-cli-check-reference",
         ),
         target_connection_id=target.connection_id,
-        target_settings=_connection_settings(
-            target,
-            environment,
-            statement_timeout,
-            "dfe-cli-check-target",
-        ),
+        target_settings=target_settings,
         metadata_connection_id=config.metadata.connection.connection_id,
-        metadata_settings=_connection_settings(
-            config.metadata.connection,
-            environment,
-            statement_timeout,
-            "dfe-cli-check-metadata",
-        ),
+        metadata_settings=metadata_settings,
         source_retry_policy=_retry_policy(),
         metadata_retry_policy=_retry_policy(),
-        protected_lock_timeout_milliseconds=min(
-            _MAX_PROTECTED_LOCK_TIMEOUT_MILLISECONDS,
-            statement_timeout - 1,
-        ),
+        protected_lock_timeout_milliseconds=protected_lock_timeout_milliseconds,
         metadata_record_bytes=metadata_record_bytes,
         metadata_total_bytes=config.execution.max_coordinator_memory_bytes,
     )
@@ -705,6 +753,13 @@ def _execution_services(
 
 def _retry_policy() -> PostgresRetryPolicy:
     return PostgresRetryPolicy(
+        max_attempts=_CONNECTION_RETRY_ATTEMPTS,
+        delay_seconds=_CONNECTION_RETRY_DELAY_SECONDS,
+    )
+
+
+def _mssql_retry_policy() -> MssqlRetryPolicy:
+    return MssqlRetryPolicy(
         max_attempts=_CONNECTION_RETRY_ATTEMPTS,
         delay_seconds=_CONNECTION_RETRY_DELAY_SECONDS,
     )
@@ -768,6 +823,40 @@ def _connection_settings_from_secret_ref(
             "PostgreSQL DSN connect_timeout",
         ),
         statement_timeout_milliseconds=statement_timeout_milliseconds,
+        application_name=application_name,
+    )
+
+
+def _mssql_connection_settings(
+    connection: ConnectionDefinition,
+    environment: Mapping[str, str],
+    application_name: str,
+) -> MssqlConnectionSettings:
+    dsn, source_description = _resolve_connection_secret(
+        connection.connection_id,
+        connection.secret_ref,
+        environment,
+    )
+    required_values = _parse_mssql_dsn(dsn, source_description)
+    return MssqlConnectionSettings(
+        host=required_values["host"],
+        port=_positive_integer(required_values["port"], "SQL Server DSN port"),
+        database=required_values["database"],
+        user=required_values["user"],
+        password=SecretStr(required_values["password"]),
+        tls_verification=_mssql_tls_verification(required_values["tls_verification"]),
+        login_timeout_seconds=_positive_integer(
+            required_values["login_timeout"],
+            "SQL Server DSN login_timeout",
+        ),
+        query_timeout_seconds=_positive_integer(
+            required_values["query_timeout"],
+            "SQL Server DSN query_timeout",
+        ),
+        cancellation_acknowledgement_timeout_seconds=_positive_finite_float(
+            required_values["cancellation_acknowledgement_timeout"],
+            "SQL Server DSN cancellation_acknowledgement_timeout",
+        ),
         application_name=application_name,
     )
 
@@ -872,12 +961,55 @@ def _parse_postgres_dsn(dsn: str, source_description: str) -> dict[str, str]:
     return required_values
 
 
+def _parse_mssql_dsn(dsn: str, source_description: str) -> dict[str, str]:
+    try:
+        tokens = shlex.split(dsn, posix=True)
+    except ValueError:
+        raise CliInputError(
+            f"SQL Server DSN from {source_description} contains invalid quoting"
+        ) from None
+    values: dict[str, str] = {}
+    for token in tokens:
+        key, separator, value = token.partition("=")
+        if separator == "" or key == "" or value == "":
+            raise CliInputError(
+                f"SQL Server DSN from {source_description} must use non-empty key=value fields"
+            )
+        if key in values:
+            raise CliInputError(f"SQL Server DSN from {source_description} repeats field {key!r}")
+        values[key] = value
+    fields = frozenset(values)
+    missing = tuple(sorted(_REQUIRED_MSSQL_DSN_FIELDS - fields))
+    unsupported = tuple(sorted(fields - _REQUIRED_MSSQL_DSN_FIELDS))
+    if missing:
+        raise CliInputError(
+            f"SQL Server DSN from {source_description} is missing required fields: "
+            f"{', '.join(missing)}"
+        )
+    if unsupported:
+        raise CliInputError(
+            f"SQL Server DSN from {source_description} contains unsupported fields: "
+            f"{', '.join(unsupported)}"
+        )
+    return values
+
+
 def _positive_integer(value: str, context: str) -> int:
     if not value.isascii() or not value.isdecimal():
         raise CliInputError(f"{context} must be a positive decimal integer")
     parsed = int(value)
     if parsed < 1:
         raise CliInputError(f"{context} must be a positive decimal integer")
+    return parsed
+
+
+def _positive_finite_float(value: str, context: str) -> float:
+    try:
+        parsed = float(value)
+    except ValueError:
+        raise CliInputError(f"{context} must be a positive finite number") from None
+    if not math.isfinite(parsed) or parsed <= 0:
+        raise CliInputError(f"{context} must be a positive finite number")
     return parsed
 
 
@@ -893,6 +1025,16 @@ def _sslmode(value: str) -> PostgresSslMode:
     except ValueError:
         supported = ", ".join(mode.value for mode in PostgresSslMode)
         raise CliInputError(f"PostgreSQL DSN sslmode must be one of: {supported}") from None
+
+
+def _mssql_tls_verification(value: str) -> MssqlTlsVerification:
+    try:
+        return MssqlTlsVerification(value)
+    except ValueError:
+        supported = ", ".join(mode.value for mode in MssqlTlsVerification)
+        raise CliInputError(
+            f"SQL Server DSN tls_verification must be one of: {supported}"
+        ) from None
 
 
 def _output_format(value: str) -> str:

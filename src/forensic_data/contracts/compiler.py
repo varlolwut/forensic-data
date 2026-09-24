@@ -68,6 +68,12 @@ from forensic_data.contracts.source import (
     SqlArtifactSource,
     load_contract_source,
 )
+from forensic_data.mssql_profile import (
+    MSSQL_2022_DRIVER,
+    MSSQL_2022_PROFILE,
+    MssqlRuntimeProfile,
+    match_mssql_runtime_profile,
+)
 from forensic_data.postgres_profile import (
     POSTGRES_17_DRIVER,
     POSTGRES_17_PROFILE,
@@ -148,7 +154,7 @@ def compile_contract(source: LoadedContractSource) -> LoadedContractConfig:
         raise ContractValidationError(
             f"metadata connection {metadata_connection.connection_id!r} must declare role 'metadata'"
         )
-    if (
+    if metadata_connection.adapter is not Adapter.POSTGRESQL or (
         match_postgres_runtime_profile(
             metadata_connection.driver,
             metadata_connection.profile,
@@ -178,11 +184,12 @@ def compile_contract(source: LoadedContractSource) -> LoadedContractConfig:
 
 def _compile_connection(source: ConnectionSource) -> ConnectionDefinition:
     connection_id = _logical_name(source.connection_id, "connection id")
-    if source.adapter != Adapter.POSTGRESQL.value:
+    try:
+        adapter = Adapter(source.adapter)
+    except ValueError:
         raise UnsupportedContractError(
             f"connection {connection_id!r} adapter is unsupported: adapter={source.adapter!r}"
-        )
-    adapter = Adapter.POSTGRESQL
+        ) from None
     driver = _logical_name(source.driver, f"connection {connection_id!r} driver")
     profile = _logical_name(source.profile, f"connection {connection_id!r} profile")
     secret_ref = _logical_name(source.secret_ref, f"connection {connection_id!r} secret_ref")
@@ -210,6 +217,17 @@ def _compile_connection(source: ConnectionSource) -> ConnectionDefinition:
             f"connection {connection_id!r} profile 'postgresql_9_6' is source-only and "
             "must declare exactly role 'source'"
         )
+    if adapter is Adapter.MSSQL:
+        if match_mssql_runtime_profile(driver, profile) is not MssqlRuntimeProfile.MSSQL_2022:
+            raise UnsupportedContractError(
+                f"connection {connection_id!r} MSSQL endpoint requires "
+                f"driver={MSSQL_2022_DRIVER!r} and profile={MSSQL_2022_PROFILE!r}"
+            )
+        if roles != [ConnectionRole.SOURCE]:
+            raise UnsupportedContractError(
+                f"connection {connection_id!r} profile {MSSQL_2022_PROFILE!r} is source-only "
+                "and must declare exactly role 'source'"
+            )
     return ConnectionDefinition(
         connection_id=connection_id,
         adapter=adapter,
@@ -323,19 +341,30 @@ def _compile_dataset_locator(
     if isinstance(source, RelationSource):
         if source.catalog is not None:
             raise UnsupportedContractError(
-                f"dataset {dataset_id!r} PostgreSQL relation catalog is unsupported; use null"
+                f"dataset {dataset_id!r} {connection.adapter.value} relation catalog is "
+                "unsupported; use null"
             )
         if source.schema is None:
             raise UnsupportedContractError(
-                f"dataset {dataset_id!r} PostgreSQL relation requires an explicit schema"
+                f"dataset {dataset_id!r} {connection.adapter.value} relation requires an "
+                "explicit schema"
             )
         try:
             relation_scope = RelationScope(source.relation_scope)
         except ValueError:
             raise UnsupportedContractError(
-                f"dataset {dataset_id!r} PostgreSQL relation scope is unsupported: "
+                f"dataset {dataset_id!r} {connection.adapter.value} relation scope is "
+                "unsupported: "
                 f"relation_scope={source.relation_scope!r}"
             ) from None
+        if (
+            connection.adapter is Adapter.MSSQL
+            and relation_scope is not RelationScope.PHYSICAL_ONLY
+        ):
+            raise UnsupportedContractError(
+                f"dataset {dataset_id!r} MSSQL relation requires physical_only scope: "
+                f"relation_scope={relation_scope.value!r}"
+            )
         return RelationLocator(
             catalog=None,
             schema=_physical_name(source.schema, f"dataset {dataset_id!r} relation schema"),
@@ -568,16 +597,15 @@ def _compile_relation_manifest_readiness(
     dataset: DatasetDefinition,
     context: str,
 ) -> RelationManifestReadiness:
-    if dataset.connection.adapter is not Adapter.POSTGRESQL:
-        raise UnsupportedContractError(
-            f"{context} relation manifest requires the PostgreSQL adapter"
-        )
     if source.relation.catalog is not None:
         raise UnsupportedContractError(
-            f"{context} PostgreSQL relation catalog is unsupported; use null"
+            f"{context} {dataset.connection.adapter.value} relation catalog is unsupported; "
+            "use null"
         )
     if source.relation.schema is None:
-        raise UnsupportedContractError(f"{context} PostgreSQL relation requires an explicit schema")
+        raise UnsupportedContractError(
+            f"{context} {dataset.connection.adapter.value} relation requires an explicit schema"
+        )
     if source.relation.relation_scope != RelationScope.PHYSICAL_ONLY.value:
         raise UnsupportedContractError(
             f"{context} relation requires physical_only scope: "

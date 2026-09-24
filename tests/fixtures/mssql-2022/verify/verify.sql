@@ -242,6 +242,64 @@ BEGIN
     THROW 51000, N'Canonical key fixture no longer exercises native collation collapse.', 1;
 END;
 
+IF (SELECT COUNT_BIG(*) FROM [dfe_fixture].[comparison_orders]) <> 1000001
+   OR
+   (
+       SELECT COUNT_BIG(*)
+       FROM [dfe_fixture].[comparison_orders]
+       WHERE [business_date] = CONVERT(date, N'2026-09-23', 23)
+   ) <> 1000000
+   OR NOT EXISTS
+   (
+       SELECT 1
+       FROM [dfe_fixture].[comparison_orders]
+       WHERE [order_id] = CONVERT(decimal(21, 2), N'1.00')
+         AND [business_date] = CONVERT(date, N'2026-09-22', 23)
+         AND [amount] = CONVERT(decimal(18, 2), N'900.00')
+   )
+   OR EXISTS
+   (
+       SELECT 1
+       FROM [dfe_fixture].[comparison_orders]
+       WHERE [business_date] = CONVERT(date, N'2026-09-23', 23)
+         AND
+         (
+             [amount] IS NULL
+             OR [amount] <> CONVERT(decimal(18, 2), N'100.00')
+             OR NOT
+             (
+                 ([order_id] BETWEEN 2 AND 2000 AND [order_id] % 2 = 0)
+                 OR [order_id] BETWEEN 1000001 AND 1999000
+             )
+         )
+   )
+BEGIN
+    THROW 51000, N'Cross-engine comparison seed is missing or changed.', 1;
+END;
+
+IF (SELECT COUNT_BIG(*) FROM [dfe_fixture].[comparison_batch_manifest]) <> 1
+   OR NOT EXISTS
+   (
+       SELECT 1
+       FROM [dfe_fixture].[comparison_batch_manifest]
+       WHERE [dataset_id] = N'reference_orders'
+         AND [scope_digest]
+             = N'df903aeb9157fcc8da48575be4a841781a2df049299fdf8b3623f719ee5465ab'
+         AND [batch_id] = N'reference-orders-baseline'
+         AND [state] = N'complete'
+         AND [business_date] = CONVERT(date, N'2026-09-23', 23)
+         AND [source_cut] = N'orders-cut-baseline'
+         AND [dataset_version] = N'reference-orders-v1'
+         AND [completed_at] = CONVERT(
+             datetimeoffset(6),
+             N'2026-09-23T12:30:45.123456+00:00',
+             127
+         )
+   )
+BEGIN
+    THROW 51000, N'Cross-engine comparison manifest seed is missing or changed.', 1;
+END;
+
 IF (SELECT COUNT_BIG(*) FROM [dfe_fixture].[rls_probe]) <> 1
    OR NOT EXISTS
    (

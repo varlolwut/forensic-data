@@ -103,6 +103,28 @@ CREATE TABLE [dfe_fixture].[canonical_key_probe]
     CONSTRAINT [PK_dfe_fixture_canonical_key_probe] PRIMARY KEY ([probe_id])
 );
 
+CREATE TABLE [dfe_fixture].[comparison_orders]
+(
+    [order_id] decimal(21, 2) NOT NULL,
+    [business_date] date NOT NULL,
+    [amount] decimal(18, 2) NULL,
+    CONSTRAINT [PK_dfe_fixture_comparison_orders] PRIMARY KEY ([order_id])
+);
+
+CREATE TABLE [dfe_fixture].[comparison_batch_manifest]
+(
+    [dataset_id] nvarchar(128) NOT NULL,
+    [scope_digest] nvarchar(64) NOT NULL,
+    [batch_id] nvarchar(128) NOT NULL,
+    [state] nvarchar(32) NOT NULL,
+    [business_date] date NOT NULL,
+    [source_cut] nvarchar(128) NULL,
+    [dataset_version] nvarchar(128) NULL,
+    [completed_at] datetimeoffset(6) NULL,
+    CONSTRAINT [PK_dfe_fixture_comparison_batch_manifest]
+        PRIMARY KEY ([dataset_id], [scope_digest])
+);
+
 CREATE TABLE [dfe_fixture].[rls_probe]
 (
     [record_id] bigint NOT NULL,

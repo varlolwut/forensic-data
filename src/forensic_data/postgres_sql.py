@@ -1262,17 +1262,21 @@ def _integer_range_values(
         upper = (
             sql.SQL("NULL::bigint")
             if item.upper_exclusive is None
-            else sql.SQL("{value}::bigint").format(value=sql.Literal(item.upper_exclusive))
+            else _bigint_literal(item.upper_exclusive)
         )
         values.append(
-            sql.SQL("({segment_id}, {lower}::bigint, {upper}, {ordinal}::integer)").format(
+            sql.SQL("({segment_id}, {lower}, {upper}, {ordinal}::integer)").format(
                 segment_id=sql.Literal(item.segment_id),
-                lower=sql.Literal(item.lower_inclusive),
+                lower=_bigint_literal(item.lower_inclusive),
                 upper=upper,
                 ordinal=sql.Literal(ordinal),
             )
         )
     return sql.SQL(", ").join(values)
+
+
+def _bigint_literal(value: int) -> sql.Composable:
+    return sql.SQL("{value}::bigint").format(value=sql.Literal(str(value)))
 
 
 def _usable_integer_key_access_path(
