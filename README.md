@@ -503,6 +503,45 @@ The legacy endpoint gate additionally proves the exact PostgreSQL 9.6.24 source 
 preinstalled pgcrypto capability, PostgreSQL 17.11 target interoperability, persisted driver/server
 provenance, and an exact retained `1 matched / 1 missing / 1 extra / 1 modified` result.
 
+## SQL Server 2022 fixture
+
+The development fixture pins the official SQL Server 2022 Developer CU27 Ubuntu 22.04 image by
+digest. It requires Linux/amd64 Docker and reserves a 3 GiB container limit with 2 GiB available to
+SQL Server. Copy the development-only environment and start the engine:
+
+```console
+# POSIX
+cp tests/fixtures/mssql-2022/.env.example tests/fixtures/mssql-2022/.env
+
+# PowerShell
+Copy-Item tests/fixtures/mssql-2022/.env.example tests/fixtures/mssql-2022/.env
+
+docker compose --env-file tests/fixtures/mssql-2022/.env --file tests/fixtures/mssql-2022/compose.yaml up --detach --wait sqlserver
+```
+
+Run the explicit administrator bootstrap, seed through the separate setup-writer login, and verify
+the restricted reader:
+
+```console
+docker compose --env-file tests/fixtures/mssql-2022/.env --file tests/fixtures/mssql-2022/compose.yaml run --rm setup-admin
+docker compose --env-file tests/fixtures/mssql-2022/.env --file tests/fixtures/mssql-2022/compose.yaml run --rm setup-writer
+docker compose --env-file tests/fixtures/mssql-2022/.env --file tests/fixtures/mssql-2022/compose.yaml run --rm verify
+```
+
+The bootstrap recreates only the fixture database and its two fixture logins. Verification requires
+the exact `16.0.4295.3` Developer build, `ALLOW_SNAPSHOT_ISOLATION=ON`,
+`READ_COMMITTED_SNAPSHOT=OFF`, an actual reader data access inside a transaction-level `SNAPSHOT`,
+and denied reader DML and DDL. The reader and setup-writer services never receive the `sa`
+credential. This fixture proves the P03-01 environment boundary, not a completed MSSQL adapter or
+cross-engine comparison.
+
+The `sa` password is persisted in the SQL Server system databases. If you change it in the ignored
+environment file, remove only this disposable fixture and its owned volume before starting again:
+
+```console
+docker compose --env-file tests/fixtures/mssql-2022/.env --file tests/fixtures/mssql-2022/compose.yaml down --volumes --remove-orphans
+```
+
 ## Build artifacts
 
 Build the wheel/source distribution and the non-root one-shot CLI image:

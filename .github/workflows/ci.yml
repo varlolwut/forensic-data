@@ -13,7 +13,7 @@ concurrency:
 
 jobs:
   quality:
-    name: Quality and PostgreSQL 17.11/9.6.24 conformance
+    name: Quality, PostgreSQL conformance, and SQL Server fixture
     runs-on: ubuntu-24.04
     env:
       DFE_PG_ADMIN_PASSWORD: phase01-admin
@@ -37,6 +37,10 @@ jobs:
       DFE_LEGACY_TARGET_PORT: "55417"
       DFE_TEST_POSTGRES_LEGACY_SOURCE_DSN: postgresql://dfe_legacy_reader:phase02-legacy-source-reader@127.0.0.1:55496/dfe_legacy?sslmode=disable&connect_timeout=5
       DFE_TEST_POSTGRES_LEGACY_TARGET_DSN: postgresql://dfe_legacy_reader:phase02-legacy-target-reader@127.0.0.1:55417/dfe_legacy?sslmode=disable&connect_timeout=5
+      DFE_MSSQL_SA_PASSWORD: Phase03-Mssql-SA-2022!
+      DFE_MSSQL_READER_PASSWORD: Phase03-Mssql-Reader-2022!
+      DFE_MSSQL_SETUP_WRITER_PASSWORD: Phase03-Mssql-Writer-2022!
+      DFE_MSSQL_PORT: "51433"
     steps:
       - name: Check out source
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
@@ -62,11 +66,19 @@ jobs:
         run: docker compose --file tests/fixtures/postgres/compose.yaml up --detach --wait
       - name: Start PostgreSQL 9.6.24 to 17.11 fixture
         run: docker compose --file tests/fixtures/postgres-legacy/compose.yaml up --detach --wait
+      - name: Start SQL Server 2022 CU27 fixture
+        run: docker compose --file tests/fixtures/mssql-2022/compose.yaml up --detach --wait sqlserver
+      - name: Configure and verify SQL Server 2022 CU27 fixture
+        run: |
+          docker compose --file tests/fixtures/mssql-2022/compose.yaml run --rm setup-admin
+          docker compose --file tests/fixtures/mssql-2022/compose.yaml run --rm setup-writer
+          docker compose --file tests/fixtures/mssql-2022/compose.yaml run --rm verify
       - name: Run tests
         run: uv run pytest
-      - name: Stop PostgreSQL fixtures
+      - name: Stop database fixtures
         if: always()
         run: |
+          docker compose --file tests/fixtures/mssql-2022/compose.yaml down --volumes --remove-orphans
           docker compose --file tests/fixtures/postgres-legacy/compose.yaml down --volumes
           docker compose --file tests/fixtures/postgres/compose.yaml down --volumes
 

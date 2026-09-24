@@ -9,6 +9,9 @@ CLAUDE.md
 data-forensics-brief.md
 docs/
 .local/
+prompts/
+state/
+secrets/
 
 # Secrets and local environments
 .env

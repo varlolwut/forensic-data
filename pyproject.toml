@@ -72,4 +72,7 @@ source-exclude = [
     "CLAUDE.md",
     "data-forensics-brief.md",
     "docs",
+    "prompts",
+    "secrets",
+    "state",
 ]
