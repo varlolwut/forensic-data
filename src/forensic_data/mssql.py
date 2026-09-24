@@ -1,6 +1,7 @@
 import logging
 import math
 import time
+from collections.abc import Callable
 from dataclasses import dataclass
 from datetime import UTC, date, datetime
 from datetime import time as datetime_time
@@ -35,6 +36,7 @@ from forensic_data.mssql_sql import (
     MssqlPhysicalField,
     MssqlRelation,
     MssqlScopePredicate,
+    MssqlUtf8HelperBinding,
     build_mssql_integer_key_summary_query,
     build_mssql_integer_range_fingerprint_query,
     build_mssql_integer_range_rows_query,
@@ -72,6 +74,10 @@ _DEADLINE_CHECK_RECORDS = 64
 type MssqlParameter = str | int | Decimal | bytes
 type MssqlValue = bool | int | Decimal | str | bytes | None
 type MssqlRow = tuple[MssqlValue, ...]
+type _MssqlRelationStorageValidator = Callable[
+    [MssqlRow],
+    tuple[int, tuple[str, ...]],
+]
 
 
 class MssqlTransportError(RuntimeError):
@@ -93,6 +99,10 @@ class MssqlQueryError(MssqlTransportError):
             "SQL Server query failed: "
             f"query_id={query_id}, session_id={session_id}, sqlstate={sqlstate!r}"
         )
+
+
+class MssqlSnapshotMetadataChangedQueryError(MssqlQueryError):
+    """SQL Server rejected a SNAPSHOT read after concurrent metadata DDL."""
 
 
 class MssqlDataValidationError(MssqlTransportError):
@@ -345,6 +355,7 @@ class MssqlServerProfile:
     database_read_only: bool
     database_updateability: str
     canonical_utf8_code_page: int
+    canonical_utf8_helper: MssqlUtf8HelperBinding | None
     can_view_definition: bool
 
 
@@ -786,6 +797,12 @@ class MssqlTransport:
                         sqlstate,
                     )
             self._retire_after_query_error(cursor, query.query_id)
+            if _is_snapshot_metadata_changed_error(error):
+                raise MssqlSnapshotMetadataChangedQueryError(
+                    query.query_id,
+                    self._evidence.session_id,
+                    sqlstate,
+                ) from None
             raise MssqlQueryError(query.query_id, self._evidence.session_id, sqlstate) from None
         except UnicodeDecodeError:
             if published and cursor is not None:
@@ -1268,7 +1285,7 @@ class MssqlReadContext:
             max_metadata_total_bytes,
         )
         relation_rows = self._execute_metadata(
-            _relation_metadata_query(relation),
+            self._build_relation_metadata_query(relation),
             1,
             max_metadata_record_bytes,
             max_metadata_total_bytes,
@@ -1312,7 +1329,7 @@ class MssqlReadContext:
             max_metadata_total_bytes,
         )
         relation_rows = self._execute_metadata_budgeted(
-            _relation_metadata_query(relation),
+            self._build_relation_metadata_query(relation),
             1,
             max_metadata_record_bytes,
             max_metadata_total_bytes,
@@ -1342,6 +1359,9 @@ class MssqlReadContext:
             column_rows,
         )
 
+    def _build_relation_metadata_query(self, relation: MssqlRelation) -> MssqlQuery:
+        return _relation_metadata_query(relation)
+
     def _relation_identity(
         self,
         relation: MssqlRelation,
@@ -1356,6 +1376,7 @@ class MssqlReadContext:
             relation_rows[0],
             relation,
             self._profile,
+            _validated_native_relation_storage,
         )
 
     def _register_inspection(
@@ -1855,6 +1876,8 @@ class MssqlReadContext:
         )
         try:
             return self._transport.execute_bounded(query, limits).rows
+        except MssqlSnapshotMetadataChangedQueryError as error:
+            self._lose_for_snapshot_metadata_change(error)
         except MssqlTransportError:
             self._state = MssqlReadContextState.LOST
             raise
@@ -1886,6 +1909,8 @@ class MssqlReadContext:
                 charge,
                 deadline,
             ).rows
+        except MssqlSnapshotMetadataChangedQueryError as error:
+            self._lose_for_snapshot_metadata_change(error)
         except (
             MssqlTransportError,
             PostgresReadDeadlineExceededError,
@@ -1908,6 +1933,8 @@ class MssqlReadContext:
                 ),
                 limits,
             )
+        except MssqlSnapshotMetadataChangedQueryError as error:
+            self._lose_for_snapshot_metadata_change(error)
         except MssqlTransportError:
             self._state = MssqlReadContextState.LOST
             raise
@@ -1930,6 +1957,8 @@ class MssqlReadContext:
                 charge,
                 deadline,
             )
+        except MssqlSnapshotMetadataChangedQueryError as error:
+            self._lose_for_snapshot_metadata_change(error)
         except (
             MssqlTransportError,
             PostgresReadDeadlineExceededError,
@@ -2011,6 +2040,13 @@ class MssqlReadContext:
             self._transport.close()
         raise MssqlMetadataError(message)
 
+    def _lose_for_snapshot_metadata_change(
+        self,
+        error: MssqlSnapshotMetadataChangedQueryError,
+    ) -> NoReturn:
+        self._state = MssqlReadContextState.LOST
+        raise _snapshot_metadata_changed_error(error) from error
+
 
 class MssqlProtectedReadContext:
     """A catalog-bound SQL Server SNAPSHOT context charged to one run budget."""
@@ -2067,6 +2103,74 @@ class MssqlProtectedReadContext:
     def cancel(self, query_id: UUID) -> None:
         self._read_context.cancel(query_id)
 
+    def _build_integer_key_summary_query(
+        self,
+        schema: CanonicalSchema,
+        inspection: MssqlInspectedRelation,
+        key_field_index: int,
+        scope: MssqlScopePredicate | None,
+        max_encoded_envelope_bytes: int,
+    ) -> MssqlCanonicalQuery:
+        return build_mssql_integer_key_summary_query(
+            schema,
+            inspection,
+            key_field_index,
+            scope,
+            max_encoded_envelope_bytes,
+        )
+
+    def _build_integer_range_fingerprint_query(
+        self,
+        schema: CanonicalSchema,
+        inspection: MssqlInspectedRelation,
+        key_field_index: int,
+        scope: MssqlScopePredicate | None,
+        ranges: tuple[MssqlIntegerRangeRequest, ...],
+        max_encoded_envelope_bytes: int,
+    ) -> MssqlCanonicalQuery:
+        return build_mssql_integer_range_fingerprint_query(
+            schema,
+            inspection,
+            key_field_index,
+            scope,
+            ranges,
+            max_encoded_envelope_bytes,
+        )
+
+    def _build_integer_range_rows_query(
+        self,
+        schema: CanonicalSchema,
+        inspection: MssqlInspectedRelation,
+        key_field_index: int,
+        scope: MssqlScopePredicate | None,
+        ranges: tuple[MssqlIntegerRangeRequest, ...],
+        max_encoded_envelope_bytes: int,
+    ) -> MssqlCanonicalQuery:
+        return build_mssql_integer_range_rows_query(
+            schema,
+            inspection,
+            key_field_index,
+            scope,
+            ranges,
+            max_encoded_envelope_bytes,
+        )
+
+    def _build_relation_manifest_query(
+        self,
+        schema: CanonicalSchema,
+        inspection: MssqlInspectedRelation,
+        dataset_id: str,
+        scope_digest: str,
+        max_record_bytes: int,
+    ) -> MssqlCanonicalQuery:
+        return build_mssql_relation_manifest_query(
+            schema,
+            inspection,
+            dataset_id,
+            scope_digest,
+            max_record_bytes,
+        )
+
     def read_integer_key_summary(
         self,
         protected_relation: MssqlInspectedRelation,
@@ -2084,7 +2188,7 @@ class MssqlProtectedReadContext:
             raise MssqlDataValidationError(
                 "SQL Server integer-key summary requires exactly one physical scan"
             )
-        query = build_mssql_integer_key_summary_query(
+        query = self._build_integer_key_summary_query(
             acquisition.schema,
             protected_relation,
             key_field_index,
@@ -2120,7 +2224,7 @@ class MssqlProtectedReadContext:
             raise MssqlDataValidationError(
                 "SQL Server range fingerprint scan reservation differs from its ranges"
             )
-        query = build_mssql_integer_range_fingerprint_query(
+        query = self._build_integer_range_fingerprint_query(
             acquisition.schema,
             protected_relation,
             key_field_index,
@@ -2159,7 +2263,7 @@ class MssqlProtectedReadContext:
             raise MssqlDataValidationError(
                 "SQL Server exact-range scan reservation differs from its ranges"
             )
-        query = build_mssql_integer_range_rows_query(
+        query = self._build_integer_range_rows_query(
             acquisition.schema,
             protected_relation,
             key_field_index,
@@ -2193,7 +2297,7 @@ class MssqlProtectedReadContext:
             raise MssqlQueryContextError(
                 "SQL Server readiness columns differ from the protected acquisition"
             )
-        query = build_mssql_relation_manifest_query(
+        query = self._build_relation_manifest_query(
             acquisition.schema,
             protected_relation,
             dataset_id,
@@ -2373,7 +2477,11 @@ def _open_mssql_read_context_budgeted(
             profile,
             snapshot_result.rows[0],
             started_at,
+            "GENERATE_SERIES count",
         )
+    except MssqlSnapshotMetadataChangedQueryError as error:
+        _close_opening_transport(transport)
+        raise _snapshot_metadata_changed_error(error) from error
     except (
         MssqlTransportError,
         PostgresReadDeadlineExceededError,
@@ -2442,7 +2550,11 @@ def open_mssql_read_context(
             profile,
             snapshot_result.rows[0],
             started_at,
+            "GENERATE_SERIES count",
         )
+    except MssqlSnapshotMetadataChangedQueryError as error:
+        _close_opening_transport(transport)
+        raise _snapshot_metadata_changed_error(error) from error
     except MssqlTransportError:
         _close_opening_transport(transport)
         raise
@@ -2608,6 +2720,7 @@ def _server_profile_from_row(
         canonical_utf8_code_page=_require_bounded_integer(
             row[18], "canonical_utf8_code_page", 1, INT32_MAX
         ),
+        canonical_utf8_helper=None,
         can_view_definition=_require_boolean(row[19], "can_view_definition"),
     )
 
@@ -2654,7 +2767,10 @@ def _read_context_evidence_from_row(
     profile: MssqlServerProfile,
     row: MssqlRow,
     started_at: datetime,
+    witness_label: str,
 ) -> MssqlReadContextEvidence:
+    if type(witness_label) is not str or not witness_label:
+        raise ValueError("SQL Server snapshot witness label must be non-empty text")
     if len(row) != 10:
         raise MssqlDataValidationError(
             "SQL Server SNAPSHOT transaction probe returned an unexpected field count: "
@@ -2673,7 +2789,7 @@ def _read_context_evidence_from_row(
     open_transaction_count = _require_bounded_integer(
         row[8], "open_transaction_count", 0, INT32_MAX
     )
-    generated_count = _require_bounded_integer(row[9], "GENERATE_SERIES count", 0, (1 << 63) - 1)
+    witness_count = _require_bounded_integer(row[9], witness_label, 0, (1 << 63) - 1)
     failures: list[str] = []
     if database_id != profile.database_id:
         failures.append(f"database_id={database_id}, profiled_database_id={profile.database_id}")
@@ -2699,8 +2815,8 @@ def _read_context_evidence_from_row(
         failures.append(f"transaction_isolation_level={transaction_isolation_level}, required=5")
     if open_transaction_count < 1:
         failures.append(f"open_transaction_count={open_transaction_count}, required>=1")
-    if generated_count != 1:
-        failures.append(f"GENERATE_SERIES count={generated_count}, required=1")
+    if witness_count != 1:
+        failures.append(f"{witness_label}={witness_count}, required=1")
     if failures:
         raise UnsupportedMssqlProfileError(
             "SQL Server transaction-level SNAPSHOT proof failed: " + "; ".join(failures)
@@ -2820,12 +2936,9 @@ def _validated_relation_metadata(
     row: MssqlRow,
     relation: MssqlRelation,
     profile: MssqlServerProfile,
+    storage_validator: _MssqlRelationStorageValidator,
 ) -> tuple[int, int, int]:
-    if len(row) != 23:
-        raise MssqlDataValidationError(
-            "SQL Server relation catalog probe returned an unexpected field count: "
-            f"expected=23, actual={len(row)}"
-        )
+    suffix_index, storage_failures = storage_validator(row)
     database_id = _require_bounded_integer(row[0], "database_id", 1, INT32_MAX)
     database_name = _require_text(row[1], "database_name")
     schema_id = _require_bounded_integer(row[2], "schema_id", 1, INT32_MAX)
@@ -2837,22 +2950,22 @@ def _validated_relation_metadata(
     is_memory_optimized = _require_boolean(row[8], "is_memory_optimized")
     temporal_type = _require_bounded_integer(row[9], "temporal_type", 0, INT32_MAX)
     is_external = _require_boolean(row[10], "is_external")
-    ledger_type = _require_bounded_integer(row[11], "ledger_type", 0, INT32_MAX)
-    is_node = _require_boolean(row[12], "is_node")
-    is_edge = _require_boolean(row[13], "is_edge")
     permissions = tuple(
         _require_bounded_integer(value, name, 0, 1)
         for value, name in zip(
-            row[14:20],
+            row[suffix_index : suffix_index + 6],
             ("SELECT", "INSERT", "UPDATE", "DELETE", "ALTER", "CONTROL"),
             strict=True,
         )
     )
-    has_column_update = _require_boolean(row[20], "has_column_update")
-    can_view_definition = _require_boolean(row[21], "can_view_definition")
-    has_enabled_security_policy = _require_boolean(row[22], "has_enabled_security_policy")
+    has_column_update = _require_boolean(row[suffix_index + 6], "has_column_update")
+    can_view_definition = _require_boolean(row[suffix_index + 7], "can_view_definition")
+    has_enabled_security_policy = _require_boolean(
+        row[suffix_index + 8],
+        "has_enabled_security_policy",
+    )
     provenance_failures: list[str] = []
-    capability_failures: list[str] = []
+    capability_failures = list(storage_failures)
     if database_id != profile.database_id or database_name != profile.database_name:
         provenance_failures.append(
             "database identity differs from the active read context: "
@@ -2869,14 +2982,12 @@ def _validated_relation_metadata(
             f"relation is not an unshipped user table: type={table_type!r}, "
             f"is_ms_shipped={is_ms_shipped}"
         )
-    if is_memory_optimized or temporal_type != 0 or is_external or ledger_type != 0:
+    if is_memory_optimized or temporal_type != 0 or is_external:
         capability_failures.append(
             "relation storage profile is unsupported: "
             f"memory_optimized={is_memory_optimized}, temporal_type={temporal_type}, "
-            f"external={is_external}, ledger_type={ledger_type}"
+            f"external={is_external}"
         )
-    if is_node or is_edge:
-        capability_failures.append(f"graph relation is unsupported: node={is_node}, edge={is_edge}")
     if permissions != (1, 0, 0, 0, 0, 0):
         capability_failures.append(
             "reader permissions must be SELECT-only for the resolved relation: "
@@ -2904,6 +3015,25 @@ def _validated_relation_metadata(
             + "; ".join(capability_failures)
         )
     return database_id, schema_id, object_id
+
+
+def _validated_native_relation_storage(
+    row: MssqlRow,
+) -> tuple[int, tuple[str, ...]]:
+    if len(row) != 23:
+        raise MssqlDataValidationError(
+            "SQL Server relation catalog probe returned an unexpected field count: "
+            f"expected=23, actual={len(row)}"
+        )
+    ledger_type = _require_bounded_integer(row[11], "ledger_type", 0, INT32_MAX)
+    is_node = _require_boolean(row[12], "is_node")
+    is_edge = _require_boolean(row[13], "is_edge")
+    failures: list[str] = []
+    if ledger_type != 0:
+        failures.append(f"ledger relation is unsupported: ledger_type={ledger_type}")
+    if is_node or is_edge:
+        failures.append(f"graph relation is unsupported: node={is_node}, edge={is_edge}")
+    return 14, tuple(failures)
 
 
 def _column_metadata_query(
@@ -3977,3 +4107,17 @@ def _sqlstate(error: pyodbc.Error) -> str:
         if len(sqlstate) == 5 and sqlstate.isascii() and sqlstate.isalnum():
             return sqlstate.upper()
     return "unknown"
+
+
+def _is_snapshot_metadata_changed_error(error: pyodbc.Error) -> bool:
+    return any(type(value) is str and "(3961)" in value for value in error.args)
+
+
+def _snapshot_metadata_changed_error(
+    error: MssqlSnapshotMetadataChangedQueryError,
+) -> MssqlMetadataError:
+    return MssqlMetadataError(
+        "SQL Server physical provenance became unverifiable because catalog metadata "
+        "changed after the SNAPSHOT transaction started: "
+        f"query_id={error.query_id}, session_id={error.session_id}, error_number=3961"
+    )

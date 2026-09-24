@@ -69,9 +69,10 @@ from forensic_data.contracts.source import (
     load_contract_source,
 )
 from forensic_data.mssql_profile import (
+    MSSQL_2016_DRIVER,
+    MSSQL_2016_PROFILE,
     MSSQL_2022_DRIVER,
     MSSQL_2022_PROFILE,
-    MssqlRuntimeProfile,
     match_mssql_runtime_profile,
 )
 from forensic_data.postgres_profile import (
@@ -211,14 +212,16 @@ def _compile_connection(source: ConnectionSource) -> ConnectionDefinition:
             )
         roles.append(role)
     if adapter is Adapter.MSSQL:
-        if match_mssql_runtime_profile(driver, profile) is not MssqlRuntimeProfile.MSSQL_2022:
+        if match_mssql_runtime_profile(driver, profile) is None:
             raise UnsupportedContractError(
-                f"connection {connection_id!r} MSSQL endpoint requires "
-                f"driver={MSSQL_2022_DRIVER!r} and profile={MSSQL_2022_PROFILE!r}"
+                f"connection {connection_id!r} MSSQL endpoint requires an exact supported "
+                "driver/profile pair: "
+                f"({MSSQL_2022_DRIVER!r}, {MSSQL_2022_PROFILE!r}) or "
+                f"({MSSQL_2016_DRIVER!r}, {MSSQL_2016_PROFILE!r})"
             )
         if roles != [ConnectionRole.SOURCE]:
             raise UnsupportedContractError(
-                f"connection {connection_id!r} profile {MSSQL_2022_PROFILE!r} is source-only "
+                f"connection {connection_id!r} profile {profile!r} is source-only "
                 "and must declare exactly role 'source'"
             )
     return ConnectionDefinition(

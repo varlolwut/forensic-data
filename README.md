@@ -5,9 +5,10 @@ discrepancies, and preserves durable evidence that can still be reviewed after s
 changes. It refuses to silently round, normalize, or drop values.
 
 The current `0.1.0.dev0` package is a development release with a typed Python API and a `forensics`
-CLI. Source connections are read-only. It supports verified PostgreSQL comparisons and the verified
-SQL Server 2022-source-to-PostgreSQL workflow, with bounded reads, protected readiness acquisition,
-durable history, retained typed differences, and explicit completed, incomplete, or error outcomes.
+CLI. Source connections are read-only. It supports verified PostgreSQL comparisons and verified
+SQL Server 2016- and 2022-source-to-PostgreSQL workflows, with bounded reads, protected readiness
+acquisition, durable history, retained typed differences, and explicit completed, incomplete, or
+error outcomes.
 
 There is no scheduler integration or background service yet. Static planning does not connect to a
 database or prove readiness, capability, schema presence, or data equality.
@@ -42,13 +43,15 @@ writes machine JSON to `.local/docker-quickstart/output/{check,history,diff}.jso
 |---|---|---|
 | PostgreSQL 17.11 | Verified | Verified |
 | PostgreSQL 9.6.24 | Verified | Not yet verified |
+| SQL Server 2016 SP3 GDR `13.0.6500.1` | Verified | Not yet implemented or verified |
 | SQL Server 2022 Developer CU27 `16.0.4295.3` | Verified | Not yet implemented or verified |
 
 This matrix records tested configurations, not a version allowlist. Database connections are not
 rejected solely because their server version, edition, or driver patch is untested. The selected
 adapter strategy must still satisfy its SQL, encoding, type, and read-consistency requirements.
-The legacy PostgreSQL strategy can be selected for either comparison side. SQL Server
-2016/2017/2019 are not yet verified; there is no silent profile fallback.
+The legacy PostgreSQL strategy can be selected for either comparison side. SQL Server source
+strategies are selected explicitly as `mssql_2016` or `mssql_2022`; there is no silent profile
+fallback. SQL Server 2017 and 2019 have not been verified.
 
 Runtime capability admission is wider than an exact verified conformance point and does not certify
 untested builds, editions, operating systems, or driver patches. See the
@@ -78,8 +81,9 @@ match exits `0`, a completed mismatch exits `1`, an error exits `2`, and an inco
   pagination, output, and exit behavior.
 - [PostgreSQL profiles and operation](guides/postgresql.md) — modern and 9.6 source profiles,
   physical scopes, readiness, budgets, and metadata bootstrap.
-- [SQL Server source profile](guides/sql-server.md) — the exact SQL Server 2022 conformance point,
-  runtime boundary, type matrix, diagnostics, and fixture.
+- [SQL Server source profiles](guides/sql-server.md) — the exact SQL Server 2016 and 2022
+  conformance points, explicit strategies, owner-installed legacy helper, protected reads,
+  fixtures, and resource limits.
 - [Development and verification](guides/development.md) — locked environment, real fixtures,
   required checks, cleanup, and package/container builds.
 

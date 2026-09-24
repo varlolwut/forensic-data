@@ -1,6 +1,8 @@
+from collections.abc import Callable
 from dataclasses import dataclass
 from decimal import Decimal
 from enum import StrEnum
+from functools import partial
 from typing import cast, final
 from uuid import UUID
 
@@ -45,7 +47,7 @@ type MssqlCanonicalParameter = str | int | Decimal | bytes
 
 
 class MssqlLoweringError(ValueError):
-    """A logical schema cannot be lowered to the SQL Server 2022 v1 profile."""
+    """A logical schema cannot be lowered to a supported SQL Server v1 profile."""
 
 
 @final
@@ -185,6 +187,132 @@ class MssqlInspectedRelation:
 
 @final
 @dataclass(frozen=True, slots=True)
+class MssqlUtf8HelperBinding:
+    database_id: int
+    database_name: str
+    database_collation: str
+    database_compatibility_level: int
+    schema_id: int
+    schema_name: str
+    object_id: int
+    object_name: str
+    object_type: str
+    definition_utf16_bytes: int
+    definition_sha256: bytes
+    return_type_schema: str
+    return_type_name: str
+    return_max_length: int
+    return_is_output: bool
+    return_has_default_value: bool
+    input_parameter_name: str
+    input_type_schema: str
+    input_type_name: str
+    input_max_length: int
+    input_is_output: bool
+    input_has_default_value: bool
+    uses_ansi_nulls: bool
+    uses_quoted_identifier: bool
+    is_schema_bound: bool
+    uses_database_collation: bool
+    null_on_null_input: bool
+    execute_as_principal_id: int | None
+    is_deterministic: bool
+    is_precise: bool
+    is_encrypted: bool
+    can_execute: bool
+    can_view_definition: bool
+    can_alter: bool
+    can_control: bool
+    ansi_nulls: bool
+    ansi_padding: bool
+    ansi_warnings: bool
+    arithabort: bool
+    concat_null_yields_null: bool
+    numeric_roundabort: bool
+    quoted_identifier: bool
+
+    def __post_init__(self) -> None:
+        _validate_positive_integer(self.database_id, "SQL Server helper database ID", INT32_MAX)
+        _validate_identifier(self.database_name, "SQL Server helper database name")
+        _validate_identifier(self.database_collation, "SQL Server helper database collation")
+        _validate_positive_integer(
+            self.database_compatibility_level,
+            "SQL Server helper database compatibility level",
+            INT32_MAX,
+        )
+        _validate_positive_integer(self.schema_id, "SQL Server helper schema ID", INT32_MAX)
+        _validate_identifier(self.schema_name, "SQL Server helper schema name")
+        _validate_positive_integer(self.object_id, "SQL Server helper object ID", INT32_MAX)
+        _validate_identifier(self.object_name, "SQL Server helper object name")
+        _validate_identifier(self.object_type, "SQL Server helper object type")
+        _validate_positive_integer(
+            self.definition_utf16_bytes,
+            "SQL Server helper definition byte length",
+            _MAX_LOB_BYTES,
+        )
+        if self.definition_utf16_bytes % 2 != 0:
+            raise MssqlLoweringError(
+                "SQL Server helper definition byte length must contain whole UTF-16 code units"
+            )
+        if type(self.definition_sha256) is not bytes or len(self.definition_sha256) != 32:
+            raise MssqlLoweringError(
+                "SQL Server helper definition SHA-256 digest must contain exactly 32 bytes"
+            )
+        _validate_identifier(self.return_type_schema, "SQL Server helper return type schema")
+        _validate_identifier(self.return_type_name, "SQL Server helper return type name")
+        _validate_catalog_max_length(
+            self.return_max_length,
+            "SQL Server helper return maximum length",
+        )
+        _validate_parameter_name(
+            self.input_parameter_name,
+            "SQL Server helper input parameter name",
+        )
+        _validate_identifier(self.input_type_schema, "SQL Server helper input type schema")
+        _validate_identifier(self.input_type_name, "SQL Server helper input type name")
+        _validate_catalog_max_length(
+            self.input_max_length,
+            "SQL Server helper input maximum length",
+        )
+        boolean_fields = (
+            ("return_is_output", self.return_is_output),
+            ("return_has_default_value", self.return_has_default_value),
+            ("input_is_output", self.input_is_output),
+            ("input_has_default_value", self.input_has_default_value),
+            ("uses_ansi_nulls", self.uses_ansi_nulls),
+            ("uses_quoted_identifier", self.uses_quoted_identifier),
+            ("is_schema_bound", self.is_schema_bound),
+            ("uses_database_collation", self.uses_database_collation),
+            ("null_on_null_input", self.null_on_null_input),
+            ("is_deterministic", self.is_deterministic),
+            ("is_precise", self.is_precise),
+            ("is_encrypted", self.is_encrypted),
+            ("can_execute", self.can_execute),
+            ("can_view_definition", self.can_view_definition),
+            ("can_alter", self.can_alter),
+            ("can_control", self.can_control),
+            ("ansi_nulls", self.ansi_nulls),
+            ("ansi_padding", self.ansi_padding),
+            ("ansi_warnings", self.ansi_warnings),
+            ("arithabort", self.arithabort),
+            ("concat_null_yields_null", self.concat_null_yields_null),
+            ("numeric_roundabort", self.numeric_roundabort),
+            ("quoted_identifier", self.quoted_identifier),
+        )
+        for name, value in boolean_fields:
+            if type(value) is not bool:
+                raise MssqlLoweringError(f"SQL Server helper {name} must be boolean")
+        if self.execute_as_principal_id is not None and (
+            type(self.execute_as_principal_id) is not int
+            or not -(1 << 31) <= self.execute_as_principal_id <= INT32_MAX
+        ):
+            raise MssqlLoweringError(
+                "SQL Server helper execute-as principal ID must be a signed 32-bit integer or None"
+            )
+
+
+@final
+@dataclass(frozen=True, slots=True)
 class MssqlScopePredicate:
     field: FieldSchema
     column_name: str
@@ -285,6 +413,7 @@ class MssqlCanonicalQuery:
 @final
 @dataclass(frozen=True, slots=True)
 class _PayloadLowering:
+    prelude: str
     is_valid: str
     payload: str
 
@@ -303,6 +432,10 @@ class _IntegerRangeSource:
     statement: str
     context: CanonicalEnvelopeContext
     parameters: tuple[MssqlCanonicalParameter, ...]
+
+
+type _OriginCteBuilder = Callable[[MssqlInspectedRelation], str]
+type _PayloadLowerer = Callable[[FieldSchema, MssqlFieldBinding, int], _PayloadLowering]
 
 
 def build_mssql_row_envelope_query(
@@ -487,16 +620,57 @@ def build_mssql_integer_key_summary_query(
     scope: MssqlScopePredicate | None,
     max_encoded_envelope_bytes: int,
 ) -> MssqlCanonicalQuery:
+    return _build_mssql_integer_key_summary_query(
+        schema,
+        inspection,
+        key_field_index,
+        scope,
+        max_encoded_envelope_bytes,
+        _origin_cte,
+        _payload_lowering,
+    )
+
+
+def build_mssql_2016_integer_key_summary_query(
+    schema: CanonicalSchema,
+    inspection: MssqlInspectedRelation,
+    helper: MssqlUtf8HelperBinding,
+    key_field_index: int,
+    scope: MssqlScopePredicate | None,
+    max_encoded_envelope_bytes: int,
+) -> MssqlCanonicalQuery:
+    origin_cte_builder: _OriginCteBuilder = partial(_mssql_2016_origin_cte, helper)
+    payload_lowerer: _PayloadLowerer = partial(_mssql_2016_payload_lowering, helper)
+    return _build_mssql_integer_key_summary_query(
+        schema,
+        inspection,
+        key_field_index,
+        scope,
+        max_encoded_envelope_bytes,
+        origin_cte_builder,
+        payload_lowerer,
+    )
+
+
+def _build_mssql_integer_key_summary_query(
+    schema: CanonicalSchema,
+    inspection: MssqlInspectedRelation,
+    key_field_index: int,
+    scope: MssqlScopePredicate | None,
+    max_encoded_envelope_bytes: int,
+    origin_cte_builder: _OriginCteBuilder,
+    payload_lowerer: _PayloadLowerer,
+) -> MssqlCanonicalQuery:
     _validate_canonical_inputs(schema, inspection, max_encoded_envelope_bytes)
     _validate_single_integer_key(schema, key_field_index)
     key_column = _qualified_column(key_field_index)
-    key_payload = _payload_lowering(
+    key_payload = payload_lowerer(
         schema.fields[key_field_index],
         inspection.bindings[key_field_index],
         key_field_index,
     )
-    scope_filter, scope_parameters = _scope_filter(inspection, scope)
-    origin = _origin_cte(inspection)
+    scope_filter, scope_parameters = _scope_filter(inspection, scope, payload_lowerer)
+    origin = origin_cte_builder(inspection)
     relation_source = _relation_source(inspection)
     origin_identity = _identity_projection("dfe_origin", inspection)
     aggregate_provenance = _aggregate_provenance_projection("dfe_keys", inspection)
@@ -560,6 +734,51 @@ def build_mssql_integer_range_fingerprint_query(
     ranges: tuple[MssqlIntegerRangeRequest, ...],
     max_encoded_envelope_bytes: int,
 ) -> MssqlCanonicalQuery:
+    return _build_mssql_integer_range_fingerprint_query(
+        schema,
+        inspection,
+        key_field_index,
+        scope,
+        ranges,
+        max_encoded_envelope_bytes,
+        _origin_cte,
+        _payload_lowering,
+    )
+
+
+def build_mssql_2016_integer_range_fingerprint_query(
+    schema: CanonicalSchema,
+    inspection: MssqlInspectedRelation,
+    helper: MssqlUtf8HelperBinding,
+    key_field_index: int,
+    scope: MssqlScopePredicate | None,
+    ranges: tuple[MssqlIntegerRangeRequest, ...],
+    max_encoded_envelope_bytes: int,
+) -> MssqlCanonicalQuery:
+    origin_cte_builder: _OriginCteBuilder = partial(_mssql_2016_origin_cte, helper)
+    payload_lowerer: _PayloadLowerer = partial(_mssql_2016_payload_lowering, helper)
+    return _build_mssql_integer_range_fingerprint_query(
+        schema,
+        inspection,
+        key_field_index,
+        scope,
+        ranges,
+        max_encoded_envelope_bytes,
+        origin_cte_builder,
+        payload_lowerer,
+    )
+
+
+def _build_mssql_integer_range_fingerprint_query(
+    schema: CanonicalSchema,
+    inspection: MssqlInspectedRelation,
+    key_field_index: int,
+    scope: MssqlScopePredicate | None,
+    ranges: tuple[MssqlIntegerRangeRequest, ...],
+    max_encoded_envelope_bytes: int,
+    origin_cte_builder: _OriginCteBuilder,
+    payload_lowerer: _PayloadLowerer,
+) -> MssqlCanonicalQuery:
     source = _integer_range_source(
         schema,
         inspection,
@@ -567,6 +786,8 @@ def build_mssql_integer_range_fingerprint_query(
         scope,
         ranges,
         max_encoded_envelope_bytes,
+        origin_cte_builder,
+        payload_lowerer,
     )
     limb_sums = ", ".join(_limb_sum_expression(index) for index in range(8))
     provenance = _aggregate_literal_provenance_projection("dfe_hash", inspection)
@@ -632,6 +853,51 @@ def build_mssql_integer_range_rows_query(
     ranges: tuple[MssqlIntegerRangeRequest, ...],
     max_encoded_envelope_bytes: int,
 ) -> MssqlCanonicalQuery:
+    return _build_mssql_integer_range_rows_query(
+        schema,
+        inspection,
+        key_field_index,
+        scope,
+        ranges,
+        max_encoded_envelope_bytes,
+        _origin_cte,
+        _payload_lowering,
+    )
+
+
+def build_mssql_2016_integer_range_rows_query(
+    schema: CanonicalSchema,
+    inspection: MssqlInspectedRelation,
+    helper: MssqlUtf8HelperBinding,
+    key_field_index: int,
+    scope: MssqlScopePredicate | None,
+    ranges: tuple[MssqlIntegerRangeRequest, ...],
+    max_encoded_envelope_bytes: int,
+) -> MssqlCanonicalQuery:
+    origin_cte_builder: _OriginCteBuilder = partial(_mssql_2016_origin_cte, helper)
+    payload_lowerer: _PayloadLowerer = partial(_mssql_2016_payload_lowering, helper)
+    return _build_mssql_integer_range_rows_query(
+        schema,
+        inspection,
+        key_field_index,
+        scope,
+        ranges,
+        max_encoded_envelope_bytes,
+        origin_cte_builder,
+        payload_lowerer,
+    )
+
+
+def _build_mssql_integer_range_rows_query(
+    schema: CanonicalSchema,
+    inspection: MssqlInspectedRelation,
+    key_field_index: int,
+    scope: MssqlScopePredicate | None,
+    ranges: tuple[MssqlIntegerRangeRequest, ...],
+    max_encoded_envelope_bytes: int,
+    origin_cte_builder: _OriginCteBuilder,
+    payload_lowerer: _PayloadLowerer,
+) -> MssqlCanonicalQuery:
     source = _integer_range_source(
         schema,
         inspection,
@@ -639,6 +905,8 @@ def build_mssql_integer_range_rows_query(
         scope,
         ranges,
         max_encoded_envelope_bytes,
+        origin_cte_builder,
+        payload_lowerer,
     )
     effective_envelope_limit = min(
         max_encoded_envelope_bytes,
@@ -696,22 +964,65 @@ def build_mssql_relation_manifest_query(
     scope_digest: str,
     max_encoded_envelope_bytes: int,
 ) -> MssqlCanonicalQuery:
+    return _build_mssql_relation_manifest_query(
+        schema,
+        inspection,
+        dataset_id,
+        scope_digest,
+        max_encoded_envelope_bytes,
+        _origin_cte,
+        _payload_lowering,
+    )
+
+
+def build_mssql_2016_relation_manifest_query(
+    schema: CanonicalSchema,
+    inspection: MssqlInspectedRelation,
+    helper: MssqlUtf8HelperBinding,
+    dataset_id: str,
+    scope_digest: str,
+    max_encoded_envelope_bytes: int,
+) -> MssqlCanonicalQuery:
+    origin_cte_builder: _OriginCteBuilder = partial(_mssql_2016_origin_cte, helper)
+    payload_lowerer: _PayloadLowerer = partial(_mssql_2016_payload_lowering, helper)
+    return _build_mssql_relation_manifest_query(
+        schema,
+        inspection,
+        dataset_id,
+        scope_digest,
+        max_encoded_envelope_bytes,
+        origin_cte_builder,
+        payload_lowerer,
+    )
+
+
+def _build_mssql_relation_manifest_query(
+    schema: CanonicalSchema,
+    inspection: MssqlInspectedRelation,
+    dataset_id: str,
+    scope_digest: str,
+    max_encoded_envelope_bytes: int,
+    origin_cte_builder: _OriginCteBuilder,
+    payload_lowerer: _PayloadLowerer,
+) -> MssqlCanonicalQuery:
     _validate_canonical_inputs(schema, inspection, max_encoded_envelope_bytes)
     if len(schema.fields) != 8:
         raise MssqlLoweringError("SQL Server readiness manifest schema must contain eight fields")
     _validate_scalar_text(dataset_id, "SQL Server readiness dataset ID")
     _validate_scalar_text(scope_digest, "SQL Server readiness scope digest")
     payloads = tuple(
-        _payload_lowering(field, binding, index)
+        payload_lowerer(field, binding, index)
         for index, (field, binding) in enumerate(
             zip(schema.fields, inspection.bindings, strict=True)
         )
     )
-    origin = _origin_cte(inspection)
+    origin = origin_cte_builder(inspection)
     relation_source = _relation_source(inspection)
     provenance = _provenance_projection("dfe_manifest", inspection)
     dataset_payload = payloads[0]
     scope_payload = payloads[1]
+    dataset_filter = _canonical_equality_predicate(dataset_payload)
+    scope_filter = _canonical_equality_predicate(scope_payload)
     statement = (
         f"WITH {origin}, [dfe_manifest] AS ("
         f"SELECT {_identity_projection('dfe_origin', inspection)}, "
@@ -727,10 +1038,7 @@ def build_mssql_relation_manifest_query(
         "CONVERT(varchar(40), SWITCHOFFSET([dfe_source].[dfe_field_7], '+00:00'), 127) "
         "AS [completed_at] FROM [dfe_origin] "
         f"LEFT JOIN ({relation_source}) AS [dfe_source] ON "
-        f"({dataset_payload.is_valid}) AND ({dataset_payload.payload}) = "
-        "CONVERT(varbinary(max), ?) "
-        f"AND ({scope_payload.is_valid}) AND ({scope_payload.payload}) = "
-        "CONVERT(varbinary(max), ?)"
+        f"{dataset_filter} AND {scope_filter}"
         ") "
         f"SELECT {provenance}, [dfe_manifest].[dataset_id], "
         "[dfe_manifest].[scope_digest], [dfe_manifest].[batch_id], "
@@ -760,6 +1068,8 @@ def _integer_range_source(
     scope: MssqlScopePredicate | None,
     ranges: tuple[MssqlIntegerRangeRequest, ...],
     max_encoded_envelope_bytes: int,
+    origin_cte_builder: _OriginCteBuilder,
+    payload_lowerer: _PayloadLowerer,
 ) -> _IntegerRangeSource:
     _validate_canonical_inputs(schema, inspection, max_encoded_envelope_bytes)
     _validate_single_integer_key(schema, key_field_index)
@@ -770,7 +1080,7 @@ def _integer_range_source(
         CanonicalSchema(protocol=schema.protocol, fields=(key_field,))
     )
     payloads = tuple(
-        _payload_lowering(field, binding, index)
+        payload_lowerer(field, binding, index)
         for index, (field, binding) in enumerate(
             zip(schema.fields, inspection.bindings, strict=True)
         )
@@ -792,9 +1102,9 @@ def _integer_range_source(
         _maximum_bounded_row_envelope_bytes(schema, inspection.bindings),
     )
     fixed_bytes = _ROW_HEADER_BYTES + (_FIELD_FRAME_BYTES * len(schema.fields))
-    scope_filter, scope_parameters = _scope_filter(inspection, scope)
+    scope_filter, scope_parameters = _scope_filter(inspection, scope, payload_lowerer)
     ranges_statement, range_parameters = _integer_range_values(ranges)
-    origin = _origin_cte(inspection)
+    origin = origin_cte_builder(inspection)
     validated_origin = _validated_origin_cte(inspection)
     relation_source = _relation_source(inspection)
     statement = (
@@ -857,6 +1167,7 @@ def _integer_range_source(
 def _scope_filter(
     inspection: MssqlInspectedRelation,
     scope: MssqlScopePredicate | None,
+    payload_lowerer: _PayloadLowerer,
 ) -> tuple[str, tuple[MssqlCanonicalParameter, ...]]:
     if scope is None:
         return "1 = 1", ()
@@ -875,10 +1186,19 @@ def _scope_filter(
     field_index, binding = matches[0]
     _validate_physical_mapping(scope.field, binding.physical, field_index)
     column = _qualified_column(field_index)
-    payload = _payload_lowering(scope.field, binding, field_index)
-    return (
+    payload = payload_lowerer(scope.field, binding, field_index)
+    predicate = (
         f"{column} IS NOT NULL AND ({payload.is_valid}) "
-        f"AND ({payload.payload}) = CONVERT(varbinary(max), ?)",
+        f"AND ({payload.payload}) = CONVERT(varbinary(max), ?)"
+    )
+    if payload.prelude:
+        predicate = _predicate_with_payload_prelude(
+            predicate,
+            payload.prelude,
+            "dfe_scope_seed",
+        )
+    return (
+        predicate,
         (scope.canonical_payload,),
     )
 
@@ -1058,6 +1378,36 @@ def _row_source(
 
 
 def _origin_cte(inspection: MssqlInspectedRelation) -> str:
+    return _build_origin_cte(
+        inspection,
+        (
+            "AND [dfe_table].[is_external] = 0 "
+            "AND [dfe_table].[ledger_type] = 0 "
+            "AND [dfe_table].[is_node] = 0 AND [dfe_table].[is_edge] = 0 "
+        ),
+        "",
+    )
+
+
+def _mssql_2016_origin_cte(
+    helper: MssqlUtf8HelperBinding,
+    inspection: MssqlInspectedRelation,
+) -> str:
+    return _build_origin_cte(
+        inspection,
+        (
+            "AND [dfe_table].[is_external] = 0 AND "
+            f"{_mssql_2016_supported_storage_predicate('dfe_table', 'dfe_storage_column')} "
+        ),
+        _mssql_2016_helper_witness(helper),
+    )
+
+
+def _build_origin_cte(
+    inspection: MssqlInspectedRelation,
+    table_profile_validation: str,
+    additional_validation: str,
+) -> str:
     relation = inspection.relation
     relation_name = _qualified_relation_name(relation)
     column_validation = _column_validation_predicate(inspection)
@@ -1088,9 +1438,7 @@ def _origin_cte(inspection: MssqlInspectedRelation) -> str:
         "AND [dfe_table].[type] = 'U' AND [dfe_table].[is_ms_shipped] = 0 "
         "AND [dfe_table].[is_memory_optimized] = 0 "
         "AND [dfe_table].[temporal_type] = 0 "
-        "AND [dfe_table].[is_external] = 0 "
-        "AND [dfe_table].[ledger_type] = 0 "
-        "AND [dfe_table].[is_node] = 0 AND [dfe_table].[is_edge] = 0 "
+        f"{table_profile_validation}"
         "AND HAS_PERMS_BY_NAME(DB_NAME(), N'DATABASE', N'VIEW DEFINITION') = 1 "
         f"AND HAS_PERMS_BY_NAME({_quote_unicode_literal(relation_name)}, "
         "N'OBJECT', N'SELECT') = 1 "
@@ -1113,7 +1461,144 @@ def _origin_cte(inspection: MssqlInspectedRelation) -> str:
         "ON [dfe_policy].[object_id] = [dfe_predicate].[object_id] "
         "WHERE [dfe_predicate].[target_object_id] = [dfe_table].[object_id] "
         "AND [dfe_policy].[is_enabled] = 1) "
+        f"{additional_validation}"
         f"{column_validation})"
+    )
+
+
+def _mssql_2016_helper_witness(helper: MssqlUtf8HelperBinding) -> str:
+    helper_name = f"{helper.schema_name}.{helper.object_name}"
+    execute_as_predicate = (
+        "[dfe_helper_module].[execute_as_principal_id] IS NULL"
+        if helper.execute_as_principal_id is None
+        else (f"[dfe_helper_module].[execute_as_principal_id] = {helper.execute_as_principal_id}")
+    )
+    return (
+        f"AND DB_ID() = {helper.database_id} "
+        "AND CONVERT(varbinary(256), DB_NAME()) = "
+        f"CONVERT(varbinary(256), {_quote_unicode_literal(helper.database_name)}) "
+        "AND CONVERT(varbinary(256), CONVERT(nvarchar(128), "
+        "DATABASEPROPERTYEX(DB_NAME(), N'Collation'))) = "
+        f"CONVERT(varbinary(256), {_quote_unicode_literal(helper.database_collation)}) "
+        "AND (SELECT [dfe_helper_database].[compatibility_level] "
+        "FROM sys.databases AS [dfe_helper_database] "
+        "WHERE [dfe_helper_database].[database_id] = DB_ID()) = "
+        f"{helper.database_compatibility_level} "
+        "AND EXISTS (SELECT 1 FROM sys.objects AS [dfe_helper_object] "
+        "JOIN sys.schemas AS [dfe_helper_schema] "
+        "ON [dfe_helper_schema].[schema_id] = [dfe_helper_object].[schema_id] "
+        "JOIN sys.sql_modules AS [dfe_helper_module] "
+        "ON [dfe_helper_module].[object_id] = [dfe_helper_object].[object_id] "
+        f"WHERE [dfe_helper_schema].[schema_id] = {helper.schema_id} "
+        "AND CONVERT(varbinary(256), [dfe_helper_schema].[name]) = "
+        f"CONVERT(varbinary(256), {_quote_unicode_literal(helper.schema_name)}) "
+        f"AND [dfe_helper_object].[object_id] = {helper.object_id} "
+        "AND CONVERT(varbinary(256), [dfe_helper_object].[name]) = "
+        f"CONVERT(varbinary(256), {_quote_unicode_literal(helper.object_name)}) "
+        "AND CONVERT(varbinary(256), CONVERT(nvarchar(2), "
+        "[dfe_helper_object].[type])) = "
+        f"CONVERT(varbinary(256), {_quote_unicode_literal(helper.object_type)}) "
+        "AND CONVERT(bigint, DATALENGTH([dfe_helper_module].[definition])) = "
+        f"CONVERT(bigint, {helper.definition_utf16_bytes}) "
+        "AND HASHBYTES('SHA2_256', CONVERT(varbinary(max), "
+        "[dfe_helper_module].[definition])) = "
+        f"0x{helper.definition_sha256.hex()} "
+        "AND [dfe_helper_module].[uses_ansi_nulls] = "
+        f"{_boolean_integer(helper.uses_ansi_nulls)} "
+        "AND [dfe_helper_module].[uses_quoted_identifier] = "
+        f"{_boolean_integer(helper.uses_quoted_identifier)} "
+        "AND [dfe_helper_module].[is_schema_bound] = "
+        f"{_boolean_integer(helper.is_schema_bound)} "
+        "AND [dfe_helper_module].[uses_database_collation] = "
+        f"{_boolean_integer(helper.uses_database_collation)} "
+        "AND [dfe_helper_module].[null_on_null_input] = "
+        f"{_boolean_integer(helper.null_on_null_input)} "
+        f"AND {execute_as_predicate} "
+        "AND CONVERT(int, OBJECTPROPERTYEX([dfe_helper_object].[object_id], "
+        f"N'IsDeterministic')) = {_boolean_integer(helper.is_deterministic)} "
+        "AND CONVERT(int, OBJECTPROPERTYEX([dfe_helper_object].[object_id], "
+        f"N'IsPrecise')) = {_boolean_integer(helper.is_precise)} "
+        "AND CONVERT(int, OBJECTPROPERTYEX([dfe_helper_object].[object_id], "
+        f"N'IsEncrypted')) = {_boolean_integer(helper.is_encrypted)} "
+        f"AND COALESCE(HAS_PERMS_BY_NAME({_quote_unicode_literal(helper_name)}, "
+        "N'OBJECT', N'EXECUTE'), 0) = "
+        f"{_boolean_integer(helper.can_execute)} "
+        f"AND COALESCE(HAS_PERMS_BY_NAME({_quote_unicode_literal(helper_name)}, "
+        "N'OBJECT', N'VIEW DEFINITION'), 0) = "
+        f"{_boolean_integer(helper.can_view_definition)} "
+        f"AND COALESCE(HAS_PERMS_BY_NAME({_quote_unicode_literal(helper_name)}, "
+        "N'OBJECT', N'ALTER'), 0) = "
+        f"{_boolean_integer(helper.can_alter)} "
+        f"AND COALESCE(HAS_PERMS_BY_NAME({_quote_unicode_literal(helper_name)}, "
+        "N'OBJECT', N'CONTROL'), 0) = "
+        f"{_boolean_integer(helper.can_control)} "
+        "AND (SELECT COUNT_BIG(*) FROM sys.parameters AS [dfe_helper_parameter] "
+        "WHERE [dfe_helper_parameter].[object_id] = "
+        "[dfe_helper_object].[object_id]) = CONVERT(bigint, 2) "
+        "AND EXISTS (SELECT 1 FROM sys.parameters AS [dfe_return_parameter] "
+        "JOIN sys.types AS [dfe_return_type] "
+        "ON [dfe_return_type].[user_type_id] = [dfe_return_parameter].[user_type_id] "
+        "JOIN sys.schemas AS [dfe_return_type_schema] "
+        "ON [dfe_return_type_schema].[schema_id] = [dfe_return_type].[schema_id] "
+        "WHERE [dfe_return_parameter].[object_id] = [dfe_helper_object].[object_id] "
+        "AND [dfe_return_parameter].[parameter_id] = 0 "
+        "AND CONVERT(varbinary(256), [dfe_return_type_schema].[name]) = "
+        f"CONVERT(varbinary(256), {_quote_unicode_literal(helper.return_type_schema)}) "
+        "AND CONVERT(varbinary(256), [dfe_return_type].[name]) = "
+        f"CONVERT(varbinary(256), {_quote_unicode_literal(helper.return_type_name)}) "
+        f"AND [dfe_return_parameter].[max_length] = {helper.return_max_length} "
+        "AND [dfe_return_parameter].[is_output] = "
+        f"{_boolean_integer(helper.return_is_output)} "
+        "AND [dfe_return_parameter].[has_default_value] = "
+        f"{_boolean_integer(helper.return_has_default_value)}) "
+        "AND EXISTS (SELECT 1 FROM sys.parameters AS [dfe_input_parameter] "
+        "JOIN sys.types AS [dfe_input_type] "
+        "ON [dfe_input_type].[user_type_id] = [dfe_input_parameter].[user_type_id] "
+        "JOIN sys.schemas AS [dfe_input_type_schema] "
+        "ON [dfe_input_type_schema].[schema_id] = [dfe_input_type].[schema_id] "
+        "WHERE [dfe_input_parameter].[object_id] = [dfe_helper_object].[object_id] "
+        "AND [dfe_input_parameter].[parameter_id] = 1 "
+        "AND CONVERT(varbinary(256), [dfe_input_parameter].[name]) = "
+        f"CONVERT(varbinary(256), {_quote_unicode_literal(helper.input_parameter_name)}) "
+        "AND CONVERT(varbinary(256), [dfe_input_type_schema].[name]) = "
+        f"CONVERT(varbinary(256), {_quote_unicode_literal(helper.input_type_schema)}) "
+        "AND CONVERT(varbinary(256), [dfe_input_type].[name]) = "
+        f"CONVERT(varbinary(256), {_quote_unicode_literal(helper.input_type_name)}) "
+        f"AND [dfe_input_parameter].[max_length] = {helper.input_max_length} "
+        "AND [dfe_input_parameter].[is_output] = "
+        f"{_boolean_integer(helper.input_is_output)} "
+        "AND [dfe_input_parameter].[has_default_value] = "
+        f"{_boolean_integer(helper.input_has_default_value)})) "
+        "AND CONVERT(int, SESSIONPROPERTY(N'ANSI_NULLS')) = "
+        f"{_boolean_integer(helper.ansi_nulls)} "
+        "AND CONVERT(int, SESSIONPROPERTY(N'ANSI_PADDING')) = "
+        f"{_boolean_integer(helper.ansi_padding)} "
+        "AND CONVERT(int, SESSIONPROPERTY(N'ANSI_WARNINGS')) = "
+        f"{_boolean_integer(helper.ansi_warnings)} "
+        "AND CONVERT(int, SESSIONPROPERTY(N'ARITHABORT')) = "
+        f"{_boolean_integer(helper.arithabort)} "
+        "AND CONVERT(int, SESSIONPROPERTY(N'CONCAT_NULL_YIELDS_NULL')) = "
+        f"{_boolean_integer(helper.concat_null_yields_null)} "
+        "AND CONVERT(int, SESSIONPROPERTY(N'NUMERIC_ROUNDABORT')) = "
+        f"{_boolean_integer(helper.numeric_roundabort)} "
+        "AND CONVERT(int, SESSIONPROPERTY(N'QUOTED_IDENTIFIER')) = "
+        f"{_boolean_integer(helper.quoted_identifier)} "
+    )
+
+
+def _mssql_2016_supported_storage_predicate(
+    table_alias: str,
+    column_alias: str,
+) -> str:
+    _validate_identifier(table_alias, "SQL Server table-catalog alias")
+    _validate_identifier(column_alias, "SQL Server column-catalog alias")
+    quoted_table_alias = _quote_identifier(table_alias)
+    quoted_column_alias = _quote_identifier(column_alias)
+    return (
+        f"NOT EXISTS (SELECT 1 FROM sys.columns AS {quoted_column_alias} "
+        f"WHERE {quoted_column_alias}.[object_id] = {quoted_table_alias}.[object_id] "
+        f"AND ({quoted_column_alias}.[is_hidden] = 1 OR "
+        f"{quoted_column_alias}.[generated_always_type] <> 0))"
     )
 
 
@@ -1267,6 +1752,7 @@ def _aggregate_literal_provenance_projection(
 def _payload_clause(payloads: tuple[_PayloadLowering, ...]) -> str:
     if not payloads:
         return ""
+    preludes = "".join(f"{payload.prelude} " for payload in payloads if payload.prelude)
     columns: list[str] = []
     for index, payload in enumerate(payloads):
         columns.extend(
@@ -1277,7 +1763,30 @@ def _payload_clause(payloads: tuple[_PayloadLowering, ...]) -> str:
                 f"{payload.payload} AS {_quote_identifier(f'payload_{index}')}",
             )
         )
-    return f"CROSS APPLY (SELECT {', '.join(columns)}) AS [dfe_payload]"
+    return f"{preludes}CROSS APPLY (SELECT {', '.join(columns)}) AS [dfe_payload]"
+
+
+def _canonical_equality_predicate(payload: _PayloadLowering) -> str:
+    predicate = f"({payload.is_valid}) AND ({payload.payload}) = CONVERT(varbinary(max), ?)"
+    if not payload.prelude:
+        return predicate
+    return _predicate_with_payload_prelude(
+        predicate,
+        payload.prelude,
+        "dfe_equality_seed",
+    )
+
+
+def _predicate_with_payload_prelude(
+    predicate: str,
+    prelude: str,
+    seed_alias: str,
+) -> str:
+    _validate_identifier(seed_alias, "SQL Server internal canonical predicate seed alias")
+    return (
+        "EXISTS (SELECT 1 FROM (VALUES (CONVERT(bit, 1))) AS "
+        f"{_quote_identifier(seed_alias)}([value]) {prelude} WHERE {predicate})"
+    )
 
 
 def _fields_valid_expression(
@@ -1464,10 +1973,28 @@ def _payload_lowering(
     )
 
 
+def _mssql_2016_payload_lowering(
+    helper: MssqlUtf8HelperBinding,
+    field: FieldSchema,
+    binding: MssqlFieldBinding,
+    field_index: int,
+) -> _PayloadLowering:
+    if field.logical_type is LogicalType.STRING:
+        _require_no_parameters(field)
+        return _mssql_2016_string_payload(
+            helper,
+            _qualified_column(field_index),
+            binding.physical,
+            field_index,
+        )
+    return _payload_lowering(field, binding, field_index)
+
+
 def _int64_payload(column: str, physical: MssqlPhysicalField) -> _PayloadLowering:
     value = f"TRY_CONVERT(bigint, {column})"
     roundtrip = f"TRY_CONVERT({_numeric_physical_type(physical)}, {value})"
     return _PayloadLowering(
+        prelude="",
         is_valid=f"{value} IS NOT NULL AND {roundtrip} = {column}",
         payload=f"CONVERT(varbinary(20), CONVERT(varchar(20), {value}))",
     )
@@ -1488,6 +2015,7 @@ def _decimal_payload(
     scaled = f"TRY_CONVERT(decimal(38, 0), REPLACE({fixed_text}, '.', ''))"
     scaled_text = f"CONVERT(varchar(39), {scaled})"
     return _PayloadLowering(
+        prelude="",
         is_valid=f"{value} IS NOT NULL AND {roundtrip} = {column} AND {scaled} IS NOT NULL",
         payload=f"CONVERT(varbinary({precision + 1}), {scaled_text})",
     )
@@ -1495,6 +2023,7 @@ def _decimal_payload(
 
 def _boolean_payload(column: str) -> _PayloadLowering:
     return _PayloadLowering(
+        prelude="",
         is_valid=f"{column} IN (CONVERT(bit, 0), CONVERT(bit, 1))",
         payload=(
             "CASE WHEN "
@@ -1516,7 +2045,12 @@ def _string_payload(column: str, physical: MssqlPhysicalField) -> _PayloadLoweri
         f"DATALENGTH({unicode_bytes}) = DATALENGTH({roundtrip_bytes}) "
         f"AND {unicode_bytes} = {roundtrip_bytes}"
     )
-    source_roundtrip = _string_source_roundtrip(column, unicode_value, physical)
+    source_roundtrip = _string_source_roundtrip(
+        column,
+        unicode_value,
+        physical,
+        _quote_identifier,
+    )
     no_nul = (
         "NOT EXISTS (SELECT 1 FROM GENERATE_SERIES("
         "CONVERT(bigint, 1), "
@@ -1525,9 +2059,35 @@ def _string_payload(column: str, physical: MssqlPhysicalField) -> _PayloadLoweri
         f"WHERE SUBSTRING({payload}, [dfe_utf8_byte].[value], 1) = 0x00)"
     )
     return _PayloadLowering(
+        prelude="",
         is_valid=(
             f"{unicode_value} IS NOT NULL AND {lossless_utf8} AND {source_roundtrip} AND {no_nul}"
         ),
+        payload=payload,
+    )
+
+
+def _mssql_2016_string_payload(
+    helper: MssqlUtf8HelperBinding,
+    column: str,
+    physical: MssqlPhysicalField,
+    field_index: int,
+) -> _PayloadLowering:
+    unicode_value = f"CONVERT(nvarchar(max), {column})"
+    helper_name = f"{_quote_identifier(helper.schema_name)}.{_quote_identifier(helper.object_name)}"
+    helper_alias = _quote_identifier(f"dfe_utf8_{field_index}")
+    payload = f"{helper_alias}.[payload]"
+    source_roundtrip = _string_source_roundtrip(
+        column,
+        unicode_value,
+        physical,
+        _mssql_2016_collation_name,
+    )
+    return _PayloadLowering(
+        prelude=(
+            f"OUTER APPLY (SELECT {helper_name}({unicode_value}) AS [payload]) AS {helper_alias}"
+        ),
+        is_valid=(f"{unicode_value} IS NOT NULL AND {payload} IS NOT NULL AND {source_roundtrip}"),
         payload=payload,
     )
 
@@ -1536,6 +2096,7 @@ def _string_source_roundtrip(
     column: str,
     unicode_value: str,
     physical: MssqlPhysicalField,
+    collation_renderer: Callable[[str], str],
 ) -> str:
     if physical.system_type_name == "nvarchar":
         return "1 = 1"
@@ -1544,7 +2105,7 @@ def _string_source_roundtrip(
     source_bytes = f"CONVERT(varbinary(max), CONVERT(varchar(max), {column}))"
     roundtrip_text = (
         "CONVERT(varchar(max), "
-        f"{unicode_value} COLLATE {_quote_identifier(physical.collation_name)})"
+        f"{unicode_value} COLLATE {collation_renderer(physical.collation_name)})"
     )
     roundtrip_bytes = f"CONVERT(varbinary(max), {roundtrip_text})"
     return (
@@ -1555,6 +2116,7 @@ def _string_source_roundtrip(
 
 def _date_payload(column: str) -> _PayloadLowering:
     return _PayloadLowering(
+        prelude="",
         is_valid="1 = 1",
         payload=f"CONVERT(varbinary(10), CONVERT(char(10), {column}, 23))",
     )
@@ -1590,6 +2152,7 @@ def _timestamp_payload(
         is_valid = "1 = 1"
     maximum_payload_bytes = 19 + (0 if precision == 0 else precision + 1) + len(suffix)
     return _PayloadLowering(
+        prelude="",
         is_valid=is_valid,
         payload=f"CONVERT(varbinary({maximum_payload_bytes}), {payload_text})",
     )
@@ -1865,10 +2428,42 @@ def _quote_unicode_literal(value: str) -> str:
     return "N'" + value.replace("'", "''") + "'"
 
 
+def _mssql_2016_collation_name(value: str) -> str:
+    _validate_identifier(value, "SQL Server 2016 collation name")
+    if not value.isascii() or not value.replace("_", "").isalnum():
+        raise MssqlLoweringError(
+            "SQL Server 2016 collation name must contain only ASCII letters, digits, and "
+            "underscores"
+        )
+    return value
+
+
 def _optional_unicode_literal(value: str | None) -> str:
     if value is None:
         return "CONVERT(nvarchar(128), NULL)"
     return _quote_unicode_literal(value)
+
+
+def _boolean_integer(value: bool) -> int:
+    if type(value) is not bool:
+        raise MssqlLoweringError("SQL Server boolean SQL literal must be boolean")
+    return 1 if value else 0
+
+
+def _validate_catalog_max_length(value: object, context: str) -> None:
+    if type(value) is not int or not (-1 <= value <= INT32_MAX):
+        raise MssqlLoweringError(f"{context} must be -1 or an integer in the range 0..{INT32_MAX}")
+
+
+def _validate_parameter_name(value: object, context: str) -> None:
+    _validate_scalar_text(value, context)
+    if not isinstance(value, str):
+        raise AssertionError("validated SQL Server parameter name did not retain its string type")
+    if not value:
+        raise MssqlLoweringError(f"{context} must not be empty")
+    utf16_units = len(value.encode("utf-16-le")) // 2
+    if utf16_units > 128:
+        raise MssqlLoweringError(f"{context} exceeds the SQL Server 128-character limit")
 
 
 def _validate_identifier(value: object, context: str) -> None:

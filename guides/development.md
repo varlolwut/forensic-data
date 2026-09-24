@@ -44,9 +44,9 @@ Copy-Item tests/fixtures/postgres-legacy/.env.example tests/fixtures/postgres-le
 Copy-Item tests/fixtures/mssql-2022/.env.example tests/fixtures/mssql-2022/.env
 ```
 
-Start the pinned PostgreSQL fixtures and the SQL Server fixture, configure SQL Server through its
-separate setup identities, then run the full gate. The host running pytest must have Microsoft ODBC
-Driver 18.7.1.1 installed; CI and the production image install the exact package automatically.
+Start the pinned PostgreSQL fixtures and the SQL Server 2022 fixture, configure SQL Server through
+its separate setup identities, then run the main gate. The host running pytest must have Microsoft
+ODBC Driver 18.7.1.1 installed; CI and the production image install the exact package automatically.
 
 ```console
 docker compose --env-file tests/fixtures/postgres/.env --file tests/fixtures/postgres/compose.yaml up --detach --wait
@@ -58,8 +58,11 @@ docker compose --env-file tests/fixtures/mssql-2022/.env --file tests/fixtures/m
 uv run ruff check .
 uv run ruff format --check .
 uv run pyright
-uv run --env-file tests/fixtures/postgres/.env --env-file tests/fixtures/postgres-legacy/.env --env-file tests/fixtures/mssql-2022/.env pytest
+uv run --env-file tests/fixtures/postgres/.env --env-file tests/fixtures/postgres-legacy/.env --env-file tests/fixtures/mssql-2022/.env pytest -m "not mssql_legacy"
 ```
+
+Run the separately provisioned [SQL Server 2016 critical gate](sql-server.md#sql-server-2016-development-fixture)
+to verify the legacy profile; it is intentionally not part of the Docker-based main gate above.
 
 PostgreSQL applies these credentials only when its data volume is initialized. If the fixture was
 previously started with different values, run the cleanup command below before starting it again.
@@ -67,7 +70,7 @@ previously started with different values, run the cleanup command below before s
 The protocol/result tests can run without Docker, but this does not verify database support:
 
 ```console
-uv run pytest --ignore=tests/test_mssql_integration.py --ignore=tests/test_mssql_canonical_integration.py --ignore=tests/test_mssql_postgres_comparison_integration.py --ignore=tests/test_postgres_integration.py --ignore=tests/test_postgres_frozen_union_integration.py --ignore=tests/test_postgres_metadata_integration.py --ignore=tests/test_postgres_protected_integration.py --ignore=tests/test_postgres_lifecycle_schema_integration.py --ignore=tests/test_postgres_lifecycle_integration.py --ignore=tests/test_postgres_comparison_integration.py --ignore=tests/test_postgres_legacy_integration.py
+uv run pytest --ignore=tests/test_mssql_integration.py --ignore=tests/test_mssql_canonical_integration.py --ignore=tests/test_mssql_postgres_comparison_integration.py --ignore=tests/test_mssql_2016_postgres_comparison_integration.py --ignore=tests/test_postgres_integration.py --ignore=tests/test_postgres_frozen_union_integration.py --ignore=tests/test_postgres_metadata_integration.py --ignore=tests/test_postgres_protected_integration.py --ignore=tests/test_postgres_lifecycle_schema_integration.py --ignore=tests/test_postgres_lifecycle_integration.py --ignore=tests/test_postgres_comparison_integration.py --ignore=tests/test_postgres_legacy_integration.py
 ```
 
 Stop and remove only these disposable fixtures and their data volumes:

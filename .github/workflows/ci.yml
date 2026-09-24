@@ -87,7 +87,7 @@ jobs:
           docker compose --file tests/fixtures/mssql-2022/compose.yaml run --rm setup-writer
           docker compose --file tests/fixtures/mssql-2022/compose.yaml run --rm verify
       - name: Run tests
-        run: uv run pytest
+        run: uv run pytest -m "not mssql_legacy"
       - name: Stop database fixtures
         if: always()
         run: |
@@ -95,9 +95,98 @@ jobs:
           docker compose --file tests/fixtures/postgres-legacy/compose.yaml down --volumes
           docker compose --file tests/fixtures/postgres/compose.yaml down --volumes
 
+  sqlserver-2016:
+    name: SQL Server 2016 to PostgreSQL integration
+    runs-on: ubuntu-24.04
+    timeout-minutes: 90
+    env:
+      DFE_MSSQL_2016_HOST: "127.0.0.1"
+      DFE_MSSQL_2016_PORT: "51416"
+      DFE_PG_ADMIN_PASSWORD: phase01-admin
+      DFE_PG_READER_PASSWORD: phase01-reader
+      DFE_PG_WRITER_PASSWORD: phase01-writer
+      DFE_PG_METADATA_MIGRATOR_PASSWORD: phase02-metadata-migrator
+      DFE_PG_METADATA_WRITER_PASSWORD: phase02-metadata-writer
+      DFE_PG_METADATA_READER_PASSWORD: phase02-metadata-reader
+      DFE_PG_PORT: "55432"
+      DFE_TEST_POSTGRES_ADMIN_DSN: postgresql://postgres:phase01-admin@127.0.0.1:55432/postgres
+      DFE_TEST_POSTGRES_READER_DSN: postgresql://dfe_fixture_reader:phase01-reader@127.0.0.1:55432/dfe_fixture
+      DFE_TEST_POSTGRES_WRITER_DSN: postgresql://dfe_fixture_writer:phase01-writer@127.0.0.1:55432/dfe_fixture
+      DFE_TEST_POSTGRES_METADATA_MIGRATOR_DSN: postgresql://dfe_metadata_migrator_login:phase02-metadata-migrator@127.0.0.1:55432/dfe_fixture
+      DFE_TEST_POSTGRES_METADATA_WRITER_DSN: postgresql://dfe_metadata_writer_login:phase02-metadata-writer@127.0.0.1:55432/dfe_fixture
+      DFE_TEST_POSTGRES_METADATA_READER_DSN: postgresql://dfe_metadata_reader_login:phase02-metadata-reader@127.0.0.1:55432/dfe_fixture
+    steps:
+      - name: Check out source
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - name: Prepare disposable hosted runner
+        shell: bash
+        run: |
+          set -euo pipefail
+          test "$RUNNER_ENVIRONMENT" = github-hosted
+          test -c /dev/kvm
+          sudo chown "$(id -u):$(id -g)" /dev/kvm
+          available_bytes=$(df --output=avail -B1 "$RUNNER_TEMP" | tail -n 1)
+          if (( available_bytes < 28 * 1024 * 1024 * 1024 )); then
+            sudo rm -rf -- /usr/local/lib/android /usr/share/dotnet
+          fi
+          sudo apt-get update
+          sudo env DEBIAN_FRONTEND=noninteractive apt-get install --yes --no-install-recommends \
+            qemu-system-x86 qemu-utils xorriso curl
+          df -h "$RUNNER_TEMP"
+          free -h
+      - name: Set up Python
+        uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
+        with:
+          python-version: "3.12.14"
+      - name: Set up uv
+        uses: astral-sh/setup-uv@c18668ad3cf93ea998bef934396af7bb5c839dc7 # v10.2.0
+        with:
+          cache-dependency-glob: uv.lock
+          enable-cache: true
+          version: "0.12.18"
+      - name: Install Microsoft ODBC Driver 18.7.1.1
+        run: |
+          curl --fail --location --silent --show-error \
+            --output /tmp/msodbcsql18_18.7.1.1-1_amd64.deb \
+            https://packages.microsoft.com/ubuntu/24.04/prod/pool/main/m/msodbcsql18/msodbcsql18_18.7.1.1-1_amd64.deb
+          echo "f506cb3de8b34cd94e9014d247b39e9dfd7effad79edad3ab67096dc3c1b6b0e  /tmp/msodbcsql18_18.7.1.1-1_amd64.deb" \
+            | sha256sum --check --strict
+          sudo env ACCEPT_EULA=Y DEBIAN_FRONTEND=noninteractive \
+            apt-get install --yes --no-install-recommends \
+            /tmp/msodbcsql18_18.7.1.1-1_amd64.deb
+          test "$(dpkg-query --show --showformat='${Version}' msodbcsql18)" = "18.7.1.1-1"
+          rm /tmp/msodbcsql18_18.7.1.1-1_amd64.deb
+      - name: Install locked dependencies
+        run: uv sync --frozen --all-groups
+      - name: Generate disposable guest and fixture credentials
+        shell: bash
+        run: |
+          set -euo pipefail
+          for variable in DFE_MSSQL_2016_SA_PASSWORD DFE_MSSQL_2016_READER_PASSWORD DFE_MSSQL_2016_SETUP_WRITER_PASSWORD; do
+            password="Aa1!$(openssl rand -hex 24)"
+            echo "::add-mask::$password"
+            echo "$variable=$password" >> "$GITHUB_ENV"
+          done
+      - name: Provision and verify actual SQL Server 2016 SP3 GDR
+        shell: bash
+        run: bash tests/fixtures/mssql-2016/ci/start.sh "$RUNNER_TEMP/dfe-sql2016"
+      - name: Start PostgreSQL 17.11 fixture
+        run: docker compose --file tests/fixtures/postgres/compose.yaml up --detach --wait
+      - name: Configure and verify fresh SQL Server 2016 fixture
+        run: uv run python tests/fixtures/mssql-2016/setup.py
+      - name: Run SQL Server 2016 critical integration tests
+        run: uv run pytest -q -m "integration and mssql and mssql_legacy" tests/test_mssql_2016_postgres_comparison_integration.py
+      - name: Remove disposable SQL Server guest and media
+        if: always()
+        shell: bash
+        run: bash tests/fixtures/mssql-2016/ci/stop.sh "$RUNNER_TEMP/dfe-sql2016"
+      - name: Stop PostgreSQL fixture
+        if: always()
+        run: docker compose --file tests/fixtures/postgres/compose.yaml down --volumes
+
   build:
     name: Build package and container
-    needs: quality
+    needs: [quality, sqlserver-2016]
     runs-on: ubuntu-24.04
     env:
       DFE_PG_ADMIN_PASSWORD: phase01-admin
@@ -148,6 +237,7 @@ jobs:
             --requirements /tmp/forensic-data-runtime.txt
           uv pip install --python .artifact-venv/bin/python --no-deps dist/*.whl
           .artifact-venv/bin/python -c "import forensic_data; print(forensic_data.__version__)"
+          .artifact-venv/bin/python -c "from forensic_data.mssql_resources import load_mssql_2016_canonical_utf8_helper_sql; load_mssql_2016_canonical_utf8_helper_sql()"
           .artifact-venv/bin/python -c "from importlib.resources import files; root = files('forensic_data.persistence'); assert root.joinpath('sql/migrations/0001_initial.sql').read_bytes(); assert root.joinpath('sql/migrations/0002_run_lifecycle.sql').read_bytes(); assert root.joinpath('sql/migrations/0003_completed_comparisons.sql').read_bytes(); assert root.joinpath('sql/migrations/0004_retained_anomalies.sql').read_bytes(); assert root.joinpath('sql/migrations/0005_frozen_physical_union.sql').read_bytes(); assert root.joinpath('sql/bootstrap.sql').read_bytes()"
           .artifact-venv/bin/forensics --help
           .artifact-venv/bin/forensics plan --config examples/postgres-relation-manifest/contract.yaml --check daily_orders --scope-json '{"business_date":"2026-09-23"}' --output json
@@ -165,6 +255,7 @@ jobs:
           docker image rm forensic-data:ci
           docker image load --input /tmp/forensic-data-ci.tar
           docker run --rm forensic-data:ci
+          docker run --rm --entrypoint /app/.venv/bin/python forensic-data:ci -c "from forensic_data.mssql_resources import load_mssql_2016_canonical_utf8_helper_sql; load_mssql_2016_canonical_utf8_helper_sql()"
           test "$(docker run --rm --entrypoint id forensic-data:ci -u)" = "10001"
       - name: Start legacy box fixtures
         run: |

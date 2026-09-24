@@ -66,6 +66,7 @@ from forensic_data.mssql_sql import (
     MssqlFieldBinding,
     MssqlInspectedRelation,
     MssqlPhysicalField,
+    MssqlUtf8HelperBinding,
     validate_mssql_inspection,
 )
 from forensic_data.persistence.errors import (
@@ -5493,7 +5494,7 @@ def _mssql_profile_semantic_value(
     context: MssqlProtectedReadContext,
 ) -> dict[str, SemanticValue]:
     profile = context.profile
-    return {
+    value: dict[str, SemanticValue] = {
         "can_view_definition": profile.can_view_definition,
         "canonical_utf8_code_page": profile.canonical_utf8_code_page,
         "compatibility_level": profile.compatibility_level,
@@ -5514,6 +5515,61 @@ def _mssql_profile_semantic_value(
         "server_collation": profile.server_collation,
         "snapshot_isolation_state": profile.snapshot_isolation_state,
         "snapshot_isolation_state_description": (profile.snapshot_isolation_state_description),
+    }
+    if profile.canonical_utf8_helper is not None:
+        value["canonical_utf8_strategy"] = "owner_installed_scalar_function_v1"
+        value["canonical_utf8_helper"] = _mssql_utf8_helper_semantic_value(
+            profile.canonical_utf8_helper
+        )
+    return value
+
+
+def _mssql_utf8_helper_semantic_value(
+    helper: MssqlUtf8HelperBinding,
+) -> dict[str, SemanticValue]:
+    return {
+        "ansi_nulls": helper.ansi_nulls,
+        "ansi_padding": helper.ansi_padding,
+        "ansi_warnings": helper.ansi_warnings,
+        "arithabort": helper.arithabort,
+        "can_alter": helper.can_alter,
+        "can_control": helper.can_control,
+        "can_execute": helper.can_execute,
+        "can_view_definition": helper.can_view_definition,
+        "concat_null_yields_null": helper.concat_null_yields_null,
+        "database_collation": helper.database_collation,
+        "database_compatibility_level": helper.database_compatibility_level,
+        "database_id": helper.database_id,
+        "database_name": helper.database_name,
+        "definition_sha256": helper.definition_sha256.hex(),
+        "definition_utf16_bytes": helper.definition_utf16_bytes,
+        "execute_as_principal_id": helper.execute_as_principal_id,
+        "input_has_default_value": helper.input_has_default_value,
+        "input_is_output": helper.input_is_output,
+        "input_max_length": helper.input_max_length,
+        "input_parameter_name": helper.input_parameter_name,
+        "input_type_name": helper.input_type_name,
+        "input_type_schema": helper.input_type_schema,
+        "is_deterministic": helper.is_deterministic,
+        "is_encrypted": helper.is_encrypted,
+        "is_precise": helper.is_precise,
+        "is_schema_bound": helper.is_schema_bound,
+        "null_on_null_input": helper.null_on_null_input,
+        "numeric_roundabort": helper.numeric_roundabort,
+        "object_id": helper.object_id,
+        "object_name": helper.object_name,
+        "object_type": helper.object_type,
+        "quoted_identifier": helper.quoted_identifier,
+        "return_has_default_value": helper.return_has_default_value,
+        "return_is_output": helper.return_is_output,
+        "return_max_length": helper.return_max_length,
+        "return_type_name": helper.return_type_name,
+        "return_type_schema": helper.return_type_schema,
+        "schema_id": helper.schema_id,
+        "schema_name": helper.schema_name,
+        "uses_ansi_nulls": helper.uses_ansi_nulls,
+        "uses_database_collation": helper.uses_database_collation,
+        "uses_quoted_identifier": helper.uses_quoted_identifier,
     }
 
 

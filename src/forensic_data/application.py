@@ -73,6 +73,7 @@ from forensic_data.mssql import (
     UnsupportedMssqlRelationError,
     open_mssql_protected_read_context,
 )
+from forensic_data.mssql_legacy import open_mssql_2016_protected_read_context
 from forensic_data.mssql_profile import MssqlRuntimeProfile, match_mssql_runtime_profile
 from forensic_data.mssql_sql import MssqlLoweringError, MssqlRelation
 from forensic_data.persistence.definitions import build_metadata_registration_definition
@@ -1111,7 +1112,10 @@ def _open_mssql_side(
         dataset.connection.driver,
         dataset.connection.profile,
     )
-    if runtime_profile is not MssqlRuntimeProfile.MSSQL_2022:
+    if runtime_profile not in (
+        MssqlRuntimeProfile.MSSQL_2022,
+        MssqlRuntimeProfile.MSSQL_2016,
+    ):
         raise UnsupportedMssqlProfileError(
             "declared SQL Server reference driver/profile is unsupported: "
             f"driver={dataset.connection.driver!r}, profile={dataset.connection.profile!r}"
@@ -1142,13 +1146,22 @@ def _open_mssql_side(
             max_metadata_total_bytes=services.metadata_total_bytes,
         ),
     )
-    context = open_mssql_protected_read_context(
-        services.reference_settings,
-        services.reference_retry_policy,
-        acquisitions,
-        source_budget,
-        PostgresSourceDirection.REFERENCE,
-    )
+    if runtime_profile is MssqlRuntimeProfile.MSSQL_2022:
+        context = open_mssql_protected_read_context(
+            services.reference_settings,
+            services.reference_retry_policy,
+            acquisitions,
+            source_budget,
+            PostgresSourceDirection.REFERENCE,
+        )
+    else:
+        context = open_mssql_2016_protected_read_context(
+            services.reference_settings,
+            services.reference_retry_policy,
+            acquisitions,
+            source_budget,
+            PostgresSourceDirection.REFERENCE,
+        )
     return _ProtectedSide(
         direction=direction,
         context=context,
@@ -2748,9 +2761,9 @@ def _validate_runtime_profiles(
 ) -> None:
     reference = check.reference.connection
     if reference.adapter is Adapter.MSSQL:
-        if (
-            match_mssql_runtime_profile(reference.driver, reference.profile)
-            is not MssqlRuntimeProfile.MSSQL_2022
+        if match_mssql_runtime_profile(reference.driver, reference.profile) not in (
+            MssqlRuntimeProfile.MSSQL_2022,
+            MssqlRuntimeProfile.MSSQL_2016,
         ):
             raise UnsupportedMssqlProfileError(
                 "declared SQL Server reference driver/profile is unsupported: "

@@ -1,0 +1,162 @@
+version: 1
+connections:
+  reference_mssql:
+    adapter: mssql
+    driver: pyodbc
+    profile: mssql_2016
+    roles: [source]
+    secret_ref: env:DFE_REFERENCE_DSN
+  target_pg:
+    adapter: postgresql
+    driver: psycopg
+    profile: postgresql_17
+    roles: [target]
+    secret_ref: env:DFE_TARGET_DSN
+  metadata_pg:
+    adapter: postgresql
+    driver: psycopg
+    profile: postgresql_17
+    roles: [metadata]
+    secret_ref: env:DFE_METADATA_DSN
+schemas:
+  legacy_record_v1:
+    fields:
+      - name: record_id
+        type: {kind: int64}
+        nullable: false
+        normalization: none
+        equality: {kind: exact}
+      - name: business_date
+        type: {kind: date}
+        nullable: false
+        normalization: none
+        equality: {kind: exact}
+      - name: unicode_value
+        type: {kind: string}
+        nullable: true
+        normalization: none
+        equality: {kind: exact}
+      - name: legacy_value
+        type: {kind: string}
+        nullable: false
+        normalization: none
+        equality: {kind: exact}
+      - name: amount
+        type: {kind: decimal, precision: 38, scale: 7}
+        nullable: false
+        normalization: none
+        equality: {kind: exact}
+      - name: observed_at
+        type: {kind: timestamp_local, precision: 6}
+        nullable: false
+        normalization: none
+        equality: {kind: exact}
+datasets:
+  reference_legacy_records:
+    connection: reference_mssql
+    relation: {catalog: null, schema: dfe_fixture, name: legacy_comparison_records}
+    logical_schema: legacy_record_v1
+    projection:
+      - {field: record_id, column: record_id}
+      - {field: business_date, column: business_date}
+      - {field: unicode_value, column: unicode_value}
+      - {field: legacy_value, column: legacy_value}
+      - {field: amount, column: amount}
+      - {field: observed_at, column: observed_at}
+    grain: [record_id]
+  target_legacy_records:
+    connection: target_pg
+    relation: {catalog: null, schema: dfe_demo, name: target_legacy_records}
+    logical_schema: legacy_record_v1
+    projection:
+      - {field: record_id, column: record_id}
+      - {field: business_date, column: business_date}
+      - {field: unicode_value, column: unicode_value}
+      - {field: legacy_value, column: legacy_value}
+      - {field: amount, column: amount}
+      - {field: observed_at, column: observed_at}
+    grain: [record_id]
+scopes:
+  daily_scope:
+    parameters:
+      business_date: {type: {kind: date}}
+    bindings:
+      reference_legacy_records:
+        {column: business_date, operator: eq, parameter: business_date}
+      target_legacy_records:
+        {column: business_date, operator: eq, parameter: business_date}
+    null_partition: reject
+checks:
+  legacy_records:
+    revision: 1
+    invariant: row_equivalence
+    reference: reference_legacy_records
+    target: target_legacy_records
+    comparison_schema: legacy_record_v1
+    key: [record_id]
+    scope_ref: daily_scope
+    consistency_policy: daily_cut
+    assurance_policy: fingerprint_allowed
+consistency:
+  daily_cut:
+    minimum_evidence: verified
+    alignment_fields: [business_date, source_cut]
+    late_arrivals: next_batch
+    datasets:
+      reference_legacy_records:
+        readiness:
+          kind: relation_manifest
+          relation: {catalog: null, schema: dfe_fixture, name: legacy_batch_manifest}
+          columns:
+            dataset_id: dataset_id
+            scope_digest: scope_digest
+            batch_id: batch_id
+            state: state
+            business_date: business_date
+            source_cut: source_cut
+            dataset_version: dataset_version
+            completed_at: completed_at
+        stable_read: {kind: transaction_snapshot}
+      target_legacy_records:
+        readiness:
+          kind: relation_manifest
+          relation: {catalog: null, schema: dfe_control, name: batch_manifest}
+          columns:
+            dataset_id: dataset_id
+            scope_digest: scope_digest
+            batch_id: batch_id
+            state: state
+            business_date: business_date
+            source_cut: source_cut
+            dataset_version: dataset_version
+            completed_at: completed_at
+        stable_read: {kind: transaction_snapshot}
+execution:
+  version: 1
+  max_queries: 100
+  max_fetched_records: 10000
+  max_application_result_bytes: 1048576
+  max_evidence_rows: 50
+  max_evidence_bytes: 65536
+  max_fingerprint_nodes: 1000
+  max_coordinator_memory_bytes: 8388608
+  max_depth: 8
+  max_full_scans_per_side: 5
+  statement_timeout_milliseconds: 60000
+  run_timeout_milliseconds: 300000
+  max_attempts: 1
+  max_checks_concurrency: 2
+  max_source_concurrency: 1
+metadata:
+  connection: metadata_pg
+evidence:
+  sql_capture: disabled
+  ddl_capture: enabled
+  fields:
+    record_id: store
+    business_date: omit
+    unicode_value: store
+    legacy_value: store
+    amount: store
+    observed_at: store
+  unspecified_fields: omit
