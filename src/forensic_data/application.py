@@ -70,10 +70,11 @@ from forensic_data.mssql import (
     MssqlRetryPolicy,
     MssqlTransportError,
     UnsupportedMssqlProfileError,
+    UnsupportedMssqlRelationError,
     open_mssql_protected_read_context,
 )
 from forensic_data.mssql_profile import MssqlRuntimeProfile, match_mssql_runtime_profile
-from forensic_data.mssql_sql import MssqlRelation
+from forensic_data.mssql_sql import MssqlLoweringError, MssqlRelation
 from forensic_data.persistence.definitions import build_metadata_registration_definition
 from forensic_data.persistence.errors import (
     CompletedComparisonNotFoundError,
@@ -796,6 +797,30 @@ def _execute_attempt(
             persisted_cut is not None,
             source_budget,
         )
+    except UnsupportedMssqlRelationError as error:
+        failure = _failure_from_error(
+            ExecutionStatus.ERROR,
+            ReasonCode.UNSUPPORTED_CAPABILITY,
+            "inspect_source_relation",
+            _actionable_mssql_error_message(error, "SQL Server relation refusal"),
+            error,
+            False,
+            resources,
+            persisted_cut is not None,
+            source_budget,
+        )
+    except MssqlLoweringError as error:
+        failure = _failure_from_error(
+            ExecutionStatus.ERROR,
+            ReasonCode.UNSUPPORTED_CAPABILITY,
+            "compile_source_query",
+            _actionable_mssql_error_message(error, "SQL Server query lowering refusal"),
+            error,
+            False,
+            resources,
+            persisted_cut is not None,
+            source_budget,
+        )
     except (
         PostgresContextLostError,
         PostgresAcquisitionRaceError,
@@ -831,12 +856,24 @@ def _execute_attempt(
             persisted_cut is not None,
             source_budget,
         )
-    except (UnsupportedPostgresProfileError, UnsupportedMssqlProfileError) as error:
+    except UnsupportedPostgresProfileError as error:
         failure = _failure_from_error(
             ExecutionStatus.ERROR,
             ReasonCode.UNSUPPORTED_CAPABILITY,
             "open_source",
             "a source does not satisfy the required runtime profile",
+            error,
+            False,
+            resources,
+            persisted_cut is not None,
+            source_budget,
+        )
+    except UnsupportedMssqlProfileError as error:
+        failure = _failure_from_error(
+            ExecutionStatus.ERROR,
+            ReasonCode.UNSUPPORTED_CAPABILITY,
+            "open_source",
+            _actionable_mssql_error_message(error, "SQL Server profile refusal"),
             error,
             False,
             resources,
@@ -1811,12 +1848,21 @@ def _failure_from_comparison_interruption(
             (SafeParameter(name="error_type", value=type(cause).__name__),),
         )
         retryable = True
-    elif isinstance(cause, (UnsupportedPostgresProfileError, UnsupportedMssqlProfileError)):
+    elif isinstance(cause, UnsupportedPostgresProfileError):
         execution_status = ExecutionStatus.ERROR
         reason = _reason(
             ReasonCode.UNSUPPORTED_CAPABILITY,
             "open_source",
             "a source does not satisfy the required runtime profile",
+            (SafeParameter(name="error_type", value=type(cause).__name__),),
+        )
+        retryable = False
+    elif isinstance(cause, UnsupportedMssqlProfileError):
+        execution_status = ExecutionStatus.ERROR
+        reason = _reason(
+            ReasonCode.UNSUPPORTED_CAPABILITY,
+            "open_source",
+            _actionable_mssql_error_message(cause, "SQL Server profile refusal"),
             (SafeParameter(name="error_type", value=type(cause).__name__),),
         )
         retryable = False
@@ -1941,6 +1987,16 @@ def _failure_from_error(
         partial_artifact=None,
         persisted_cut=None,
     )
+
+
+def _actionable_mssql_error_message(
+    error: MssqlLoweringError | UnsupportedMssqlProfileError | UnsupportedMssqlRelationError,
+    context: str,
+) -> str:
+    message = str(error).strip()
+    if not message:
+        raise ApplicationStateError(f"{context} must include a safe actionable explanation")
+    return message
 
 
 def _failure_from_terminal_source_reason(

@@ -1181,8 +1181,8 @@ def _execute_postgres_integer_key_comparison(
         )
     if not reference_summary.usable_access_path or not target_summary.usable_access_path:
         raise UnsupportedComparisonError(
-            "integer-range comparison requires a confirmed leading, non-partial, built-in "
-            "PostgreSQL btree path on both protected relations"
+            "integer-range comparison requires a confirmed leading, non-partial B-tree "
+            "access path on both protected relations"
         )
 
     pending: tuple[_PendingSegment, ...] = (root,)

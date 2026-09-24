@@ -31,6 +31,7 @@ from forensic_data.mssql_sql import (
     MssqlFieldBinding,
     MssqlInspectedRelation,
     MssqlIntegerRangeRequest,
+    MssqlLoweringError,
     MssqlPhysicalField,
     MssqlRelation,
     MssqlScopePredicate,
@@ -179,6 +180,10 @@ class UnsupportedMssqlProfileError(MssqlTransportError):
 
 class MssqlMetadataError(MssqlDataValidationError):
     """SQL Server catalog provenance is absent, unsupported, or changed."""
+
+
+class UnsupportedMssqlRelationError(MssqlMetadataError):
+    """Initial SQL Server relation inspection rejected the declared source."""
 
 
 class MssqlQueryContextError(MssqlTransportError):
@@ -2270,6 +2275,14 @@ def open_mssql_protected_read_context(
                 source_direction,
                 _mssql_source_deadline(source_budget),
             )
+    except (MssqlMetadataError, MssqlLoweringError) as error:
+        context.close()
+        message = str(error).strip()
+        if not message:
+            raise MssqlDataValidationError(
+                "SQL Server relation inspection failed without an actionable explanation"
+            ) from error
+        raise UnsupportedMssqlRelationError(message) from error
     except (
         MssqlTransportError,
         PostgresReadDeadlineExceededError,

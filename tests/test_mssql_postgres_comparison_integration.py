@@ -2,6 +2,7 @@
 
 import hashlib
 from contextlib import closing
+from dataclasses import replace
 from datetime import date
 from pathlib import Path
 from uuid import uuid4
@@ -20,14 +21,29 @@ from forensic_data.application import (
     read_history,
 )
 from forensic_data.contracts import load_contract_config
-from forensic_data.contracts.model import LoadedContractConfig, RowCheckDefinition
+from forensic_data.contracts.model import (
+    LoadedContractConfig,
+    RelationLocator,
+    RowCheckDefinition,
+)
 from forensic_data.contracts.semantics import canonicalize_semantic_json
 from forensic_data.mssql import MssqlRetryPolicy
 from forensic_data.persistence.postgres import migrate_postgres_metadata
 from forensic_data.planning import ResolvedScope, resolve_scope_values
 from forensic_data.postgres import PostgresRetryPolicy
-from forensic_data.reporting import DetailAvailability, HistoryAttemptStatus
-from forensic_data.result import RunResult
+from forensic_data.reporting import (
+    DetailAvailability,
+    HistoryAttemptStatus,
+    StoredResultAvailability,
+)
+from forensic_data.result import (
+    ExecutionStatus,
+    Guarantee,
+    PersistenceState,
+    ReasonCode,
+    RunResult,
+    Verdict,
+)
 from tests import test_postgres_comparison_integration as pg_comparison
 from tests.metadata_postgres_support import (
     MetadataDatabaseSettings,
@@ -146,8 +162,94 @@ def test_mssql_source_to_postgres_target_retains_historical_corruption_evidence(
         _reset_mssql_reference()
 
 
+def test_mssql_source_mapping_refusal_is_terminal_and_replayable() -> None:
+    metadata_request = required_metadata_database_settings()
+    target = pg_comparison._new_source_database_settings("target")
+    with disposable_metadata_database(metadata_request) as metadata:
+        migrate_postgres_metadata(metadata.migrator, _NO_POSTGRES_RETRY, 5_000)
+        config = _unsupported_mapping_config()
+        check = config.checks[0]
+        scope = resolve_scope_values(check, {})
+        services = _execution_services(metadata, target, check)
+        metadata_services = PostgresMetadataServices(
+            connection_id=config.metadata.connection.connection_id,
+            settings=metadata.reader,
+            retry_policy=_NO_POSTGRES_RETRY,
+        )
+        request = ExecuteCheckRequest(
+            request_id=uuid4(),
+            check_id=check.check_id,
+            scope_values=(),
+            reference_expected_batch_id="not-read-before-refusal",
+            target_expected_batch_id="not-read-before-refusal",
+            origin="mssql-postgres-mapping-refusal-integration",
+        )
+
+        result = execute_check(config, request, services)
+
+        assert result.execution_status is ExecutionStatus.ERROR
+        assert result.verdict is Verdict.INCONCLUSIVE
+        assert result.guarantee is Guarantee.NOT_ESTABLISHED
+        assert result.persistence.state is PersistenceState.CONFIRMED
+        assert len(result.reasons) == 1
+        reason = result.reasons[0]
+        assert reason.code is ReasonCode.UNSUPPORTED_CAPABILITY
+        assert reason.operation == "inspect_source_relation"
+        assert "field_index=0" in reason.message
+        assert "logical_type=int64" in reason.message
+        assert "physical_type=sys.nvarchar" in reason.message
+        assert "allowed_physical_types=sys.tinyint" in reason.message
+        assert reason.safe_parameters[0].name == "error_type"
+        assert reason.safe_parameters[0].value == "UnsupportedMssqlRelationError"
+
+        assert execute_check(config, request, services) == result
+        history = read_history(
+            HistoryRequest(
+                check_id=check.check_id,
+                scope_digest=scope.scope_digest,
+                limit=10,
+                cursor=None,
+            ),
+            metadata_services,
+        )
+        assert len(history.items) == 1
+        item = history.items[0]
+        assert item.run_id == result.run_id
+        assert item.attempt_id == result.attempt_id
+        assert item.status is HistoryAttemptStatus.ERROR
+        assert item.is_run_terminal
+        assert item.terminal_reason == reason
+        assert item.stored_result_availability is StoredResultAvailability.NOT_CREATED
+        assert item.stored_result is None
+        assert history.next_cursor is None
+
+
 def _mixed_engine_config() -> LoadedContractConfig:
     return load_contract_config(_CONTRACT_PATH)
+
+
+def _unsupported_mapping_config() -> LoadedContractConfig:
+    config = _mixed_engine_config()
+    check = config.checks[0]
+    locator = check.reference.locator
+    if not isinstance(locator, RelationLocator):
+        raise TypeError("SQL Server integration fixture must use a relation locator")
+    reference = replace(
+        check.reference,
+        locator=replace(locator, name="canonical_key_probe"),
+        projection=(
+            replace(check.reference.projection[0], column_name="text_key"),
+            replace(check.reference.projection[1], column_name="probe_id"),
+            replace(check.reference.projection[2], column_name="numeric_key"),
+        ),
+    )
+    full_scope = replace(check.scope, parameters=(), bindings=())
+    unsupported_check = replace(check, reference=reference, scope=full_scope)
+    return replace(
+        config,
+        datasets=(reference, check.target),
+        checks=(unsupported_check,),
+    )
 
 
 def _execution_services(
