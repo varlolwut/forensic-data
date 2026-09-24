@@ -63,6 +63,23 @@ uv run --env-file tests/fixtures/postgres/.env --env-file tests/fixtures/postgre
 
 Run the separately provisioned [SQL Server 2016 critical gate](sql-server.md#sql-server-2016-development-fixture)
 to verify the legacy profile; it is intentionally not part of the Docker-based main gate above.
+On each push and pull request, CI runs lint, formatting, type checks, the existing tests marked
+`not integration`, and wheel/source-distribution build and wheel smoke checks. These runs do not
+start databases, download database images, or build a Docker image.
+
+Explicitly dispatch the `CI` workflow for a selected ref when database integration or Docker
+delivery verification is required. It runs the PostgreSQL 17 / PostgreSQL 9.6-to-17 / SQL Server
+2022 fixtures, the integration suite, and Docker export/import, box and persistence smoke checks.
+Run the relevant checks when handing off changes that affect their behavior and before release;
+do not repeat passed integration checks for unrelated documentation or CI orchestration edits.
+The Docker build reuses the GitHub Actions BuildKit layer cache. A new hosted runner still downloads
+required fixture images and cached layers. Containers, database volumes, guest disks, and generated
+credentials are never shared through that cache.
+
+The hosted `SQL Server 2016 compatibility` workflow is also explicitly dispatched for a selected
+ref. It installs a disposable Windows guest. A green ordinary CI run does not by itself establish
+database compatibility or Docker delivery. Retain each separate integration result and its commit
+SHA. Full version-matrix testing is separate from these targeted checks.
 
 PostgreSQL applies these credentials only when its data volume is initialized. If the fixture was
 previously started with different values, run the cleanup command below before starting it again.

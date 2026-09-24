@@ -2,8 +2,19 @@
 
 This directory builds a disposable Windows Server 2019 Evaluation guest with
 SQL Server 2016 SP3 Express patched to GDR build `13.0.6500.1`. It is intended
-only for the project's legacy-source integration gate on an ephemeral Linux
-runner with KVM. It is not a production deployment or a reusable VM image.
+only for an explicitly requested legacy-source compatibility check on an
+ephemeral Linux runner with KVM. The `SQL Server 2016 compatibility` workflow
+uses `workflow_dispatch` only: ordinary pushes, pull requests, and package/image
+builds do not provision this guest or download its installation media. Select
+the ref to verify when starting that workflow; its result applies to that ref's
+recorded commit, not to later changes.
+
+A cold compatibility run downloads about 6.3 GiB of pinned Microsoft media and
+installs a fresh guest. Use it when fresh provisioning needs verification;
+connector changes can also run the same critical tests against an existing
+isolated SQL Server 2016 instance as described in the development guide. Do not
+repeat a passed compatibility check for unrelated edits. This fixture is not a
+production deployment or a reusable VM image.
 
 The workflow provides a strong, temporary password in
 `DFE_MSSQL_2016_SA_PASSWORD` and calls:
@@ -38,7 +49,7 @@ CD. No VNC or interactive console is opened.
 
 | Media | Bytes | SHA-256 authority |
 |---|---:|---|
-| [Windows Server 2019 Evaluation](https://software-static.download.prss.microsoft.com/dbazure/988969d5-f34g-4e03-ac9d-1f9786c66749/17763.3650.221105-1748.rs5_release_svc_refresh_SERVER_EVAL_x64FRE_en-us.iso) | 5,652,088,832 | `b490bbddaafd2c9604feaf9fb90bf556a550b6485e9c21ddcf6e36239f321c19` (project-measured; Microsoft did not publish a hash on the evaluated download page) |
+| [Windows Server 2019 Evaluation](https://software-static.download.prss.microsoft.com/dbazure/988969d5-f34g-4e03-ac9d-1f9786c66749/17763.3650.221105-1748.rs5_release_svc_refresh_SERVER_EVAL_x64FRE_en-us.iso) | 5,652,088,832 | `6dae072e7f78f4ccab74a45341de0d6e2d45c39be25f1f5920a2ab4f51d7bcbb` (independently measured on fresh Microsoft downloads locally and in hosted CI; Microsoft did not publish a hash on the evaluated download page) |
 | [SQL Server 2016 SP3 Express](https://download.microsoft.com/download/f/9/8/f982347c-fee3-4b3e-a8dc-c95383aa3020/sql16_sp3_dlc/en-us/SQLEXPR_x64_ENU.exe) | 564,016,512 | `123f35eb622e56a45a6a0ad951760aaba0df8b908f30ed5d4aa0f93bc93fd448` (project-measured; the executable is also Microsoft Authenticode-signed) |
 | [SQL Server 2016 GDR KB5102340](https://catalog.s.download.windowsupdate.com/d/msdownload/update/software/secu/2026/06/sqlserver2016-kb5102340-x64_35e5ef7a44a1851cd658c5aef3294559d67cb817.exe) | 536,162,048 | `e86109191b199a1347ad7ff62d2c785d1caa5538fedafdf096c87ed0e78e0201` (Microsoft-published) |
 

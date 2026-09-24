@@ -3,7 +3,7 @@ set -Eeuo pipefail
 
 readonly WINDOWS_ISO_URL="https://software-static.download.prss.microsoft.com/dbazure/988969d5-f34g-4e03-ac9d-1f9786c66749/17763.3650.221105-1748.rs5_release_svc_refresh_SERVER_EVAL_x64FRE_en-us.iso"
 readonly WINDOWS_ISO_BYTES="5652088832"
-readonly WINDOWS_ISO_SHA256="b490bbddaafd2c9604feaf9fb90bf556a550b6485e9c21ddcf6e36239f321c19"
+readonly WINDOWS_ISO_SHA256="6dae072e7f78f4ccab74a45341de0d6e2d45c39be25f1f5920a2ab4f51d7bcbb"
 readonly SQL_EXPRESS_URL="https://download.microsoft.com/download/f/9/8/f982347c-fee3-4b3e-a8dc-c95383aa3020/sql16_sp3_dlc/en-us/SQLEXPR_x64_ENU.exe"
 readonly SQL_EXPRESS_BYTES="564016512"
 readonly SQL_EXPRESS_SHA256="123f35eb622e56a45a6a0ad951760aaba0df8b908f30ed5d4aa0f93bc93fd448"
