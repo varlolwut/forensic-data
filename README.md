@@ -1,730 +1,87 @@
 # Forensic Data Engine
 
-Forensic Data Engine is a typed, read-only foundation for detecting data differences and producing
-explicit evidence of agreement across database systems without silently rounding, normalizing, or
-dropping values.
+Forensic Data Engine compares scoped datasets across database systems, reports matches and concrete
+discrepancies, and preserves durable evidence that can still be reviewed after source access
+changes. It refuses to silently round, normalize, or drop values.
 
-The current `0.1.0.dev0` package is a development release with a typed application API and a
-`forensics` CLI for PostgreSQL comparisons and the verified SQL Server 2022-source-to-PostgreSQL
-workflow. It provides:
-
-- strict comparison-result models with distinct completed, incomplete, and error outcomes;
-- the versioned `dfe_canon_v1` row/key envelope, schema digest, SHA-256 fingerprint, and segment
-  identity primitives;
-- a strict version-1 YAML contract loader, pure reference/schema resolver, semantic digests, and
-  static plan report;
-- bounded PostgreSQL and source-only SQL Server 2022 read connectors, protected relation-manifest
-  readiness acquisition, and SQL lowering for the initial common type profile;
-- versioned PostgreSQL metadata migrations, typed immutable contract registration, durable
-  run/acquisition lifecycle records, and completed or interrupted comparison results;
-- bounded same-engine and cross-engine check execution, idempotent request IDs, attempt history,
-  retained typed difference evidence, and metadata-only result replay; and
-- reproducible Python package, PostgreSQL and SQL Server fixtures, container, and CI builds.
+The current `0.1.0.dev0` package is a development release with a typed Python API and a `forensics`
+CLI. Source connections are read-only. It supports verified PostgreSQL comparisons and the verified
+SQL Server 2022-source-to-PostgreSQL workflow, with bounded reads, protected readiness acquisition,
+durable history, retained typed differences, and explicit completed, incomplete, or error outcomes.
 
 There is no scheduler integration or background service yet. Static planning does not connect to a
 database or prove readiness, capability, schema presence, or data equality.
 
-## Docker quickstart
+## First run
 
 The primary delivery is a one-shot, non-root DFE container plus a dedicated PostgreSQL 17.11
-metadata store. The synthetic source is opt-in through the `demo` profile; the default box does not
-contain or connect to a production warehouse. This path needs Docker with Compose, not host Python,
-`uv`, or `psql`.
-
-The commands below were verified on Linux/amd64 containers with Docker Desktop 4.86.0, Docker
-Engine 29.7.2, and Docker Compose 5.3.1. A lower Docker/Compose or resource minimum has not yet been
-certified.
-
-From a clean checkout, generate random local credentials and an output directory. The generator is
-idempotent and never overwrites existing secrets:
-
-```console
-mkdir -p .local/docker-quickstart
-DFE_HOST_UID="$(id -u)" DFE_HOST_GID="$(id -g)" \
-  docker compose --file examples/docker-quickstart/secrets.compose.yaml run --rm generate
-docker compose --file examples/docker-quickstart/secrets.compose.yaml down
-```
-
-On Docker Desktop for Windows, use PowerShell; the host IDs default to the container UID/GID
-`10001`:
-
-```powershell
-New-Item -ItemType Directory -Force .local/docker-quickstart | Out-Null
-docker compose --file examples/docker-quickstart/secrets.compose.yaml run --rm generate
-docker compose --file examples/docker-quickstart/secrets.compose.yaml down
-```
-
-On native Linux, pass the host IDs as shown in the first block so the protected secret directory and
-output remain accessible to the invoking account. Pre-creating the state path also prevents Docker
-from creating an undeletable root-owned `.local` parent.
-
-The generated files live under the ignored `.local/docker-quickstart` directory. They are mounted
-through Compose secrets and are never copied into the image. Keep them with the metadata backup: if
-one is lost after initialization, restore that original secret rather than generating a new set.
-
-Build the DFE image, start the persistent metadata database and opt-in synthetic source, then run
-the explicit bootstrap and migrations:
+metadata store. Start with the [complete Docker quickstart](guides/docker-quickstart.md), which
+includes the required Linux and Docker Desktop credential-generation steps. After generating those
+local secrets, the common first-run path is:
 
 ```console
 docker compose build dfe
 docker compose --profile demo up --detach --wait metadata demo-postgres
 docker compose run --rm metadata-init
 docker compose run --rm metadata-migrate
-```
-
-`metadata-init` has the admin and login-password secrets. `metadata-migrate` has only the migrator
-DSN. Neither `up` nor a normal DFE command silently bootstraps, migrates, resets, or deletes the
-metadata volume. Both setup commands are safe to repeat against compatible state; a repeated
-migration reports `Applied migrations: none (already current)`.
-
-Run the real comparison, then inspect durable history and retained row differences:
-
-```console
 docker compose run --rm demo-check
 docker compose run --rm demo-history
 docker compose run --rm demo-diff
-```
-
-The demo intentionally returns a completed mismatch: one modified row, one missing row, and one
-extra row, all under exact coverage. The underlying `forensics check` exit code is `1`, meaning a
-completed data mismatch rather than an engine failure; the demo wrapper validates that expected
-outcome and exits successfully. It prints the verdict, coverage, totals, and next action. Machine
-JSON is written to `.local/docker-quickstart/output/{check,history,diff}.json` through the separate
-writable output bind. The check service receives only source-reader and metadata runtime-writer
-secrets; history and diff receive only the metadata-reader secret and never query the source.
-
-To prove persistence, stop the demo source, recreate the metadata container without deleting its
-named volume, and read the same stored result again:
-
-```console
-docker compose stop demo-postgres
-docker compose stop metadata
-docker compose rm --force metadata
-docker compose up --detach --wait metadata
-docker compose run --rm demo-history
-docker compose run --rm demo-diff
-```
-
-Normal shutdown preserves both named volumes:
-
-```console
 docker compose --profile demo down
 ```
 
-Do not use `down --volumes` for normal shutdown or upgrade. Before changing the DFE or PostgreSQL
-image, back up the `forensic-data_metadata-data` volume and the matching secret files using the
-organization's PostgreSQL backup procedure, start the compatible metadata service, and run the
-explicit `metadata-init` and `metadata-migrate` commands. Migration refuses gaps, changed checksums,
-and unknown newer versions rather than resetting the store.
+The demo intentionally returns a completed mismatch under exact coverage: one modified row, one
+missing row, and one extra row. The underlying `forensics check` exit code is `1`, meaning a
+completed data mismatch rather than an engine failure. The demo wrapper validates that result and
+writes machine JSON to `.local/docker-quickstart/output/{check,history,diff}.json`.
 
-For your own data, start from `examples/docker-quickstart/contract.yaml`, replace the synthetic
-relations and manifests, and mount one complete connection secret in the adapter's accepted format
-at each absolute `file:/run/secrets/...` path named by the contract. Add those secret mounts with a
-local Compose override so each one-shot service receives only the endpoints it uses. Source logins
-must be read-only; the metadata runtime login needs both writer and reader capability memberships.
-The standalone CLI and orchestrators may continue to use `env:NAME` references. The generated demo
-PostgreSQL DSNs use `sslmode=disable` only on the private local Compose network; use the
-organization's required TLS mode and certificates for external endpoints.
+## Verified matrix
 
-## Verified scope
+| Verified database/version | Source | Target | Metadata store |
+|---|---|---|---|
+| PostgreSQL 17.11 | Verified | Verified | Verified |
+| PostgreSQL 9.6.24 | Verified source-only profile | Not supported | Not supported |
+| SQL Server 2022 Developer CU27 `16.0.4295.3` | Verified source-only profile | Not supported | Not supported |
 
-The modern PostgreSQL path is verified against PostgreSQL 17.11 on Linux/amd64 with Psycopg 3.3.6
-and the explicit `psycopg` / `postgresql_17` driver-profile pair. Modern source, target, and metadata
-connections require PostgreSQL 17.x, UTF-8 server/client encodings, integer datetimes, UTC, and a
-read-only Repeatable Read transaction for source data.
+Other PostgreSQL majors and PostgreSQL 9.6 patches are not verified. SQL Server 2016/2017/2019 are
+not implemented or verified, and there is no silent profile fallback.
 
-An additional source-only path is verified against the exact PostgreSQL 9.6.24 official
-Linux/amd64 image with Psycopg2 2.9.13 and the explicit `psycopg2` / `postgresql_9_6` pair. Its
-target and metadata connections must remain on the modern profile. The legacy source must use
-UTF-8, integer datetimes, UTC, and read-only Repeatable Read, and must already have pgcrypto 1.3 in
-schema `dfe_ext`; the reader needs `USAGE` on that schema and `EXECUTE` on
-`dfe_ext.digest(bytea,text)`. Runtime validates these capabilities and the canonical SHA-256 result;
-it never installs the extension or silently changes drivers. Other PostgreSQL 9.6 patches, other
-PostgreSQL majors, and other legacy PostgreSQL profiles are not verified by the current code.
+Runtime capability admission is wider than an exact verified conformance point and does not certify
+untested builds, editions, operating systems, or driver patches. See the
+[PostgreSQL guide](guides/postgresql.md) and [SQL Server guide](guides/sql-server.md) for relation,
+type, snapshot, provenance, assurance, and resource limits.
 
-A source-only SQL Server path is verified against the exact SQL Server 2022 Developer CU27 build
-`16.0.4295.3` on Linux/amd64 with pyodbc 5.3.0, Microsoft ODBC Driver 18.7.1.1-1, and the explicit
-`pyodbc` / `mssql_2022` pair. Its target and metadata connections remain on PostgreSQL 17.11. The
-current cross-engine executor requires one `physical_only` table, relation-manifest readiness, and
-a non-null logical INT64 key with a confirmed leading, non-partial access path on both sides. The
-exact verified fixture and the broader runtime-admission boundary are distinguished below. SQL
-Server is not accepted as a target or metadata store. The separate SQL Server 2016 source profile is
-not implemented and not verified.
+## Commands
 
-PostgreSQL relations must be given as an exact `(schema, table)` pair and select one explicit scope. The
-default `physical_only` scope reads one permanent regular table with `FROM ONLY`: ordinary
-inheritance children are excluded, a partition leaf can be addressed directly, and partitioned
-parents and views are rejected. The opt-in `frozen_physical_union` scope resolves the root's full
-inheritance or partition hierarchy, accepts only permanent regular or partitioned members, and
-reads every discovered regular member through an explicit `ONLY` branch. Partitioned members are
-retained as topology-only evidence and do not contribute their own rows.
-
-Protected acquisition resolves and holds every selected dataset member plus the physical-only
-readiness manifest with `ACCESS SHARE` locks before the first snapshot-forming query in the
-read-only Repeatable Read transaction. It then proves the hierarchy again inside that snapshot.
-Qualified identities, direct edges, row types, and projected physical bindings are sealed for the
-life of the context, including across empty reads. A relation attached after that frozen closure is
-not added to the query; detaching or replacing a locked member is blocked until the context closes.
-
-The initial logical-to-physical mappings are:
-
-| Logical type | Accepted PostgreSQL base types |
+| Command | Purpose |
 |---|---|
-| `int64` | `smallint`, `integer`, `bigint`, exact integral `numeric` |
-| `decimal(p,s)` | `smallint`, `integer`, `bigint`, exact `numeric` |
-| `boolean` | `boolean` |
-| `string` | `text`, `varchar` |
-| `date` | `date` |
-| `timestamp_local(p)` | `timestamp without time zone` |
-| `timestamp_instant(p)` | `timestamp with time zone` |
-
-Domains, arrays, blank-padded `character`, lossy decimal/timestamp values, unsupported relation
-kinds, and envelopes above the configured byte budget fail explicitly. Fingerprint mismatch proves
-a content difference; fingerprint match must be treated as probabilistic.
-
-Relation comparison charges by the compiled physical query shape. If a side has `C` row-contributing
-regular members, its summary reserves `C` full-scan-equivalents and a request containing `R`
-fingerprint or exact ranges reserves `R × C`; topology-only partitioned members contribute zero
-scans. The physical-only relation-manifest example still has `C = 1`, so its corruption path
-reserves five per side: one summary, one root fingerprint range, two child fingerprint ranges, and
-one exact range. A budget of four cannot complete that path. Result-byte and coordinator-memory
-reservations also include every member's bounded provenance witness and the empty-result sentinel.
-Reported `coordinator_peak_bytes` is the conservative reservation high-water estimate for retained
-and decoded coordinator data, not a measurement of process RSS or allocator peak usage.
-
-## Developer setup
-
-- Python 3.12
-- [uv](https://docs.astral.sh/uv/) 0.12.18
-- Docker with Compose for PostgreSQL and SQL Server integration tests
-
-The locked PostgreSQL drivers are C extensions built from source. A direct host installation
-therefore needs a C toolchain plus `pg_config` and matching libpq development headers. The
-production Docker build provides the reproducible path: it builds Psycopg 3.3.6 and Psycopg2
-2.9.13 against the same pinned libpq 17.11, installs the pinned Microsoft ODBC Driver
-18.7.1.1-1 runtime for pyodbc 5.3.0, and excludes compilers and headers from the runtime image.
-
-Install the locked development environment:
-
-```console
-uv sync --frozen --all-groups
-uv run python -c "import forensic_data; print(forensic_data.__version__)"
-```
-
-## CLI and application workflow
-
-The installed `forensics` command exposes four bounded data operations plus explicit metadata
-migration administration. The relation-manifest example uses the check and scope names shown below:
-
-```console
-uv run forensics plan --config examples/postgres-relation-manifest/contract.yaml --check daily_orders --scope-json '{"business_date":"2026-09-23"}' --output json
-
-uv run forensics check --config examples/postgres-relation-manifest/contract.yaml --check daily_orders --scope-json '{"business_date":"2026-09-23"}' --reference-batch reference-batch-42 --target-batch target-batch-42 --request-id 7fa700c4-7c5d-42eb-8f55-50e372ed0e25 --output json
-
-uv run forensics history --config examples/postgres-relation-manifest/contract.yaml --check daily_orders --scope-json '{"business_date":"2026-09-23"}' --limit 20 --output json
-
-uv run forensics diff --config examples/postgres-relation-manifest/contract.yaml --run-id 04be2d56-6c2f-4f66-8c84-4cfdb33a79ea --attempt-id 2d4d807a-a079-424a-8a67-a48b27777386 --limit 20 --output json
-
-uv run forensics diff --config examples/postgres-relation-manifest/contract.yaml --run-id 04be2d56-6c2f-4f66-8c84-4cfdb33a79ea --attempt-id 2d4d807a-a079-424a-8a67-a48b27777386 --limit 20 --cursor-json '{"run_id":"04be2d56-6c2f-4f66-8c84-4cfdb33a79ea","attempt_id":"2d4d807a-a079-424a-8a67-a48b27777386","check_id":"daily_orders","result_operation_id":"6c499e11-e120-484b-945a-c49960e2d17c","sequence":19}' --output json
-```
-
-Scope input is an exact JSON object whose values are booleans, integers, or strings. `check`
-requires both expected batch IDs and a canonical request UUID; repeating that request reads the
-same durable outcome instead of silently creating a different run. History and diff pagination use
-`--cursor-json` with the exact `next_cursor` object returned by the previous page. A diff cursor is
-bound to the run, attempt, check, immutable result operation, and last retained sequence, so it
-cannot be reused for another result.
-
-For every connection a command resolves, the CLI accepts endpoint secrets through an exact
-`env:NAME` or `file:/absolute/path` contract reference. Either source must contain one complete
-PostgreSQL DSN with `host`, `port`, `dbname`, `user`, `password`, `sslmode`, and `connect_timeout`,
-or one SQL Server DSN with the exact fields shown below. There is no raw-DSN command-line flag or
-provider fallback. A secret file must be a readable regular file of at most 16 KiB containing
-exactly one non-empty UTF-8 DSN line. Errors never print its path or contents. `plan` neither
-resolves secret references nor opens a connection. `history` and `diff` resolve only the metadata
-connection and never query a source or target endpoint.
-
-```text
-host=sql.example.internal port=1433 database=warehouse user=dfe_reader password='replace with secret value' tls_verification=verify-server-certificate login_timeout=5 query_timeout=30 cancellation_acknowledgement_timeout=5
-```
-
-The SQL Server form is a whitespace-separated, shell-style `key=value` record; it is not an ODBC
-semicolon connection string. Quote a password containing spaces or shell metacharacters as one
-shell-style value. Production endpoints use `verify-server-certificate`;
-`trust-fixture-certificate` must be used only for the disposable localhost fixture. Put the whole
-record in the environment variable named by `env:NAME`, or in the one-line file named by
-`file:/absolute/path`. The [mixed-engine fixture contract](tests/fixtures/mssql-2022/comparison-contract.yaml)
-shows the SQL Server reference plus PostgreSQL target/metadata wiring and uses the same `forensics
-check` invocation shape shown above.
-
-The metadata login used by `check` or `execute_check` must be a member of both
-`dfe_metadata_writer` and `dfe_metadata_reader`. The login used by `history`, `diff`,
-`read_history`, or `read_diff` needs only `dfe_metadata_reader`. Keep those capability roles
-separate and grant both memberships to the runtime writer login; metadata migrator and database
-administrator credentials are only for setup and bootstrap.
-
-Packaged metadata migrations are applied explicitly with a migrator-only connection:
-
-```console
-forensics metadata migrate --secret-ref file:/run/secrets/metadata_migrator_dsn --statement-timeout-milliseconds 30000 --lock-timeout-milliseconds 5000
-```
-
-The command validates the PostgreSQL 17 profile, takes the migration advisory lock, checks the
-entire stored checksum prefix, and applies the pending batch transactionally. It is never invoked by
-`check`, `history`, or `diff`.
-
-Evidence retention is explicit per projected field. `store` retains the typed canonical value;
-`redact` retains the field/type and an explicit unavailable marker but not the raw value; `omit`
-retains no value for that field. `unspecified_fields` applies the declared action to every field
-without an explicit entry. The shipped relation-manifest example stores `order_id` and `amount`,
-omits `business_date`, and omits any otherwise unspecified field. A key digest exists only when the
-complete key is retained; no key digest is emitted for a redacted or omitted key.
-Human diff rows show a missing side as `<absent>`, a retained SQL null as `NULL`, and a redacted
-value as `<redacted>`; omitted field names are listed separately from both nulls and absent sides.
-
-Human output is the default. `--output json` emits the exact schema-version 1 typed model returned
-by the corresponding application API: `PlanReport`, `RunResult`, `HistoryPage`, or `DiffPage`.
-In `forensic_data.application`, `plan_check` accepts a compiled contract and typed request,
-`execute_check` adds explicit engine-specific execution services, and `read_history`/`read_diff`
-accept typed requests with metadata-only services. A `PlanReport` is informational and cannot be
-supplied to `execute_check`; execution resolves and validates the compiled contract again.
-
-Human `check` and `diff` output names the logical connection and dataset, the quoted qualified
-relation (or SQL dialect and content digest), and canonical scope values. It never prints a DSN,
-secret reference, or credential. `check` renders current labels only after the returned result
-identity matches the validated check, contract, and scope. Historical `diff` uses the immutable
-comparison context stored with the result rather than relabeling it from the current YAML.
-
-| Exit code | Meaning |
-|---:|---|
-| `0` | Command succeeded; for `check`, the completed result is a match. |
-| `1` | The check completed with a mismatch. |
-| `2` | The check ended in error, or command/configuration input failed. |
-| `3` | The check is incomplete, such as when readiness or a required execution budget was not established. |
-
-History returns bounded durable attempt metadata and an optional stored result. Diff is also a
-metadata-only view: it pages immutable retained evidence and never revisits the compared endpoints,
-so later source mutations cannot change an already published page. `found_records` describes the
-comparison findings while `retained_records` and `detail_availability` truthfully describe what the
-evidence row/byte policy allowed the metadata store to keep. A completed full manifest supports
-full replay only after the complete ordered retained-evidence manifest validates; partial retention
-is explicitly marked and completeness must not be inferred from a count or a final page alone.
-
-If a query, snapshot, or execution budget interrupts comparison after useful work, the attempt keeps
-an immutable partial result with its established totals, coverage frontier, metrics, reasons, and
-any policy-permitted anomaly prefix. It remains an incomplete or error outcome rather than being
-reported as completed. Replaying the same request returns that durable outcome and diff pages expose
-only its retained prefix, with truncation explicit.
-
-## Canonical API example
-
-```python
-from forensic_data.canonical import (
-    PROTOCOL,
-    CanonicalSchema,
-    FieldSchema,
-    LogicalType,
-    NoParameters,
-    Normalization,
-    encode_row,
-    fingerprint_rows,
-)
-
-schema = CanonicalSchema(
-    protocol=PROTOCOL,
-    fields=(
-        FieldSchema(
-            name="record_id",
-            logical_type=LogicalType.INT64,
-            nullable=False,
-            parameters=NoParameters(),
-            normalization=Normalization.NONE,
-        ),
-    ),
-)
-envelope = encode_row(schema, (42,))
-fingerprint = fingerprint_rows((envelope,))
-```
-
-The envelope bytes are the comparison input. Do not substitute database-native text formatting or
-hash a different serialization and call it protocol-compatible.
-
-## Static contract and plan
-
-The version-1 contract requires explicit `connections`, `schemas`, `datasets`, `checks`,
-`consistency`, `execution`, `metadata`, and `evidence` mappings. Named `scopes` are optional, but
-every check must provide exactly one inline scope or resolvable scope reference. Unknown or duplicate
-YAML keys fail validation. Connections contain a `secret_ref`; inline credentials and DSNs are not
-part of the contract shape.
-
-Datasets use exactly one relation locator or SQL artifact. A relation locator defaults to
-`relation_scope: physical_only`; `relation_scope: frozen_physical_union` must be selected explicitly
-and is part of the dataset's immutable semantic identity. Readiness relations remain
-`physical_only`. Relative SQL artifact paths are resolved from the contract directory; absolute and
-UNC paths are also accepted for operator-managed files.
-The loader assumes the contract and artifacts remain stable while they are captured, reads each
-distinct artifact once as strict UTF-8, and binds its exact bytes by SHA-256. Contract input is
-bounded to 1 MiB, composed YAML to 10,000 nodes, and nesting to 64 levels; YAML aliases are rejected.
-Each SQL artifact is bounded to 4 MiB and all distinct SQL artifacts to 32 MiB. The compiler resolves
-every reference and validates ordered schemas, projection, grain, keys, scope bindings, readiness
-parameters, and direction roles without opening an endpoint.
-
-```python
-from pathlib import Path
-
-from forensic_data.contracts import load_contract_config
-from forensic_data.planning import compile_static_plan
-
-config = load_contract_config(Path("examples/postgres-row/contract.yaml"))
-plan = compile_static_plan(
-    config,
-    "daily_orders",
-    {"business_date": "2026-09-23"},
-)
-print(plan.model_dump_json(indent=2))
-```
-
-The checked-in [SQL-backed example](examples/postgres-row/contract.yaml) is complete and loadable,
-but planning it remains static. Its readiness SQL describes operator-managed batch-manifest
-evidence; capturing that SQL does not execute it or prove the sources ready. SQL dataset locators
-and opaque SQL readiness artifacts are not supported by the current runtime acquisition path.
-
-The [native relation-manifest example](examples/postgres-relation-manifest/contract.yaml) shows the
-runtime-supported readiness form. Static planning is still informational for this example and does
-not itself acquire a snapshot or compare data.
-
-`contract_digest` identifies the resolved comparison semantics but excludes runtime scope values,
-secrets, paths, budgets, evidence settings, and metadata settings. `scope_digest` binds the typed
-values for this invocation. A `PlanReport` is not a comparison result: its live probes and execution
-stages remain explicitly `required_not_run` or `planned_not_run`, and its estimates remain
-`unknown`. It is unsigned informational output, not an authenticated executable contract; digest
-fields in a deserialized report are sender claims. Execution must load and compile the source
-contract again rather than trusting a supplied report.
-
-## Native readiness and durable acquisition
-
-The native `relation_manifest` provider runs on the same connection as its dataset and requires an
-explicit mapping for exactly eight facts: `dataset_id`, `scope_digest`, `batch_id`, `state`,
-`business_date`, `source_cut`, `dataset_version`, and `completed_at`. It reads the current manifest
-head for the requested dataset and scope, then checks the expected batch in application code. Zero
-rows, more than one row, a `building` row, or a different batch produces a typed `NOT_READY`
-outcome. Unknown state values, malformed identities, invalid physical types, and malformed
-completion facts are errors.
-
-The runtime request supplies expected batch IDs separately for the reference and target; they may
-differ, and the provider never chooses a latest batch automatically. The loader must publish the
-dataset and its current manifest head consistently, mark a row `complete` only after the data is
-ready, issue a new `dataset_version` whenever the published dataset cut changes, and keep
-`source_cut` consistent with the upstream cut. `VERIFIED` means that these facts were observed in
-the protected snapshot under that publication protocol, not that the provider independently proved
-the manifest's truthfulness.
-
-Metadata persistence records immutable run requests, leased attempts, protected read contexts,
-per-dataset readiness observations, and completed or partial comparison results. The first aligned
-input cut is bound once to the run; retries may use a new snapshot but cannot silently change that
-cut. Observations and retained anomalies must belong to the same attempt, so a retry cannot publish
-evidence captured under an earlier snapshot. Attempts may be completed, incomplete, error, or
-abandoned. A result is published only after its observations, closed protected contexts, comparison
-output, retained-evidence manifest, and terminal attempt state pass durable closure validation.
-
-Internal retries within one `forensics check` invocation share one owner token and one in-memory
-whole-run source budget. A fresh process, including an Airflow task retry, cannot resume a
-nonterminal run that already admitted an attempt: inspect its durable history and start the retry
-with a new request UUID. Version 0.1 deliberately does not persist cross-process source-budget
-usage, so treating an external retry as continuation would make the configured whole-run limits
-untruthful.
-
-## PostgreSQL metadata bootstrap
-
-Metadata installation is an explicit administrator operation. The packaged bootstrap creates and
-validates three fixed `NOLOGIN` capability roles and the `dfe_metadata` schema; it never creates
-login accounts, stores passwords, or takes over an incompatible existing role, schema, or ACL. An
-operator grants the appropriate capability role to separately managed login accounts.
-
-Render and review the exact packaged bootstrap before applying it to the dedicated metadata
-database:
-
-```console
-python -c "from pathlib import Path; from forensic_data.persistence import load_postgres_metadata_bootstrap_sql as load; Path('dfe-metadata-bootstrap.sql').write_bytes(load().encode('utf-8'))"
-psql "$DFE_METADATA_ADMIN_DSN" --set=ON_ERROR_STOP=1 --file dfe-metadata-bootstrap.sql
-```
-
-After bootstrap, `migrate_postgres_metadata(settings, retry_policy,
-lock_timeout_milliseconds)` applies the packaged numbered SQL with an advisory transaction lock.
-The journal must be an exact checksum-matching prefix of the package; unknown, missing, renamed, or
-changed migrations fail explicitly. Repeating an up-to-date migration is a no-op. Runtime reader
-and writer roles can validate the journal version but cannot change it or perform schema DDL.
-
-`build_metadata_registration_definition(...)` creates the safe persistence boundary from a
-validated row check. `register_postgres_metadata(...)` then stores immutable dataset and contract
-versions and append-only SQL capture records. Secret references, artifact paths, budgets, and SQL
-bytes disabled by the evidence policy are never stored. A later enabled capture creates a separate
-record without mutating the semantic version. Migration `0002` adds run, attempt, protected
-read-context, and dataset-observation records plus narrow immutable lease-renewal receipts;
-migration `0003` adds completed check results and segment fingerprints; migration `0004` adds
-partial check results, immutable retained anomalies and their full-replay manifest, plus the typed
-numeric-difference inspection view; migration `0005` admits the immutable
-`frozen_physical_union` dataset scope. Dataset observations keep each side's root and complete
-member/edge composition with per-member binding digests; the composition digest is evidence of the
-observed protected closure, not an equality requirement between source and target physical OIDs.
-
-## PostgreSQL fixture and checks
-
-Copy the disposable local fixture environment. The checked-in values are development-only
-credentials bound to `127.0.0.1` with `sslmode=disable`; replace the security profile if the
-fixture is used anywhere else.
-
-If you change `DFE_PG_PORT`, update the port in every test DSN in the same environment file. If you
-change a fixture password, update the matching password in its DSN too.
-
-```console
-# POSIX
-cp tests/fixtures/postgres/.env.example tests/fixtures/postgres/.env
-cp tests/fixtures/postgres-legacy/.env.example tests/fixtures/postgres-legacy/.env
-cp tests/fixtures/mssql-2022/.env.example tests/fixtures/mssql-2022/.env
-
-# PowerShell
-Copy-Item tests/fixtures/postgres/.env.example tests/fixtures/postgres/.env
-Copy-Item tests/fixtures/postgres-legacy/.env.example tests/fixtures/postgres-legacy/.env
-Copy-Item tests/fixtures/mssql-2022/.env.example tests/fixtures/mssql-2022/.env
-```
-
-Start the pinned PostgreSQL fixtures and the SQL Server fixture, configure SQL Server through its
-separate setup identities, then run the full gate. The host running pytest must have Microsoft ODBC
-Driver 18.7.1.1 installed; CI and the production image install the exact package automatically.
-
-```console
-docker compose --env-file tests/fixtures/postgres/.env --file tests/fixtures/postgres/compose.yaml up --detach --wait
-docker compose --env-file tests/fixtures/postgres-legacy/.env --file tests/fixtures/postgres-legacy/compose.yaml up --detach --wait
-docker compose --env-file tests/fixtures/mssql-2022/.env --file tests/fixtures/mssql-2022/compose.yaml up --detach --wait sqlserver
-docker compose --env-file tests/fixtures/mssql-2022/.env --file tests/fixtures/mssql-2022/compose.yaml run --rm setup-admin
-docker compose --env-file tests/fixtures/mssql-2022/.env --file tests/fixtures/mssql-2022/compose.yaml run --rm setup-writer
-docker compose --env-file tests/fixtures/mssql-2022/.env --file tests/fixtures/mssql-2022/compose.yaml run --rm verify
-uv run ruff check .
-uv run ruff format --check .
-uv run pyright
-uv run --env-file tests/fixtures/postgres/.env --env-file tests/fixtures/postgres-legacy/.env --env-file tests/fixtures/mssql-2022/.env pytest
-```
-
-PostgreSQL applies these credentials only when its data volume is initialized. If the fixture was
-previously started with different values, run the cleanup command below before starting it again.
-
-The protocol/result tests can run without Docker, but this does not verify database support:
-
-```console
-uv run pytest --ignore=tests/test_mssql_integration.py --ignore=tests/test_mssql_canonical_integration.py --ignore=tests/test_mssql_postgres_comparison_integration.py --ignore=tests/test_postgres_integration.py --ignore=tests/test_postgres_frozen_union_integration.py --ignore=tests/test_postgres_metadata_integration.py --ignore=tests/test_postgres_protected_integration.py --ignore=tests/test_postgres_lifecycle_schema_integration.py --ignore=tests/test_postgres_lifecycle_integration.py --ignore=tests/test_postgres_comparison_integration.py --ignore=tests/test_postgres_legacy_integration.py
-```
-
-Stop and remove only these disposable fixtures and their data volumes:
-
-```console
-docker compose --env-file tests/fixtures/postgres/.env --file tests/fixtures/postgres/compose.yaml down --volumes
-docker compose --env-file tests/fixtures/postgres-legacy/.env --file tests/fixtures/postgres-legacy/compose.yaml down --volumes
-docker compose --env-file tests/fixtures/mssql-2022/.env --file tests/fixtures/mssql-2022/compose.yaml down --volumes --remove-orphans
-```
-
-The integration suite exercises real catalog inspection, canonical row/hash equivalence, bounded
-server-side cursors, duplicate bags, empty tables, precision rejection, relation replacement, row
-level security, read-only enforcement, concurrent-writer snapshot stability, protected
-dataset/manifest locking, metadata migration serialization and rollback, role separation, immutable
-registration/readback, lifecycle fencing and identity constraints, million-row retained-difference
-paging after source mutation, typed numeric evidence, durable partial-result replay, and frozen
-partition/inheritance compositions with concurrent membership-change behavior and durable
-per-endpoint evidence.
-The legacy endpoint gate additionally proves the exact PostgreSQL 9.6.24 source profile, its
-preinstalled pgcrypto capability, PostgreSQL 17.11 target interoperability, persisted driver/server
-provenance, and an exact retained `1 matched / 1 missing / 1 extra / 1 modified` result.
-
-## SQL Server 2022 source profile and fixture
-
-SQL Server support is source-only and intentionally separates an exact verified conformance point
-from the wider capability boundary admitted by the runtime:
-
-| Status | Profile | Direction and boundary |
-|---|---|---|
-| Verified | SQL Server 2022 Developer CU27 `16.0.4295.3`, `pyodbc` / `mssql_2022` | Reference/source only; target and metadata remain PostgreSQL 17.11. |
-| Runtime-admitted, not verified | Product major 16, EngineEdition `2`, `3`, or `4`, compatibility level 160, `ALLOW_SNAPSHOT_ISOLATION=ON`, canonical UTF-8 code page 65001, database `VIEW DEFINITION`, and matching driver/server version probes | Reference/source only. Other SQL Server 2022 builds, editions, operating systems, and driver patches can pass these capability checks but are not verified conformance points. |
-| Rejected or unimplemented | SQL Server 2016/2017/2019; any pair other than `pyodbc` / `mssql_2022`; SQL Server target or metadata roles | No fallback or silent profile substitution. SQL Server 2016 is not implemented and not verified. |
-
-The verified fixture is exact:
-
-| Component | Verified value |
-|---|---|
-| Server image | `mcr.microsoft.com/mssql/server:2022-CU27-ubuntu-22.04@sha256:4402d880dd4c34bfa7d8705e56a86cd6c88da80a1f6bbbe741f999e76264a090` |
-| Server | Developer Edition (64-bit), CU27, build `16.0.4295.3`; Ubuntu 22.04.5 LTS on Linux/amd64 |
-| Python and ODBC client | pyodbc 5.3.0; package `msodbcsql18` 18.7.1.1-1; library `libmsodbcsql-18.7.so.1.1`; reported driver version `18.07.0001` |
-| Positive database | Compatibility 160; collation `Latin1_General_100_CI_AS_SC`; `ALLOW_SNAPSHOT_ISOLATION=ON`; RCSI OFF |
-| Canonical Unicode path | `Latin1_General_100_BIN2_UTF8`, code page 65001 |
-| Reader | Least-privilege SELECT-only relation access; `VIEW DEFINITION` and fixture-hardening grant `VIEW SECURITY DEFINITION`; no enabled row-level security |
-| Transport | `Encrypt=Mandatory`; production uses `TrustServerCertificate=No`; only the disposable localhost fixture uses the explicit trust exception |
-
-The runtime records the exact build, edition text, server/database collations, database updateability,
-RCSI state, pyodbc version, ODBC library, and ODBC version as evidence. It does not turn the fixture's
-exact patch, edition text, operating system, or client patch into broader compatibility claims.
-
-The canonical comparison type matrix is:
-
-| Logical field | Accepted direct `sys` physical types | Lossless requirement |
-|---|---|---|
-| `int64` | `tinyint`, `smallint`, `int`, `bigint`, `decimal`, `numeric` | Integral, signed-INT64 range, and exact physical round-trip |
-| `decimal(p,s)` | `tinyint`, `smallint`, `int`, `bigint`, `decimal`, `numeric` | Each value must convert exactly to logical `(p,s)` and round-trip to its physical type; no rounding |
-| `boolean` | `bit` | Exact `0` or `1` |
-| `string` | `varchar`, `nvarchar`, including `max` | Lossless source-to-Unicode-to-UTF-8 round-trip; U+0000 rejected |
-| `date` | `date` | Exact date representation |
-| `timestamp_local(p)` | `datetime2` | Logical precision `0..9`, physical scale `0..7`; discarded digits must be zero |
-| `timestamp_instant(p)` | `datetimeoffset` | Same precision rule, normalized to UTC without rounding |
-
-All other SQL Server physical types are rejected by this comparison profile. Known examples include
-`char`, `nchar`, `text`, `ntext`, `binary`, `varbinary`, `image`, `rowversion`/`timestamp`, `real`,
-`float`, `money`, `smallmoney`, `datetime`, `smalldatetime`, `time`, `uniqueidentifier`, `xml`,
-`sql_variant`, `hierarchyid`, `geometry`, and `geography`. Alias/user-defined, CLR, and table types
-are rejected even when based on an accepted type. This is the comparison allowlist, not the
-lower-level bounded transport's value-type list. Identity is inspected but identity alone is not a
-refusal.
-
-The relation and read boundary is equally explicit:
-
-| Requirement | Refusal or enforced behavior |
-|---|---|
-| One exact `physical_only` user table | Views, system tables, memory-optimized, temporal, external, ledger, node, and edge tables are rejected. |
-| Direct projected columns | Missing, alias/user-defined/assembly/table-typed, computed, generated, encrypted, hidden, or masked columns are rejected. |
-| SELECT-only reader | INSERT, UPDATE, DELETE, ALTER, CONTROL, or column UPDATE capability is rejected. `ApplicationIntent=ReadOnly` is not the security boundary. |
-| Complete security metadata | Missing database `VIEW DEFINITION` or enabled row-level security is rejected. `VIEW SECURITY DEFINITION` is a fixture hardening grant, not a separate runtime gate. |
-| Comparison key and access path | Exactly one non-null logical INT64 key equal to both dataset grains. SQL Server requires a leading, enabled, non-hypothetical, unfiltered clustered or nonclustered rowstore index. PostgreSQL requires a leading, valid, ready, live, non-partial, non-expression B-tree index with a `pg_catalog` operator class. |
-| Scope | Full scope or one equality parameter bound once to the projected scope field on each side. |
-| Assurance | `fingerprint_allowed`; the current cross-engine executor rejects `exact_required`. |
-| Protected read | One transaction-level `SNAPSHOT` context, one active query, sequential use, rollback-only close, and same-statement physical provenance checks. |
-
-The selected Python client uses encrypted transport and a least-privilege login. The connector sets
-`ApplicationIntent=ReadOnly`, disables MARS and connection retries, and enables `LongAsMax`, but the
-verified grants and explicit permission inspection provide the write-safety boundary.
-
-The connector-generated canonical query projects `datetime2` and `datetimeoffset` through
-deterministic ISO text so seventh-digit precision can be checked before Python's six-digit
-`datetime` boundary. Decimal values remain `Decimal` and `nvarchar` remains Unicode.
-`fetchmany(batch_size)` bounds the number of materialized rows, but not the size of one
-`varchar(max)`, `nvarchar(max)`, or `varbinary(max)` value; the transport therefore also caps each
-declared value, row, transient batch, and retained result. Those decoded-payload limits are not a
-measurement of process RSS.
-
-Compatibility level 160 is required. The Unicode path normalizes to `nvarchar(max)`, converts
-through `Latin1_General_100_BIN2_UTF8`, and uses `GENERATE_SERIES` with binary `SUBSTRING` to reject
-U+0000 without collation-dependent character searches. Canonical frames introduce a MAX operand
-before concatenation, including general canonical rows whose envelope exceeds 8,000 bytes; SHA-256
-remains internal, counts use `COUNT_BIG`, and every digest limb is widened to `decimal(38,0)` before
-`SUM`. SQL Server 2016 has neither this UTF-8 collation nor `GENERATE_SERIES`; its separate legacy
-encoding/driver profile must not be replaced by a silent fallback.
-
-The protected context selects transaction-level `SNAPSHOT` through the ODBC connection attribute
-before its first protected query, then proves the same session has `@@TRANCOUNT=1`,
-`XACT_STATE()=1`, and isolation level 5. `READ_COMMITTED_SNAPSHOT` is recorded but never substitutes
-for `ALLOW_SNAPSHOT_ISOLATION=ON`; the separate RCSI-only fixture is rejected before relation
-inspection. Every canonical query rechecks database/schema/object/column provenance in the same
-statement and loses the context on missing or changed metadata rather than silently rebinding.
-
-Key summaries encode the complete key with canonical v1 framing and use `COUNT_BIG` to report null,
-invalid, oversized, valid, and distinct `varbinary` envelopes. They do not use source-collation
-equality, so case, trailing-space, and Unicode-normalization adversaries remain distinct whenever
-their canonical bytes differ.
-
-Integer-range fingerprinting hashes each validated row once into a session-local temporary table
-in `tempdb`, aggregates compact hash records, and confirms the terminal `DROP` before returning. It
-creates no permanent object and requires no extra reader grant, but it is real temporary-storage
-work. The published limits and measured point are:
-
-| Limit | Meaning |
-|---|---|
-| Projected columns | Maximum 1,024. |
-| Integer-range batch | Maximum 524 ranges, a project-derived bound that keeps the generated request below SQL Server's 2,100-parameter ceiling. |
-| Cross-engine exact-row envelope | Maximum 8,000 bytes for the integer-range comparison path; an oversize row is explicit and is never truncated. |
-| Protected concurrency | One active query per SQL Server context; contexts are sequential and rollback-only. |
-| Current mixed fixture budgets | ODBC query timeout 60 seconds, statement budget 60,000 ms, whole-run budget 300,000 ms. Each statement receives the minimum of the connection query timeout, immutable statement budget, and remaining run budget. |
-| Measured temporary storage | The 1,000,000-row root allocated 9,104 × 8 KiB user-object pages (71.125 MiB); 8,936 pages remained attributed until the SNAPSHOT context closed. This is a measurement, not a sizing formula. |
-| Readiness timestamp | Six logical fractional digits; a seventh digit is accepted only when it is zero and removable without loss. |
-
-The measured root completed in 24.334 seconds under the earlier 30-second test setting. That timing
-is a conformance observation, not a latency guarantee or the current fixture limit; size `tempdb`
-and execution budgets for the expected concurrent source workload.
-
-For safe structured diagnostics, run `check --output json` and inspect `reasons`, `metrics`,
-`native_error_code`, `query_id`, and `safe_parameters`. DSNs, credentials, and source row values are
-not emitted.
-
-| Result | Meaning and next action |
-|---|---|
-| `unsupported_capability` / `open_source` | An admitted `pyodbc` / `mssql_2022` source failed a server/database/transaction prerequisite such as major, edition class, compatibility, SNAPSHOT, UTF-8, or metadata visibility. The reason identifies the failed capability; compare it with the runtime-admission row. |
-| `unsupported_capability` / `inspect_source_relation` | The exact relation, projected physical type, column semantics, permissions, or RLS state is unsupported. The reason identifies the field or relation boundary; correct the contract/source and use a new request UUID. |
-| `snapshot_lost` / `read_source` | Protected physical provenance changed after the context opened. Re-establish the declared table and retry with a new request UUID; the failed context is never resumed. |
-| `budget_exhausted` / `read_source` with `HYT00` or `HYT01` | `MssqlQueryTimeoutError`: the ODBC query timeout or immutable execution deadline ended the statement. Measure the workload and set explicit aligned budgets. |
-| `lossy_transport` / `validate_key_mapping` | A scoped key cannot map exactly to logical INT64. Correct the contract or source data; the engine will not round. |
-| `protocol_violation`, `query_error`, or `cancellation_unconfirmed` | Inspect the available safe fields and server/driver health. Timeout and cancellation results carry their structured native/query identity where available; the protected context is retired. |
-
-Human `check` output includes the reason message. Human `history` is intentionally compact; use
-`history --output json` for the full durable terminal reason. Reusing the same request UUID replays
-the already-published outcome rather than rerunning it. Unsupported declared driver/profile pairs
-and SQL Server target or metadata roles fail contract/application validation before a run is
-created, so they do not produce a durable `open_source` result.
-
-The development fixture requires Linux/amd64 Docker, reserves a 3 GiB container limit with 2 GiB
-available to SQL Server, and uses disposable local credentials. Copy its ignored environment and
-start the engine:
-
-```console
-# POSIX
-cp tests/fixtures/mssql-2022/.env.example tests/fixtures/mssql-2022/.env
-
-# PowerShell
-Copy-Item tests/fixtures/mssql-2022/.env.example tests/fixtures/mssql-2022/.env
-
-docker compose --env-file tests/fixtures/mssql-2022/.env --file tests/fixtures/mssql-2022/compose.yaml up --detach --wait sqlserver
-```
-
-Run the explicit administrator bootstrap, seed through the separate setup-writer login, and verify
-the restricted reader:
-
-```console
-docker compose --env-file tests/fixtures/mssql-2022/.env --file tests/fixtures/mssql-2022/compose.yaml run --rm setup-admin
-docker compose --env-file tests/fixtures/mssql-2022/.env --file tests/fixtures/mssql-2022/compose.yaml run --rm setup-writer
-docker compose --env-file tests/fixtures/mssql-2022/.env --file tests/fixtures/mssql-2022/compose.yaml run --rm verify
-```
-
-Run the SQL Server integration tests with the fixture-only port, reader password, setup-writer
-password, and disposable administrator password. Start the PostgreSQL 17 fixture too for the mixed
-endpoint test. Administrator and setup-writer connections are fixture orchestration only; product
-reads still use the least-privilege reader. The tests construct fixed localhost connections and
-their explicit test-only certificate exception:
-
-```console
-uv run --env-file tests/fixtures/postgres/.env --env-file tests/fixtures/mssql-2022/.env pytest tests/test_mssql_integration.py tests/test_mssql_canonical_integration.py tests/test_mssql_postgres_comparison_integration.py
-```
-
-The bootstrap recreates the main and RCSI-only fixture databases and their two fixture logins.
-Verification requires the exact `16.0.4295.3` Developer build, compatibility level 160,
-`ALLOW_SNAPSHOT_ISOLATION=ON` for the main database, `SNAPSHOT=OFF` plus RCSI ON for the negative
-fixture, and denied reader DML and DDL. The reader and setup-writer services never receive the `sa`
-credential. The SQL Server 2022-to-PostgreSQL endpoint verifies the million-row baseline, exact
-`999,967 matched / 21 missing / 4 extra / 12 modified` corruption oracle, 37 retained differences,
-physical provenance, and metadata-only history/diff after later source mutation. The real SQL
-Server 2016 source profile is not yet implemented or verified.
-
-The `sa` password is persisted in the SQL Server system databases. If you change it in the ignored
-environment file, remove only this disposable fixture and its owned volume before starting again:
-
-```console
-docker compose --env-file tests/fixtures/mssql-2022/.env --file tests/fixtures/mssql-2022/compose.yaml down --volumes --remove-orphans
-```
-
-## Build artifacts
-
-Build the wheel/source distribution and the non-root one-shot CLI image:
-
-```console
-uv sync --frozen --only-group build
-uv lock --check
-uv build --no-build-isolation --no-create-gitignore --clear
-docker build --platform linux/amd64 --tag forensic-data:dev .
-docker run --rm forensic-data:dev
-```
-
-The default container command prints CLI help. Supply a normal `forensics` argument list after the
-image name; the image remains a one-shot process rather than a long-running service.
+| `forensics plan` | Compile and inspect a contract without opening database connections. |
+| `forensics check` | Execute a bounded comparison and publish its durable outcome. |
+| `forensics history` | Read bounded durable attempt history from metadata only. |
+| `forensics diff` | Page immutable retained evidence from metadata only. |
+| `forensics metadata migrate` | Apply packaged metadata migrations with a migrator-only connection. |
+
+Human output is the default; `--output json` returns the schema-version 1 typed model. A completed
+match exits `0`, a completed mismatch exits `1`, an error exits `2`, and an incomplete check exits
+`3`. Full invocation, pagination, secret-reference, retention, and API details are in
+[CLI and contracts](guides/cli-and-contracts.md).
+
+## Guides
+
+- [Docker quickstart](guides/docker-quickstart.md) — secrets, first run, persistence proof, shutdown,
+  backup, and connecting your own data.
+- [CLI and contracts](guides/cli-and-contracts.md) — commands, typed API, static planning, retention,
+  pagination, output, and exit behavior.
+- [PostgreSQL profiles and operation](guides/postgresql.md) — modern and 9.6 source profiles,
+  physical scopes, readiness, budgets, and metadata bootstrap.
+- [SQL Server source profile](guides/sql-server.md) — the exact SQL Server 2022 conformance point,
+  runtime boundary, type matrix, diagnostics, and fixture.
+- [Development and verification](guides/development.md) — locked environment, real fixtures,
+  required checks, cleanup, and package/container builds.
+
+## Examples
+
+- [Docker quickstart contract](examples/docker-quickstart/contract.yaml)
+- [PostgreSQL relation-manifest contract](examples/postgres-relation-manifest/contract.yaml)
+- [PostgreSQL SQL-backed contract](examples/postgres-row/contract.yaml)
+- [SQL Server-to-PostgreSQL fixture contract](tests/fixtures/mssql-2022/comparison-contract.yaml)
