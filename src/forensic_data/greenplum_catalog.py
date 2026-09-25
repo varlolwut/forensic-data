@@ -14,9 +14,13 @@ from forensic_data.postgres import (
 from forensic_data.postgres_sql import MAX_COMPILED_RELATION_MEMBERS, PostgresFieldBinding
 
 _BYTEA_OID = 17
+_INT8_OID = 20
+_INT2_OID = 21
+_INT4_OID = 23
 _TEXT_OID = 25
 _SHA256_BYTES = 32
 _MAX_HASH_ROWS = 10_000
+_INTEGER_TYPE_OIDS = (_INT2_OID, _INT4_OID, _INT8_OID)
 
 type GreenplumCatalogParameter = str | int
 
@@ -143,6 +147,7 @@ class OriginalGreenplumRelationCatalog:
     relation_name: str
     relation_kind: str
     storage_code: str
+    has_distribution_policy: bool
     distribution_attribute_numbers: tuple[int, ...]
     reader_has_select: bool
     reader_has_schema_usage: bool
@@ -161,6 +166,7 @@ class GreengageRelationCatalog:
     row_security_forced: bool
     access_method: str
     is_append_optimized: bool
+    has_distribution_policy: bool
     distribution_policy_type: str
     distribution_segment_count: int
     distribution_attribute_numbers: tuple[int, ...]
@@ -186,7 +192,7 @@ class OriginalGreenplumHashCapability:
     is_strict: bool
     reader_has_execute: bool
     reader_has_schema_usage: bool
-    installation_provenance: str
+    selected_strategy: str
 
 
 @final
@@ -201,7 +207,7 @@ class GreengageHashCapability:
     is_strict: bool
     reader_has_execute: bool
     reader_has_schema_usage: bool
-    provider_provenance: str
+    selected_strategy: str
 
 
 @final
@@ -239,6 +245,7 @@ READER_IDENTITY_QUERY = (
 ORIGINAL_GREENPLUM_RELATION_QUERY = (
     "SELECT relation.oid::bigint, relation.reltype::bigint, namespace.nspname, "
     "relation.relname, relation.relkind::text, relation.relstorage::text, "
+    "policy.localoid IS NOT NULL, "
     "pg_catalog.array_to_string(policy.attrnums, ','), "
     "pg_catalog.has_table_privilege(relation.oid, 'SELECT'), "
     "pg_catalog.has_schema_privilege(namespace.oid, 'USAGE') "
@@ -253,7 +260,8 @@ GREENGAGE_RELATION_QUERY = (
     "SELECT relation.oid::bigint, relation.reltype::bigint, namespace.nspname, "
     "relation.relname, relation.relkind::text, relation.relpersistence::text, "
     "relation.relrowsecurity, relation.relforcerowsecurity, access_method.amname, "
-    "append_only.relid IS NOT NULL, policy.policytype::text, policy.numsegments::integer, "
+    "append_only.relid IS NOT NULL, policy.localoid IS NOT NULL, "
+    "policy.policytype::text, policy.numsegments::integer, "
     "pg_catalog.array_to_string(policy.distkey, ','), "
     "pg_catalog.has_table_privilege(relation.oid, 'SELECT'), "
     "pg_catalog.has_schema_privilege(namespace.oid, 'USAGE') "
@@ -457,10 +465,19 @@ def parse_original_greenplum_relation_catalog(
     request: GreenplumRelationProbeRequest,
 ) -> OriginalGreenplumRelationCatalog:
     row = _require_single_row(rows, "original Greenplum relation catalog")
-    _require_field_count(row, 9, "original Greenplum relation catalog row")
+    _require_field_count(row, 10, "original Greenplum relation catalog row")
     schema_name = _require_text(row[2], "original Greenplum relation schema")
     relation_name = _require_text(row[3], "original Greenplum relation name")
     _require_requested_relation(schema_name, relation_name, request)
+    has_distribution_policy = _require_boolean(
+        row[6],
+        "original Greenplum distribution-policy presence",
+    )
+    if not has_distribution_policy:
+        raise GreenplumCatalogMetadataError(
+            "original Greenplum relation has no distribution policy: "
+            f"relation={request.schema_name!r}.{request.relation_name!r}"
+        )
     catalog = OriginalGreenplumRelationCatalog(
         relation_oid=_require_bounded_integer(
             row[0],
@@ -478,16 +495,17 @@ def parse_original_greenplum_relation_catalog(
         relation_name=relation_name,
         relation_kind=_require_code(row[4], "original Greenplum relation kind"),
         storage_code=_require_code(row[5], "original Greenplum storage code"),
-        distribution_attribute_numbers=_parse_attribute_numbers(
-            row[6],
+        has_distribution_policy=has_distribution_policy,
+        distribution_attribute_numbers=_parse_original_greenplum_attribute_numbers(
+            row[7],
             "original Greenplum distribution attributes",
         ),
         reader_has_select=_require_boolean(
-            row[7],
+            row[8],
             "original Greenplum reader SELECT privilege",
         ),
         reader_has_schema_usage=_require_boolean(
-            row[8],
+            row[9],
             "original Greenplum reader schema USAGE privilege",
         ),
     )
@@ -504,10 +522,19 @@ def parse_greengage_relation_catalog(
     request: GreenplumRelationProbeRequest,
 ) -> GreengageRelationCatalog:
     row = _require_single_row(rows, "Greengage relation catalog")
-    _require_field_count(row, 15, "Greengage relation catalog row")
+    _require_field_count(row, 16, "Greengage relation catalog row")
     schema_name = _require_text(row[2], "Greengage relation schema")
     relation_name = _require_text(row[3], "Greengage relation name")
     _require_requested_relation(schema_name, relation_name, request)
+    has_distribution_policy = _require_boolean(
+        row[10],
+        "Greengage distribution-policy presence",
+    )
+    if not has_distribution_policy:
+        raise GreenplumCatalogMetadataError(
+            "Greengage relation has no distribution policy: "
+            f"relation={request.schema_name!r}.{request.relation_name!r}"
+        )
     catalog = GreengageRelationCatalog(
         relation_oid=_require_bounded_integer(
             row[0],
@@ -529,23 +556,24 @@ def parse_greengage_relation_catalog(
         row_security_forced=_require_boolean(row[7], "Greengage forced row-security flag"),
         access_method=_require_text(row[8], "Greengage relation access method"),
         is_append_optimized=_require_boolean(row[9], "Greengage append-only flag"),
+        has_distribution_policy=has_distribution_policy,
         distribution_policy_type=_require_code(
-            row[10],
+            row[11],
             "Greengage distribution policy type",
         ),
         distribution_segment_count=_require_bounded_integer(
-            row[11],
+            row[12],
             "Greengage distribution segment count",
             1,
             INT64_MAX,
         ),
-        distribution_attribute_numbers=_parse_attribute_numbers(
-            row[12],
+        distribution_attribute_numbers=_parse_greengage_attribute_numbers(
+            row[13],
             "Greengage distribution attributes",
         ),
-        reader_has_select=_require_boolean(row[13], "Greengage reader SELECT privilege"),
+        reader_has_select=_require_boolean(row[14], "Greengage reader SELECT privilege"),
         reader_has_schema_usage=_require_boolean(
-            row[14],
+            row[15],
             "Greengage reader schema USAGE privilege",
         ),
     )
@@ -589,6 +617,33 @@ def parse_greenplum_type_probe(
     return GreenplumTypeProbe(bindings=tuple(bindings))
 
 
+def require_hash_record_id_integer_type(
+    probe: GreenplumTypeProbe,
+    request: GreenplumRelationProbeRequest,
+) -> None:
+    matching_bindings = tuple(
+        binding
+        for binding in probe.bindings
+        if binding.column_name == request.hash_record_id_column
+    )
+    if len(matching_bindings) != 1:
+        raise GreenplumCatalogMetadataError(
+            "Greenplum distributed hash record ID metadata must resolve exactly once: "
+            f"column_name={request.hash_record_id_column!r}, "
+            f"actual={len(matching_bindings)}"
+        )
+    binding = matching_bindings[0]
+    if binding.physical.base_type.oid not in _INTEGER_TYPE_OIDS:
+        raise GreenplumCatalogMetadataError(
+            "Greenplum distributed hash record ID column must use an integer base type: "
+            f"column_name={request.hash_record_id_column!r}, "
+            "base_type_identity=("
+            f"{binding.physical.base_type.schema_name!r}, "
+            f"{binding.physical.base_type.type_name!r}, "
+            f"{binding.physical.base_type.oid})"
+        )
+
+
 def parse_original_greenplum_hash_capability(
     rows: tuple[DatabaseRow, ...],
 ) -> OriginalGreenplumHashCapability:
@@ -622,7 +677,7 @@ def parse_original_greenplum_hash_capability(
             row[8],
             "original Greenplum hash schema USAGE privilege",
         ),
-        installation_provenance="unpackaged_contrib_sql",
+        selected_strategy="unpackaged_contrib_sql",
     )
     _validate_hash_capability(
         capability.schema_name,
@@ -668,7 +723,7 @@ def parse_greengage_hash_capability(
             row[8],
             "Greengage hash schema USAGE privilege",
         ),
-        provider_provenance="pg_catalog_builtin",
+        selected_strategy="pg_catalog_builtin",
     )
     _validate_hash_capability(
         capability.schema_name,
@@ -707,13 +762,13 @@ def parse_greenplum_distributed_hash_rows(
             )
         parsed.append(
             GreenplumDistributedHashRow(
-                segment_id=_require_bounded_integer(
+                segment_id=_require_private_bounded_integer(
                     row[0],
                     f"Greenplum segment ID at hash row {index}",
                     0,
                     INT64_MAX,
                 ),
-                record_id=_require_bounded_integer(
+                record_id=_require_private_bounded_integer(
                     row[1],
                     f"Greenplum record ID at hash row {index}",
                     -(1 << 63),
@@ -975,10 +1030,26 @@ def _require_requested_relation(
         )
 
 
-def _parse_attribute_numbers(value: object, label: str) -> tuple[int, ...]:
-    text = _require_text(value, label)
-    if text == "":
+def _parse_original_greenplum_attribute_numbers(
+    value: object,
+    label: str,
+) -> tuple[int, ...]:
+    if value is None:
         return ()
+    return _parse_text_attribute_numbers(value, label)
+
+
+def _parse_greengage_attribute_numbers(
+    value: object,
+    label: str,
+) -> tuple[int, ...]:
+    return _parse_text_attribute_numbers(value, label)
+
+
+def _parse_text_attribute_numbers(value: object, label: str) -> tuple[int, ...]:
+    if type(value) is str and value == "":
+        return ()
+    text = _require_text(value, label)
     values: list[int] = []
     for item in text.split(","):
         try:
@@ -1083,6 +1154,17 @@ def _require_bounded_integer(
         raise GreenplumCatalogDataError(
             f"{label} must be an integer in [{minimum}, {maximum}]: value={value!r}"
         )
+    return value
+
+
+def _require_private_bounded_integer(
+    value: object,
+    label: str,
+    minimum: int,
+    maximum: int,
+) -> int:
+    if type(value) is not int or value < minimum or value > maximum:
+        raise GreenplumCatalogDataError(f"{label} must be an integer in [{minimum}, {maximum}]")
     return value
 
 

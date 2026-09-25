@@ -95,6 +95,7 @@ def test_original_greenplum_connector_catalog_types_and_hash_probe() -> None:
     assert evidence.relation.relation_name == "capability_types"
     assert evidence.relation.relation_kind == "r"
     assert evidence.relation.storage_code == "h"
+    assert evidence.relation.has_distribution_policy
     assert evidence.relation.distribution_attribute_numbers == (1,)
     assert evidence.relation.reader_has_select
     assert evidence.relation.reader_has_schema_usage
@@ -109,7 +110,7 @@ def test_original_greenplum_connector_catalog_types_and_hash_probe() -> None:
     assert evidence.hash_capability.is_strict
     assert evidence.hash_capability.reader_has_execute
     assert evidence.hash_capability.reader_has_schema_usage
-    assert evidence.hash_capability.installation_provenance == "unpackaged_contrib_sql"
+    assert evidence.hash_capability.selected_strategy == "unpackaged_contrib_sql"
     assert evidence.required_extensions == ()
     assert evidence.hash_plan.execution_locus == "seqscan_targetlist_below_motion"
     _assert_distributed_hash_evidence(
@@ -187,6 +188,7 @@ def test_greengage_connector_catalog_types_and_hash_probe() -> None:
     assert not evidence.relation.row_security_forced
     assert evidence.relation.access_method == "heap"
     assert not evidence.relation.is_append_optimized
+    assert evidence.relation.has_distribution_policy
     assert evidence.relation.distribution_policy_type == "p"
     assert evidence.relation.distribution_segment_count == 2
     assert evidence.relation.distribution_attribute_numbers == (1,)
@@ -203,7 +205,7 @@ def test_greengage_connector_catalog_types_and_hash_probe() -> None:
     assert evidence.hash_capability.is_strict
     assert evidence.hash_capability.reader_has_execute
     assert evidence.hash_capability.reader_has_schema_usage
-    assert evidence.hash_capability.provider_provenance == "pg_catalog_builtin"
+    assert evidence.hash_capability.selected_strategy == "pg_catalog_builtin"
     assert evidence.required_extensions == ()
     assert evidence.hash_plan.execution_locus == "seqscan_output_below_motion"
     _assert_distributed_hash_evidence(

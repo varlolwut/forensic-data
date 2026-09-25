@@ -47,6 +47,7 @@ from forensic_data.greenplum_catalog import (
     parse_original_greenplum_distributed_hash_plan,
     parse_original_greenplum_hash_capability,
     parse_original_greenplum_relation_catalog,
+    require_hash_record_id_integer_type,
     require_hash_rows_cover_topology,
 )
 from forensic_data.greenplum_profile import GreenplumRuntimeProfile
@@ -126,13 +127,19 @@ class GreenplumDataValidationError(GreenplumConnectorError):
 class GreenplumQueryError(GreenplumConnectorError):
     """A bounded Greenplum-family probe query failed without retry."""
 
-    def __init__(self, operation: str, sqlstate: str | None, detail: str) -> None:
+    def __init__(
+        self,
+        operation: str,
+        sqlstate: str | None,
+        error_category: str,
+    ) -> None:
         self.operation = operation
         self.sqlstate = sqlstate
-        self.detail = detail
+        self.error_category = error_category
         super().__init__(
             "Greenplum-family query failed: "
-            f"operation={operation!r}, sqlstate={sqlstate!r}, detail={detail!r}"
+            f"operation={operation!r}, sqlstate={sqlstate!r}, "
+            f"error_category={error_category!r}"
         )
 
 
@@ -257,7 +264,7 @@ class _OriginalGreenplumSession:
             raise GreenplumQueryError(
                 operation,
                 error.pgcode,
-                str(error).strip(),
+                type(error).__name__,
             ) from None
         result = tuple(cast(DatabaseRow, row) for row in rows)
         _require_bounded_result(result, max_rows, operation)
@@ -333,7 +340,7 @@ class _GreengageSession:
             raise GreenplumQueryError(
                 operation,
                 error.sqlstate,
-                str(error).strip(),
+                type(error).__name__,
             ) from None
         result = tuple(rows)
         _require_bounded_result(result, max_rows, operation)
@@ -391,6 +398,7 @@ def probe_original_greenplum(
             )
             relation = parse_original_greenplum_relation_catalog(relation_rows, request)
             type_probe = _probe_types(session, relation.relation_oid, request)
+            require_hash_record_id_integer_type(type_probe, request)
             hash_capability_rows = session.fetch_rows(
                 ORIGINAL_GREENPLUM_HASH_CAPABILITY_QUERY,
                 (),
@@ -458,6 +466,7 @@ def probe_greengage(
             )
             relation = parse_greengage_relation_catalog(relation_rows, request)
             type_probe = _probe_types(session, relation.relation_oid, request)
+            require_hash_record_id_integer_type(type_probe, request)
             hash_capability_rows = session.fetch_rows(
                 GREENGAGE_HASH_CAPABILITY_QUERY,
                 (),
