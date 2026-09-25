@@ -3,6 +3,7 @@ import time
 from dataclasses import dataclass
 from datetime import UTC, datetime
 from importlib.metadata import version
+from threading import Lock
 from types import TracebackType
 from typing import LiteralString, Protocol, Self, cast, final
 from uuid import UUID, uuid4
@@ -68,6 +69,7 @@ from forensic_data.postgres import (
     DatabaseRow,
     PostgresConnectionSettings,
     PostgresRetryPolicy,
+    ReadContextState,
 )
 from forensic_data.postgres_sql import PostgresLoweringError
 
@@ -92,7 +94,8 @@ ORIGINAL_GREENPLUM_PROFILE_QUERY = (
     "pg_catalog.current_setting('gp_session_role'), current_database(), "
     "pg_catalog.pg_backend_pid(), "
     "pg_catalog.current_setting('transaction_isolation'), "
-    "pg_catalog.current_setting('transaction_read_only') = 'on'"
+    "pg_catalog.current_setting('transaction_read_only') = 'on', "
+    "pg_catalog.txid_current_snapshot()::text"
 )
 
 GREENGAGE_PROFILE_QUERY = (
@@ -108,7 +111,8 @@ GREENGAGE_PROFILE_QUERY = (
     "pg_catalog.current_setting('gp_session_role'), current_database(), "
     "pg_catalog.pg_backend_pid(), "
     "pg_catalog.current_setting('transaction_isolation'), "
-    "pg_catalog.current_setting('transaction_read_only') = 'on'"
+    "pg_catalog.current_setting('transaction_read_only') = 'on', "
+    "pg_catalog.txid_current_snapshot()::text"
 )
 
 _SESSION_SETUP_QUERY = (
@@ -165,6 +169,14 @@ class GreenplumCloseError(GreenplumConnectorError):
     """A Greenplum-family probe session could not roll back and close cleanly."""
 
 
+class GreenplumContextClosedError(GreenplumConnectorError):
+    """A Greenplum canonical read context cannot execute another read."""
+
+
+class GreenplumContextLostError(GreenplumConnectorError):
+    """A Greenplum canonical read context lost its transaction snapshot."""
+
+
 @final
 @dataclass(frozen=True, slots=True)
 class GreenplumDriverEvidence:
@@ -193,6 +205,7 @@ class GreenplumServerProfile:
     backend_process_id: int
     transaction_isolation: str
     transaction_read_only: bool
+    snapshot_locator: str
 
 
 @final
@@ -247,6 +260,62 @@ class GreengageCanonicalRelationEvidence:
     query: GreenplumCanonicalFingerprintQuery
     plan: GreenplumCanonicalFingerprintPlan
     fingerprint: GreenplumCanonicalFingerprint
+
+
+@final
+@dataclass(frozen=True, slots=True)
+class GreenplumRelationLockEvidence:
+    relation_oid: int
+    schema_name: str
+    relation_name: str
+    lock_mode: str
+
+
+@final
+@dataclass(frozen=True, slots=True)
+class GreenplumCanonicalReadContextEvidence:
+    context_id: UUID
+    runtime_profile: GreenplumRuntimeProfile
+    strategy: str
+    snapshot_locator: str
+    started_at: datetime
+    backend_process_id: int
+    allowed_concurrency: int
+    relation_locks: tuple[GreenplumRelationLockEvidence, ...]
+    acquired_before_snapshot: bool
+    limitations: tuple[str, ...]
+
+
+@final
+@dataclass(frozen=True, slots=True)
+class _OriginalGreenplumPreparedCanonicalRelation:
+    relation: OriginalGreenplumRelationCatalog
+    types: GreenplumTypeProbe
+    query: GreenplumCanonicalFingerprintQuery
+    plan: GreenplumCanonicalFingerprintPlan
+
+
+@final
+@dataclass(frozen=True, slots=True)
+class _GreengagePreparedCanonicalRelation:
+    relation: GreengageRelationCatalog
+    types: GreenplumTypeProbe
+    query: GreenplumCanonicalFingerprintQuery
+    plan: GreenplumCanonicalFingerprintPlan
+
+
+@final
+@dataclass(frozen=True, slots=True)
+class _OriginalGreenplumCanonicalCandidate:
+    relation: OriginalGreenplumRelationCatalog
+    types: GreenplumTypeProbe
+
+
+@final
+@dataclass(frozen=True, slots=True)
+class _GreengageCanonicalCandidate:
+    relation: GreengageRelationCatalog
+    types: GreenplumTypeProbe
 
 
 @final
@@ -309,6 +378,24 @@ class _OriginalGreenplumSession:
                 f"sqlstate={error.pgcode!r}, detail={str(error).strip()!r}"
             ) from None
 
+    def begin_canonical_snapshot(
+        self,
+        statement_timeout_milliseconds: int,
+        lock_statement: str,
+    ) -> None:
+        try:
+            with self._connection.cursor() as cursor:
+                cursor.execute("BEGIN ISOLATION LEVEL SERIALIZABLE READ ONLY")
+                for statement in _canonical_setup_statements(statement_timeout_milliseconds):
+                    cursor.execute(cast(LiteralString, statement))
+                cursor.execute(cast(LiteralString, lock_statement))
+        except psycopg2.Error as error:
+            raise GreenplumConnectionError(
+                "original Greenplum canonical snapshot setup failed: "
+                "strategy='read_only_serializable', "
+                f"sqlstate={error.pgcode!r}, detail={str(error).strip()!r}"
+            ) from None
+
     def fetch_rows(
         self,
         statement: str,
@@ -338,6 +425,12 @@ class _OriginalGreenplumSession:
 
     def __enter__(self) -> Self:
         return self
+
+    def close(self) -> None:
+        self.__exit__(None, None, None)
+
+    def close_after_failure(self, error: BaseException) -> None:
+        self.__exit__(type(error), error, error.__traceback__)
 
     def __exit__(
         self,
@@ -385,6 +478,25 @@ class _GreengageSession:
                 f"sqlstate={error.sqlstate!r}, detail={str(error).strip()!r}"
             ) from None
 
+    def begin_canonical_snapshot(
+        self,
+        statement_timeout_milliseconds: int,
+        lock_statement: str,
+    ) -> None:
+        try:
+            with self._connection.cursor() as cursor:
+                cursor.execute("BEGIN ISOLATION LEVEL REPEATABLE READ READ ONLY")
+                for statement in _canonical_setup_statements(statement_timeout_milliseconds):
+                    cursor.execute(cast(LiteralString, statement))
+                cursor.execute("SET LOCAL row_security TO off")
+                cursor.execute(cast(LiteralString, lock_statement))
+        except psycopg.Error as error:
+            raise GreenplumConnectionError(
+                "Greengage canonical snapshot setup failed: "
+                "strategy='read_only_repeatable_read', "
+                f"sqlstate={error.sqlstate!r}, detail={str(error).strip()!r}"
+            ) from None
+
     def fetch_rows(
         self,
         statement: str,
@@ -414,6 +526,12 @@ class _GreengageSession:
 
     def __enter__(self) -> Self:
         return self
+
+    def close(self) -> None:
+        self.__exit__(None, None, None)
+
+    def close_after_failure(self, error: BaseException) -> None:
+        self.__exit__(type(error), error, error.__traceback__)
 
     def __exit__(
         self,
@@ -582,48 +700,24 @@ def probe_original_greenplum_canonical_fingerprints(
     retry_policy: PostgresRetryPolicy,
     requests: tuple[GreenplumCanonicalProbeRequest, ...],
 ) -> OriginalGreenplumCanonicalProbeEvidence:
-    _validate_canonical_requests(requests)
-    started_at = datetime.now(UTC)
-    session = _connect_original_greenplum(settings, retry_policy)
-    with session:
-        try:
-            session.begin_read_only(settings.statement_timeout_milliseconds)
-            driver = _original_greenplum_driver_evidence()
-            server = _probe_original_greenplum_profile(session, settings)
-            topology = _probe_topology(session)
-            reader = _probe_reader_identity(session, settings)
-            hash_capability_rows = session.fetch_rows(
-                ORIGINAL_GREENPLUM_HASH_CAPABILITY_QUERY,
-                (),
-                2,
-                "original_greenplum_canonical_hash_capability",
-            )
-            hash_capability = parse_original_greenplum_hash_capability(hash_capability_rows)
-            relation_evidence = tuple(
-                _probe_original_greenplum_canonical_relation(
-                    session,
-                    request,
-                    server,
-                    topology,
-                    hash_capability.function_oid,
-                )
-                for request in requests
-            )
-        except (GreenplumCatalogMetadataError, PostgresLoweringError) as error:
-            raise GreenplumMetadataError(str(error)) from None
-        except GreenplumCatalogDataError as error:
-            raise GreenplumDataValidationError(str(error)) from None
-    return OriginalGreenplumCanonicalProbeEvidence(
-        probe_id=uuid4(),
-        started_at=started_at,
-        driver=driver,
-        server=server,
-        reader=reader,
-        topology=topology,
-        hash_capability=hash_capability,
-        relations=relation_evidence,
-        required_extensions=(),
+    context = open_original_greenplum_canonical_read_context(
+        settings,
+        retry_policy,
+        requests,
     )
+    with context:
+        relations = context.read_canonical_fingerprints()
+        return OriginalGreenplumCanonicalProbeEvidence(
+            probe_id=context.evidence.context_id,
+            started_at=context.evidence.started_at,
+            driver=context.driver,
+            server=context.server,
+            reader=context.reader,
+            topology=context.topology,
+            hash_capability=context.hash_capability,
+            relations=relations,
+            required_extensions=(),
+        )
 
 
 def probe_greengage_canonical_fingerprints(
@@ -631,65 +725,557 @@ def probe_greengage_canonical_fingerprints(
     retry_policy: PostgresRetryPolicy,
     requests: tuple[GreenplumCanonicalProbeRequest, ...],
 ) -> GreengageCanonicalProbeEvidence:
+    context = open_greengage_canonical_read_context(
+        settings,
+        retry_policy,
+        requests,
+    )
+    with context:
+        relations = context.read_canonical_fingerprints()
+        return GreengageCanonicalProbeEvidence(
+            probe_id=context.evidence.context_id,
+            started_at=context.evidence.started_at,
+            driver=context.driver,
+            server=context.server,
+            reader=context.reader,
+            topology=context.topology,
+            hash_capability=context.hash_capability,
+            relations=relations,
+            required_extensions=(),
+        )
+
+
+class OriginalGreenplumCanonicalReadContext:
+    """One sealed original Greenplum read-only Serializable snapshot."""
+
+    def __init__(
+        self,
+        session: _OriginalGreenplumSession,
+        driver: GreenplumDriverEvidence,
+        server: GreenplumServerProfile,
+        reader: GreenplumReaderIdentity,
+        topology: GreenplumTopology,
+        hash_capability: OriginalGreenplumHashCapability,
+        prepared_relations: tuple[_OriginalGreenplumPreparedCanonicalRelation, ...],
+        evidence: GreenplumCanonicalReadContextEvidence,
+    ) -> None:
+        self._session = session
+        self._driver = driver
+        self._server = server
+        self._reader = reader
+        self._topology = topology
+        self._hash_capability = hash_capability
+        self._prepared_relations = prepared_relations
+        self._evidence = evidence
+        self._state = ReadContextState.ACTIVE
+        self._query_lock = Lock()
+
+    @property
+    def driver(self) -> GreenplumDriverEvidence:
+        return self._driver
+
+    @property
+    def server(self) -> GreenplumServerProfile:
+        return self._server
+
+    @property
+    def reader(self) -> GreenplumReaderIdentity:
+        return self._reader
+
+    @property
+    def topology(self) -> GreenplumTopology:
+        return self._topology
+
+    @property
+    def hash_capability(self) -> OriginalGreenplumHashCapability:
+        return self._hash_capability
+
+    @property
+    def evidence(self) -> GreenplumCanonicalReadContextEvidence:
+        return self._evidence
+
+    @property
+    def state(self) -> ReadContextState:
+        return self._state
+
+    def read_canonical_fingerprints(
+        self,
+    ) -> tuple[OriginalGreenplumCanonicalRelationEvidence, ...]:
+        with self._query_lock:
+            self._require_active()
+            try:
+                return tuple(
+                    _read_original_greenplum_canonical_relation(self._session, prepared)
+                    for prepared in self._prepared_relations
+                )
+            except GreenplumCatalogMetadataError as error:
+                mapped = GreenplumMetadataError(str(error))
+                self._lose(mapped)
+                raise mapped from None
+            except GreenplumCatalogDataError as error:
+                mapped = GreenplumDataValidationError(str(error))
+                self._lose(mapped)
+                raise mapped from None
+            except GreenplumConnectorError as error:
+                self._lose(error)
+                raise
+
+    def close(self) -> None:
+        self._close(None)
+
+    def __enter__(self) -> Self:
+        self._require_active()
+        return self
+
+    def __exit__(
+        self,
+        exception_type: type[BaseException] | None,
+        exception: BaseException | None,
+        traceback: TracebackType | None,
+    ) -> None:
+        self._close(exception)
+
+    def _close(self, primary_error: BaseException | None) -> None:
+        with self._query_lock:
+            if self._state is ReadContextState.CLOSED:
+                return
+            previous_state = self._state
+            self._state = ReadContextState.CLOSED
+            if previous_state is not ReadContextState.ACTIVE:
+                return
+            if primary_error is None:
+                self._session.close()
+            else:
+                self._session.close_after_failure(primary_error)
+
+    def _lose(self, error: BaseException) -> None:
+        self._state = ReadContextState.LOST
+        self._session.close_after_failure(error)
+
+    def _require_active(self) -> None:
+        if self._state is ReadContextState.CLOSED:
+            raise GreenplumContextClosedError(
+                "original Greenplum canonical read context is already closed"
+            )
+        if self._state is ReadContextState.LOST:
+            raise GreenplumContextLostError(
+                "original Greenplum canonical transaction snapshot was lost and cannot be reused"
+            )
+
+
+class GreengageCanonicalReadContext:
+    """One sealed Greengage read-only Repeatable Read snapshot."""
+
+    def __init__(
+        self,
+        session: _GreengageSession,
+        driver: GreenplumDriverEvidence,
+        server: GreenplumServerProfile,
+        reader: GreenplumReaderIdentity,
+        topology: GreenplumTopology,
+        hash_capability: GreengageHashCapability,
+        prepared_relations: tuple[_GreengagePreparedCanonicalRelation, ...],
+        evidence: GreenplumCanonicalReadContextEvidence,
+    ) -> None:
+        self._session = session
+        self._driver = driver
+        self._server = server
+        self._reader = reader
+        self._topology = topology
+        self._hash_capability = hash_capability
+        self._prepared_relations = prepared_relations
+        self._evidence = evidence
+        self._state = ReadContextState.ACTIVE
+        self._query_lock = Lock()
+
+    @property
+    def driver(self) -> GreenplumDriverEvidence:
+        return self._driver
+
+    @property
+    def server(self) -> GreenplumServerProfile:
+        return self._server
+
+    @property
+    def reader(self) -> GreenplumReaderIdentity:
+        return self._reader
+
+    @property
+    def topology(self) -> GreenplumTopology:
+        return self._topology
+
+    @property
+    def hash_capability(self) -> GreengageHashCapability:
+        return self._hash_capability
+
+    @property
+    def evidence(self) -> GreenplumCanonicalReadContextEvidence:
+        return self._evidence
+
+    @property
+    def state(self) -> ReadContextState:
+        return self._state
+
+    def read_canonical_fingerprints(
+        self,
+    ) -> tuple[GreengageCanonicalRelationEvidence, ...]:
+        with self._query_lock:
+            self._require_active()
+            try:
+                return tuple(
+                    _read_greengage_canonical_relation(self._session, prepared)
+                    for prepared in self._prepared_relations
+                )
+            except GreenplumCatalogMetadataError as error:
+                mapped = GreenplumMetadataError(str(error))
+                self._lose(mapped)
+                raise mapped from None
+            except GreenplumCatalogDataError as error:
+                mapped = GreenplumDataValidationError(str(error))
+                self._lose(mapped)
+                raise mapped from None
+            except GreenplumConnectorError as error:
+                self._lose(error)
+                raise
+
+    def close(self) -> None:
+        self._close(None)
+
+    def __enter__(self) -> Self:
+        self._require_active()
+        return self
+
+    def __exit__(
+        self,
+        exception_type: type[BaseException] | None,
+        exception: BaseException | None,
+        traceback: TracebackType | None,
+    ) -> None:
+        self._close(exception)
+
+    def _close(self, primary_error: BaseException | None) -> None:
+        with self._query_lock:
+            if self._state is ReadContextState.CLOSED:
+                return
+            previous_state = self._state
+            self._state = ReadContextState.CLOSED
+            if previous_state is not ReadContextState.ACTIVE:
+                return
+            if primary_error is None:
+                self._session.close()
+            else:
+                self._session.close_after_failure(primary_error)
+
+    def _lose(self, error: BaseException) -> None:
+        self._state = ReadContextState.LOST
+        self._session.close_after_failure(error)
+
+    def _require_active(self) -> None:
+        if self._state is ReadContextState.CLOSED:
+            raise GreenplumContextClosedError("Greengage canonical read context is already closed")
+        if self._state is ReadContextState.LOST:
+            raise GreenplumContextLostError(
+                "Greengage canonical transaction snapshot was lost and cannot be reused"
+            )
+
+
+def open_original_greenplum_canonical_read_context(
+    settings: PostgresConnectionSettings,
+    retry_policy: PostgresRetryPolicy,
+    requests: tuple[GreenplumCanonicalProbeRequest, ...],
+) -> OriginalGreenplumCanonicalReadContext:
     _validate_canonical_requests(requests)
+    candidates = _discover_original_greenplum_canonical_candidates(
+        settings,
+        retry_policy,
+        requests,
+    )
     started_at = datetime.now(UTC)
+    session = _connect_original_greenplum(settings, retry_policy)
+    try:
+        session.begin_canonical_snapshot(
+            settings.statement_timeout_milliseconds,
+            _canonical_lock_statement(requests),
+        )
+        driver = _original_greenplum_driver_evidence()
+        server = _probe_original_greenplum_profile(session, settings)
+        _validate_canonical_snapshot_profile(
+            server,
+            "serializable",
+            "read_only_serializable",
+        )
+        topology = _probe_topology(session)
+        reader = _probe_reader_identity(session, settings)
+        hash_capability_rows = session.fetch_rows(
+            ORIGINAL_GREENPLUM_HASH_CAPABILITY_QUERY,
+            (),
+            2,
+            "original_greenplum_canonical_hash_capability",
+        )
+        hash_capability = parse_original_greenplum_hash_capability(hash_capability_rows)
+        bound_relations = tuple(
+            _bind_original_greenplum_canonical_relation(
+                session,
+                request,
+                candidate,
+                server,
+            )
+            for request, candidate in zip(requests, candidates, strict=True)
+        )
+        relation_locks = _probe_relation_locks(
+            session,
+            tuple(bound.relation for bound in bound_relations),
+            "original_greenplum_canonical_relation_locks",
+        )
+        prepared_relations = tuple(
+            _prepare_original_greenplum_canonical_relation(
+                session,
+                request,
+                bound,
+                server,
+                topology,
+                hash_capability.function_oid,
+            )
+            for request, bound in zip(requests, bound_relations, strict=True)
+        )
+        _require_relation_locks_unchanged(
+            relation_locks,
+            _probe_relation_locks(
+                session,
+                tuple(bound.relation for bound in bound_relations),
+                "original_greenplum_canonical_retained_relation_locks",
+            ),
+            server.runtime_profile,
+        )
+        evidence = GreenplumCanonicalReadContextEvidence(
+            context_id=uuid4(),
+            runtime_profile=server.runtime_profile,
+            strategy="read_only_serializable",
+            snapshot_locator=server.snapshot_locator,
+            started_at=started_at,
+            backend_process_id=server.backend_process_id,
+            allowed_concurrency=1,
+            relation_locks=relation_locks,
+            acquired_before_snapshot=True,
+            limitations=(
+                "Original Greenplum rejects Repeatable Read; this profile uses its native "
+                "read-only Serializable transaction mode.",
+                "The legacy Serializable label is not evidence of modern PostgreSQL SSI semantics.",
+                "Append-optimized DELETE is unavailable at Serializable isolation; fixture "
+                "mutation and cleanup use a separate Read Committed writer.",
+            ),
+        )
+    except (GreenplumCatalogMetadataError, PostgresLoweringError) as error:
+        mapped = GreenplumMetadataError(str(error))
+        session.close_after_failure(mapped)
+        raise mapped from None
+    except GreenplumCatalogDataError as error:
+        mapped = GreenplumDataValidationError(str(error))
+        session.close_after_failure(mapped)
+        raise mapped from None
+    except BaseException as error:
+        session.close_after_failure(error)
+        raise
+    return OriginalGreenplumCanonicalReadContext(
+        session,
+        driver,
+        server,
+        reader,
+        topology,
+        hash_capability,
+        prepared_relations,
+        evidence,
+    )
+
+
+def open_greengage_canonical_read_context(
+    settings: PostgresConnectionSettings,
+    retry_policy: PostgresRetryPolicy,
+    requests: tuple[GreenplumCanonicalProbeRequest, ...],
+) -> GreengageCanonicalReadContext:
+    _validate_canonical_requests(requests)
+    candidates = _discover_greengage_canonical_candidates(
+        settings,
+        retry_policy,
+        requests,
+    )
+    started_at = datetime.now(UTC)
+    session = _connect_greengage(settings, retry_policy)
+    try:
+        session.begin_canonical_snapshot(
+            settings.statement_timeout_milliseconds,
+            _canonical_lock_statement(requests),
+        )
+        driver = _greengage_driver_evidence()
+        server = _probe_greengage_profile(session, settings)
+        _validate_canonical_snapshot_profile(
+            server,
+            "repeatable read",
+            "read_only_repeatable_read",
+        )
+        topology = _probe_topology(session)
+        reader = _probe_reader_identity(session, settings)
+        hash_capability_rows = session.fetch_rows(
+            GREENGAGE_HASH_CAPABILITY_QUERY,
+            (),
+            2,
+            "greengage_canonical_hash_capability",
+        )
+        hash_capability = parse_greengage_hash_capability(hash_capability_rows)
+        bound_relations = tuple(
+            _bind_greengage_canonical_relation(
+                session,
+                request,
+                candidate,
+                server,
+            )
+            for request, candidate in zip(requests, candidates, strict=True)
+        )
+        relation_locks = _probe_relation_locks(
+            session,
+            tuple(bound.relation for bound in bound_relations),
+            "greengage_canonical_relation_locks",
+        )
+        prepared_relations = tuple(
+            _prepare_greengage_canonical_relation(
+                session,
+                request,
+                bound,
+                server,
+                topology,
+            )
+            for request, bound in zip(requests, bound_relations, strict=True)
+        )
+        _require_relation_locks_unchanged(
+            relation_locks,
+            _probe_relation_locks(
+                session,
+                tuple(bound.relation for bound in bound_relations),
+                "greengage_canonical_retained_relation_locks",
+            ),
+            server.runtime_profile,
+        )
+        evidence = GreenplumCanonicalReadContextEvidence(
+            context_id=uuid4(),
+            runtime_profile=server.runtime_profile,
+            strategy="read_only_repeatable_read",
+            snapshot_locator=server.snapshot_locator,
+            started_at=started_at,
+            backend_process_id=server.backend_process_id,
+            allowed_concurrency=1,
+            relation_locks=relation_locks,
+            acquired_before_snapshot=True,
+            limitations=(
+                "Append-optimized DELETE is unavailable at Repeatable Read isolation; fixture "
+                "mutation and cleanup use a separate Read Committed writer.",
+            ),
+        )
+    except (GreenplumCatalogMetadataError, PostgresLoweringError) as error:
+        mapped = GreenplumMetadataError(str(error))
+        session.close_after_failure(mapped)
+        raise mapped from None
+    except GreenplumCatalogDataError as error:
+        mapped = GreenplumDataValidationError(str(error))
+        session.close_after_failure(mapped)
+        raise mapped from None
+    except BaseException as error:
+        session.close_after_failure(error)
+        raise
+    return GreengageCanonicalReadContext(
+        session,
+        driver,
+        server,
+        reader,
+        topology,
+        hash_capability,
+        prepared_relations,
+        evidence,
+    )
+
+
+def _discover_original_greenplum_canonical_candidates(
+    settings: PostgresConnectionSettings,
+    retry_policy: PostgresRetryPolicy,
+    requests: tuple[GreenplumCanonicalProbeRequest, ...],
+) -> tuple[_OriginalGreenplumCanonicalCandidate, ...]:
+    session = _connect_original_greenplum(settings, retry_policy)
+    with session:
+        try:
+            session.begin_read_only(settings.statement_timeout_milliseconds)
+            server = _probe_original_greenplum_profile(session, settings)
+            candidates: list[_OriginalGreenplumCanonicalCandidate] = []
+            for request in requests:
+                _validate_request_identifier_lengths(
+                    request,
+                    server.max_identifier_utf8_bytes,
+                )
+                relation = _probe_original_greenplum_relation(session, request)
+                candidates.append(
+                    _OriginalGreenplumCanonicalCandidate(
+                        relation=relation,
+                        types=_probe_types(session, relation.relation_oid, request),
+                    )
+                )
+        except GreenplumCatalogMetadataError as error:
+            raise GreenplumMetadataError(str(error)) from None
+        except GreenplumCatalogDataError as error:
+            raise GreenplumDataValidationError(str(error)) from None
+    return tuple(candidates)
+
+
+def _discover_greengage_canonical_candidates(
+    settings: PostgresConnectionSettings,
+    retry_policy: PostgresRetryPolicy,
+    requests: tuple[GreenplumCanonicalProbeRequest, ...],
+) -> tuple[_GreengageCanonicalCandidate, ...]:
     session = _connect_greengage(settings, retry_policy)
     with session:
         try:
             session.begin_read_only(settings.statement_timeout_milliseconds)
-            driver = _greengage_driver_evidence()
             server = _probe_greengage_profile(session, settings)
-            topology = _probe_topology(session)
-            reader = _probe_reader_identity(session, settings)
-            hash_capability_rows = session.fetch_rows(
-                GREENGAGE_HASH_CAPABILITY_QUERY,
-                (),
-                2,
-                "greengage_canonical_hash_capability",
-            )
-            hash_capability = parse_greengage_hash_capability(hash_capability_rows)
-            relation_evidence = tuple(
-                _probe_greengage_canonical_relation(
-                    session,
+            candidates: list[_GreengageCanonicalCandidate] = []
+            for request in requests:
+                _validate_request_identifier_lengths(
                     request,
-                    server,
-                    topology,
+                    server.max_identifier_utf8_bytes,
                 )
-                for request in requests
-            )
-        except (GreenplumCatalogMetadataError, PostgresLoweringError) as error:
+                relation = _probe_greengage_relation(session, request)
+                candidates.append(
+                    _GreengageCanonicalCandidate(
+                        relation=relation,
+                        types=_probe_types(session, relation.relation_oid, request),
+                    )
+                )
+        except GreenplumCatalogMetadataError as error:
             raise GreenplumMetadataError(str(error)) from None
         except GreenplumCatalogDataError as error:
             raise GreenplumDataValidationError(str(error)) from None
-    return GreengageCanonicalProbeEvidence(
-        probe_id=uuid4(),
-        started_at=started_at,
-        driver=driver,
-        server=server,
-        reader=reader,
-        topology=topology,
-        hash_capability=hash_capability,
-        relations=relation_evidence,
-        required_extensions=(),
-    )
+    return tuple(candidates)
 
 
-def _probe_original_greenplum_canonical_relation(
+def _bind_original_greenplum_canonical_relation(
     session: _GreenplumProbeSession,
     request: GreenplumCanonicalProbeRequest,
+    candidate: _OriginalGreenplumCanonicalCandidate,
+    server: GreenplumServerProfile,
+) -> _OriginalGreenplumCanonicalCandidate:
+    _validate_request_identifier_lengths(request, server.max_identifier_utf8_bytes)
+    relation = _probe_original_greenplum_relation(session, request)
+    type_probe = _probe_types(session, relation.relation_oid, request)
+    _require_original_greenplum_candidate(candidate, relation, type_probe, request)
+    return _OriginalGreenplumCanonicalCandidate(relation=relation, types=type_probe)
+
+
+def _prepare_original_greenplum_canonical_relation(
+    session: _GreenplumProbeSession,
+    request: GreenplumCanonicalProbeRequest,
+    bound: _OriginalGreenplumCanonicalCandidate,
     server: GreenplumServerProfile,
     topology: GreenplumTopology,
     hash_function_oid: int,
-) -> OriginalGreenplumCanonicalRelationEvidence:
-    _validate_request_identifier_lengths(request, server.max_identifier_utf8_bytes)
-    relation_rows = session.fetch_rows(
-        ORIGINAL_GREENPLUM_RELATION_QUERY,
-        (request.schema_name, request.relation_name),
-        2,
-        "original_greenplum_canonical_relation_catalog",
-    )
-    relation = parse_original_greenplum_relation_catalog(relation_rows, request)
-    type_probe = _probe_types(session, relation.relation_oid, request)
+) -> _OriginalGreenplumPreparedCanonicalRelation:
+    relation = bound.relation
+    type_probe = bound.types
     query = build_original_greenplum_fingerprint_query(
         request,
         relation.relation_row_type_oid,
@@ -708,45 +1294,38 @@ def _probe_original_greenplum_canonical_relation(
         request,
         len(topology.primary_content_ids),
         hash_function_oid,
+        relation.storage_kind,
     )
-    fingerprint_rows = session.fetch_rows(
-        query.statement,
-        query.parameters,
-        2,
-        "original_greenplum_canonical_fingerprint",
-    )
-    fingerprint = parse_greenplum_canonical_fingerprint(fingerprint_rows, query)
-    return OriginalGreenplumCanonicalRelationEvidence(
+    return _OriginalGreenplumPreparedCanonicalRelation(
         relation=relation,
         types=type_probe,
         query=query,
         plan=plan,
-        fingerprint=fingerprint,
     )
 
 
-def _probe_greengage_canonical_relation(
+def _bind_greengage_canonical_relation(
     session: _GreenplumProbeSession,
     request: GreenplumCanonicalProbeRequest,
+    candidate: _GreengageCanonicalCandidate,
+    server: GreenplumServerProfile,
+) -> _GreengageCanonicalCandidate:
+    _validate_request_identifier_lengths(request, server.max_identifier_utf8_bytes)
+    relation = _probe_greengage_relation(session, request)
+    type_probe = _probe_types(session, relation.relation_oid, request)
+    _require_greengage_candidate(candidate, relation, type_probe, request)
+    return _GreengageCanonicalCandidate(relation=relation, types=type_probe)
+
+
+def _prepare_greengage_canonical_relation(
+    session: _GreenplumProbeSession,
+    request: GreenplumCanonicalProbeRequest,
+    bound: _GreengageCanonicalCandidate,
     server: GreenplumServerProfile,
     topology: GreenplumTopology,
-) -> GreengageCanonicalRelationEvidence:
-    _validate_request_identifier_lengths(request, server.max_identifier_utf8_bytes)
-    relation_rows = session.fetch_rows(
-        GREENGAGE_RELATION_QUERY,
-        (request.schema_name, request.relation_name),
-        2,
-        "greengage_canonical_relation_catalog",
-    )
-    relation = parse_greengage_relation_catalog(relation_rows, request)
-    if relation.row_security_enabled or relation.row_security_forced:
-        raise GreenplumCatalogMetadataError(
-            "Greengage canonical relation enables row-level security, which is unsupported: "
-            f"relation={relation.schema_name!r}.{relation.relation_name!r}, "
-            f"row_security_enabled={relation.row_security_enabled}, "
-            f"row_security_forced={relation.row_security_forced}"
-        )
-    type_probe = _probe_types(session, relation.relation_oid, request)
+) -> _GreengagePreparedCanonicalRelation:
+    relation = bound.relation
+    type_probe = bound.types
     query = build_greengage_fingerprint_query(
         request,
         relation.relation_row_type_oid,
@@ -764,20 +1343,51 @@ def _probe_greengage_canonical_relation(
         plan_rows,
         request,
         len(topology.primary_content_ids),
+        relation.storage_kind,
     )
-    fingerprint_rows = session.fetch_rows(
-        query.statement,
-        query.parameters,
-        2,
-        "greengage_canonical_fingerprint",
-    )
-    fingerprint = parse_greenplum_canonical_fingerprint(fingerprint_rows, query)
-    return GreengageCanonicalRelationEvidence(
+    return _GreengagePreparedCanonicalRelation(
         relation=relation,
         types=type_probe,
         query=query,
         plan=plan,
-        fingerprint=fingerprint,
+    )
+
+
+def _read_original_greenplum_canonical_relation(
+    session: _GreenplumProbeSession,
+    prepared: _OriginalGreenplumPreparedCanonicalRelation,
+) -> OriginalGreenplumCanonicalRelationEvidence:
+    rows = session.fetch_rows(
+        prepared.query.statement,
+        prepared.query.parameters,
+        2,
+        "original_greenplum_canonical_fingerprint",
+    )
+    return OriginalGreenplumCanonicalRelationEvidence(
+        relation=prepared.relation,
+        types=prepared.types,
+        query=prepared.query,
+        plan=prepared.plan,
+        fingerprint=parse_greenplum_canonical_fingerprint(rows, prepared.query),
+    )
+
+
+def _read_greengage_canonical_relation(
+    session: _GreenplumProbeSession,
+    prepared: _GreengagePreparedCanonicalRelation,
+) -> GreengageCanonicalRelationEvidence:
+    rows = session.fetch_rows(
+        prepared.query.statement,
+        prepared.query.parameters,
+        2,
+        "greengage_canonical_fingerprint",
+    )
+    return GreengageCanonicalRelationEvidence(
+        relation=prepared.relation,
+        types=prepared.types,
+        query=prepared.query,
+        plan=prepared.plan,
+        fingerprint=parse_greenplum_canonical_fingerprint(rows, prepared.query),
     )
 
 
@@ -792,9 +1402,9 @@ def _probe_original_greenplum_profile(
         "original_greenplum_server_profile",
     )
     row = _require_single_row(rows, "original Greenplum server profile")
-    if len(row) != 14:
+    if len(row) != 15:
         raise GreenplumDataValidationError(
-            f"original Greenplum profile must return exactly fourteen fields: actual={len(row)}"
+            f"original Greenplum profile must return exactly fifteen fields: actual={len(row)}"
         )
     full_version = _require_text(row[0], "original Greenplum full version")
     product_version = _extract_product_version(full_version, "Greenplum Database")
@@ -820,9 +1430,9 @@ def _probe_greengage_profile(
         "greengage_server_profile",
     )
     row = _require_single_row(rows, "Greengage server profile")
-    if len(row) != 15:
+    if len(row) != 16:
         raise GreenplumDataValidationError(
-            f"Greengage profile must return exactly fifteen fields: actual={len(row)}"
+            f"Greengage profile must return exactly sixteen fields: actual={len(row)}"
         )
     full_version = _require_text(row[0], "Greengage full version")
     product_version = _require_text(row[1], "Greengage product version")
@@ -907,6 +1517,10 @@ def _build_server_profile(
             row[compatibility_index + 12],
             "Greenplum transaction read-only flag",
         ),
+        snapshot_locator=_require_snapshot_locator(
+            row[compatibility_index + 13],
+            "Greenplum transaction snapshot locator",
+        ),
     )
 
 
@@ -936,6 +1550,25 @@ def _validate_server_profile(
             "Greenplum-family capability profile is unsupported: "
             f"runtime_profile={profile.runtime_profile.value!r}, "
             f"full_version={profile.full_version!r}; " + "; ".join(failures)
+        )
+
+
+def _validate_canonical_snapshot_profile(
+    profile: GreenplumServerProfile,
+    required_isolation: str,
+    strategy: str,
+) -> None:
+    if profile.transaction_isolation != required_isolation:
+        raise UnsupportedGreenplumProfileError(
+            "Greenplum-family canonical snapshot isolation differs from its declared "
+            "strategy: "
+            f"runtime_profile={profile.runtime_profile.value!r}, strategy={strategy!r}, "
+            f"actual={profile.transaction_isolation!r}, required={required_isolation!r}"
+        )
+    if not profile.transaction_read_only:
+        raise UnsupportedGreenplumProfileError(
+            "Greenplum-family canonical snapshot must be read-only: "
+            f"runtime_profile={profile.runtime_profile.value!r}, strategy={strategy!r}"
         )
 
 
@@ -1030,6 +1663,190 @@ def _validate_canonical_requests(
         identities.append((request.schema_name, request.relation_name))
     if len(set(identities)) != len(identities):
         raise ValueError("Greenplum canonical relation requests must be unique")
+
+
+def _canonical_setup_statements(
+    statement_timeout_milliseconds: int,
+) -> tuple[str, ...]:
+    if type(statement_timeout_milliseconds) is not int or statement_timeout_milliseconds < 1:
+        raise ValueError("Greenplum statement timeout must be a positive integer")
+    return (
+        "SET LOCAL search_path TO pg_catalog",
+        "SET LOCAL TimeZone TO 'UTC'",
+        "SET LOCAL DateStyle TO 'ISO, YMD'",
+        f"SET LOCAL statement_timeout TO '{statement_timeout_milliseconds}ms'",
+    )
+
+
+def _canonical_lock_statement(
+    requests: tuple[GreenplumCanonicalProbeRequest, ...],
+) -> str:
+    ordered_relations = tuple(
+        sorted(
+            (
+                (_quote_identifier(request.schema_name), _quote_identifier(request.relation_name))
+                for request in requests
+            ),
+        )
+    )
+    relation_list = ", ".join(
+        f"{schema_name}.{relation_name}" for schema_name, relation_name in ordered_relations
+    )
+    return f"LOCK TABLE {relation_list} IN ACCESS SHARE MODE"
+
+
+def _quote_identifier(identifier: str) -> str:
+    if type(identifier) is not str or not identifier or "\x00" in identifier:
+        raise ValueError("Greenplum SQL identifier must be non-empty text without U+0000")
+    return '"' + identifier.replace('"', '""') + '"'
+
+
+def _probe_original_greenplum_relation(
+    session: _GreenplumProbeSession,
+    request: GreenplumCanonicalProbeRequest,
+) -> OriginalGreenplumRelationCatalog:
+    rows = session.fetch_rows(
+        ORIGINAL_GREENPLUM_RELATION_QUERY,
+        (request.schema_name, request.relation_name),
+        2,
+        "original_greenplum_canonical_relation_catalog",
+    )
+    return parse_original_greenplum_relation_catalog(rows, request)
+
+
+def _probe_greengage_relation(
+    session: _GreenplumProbeSession,
+    request: GreenplumCanonicalProbeRequest,
+) -> GreengageRelationCatalog:
+    rows = session.fetch_rows(
+        GREENGAGE_RELATION_QUERY,
+        (request.schema_name, request.relation_name),
+        2,
+        "greengage_canonical_relation_catalog",
+    )
+    relation = parse_greengage_relation_catalog(rows, request)
+    if relation.row_security_enabled or relation.row_security_forced:
+        raise GreenplumCatalogMetadataError(
+            "Greengage canonical relation enables row-level security, which is unsupported: "
+            f"relation={relation.schema_name!r}.{relation.relation_name!r}, "
+            f"row_security_enabled={relation.row_security_enabled}, "
+            f"row_security_forced={relation.row_security_forced}"
+        )
+    return relation
+
+
+def _require_original_greenplum_candidate(
+    candidate: _OriginalGreenplumCanonicalCandidate,
+    relation: OriginalGreenplumRelationCatalog,
+    type_probe: GreenplumTypeProbe,
+    request: GreenplumCanonicalProbeRequest,
+) -> None:
+    if candidate.relation != relation or candidate.types != type_probe:
+        raise GreenplumMetadataError(
+            "original Greenplum relation identity or type metadata changed between discovery "
+            "and protected snapshot acquisition: "
+            f"relation={request.schema_name!r}.{request.relation_name!r}"
+        )
+
+
+def _require_greengage_candidate(
+    candidate: _GreengageCanonicalCandidate,
+    relation: GreengageRelationCatalog,
+    type_probe: GreenplumTypeProbe,
+    request: GreenplumCanonicalProbeRequest,
+) -> None:
+    if candidate.relation != relation or candidate.types != type_probe:
+        raise GreenplumMetadataError(
+            "Greengage relation identity or type metadata changed between discovery and "
+            "protected snapshot acquisition: "
+            f"relation={request.schema_name!r}.{request.relation_name!r}"
+        )
+
+
+def _probe_relation_locks(
+    session: _GreenplumProbeSession,
+    relations: tuple[OriginalGreenplumRelationCatalog | GreengageRelationCatalog, ...],
+    operation: str,
+) -> tuple[GreenplumRelationLockEvidence, ...]:
+    expected_by_oid = {
+        relation.relation_oid: (relation.schema_name, relation.relation_name)
+        for relation in relations
+    }
+    if len(expected_by_oid) != len(relations):
+        raise GreenplumMetadataError(
+            "Greenplum canonical relation closure contains duplicate relation OIDs"
+        )
+    placeholders = ", ".join("%s::oid" for _ in relations)
+    statement = (
+        "SELECT relation::bigint, mode::text, granted "
+        "FROM pg_catalog.pg_locks "
+        "WHERE pid = pg_catalog.pg_backend_pid() AND locktype = 'relation' "
+        "AND mode = 'AccessShareLock' AND granted "
+        f"AND relation IN ({placeholders}) ORDER BY relation"
+    )
+    rows = session.fetch_rows(
+        statement,
+        tuple(expected_by_oid),
+        len(relations),
+        operation,
+    )
+    locks: list[GreenplumRelationLockEvidence] = []
+    observed_oids: list[int] = []
+    for index, row in enumerate(rows):
+        if len(row) != 3:
+            raise GreenplumDataValidationError(
+                "Greenplum relation-lock row must return exactly three fields: "
+                f"row_index={index}, actual={len(row)}"
+            )
+        relation_oid = _require_bounded_integer(
+            row[0],
+            f"Greenplum locked relation OID at row {index}",
+            1,
+            INT64_MAX,
+        )
+        identity = expected_by_oid.get(relation_oid)
+        if identity is None:
+            raise GreenplumDataValidationError(
+                "Greenplum relation-lock query returned an unexpected relation OID: "
+                f"relation_oid={relation_oid}"
+            )
+        mode = _require_text(row[1], f"Greenplum relation lock mode at row {index}")
+        granted = _require_boolean(row[2], f"Greenplum relation lock grant at row {index}")
+        if mode != "AccessShareLock" or not granted:
+            raise GreenplumMetadataError(
+                "Greenplum canonical relation does not hold its required granted lock: "
+                f"relation_oid={relation_oid}, mode={mode!r}, granted={granted}"
+            )
+        observed_oids.append(relation_oid)
+        locks.append(
+            GreenplumRelationLockEvidence(
+                relation_oid=relation_oid,
+                schema_name=identity[0],
+                relation_name=identity[1],
+                lock_mode=mode,
+            )
+        )
+    if len(observed_oids) != len(expected_by_oid) or set(observed_oids) != set(expected_by_oid):
+        raise GreenplumMetadataError(
+            "Greenplum canonical transaction does not hold the complete relation lock "
+            "closure: "
+            f"expected_oids={tuple(sorted(expected_by_oid))!r}, "
+            f"observed_oids={tuple(sorted(observed_oids))!r}"
+        )
+    return tuple(sorted(locks, key=lambda lock: (lock.schema_name, lock.relation_name)))
+
+
+def _require_relation_locks_unchanged(
+    acquired: tuple[GreenplumRelationLockEvidence, ...],
+    retained: tuple[GreenplumRelationLockEvidence, ...],
+    runtime_profile: GreenplumRuntimeProfile,
+) -> None:
+    if acquired != retained:
+        raise GreenplumMetadataError(
+            "Greenplum canonical relation lock closure changed during plan preparation: "
+            f"runtime_profile={runtime_profile.value!r}, acquired={acquired!r}, "
+            f"retained={retained!r}"
+        )
 
 
 def _probe_original_greenplum_hash_plan(
@@ -1344,6 +2161,23 @@ def _require_text(value: object, label: str) -> str:
     if len(value.encode("utf-8")) > _MAX_PROFILE_TEXT_BYTES:
         raise GreenplumDataValidationError(f"{label} exceeds {_MAX_PROFILE_TEXT_BYTES} UTF-8 bytes")
     return value
+
+
+def _require_snapshot_locator(value: object, label: str) -> str:
+    locator = _require_text(value, label)
+    if not locator.isascii():
+        raise GreenplumDataValidationError(f"{label} must be ASCII text")
+    parts = locator.split(":")
+    if len(parts) != 3 or not parts[0].isdigit() or not parts[1].isdigit():
+        raise GreenplumDataValidationError(
+            f"{label} must use canonical xmin:xmax:xip-list syntax: value={locator!r}"
+        )
+    active_ids = () if not parts[2] else tuple(parts[2].split(","))
+    if any(not transaction_id.isdigit() for transaction_id in active_ids):
+        raise GreenplumDataValidationError(
+            f"{label} contains a non-decimal active transaction ID: value={locator!r}"
+        )
+    return locator
 
 
 def _require_boolean(value: object, label: str) -> bool:

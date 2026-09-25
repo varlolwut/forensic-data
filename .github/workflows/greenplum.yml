@@ -24,23 +24,35 @@ jobs:
       - name: Acquire exact artifacts
         shell: bash
         run: bash tests/fixtures/greenplum/prepare-artifacts.sh
-      - name: Create ephemeral reader secrets
+      - name: Create ephemeral integration secrets
         shell: bash
         run: |
           umask 077
-          original_greenplum_password_file="${RUNNER_TEMP}/dfe-original-greenplum-reader-password"
-          greengage_password_file="${RUNNER_TEMP}/dfe-greengage-reader-password"
-          original_greenplum_password="$(openssl rand -hex 32)"
-          greengage_password="$(openssl rand -hex 32)"
-          echo "::add-mask::${original_greenplum_password}"
-          echo "::add-mask::${greengage_password}"
-          printf '%s' "${original_greenplum_password}" > "${original_greenplum_password_file}"
-          printf '%s' "${greengage_password}" > "${greengage_password_file}"
+          original_greenplum_reader_file="${RUNNER_TEMP}/dfe-original-greenplum-reader-password"
+          original_greenplum_writer_file="${RUNNER_TEMP}/dfe-original-greenplum-writer-password"
+          greengage_reader_file="${RUNNER_TEMP}/dfe-greengage-reader-password"
+          greengage_writer_file="${RUNNER_TEMP}/dfe-greengage-writer-password"
+          original_greenplum_reader="$(openssl rand -hex 32)"
+          original_greenplum_writer="$(openssl rand -hex 32)"
+          greengage_reader="$(openssl rand -hex 32)"
+          greengage_writer="$(openssl rand -hex 32)"
+          echo "::add-mask::${original_greenplum_reader}"
+          echo "::add-mask::${original_greenplum_writer}"
+          echo "::add-mask::${greengage_reader}"
+          echo "::add-mask::${greengage_writer}"
+          printf '%s' "${original_greenplum_reader}" > "${original_greenplum_reader_file}"
+          printf '%s' "${original_greenplum_writer}" > "${original_greenplum_writer_file}"
+          printf '%s' "${greengage_reader}" > "${greengage_reader_file}"
+          printf '%s' "${greengage_writer}" > "${greengage_writer_file}"
           {
-            echo "DFE_ORIGINAL_GREENPLUM_READER_PASSWORD_FILE=${original_greenplum_password_file}"
-            echo "DFE_GREENGAGE_READER_PASSWORD_FILE=${greengage_password_file}"
-            echo "DFE_TEST_ORIGINAL_GREENPLUM_READER_DSN=postgresql://dfe_original_greenplum_reader:${original_greenplum_password}@127.0.0.1:${DFE_ORIGINAL_GREENPLUM_PORT}/dfe_fixture?sslmode=disable&connect_timeout=5"
-            echo "DFE_TEST_GREENGAGE_READER_DSN=postgresql://dfe_greengage_reader:${greengage_password}@127.0.0.1:${DFE_GREENGAGE_PORT}/dfe_fixture?sslmode=disable&connect_timeout=5"
+            echo "DFE_ORIGINAL_GREENPLUM_READER_PASSWORD_FILE=${original_greenplum_reader_file}"
+            echo "DFE_ORIGINAL_GREENPLUM_WRITER_PASSWORD_FILE=${original_greenplum_writer_file}"
+            echo "DFE_GREENGAGE_READER_PASSWORD_FILE=${greengage_reader_file}"
+            echo "DFE_GREENGAGE_WRITER_PASSWORD_FILE=${greengage_writer_file}"
+            echo "DFE_TEST_ORIGINAL_GREENPLUM_READER_DSN=postgresql://dfe_original_greenplum_reader:${original_greenplum_reader}@127.0.0.1:${DFE_ORIGINAL_GREENPLUM_PORT}/dfe_fixture?sslmode=disable&connect_timeout=5"
+            echo "DFE_TEST_ORIGINAL_GREENPLUM_WRITER_DSN=postgresql://dfe_original_greenplum_writer:${original_greenplum_writer}@127.0.0.1:${DFE_ORIGINAL_GREENPLUM_PORT}/dfe_fixture?sslmode=disable&connect_timeout=5"
+            echo "DFE_TEST_GREENGAGE_READER_DSN=postgresql://dfe_greengage_reader:${greengage_reader}@127.0.0.1:${DFE_GREENGAGE_PORT}/dfe_fixture?sslmode=disable&connect_timeout=5"
+            echo "DFE_TEST_GREENGAGE_WRITER_DSN=postgresql://dfe_greengage_writer:${greengage_writer}@127.0.0.1:${DFE_GREENGAGE_PORT}/dfe_fixture?sslmode=disable&connect_timeout=5"
           } >> "${GITHUB_ENV}"
       - name: Validate Compose model
         run: >-
@@ -97,7 +109,9 @@ jobs:
           docker build --target build --tag forensic-data-greenplum-test .
           docker run --rm --network host \
             --env DFE_TEST_ORIGINAL_GREENPLUM_READER_DSN \
+            --env DFE_TEST_ORIGINAL_GREENPLUM_WRITER_DSN \
             --env DFE_TEST_GREENGAGE_READER_DSN \
+            --env DFE_TEST_GREENGAGE_WRITER_DSN \
             --env RUFF_CACHE_DIR=/tmp/ruff-cache \
             --env UV_PROJECT_ENVIRONMENT=/tmp/dfe-test-venv \
             --volume "${GITHUB_WORKSPACE}:/workspace:ro" \
@@ -116,4 +130,6 @@ jobs:
           docker compose --file tests/fixtures/greenplum/compose.yaml down --volumes --remove-orphans
           rm -f -- \
             "${RUNNER_TEMP}/dfe-greengage-reader-password" \
-            "${RUNNER_TEMP}/dfe-original-greenplum-reader-password"
+            "${RUNNER_TEMP}/dfe-greengage-writer-password" \
+            "${RUNNER_TEMP}/dfe-original-greenplum-reader-password" \
+            "${RUNNER_TEMP}/dfe-original-greenplum-writer-password"

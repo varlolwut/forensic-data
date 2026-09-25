@@ -8,6 +8,7 @@ readonly MASTER_DATA_DIRECTORY=/home/gpadmin/gpdemo-data/qddir/demoDataDir-1
 readonly INITIALIZATION_MARKER=/home/gpadmin/gpdemo-data/.dfe-initialized
 readonly INTEGRATION_READY_MARKER=/home/gpadmin/gpdemo-data/.dfe-integration-ready
 readonly READER_PASSWORD_FILE=/run/secrets/dfe-original-greenplum-reader-password
+readonly WRITER_PASSWORD_FILE=/run/secrets/dfe-original-greenplum-writer-password
 export MASTER_DATA_DIRECTORY
 
 run_as_gpadmin() {
@@ -49,8 +50,12 @@ shutdown_cluster() {
 
 test "$(/workspace/gpdb/getversion)" = "4.3.99.00 build dev"
 install --directory --owner=gpadmin --group=gpadmin "${DATA_ROOT}"
-if [[ -e "${READER_PASSWORD_FILE}" ]]; then
+if [[ -e "${READER_PASSWORD_FILE}" || -e "${WRITER_PASSWORD_FILE}" ]]; then
   rm -f "${INTEGRATION_READY_MARKER}"
+  if [[ ! -f "${READER_PASSWORD_FILE}" || ! -f "${WRITER_PASSWORD_FILE}" ]]; then
+    echo "Original Greenplum integration requires both reader and writer password secrets." >&2
+    exit 1
+  fi
 fi
 install --directory --owner=gpadmin --group=gpadmin --mode=0700 /home/gpadmin/.ssh
 ssh-keygen -A
@@ -86,8 +91,10 @@ else
   chown gpadmin:gpadmin "${INITIALIZATION_MARKER}"
 fi
 
-if [[ -e "${READER_PASSWORD_FILE}" ]]; then
-  /usr/local/bin/dfe-original-greenplum-setup-integration "${READER_PASSWORD_FILE}"
+if [[ -e "${READER_PASSWORD_FILE}" && -e "${WRITER_PASSWORD_FILE}" ]]; then
+  /usr/local/bin/dfe-original-greenplum-setup-integration \
+    "${READER_PASSWORD_FILE}" \
+    "${WRITER_PASSWORD_FILE}"
   touch "${INTEGRATION_READY_MARKER}"
   chown gpadmin:gpadmin "${INTEGRATION_READY_MARKER}"
 fi

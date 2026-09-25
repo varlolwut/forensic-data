@@ -16,6 +16,7 @@ from forensic_data.greenplum_catalog import (
     GreenplumCatalogMetadataError,
     GreenplumCatalogParameter,
     GreenplumRelationRequest,
+    GreenplumStorageKind,
 )
 from forensic_data.postgres import INT64_MAX, DatabaseRow
 from forensic_data.postgres_sql import (
@@ -247,9 +248,15 @@ def parse_original_greenplum_fingerprint_plan(
     request: GreenplumCanonicalProbeRequest,
     primary_count: int,
     hash_function_oid: int,
+    storage_kind: GreenplumStorageKind,
 ) -> GreenplumCanonicalFingerprintPlan:
     _require_integer(hash_function_oid, "original Greenplum hash function OID", 1, UINT32_MAX)
-    shape = _parse_greenplum_fingerprint_plan_shape(rows, request, primary_count)
+    shape = _parse_greenplum_fingerprint_plan_shape(
+        rows,
+        request,
+        primary_count,
+        _original_greenplum_relation_scan_label(storage_kind),
+    )
     serialized_plan = "\n".join(shape.lines)
     for index in range(8):
         if f":resname limb_{index}" not in serialized_plan:
@@ -295,7 +302,7 @@ def parse_original_greenplum_fingerprint_plan(
     )
     relation_scan_index = _find_serialized_plan_node(
         shape.lines,
-        "{SEQSCAN",
+        _original_greenplum_serialized_relation_scan_node(storage_kind),
         row_subquery_index + 1,
         "canonical relation scan below the partial segment aggregate",
     )
@@ -396,8 +403,14 @@ def parse_greengage_fingerprint_plan(
     rows: tuple[DatabaseRow, ...],
     request: GreenplumCanonicalProbeRequest,
     primary_count: int,
+    storage_kind: GreenplumStorageKind,
 ) -> GreenplumCanonicalFingerprintPlan:
-    shape = _parse_greenplum_fingerprint_plan_shape(rows, request, primary_count)
+    shape = _parse_greenplum_fingerprint_plan_shape(
+        rows,
+        request,
+        primary_count,
+        _greengage_relation_scan_label(storage_kind),
+    )
     if "sha256(" not in shape.lower_aggregate_subtree:
         raise GreenplumCatalogMetadataError(
             "Greengage canonical fingerprint plan does not hash below Motion"
@@ -568,6 +581,7 @@ def _parse_greenplum_fingerprint_plan_shape(
     rows: tuple[DatabaseRow, ...],
     request: GreenplumCanonicalProbeRequest,
     primary_count: int,
+    relation_scan_label: str,
 ) -> _GreenplumCanonicalPlanShape:
     _require_integer(primary_count, "Greenplum primary segment count", 1, INT64_MAX)
     lines = _plan_lines(rows)
@@ -594,9 +608,11 @@ def _parse_greenplum_fingerprint_plan_shape(
     )
     relation_scan_index = _find_human_node(
         human_nodes,
-        lambda line: "seq scan" in line.lower() and request.relation_name.lower() in line.lower(),
+        lambda line: (
+            relation_scan_label in line.lower() and request.relation_name.lower() in line.lower()
+        ),
         append_index + 1,
-        "canonical relation scan",
+        f"canonical relation {relation_scan_label}",
     )
     topology_scan_index = _find_human_node(
         human_nodes,
@@ -652,6 +668,41 @@ def _parse_greenplum_fingerprint_plan_shape(
         lines=lines,
         lower_aggregate_subtree="\n".join(lines[segment_aggregate_index:lower_subtree_end]).lower(),
     )
+
+
+def _original_greenplum_relation_scan_label(storage_kind: GreenplumStorageKind) -> str:
+    labels = {
+        GreenplumStorageKind.HEAP: "seq scan",
+        GreenplumStorageKind.APPEND_OPTIMIZED_ROW: "append-only scan",
+        GreenplumStorageKind.APPEND_OPTIMIZED_COLUMN: "append-only columnar scan",
+    }
+    if type(storage_kind) is not GreenplumStorageKind:
+        raise TypeError("original Greenplum storage kind must be a GreenplumStorageKind")
+    return labels[storage_kind]
+
+
+def _original_greenplum_serialized_relation_scan_node(
+    storage_kind: GreenplumStorageKind,
+) -> str:
+    nodes = {
+        GreenplumStorageKind.HEAP: "{SEQSCAN",
+        GreenplumStorageKind.APPEND_OPTIMIZED_ROW: "{APPENDONLYSCAN",
+        GreenplumStorageKind.APPEND_OPTIMIZED_COLUMN: "{AOCSSCAN",
+    }
+    if type(storage_kind) is not GreenplumStorageKind:
+        raise TypeError("original Greenplum storage kind must be a GreenplumStorageKind")
+    return nodes[storage_kind]
+
+
+def _greengage_relation_scan_label(storage_kind: GreenplumStorageKind) -> str:
+    labels = {
+        GreenplumStorageKind.HEAP: "seq scan",
+        GreenplumStorageKind.APPEND_OPTIMIZED_ROW: "seq scan",
+        GreenplumStorageKind.APPEND_OPTIMIZED_COLUMN: "seq scan",
+    }
+    if type(storage_kind) is not GreenplumStorageKind:
+        raise TypeError("Greengage storage kind must be a GreenplumStorageKind")
+    return labels[storage_kind]
 
 
 def _canonical_fingerprint_plan(

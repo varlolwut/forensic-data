@@ -1,7 +1,8 @@
 from collections.abc import Callable
 from dataclasses import dataclass
+from enum import StrEnum
 from hashlib import sha256
-from typing import final
+from typing import cast, final
 
 from forensic_data.postgres import (
     INT64_MAX,
@@ -23,6 +24,25 @@ _MAX_HASH_ROWS = 10_000
 _INTEGER_TYPE_OIDS = (_INT2_OID, _INT4_OID, _INT8_OID)
 
 type GreenplumCatalogParameter = str | int
+
+
+class GreenplumStorageKind(StrEnum):
+    HEAP = "heap"
+    APPEND_OPTIMIZED_ROW = "append_optimized_row"
+    APPEND_OPTIMIZED_COLUMN = "append_optimized_column"
+
+
+@final
+@dataclass(frozen=True, slots=True)
+class GreenplumStorageProfile:
+    kind: GreenplumStorageKind
+    append_only_catalog_present: bool
+    relation_options: tuple[tuple[str, str], ...]
+    block_size_bytes: int | None
+    compression_type: str | None
+    compression_level: int | None
+    checksum: bool | None
+    column_store: bool | None
 
 
 class GreenplumCatalogError(ValueError):
@@ -155,9 +175,15 @@ class OriginalGreenplumRelationCatalog:
     relation_name: str
     relation_kind: str
     storage_code: str
+    storage_kind: GreenplumStorageKind
+    storage_profile: GreenplumStorageProfile
     has_distribution_policy: bool
     distribution_attribute_numbers: tuple[int, ...]
     reader_has_select: bool
+    reader_has_insert: bool
+    reader_has_update: bool
+    reader_has_delete: bool
+    reader_has_truncate: bool
     reader_has_schema_usage: bool
 
 
@@ -174,11 +200,17 @@ class GreengageRelationCatalog:
     row_security_forced: bool
     access_method: str
     is_append_optimized: bool
+    storage_kind: GreenplumStorageKind
+    storage_profile: GreenplumStorageProfile
     has_distribution_policy: bool
     distribution_policy_type: str
     distribution_segment_count: int
     distribution_attribute_numbers: tuple[int, ...]
     reader_has_select: bool
+    reader_has_insert: bool
+    reader_has_update: bool
+    reader_has_delete: bool
+    reader_has_truncate: bool
     reader_has_schema_usage: bool
 
 
@@ -256,9 +288,17 @@ ORIGINAL_GREENPLUM_RELATION_QUERY = (
     "policy.localoid IS NOT NULL, "
     "pg_catalog.array_to_string(policy.attrnums, ','), "
     "pg_catalog.has_table_privilege(relation.oid, 'SELECT'), "
-    "pg_catalog.has_schema_privilege(namespace.oid, 'USAGE') "
+    "pg_catalog.has_schema_privilege(namespace.oid, 'USAGE'), "
+    "append_only.relid IS NOT NULL, append_only.blocksize::integer, "
+    "append_only.compresstype::text, append_only.compresslevel::integer, "
+    "append_only.checksum, append_only.columnstore, "
+    "pg_catalog.has_table_privilege(relation.oid, 'INSERT'), "
+    "pg_catalog.has_table_privilege(relation.oid, 'UPDATE'), "
+    "pg_catalog.has_table_privilege(relation.oid, 'DELETE'), "
+    "pg_catalog.has_table_privilege(relation.oid, 'TRUNCATE') "
     "FROM pg_catalog.pg_class AS relation "
     "JOIN pg_catalog.pg_namespace AS namespace ON namespace.oid = relation.relnamespace "
+    "LEFT JOIN pg_catalog.pg_appendonly AS append_only ON append_only.relid = relation.oid "
     "LEFT JOIN pg_catalog.gp_distribution_policy AS policy "
     "ON policy.localoid = relation.oid "
     "WHERE namespace.nspname = %s AND relation.relname = %s"
@@ -272,7 +312,11 @@ GREENGAGE_RELATION_QUERY = (
     "policy.policytype::text, policy.numsegments::integer, "
     "pg_catalog.array_to_string(policy.distkey, ','), "
     "pg_catalog.has_table_privilege(relation.oid, 'SELECT'), "
-    "pg_catalog.has_schema_privilege(namespace.oid, 'USAGE') "
+    "pg_catalog.has_schema_privilege(namespace.oid, 'USAGE'), relation.reloptions, "
+    "pg_catalog.has_table_privilege(relation.oid, 'INSERT'), "
+    "pg_catalog.has_table_privilege(relation.oid, 'UPDATE'), "
+    "pg_catalog.has_table_privilege(relation.oid, 'DELETE'), "
+    "pg_catalog.has_table_privilege(relation.oid, 'TRUNCATE') "
     "FROM pg_catalog.pg_class AS relation "
     "JOIN pg_catalog.pg_namespace AS namespace ON namespace.oid = relation.relnamespace "
     "LEFT JOIN pg_catalog.pg_am AS access_method ON access_method.oid = relation.relam "
@@ -473,7 +517,7 @@ def parse_original_greenplum_relation_catalog(
     request: GreenplumRelationRequest,
 ) -> OriginalGreenplumRelationCatalog:
     row = _require_single_row(rows, "original Greenplum relation catalog")
-    _require_field_count(row, 10, "original Greenplum relation catalog row")
+    _require_field_count(row, 20, "original Greenplum relation catalog row")
     schema_name = _require_text(row[2], "original Greenplum relation schema")
     relation_name = _require_text(row[3], "original Greenplum relation name")
     _require_requested_relation(schema_name, relation_name, request)
@@ -486,6 +530,41 @@ def parse_original_greenplum_relation_catalog(
             "original Greenplum relation has no distribution policy: "
             f"relation={request.schema_name!r}.{request.relation_name!r}"
         )
+    storage_code = _require_code(row[5], "original Greenplum storage code")
+    storage_profile = _parse_original_greenplum_storage_profile(
+        storage_code,
+        row[10],
+        row[11],
+        row[12],
+        row[13],
+        row[14],
+        row[15],
+        request,
+    )
+    reader_has_select = _require_boolean(
+        row[8],
+        "original Greenplum reader SELECT privilege",
+    )
+    reader_has_schema_usage = _require_boolean(
+        row[9],
+        "original Greenplum reader schema USAGE privilege",
+    )
+    reader_has_insert = _require_boolean(
+        row[16],
+        "original Greenplum reader INSERT privilege",
+    )
+    reader_has_update = _require_boolean(
+        row[17],
+        "original Greenplum reader UPDATE privilege",
+    )
+    reader_has_delete = _require_boolean(
+        row[18],
+        "original Greenplum reader DELETE privilege",
+    )
+    reader_has_truncate = _require_boolean(
+        row[19],
+        "original Greenplum reader TRUNCATE privilege",
+    )
     catalog = OriginalGreenplumRelationCatalog(
         relation_oid=_require_bounded_integer(
             row[0],
@@ -502,23 +581,27 @@ def parse_original_greenplum_relation_catalog(
         schema_name=schema_name,
         relation_name=relation_name,
         relation_kind=_require_code(row[4], "original Greenplum relation kind"),
-        storage_code=_require_code(row[5], "original Greenplum storage code"),
+        storage_code=storage_code,
+        storage_kind=storage_profile.kind,
+        storage_profile=storage_profile,
         has_distribution_policy=has_distribution_policy,
         distribution_attribute_numbers=_parse_original_greenplum_attribute_numbers(
             row[7],
             "original Greenplum distribution attributes",
         ),
-        reader_has_select=_require_boolean(
-            row[8],
-            "original Greenplum reader SELECT privilege",
-        ),
-        reader_has_schema_usage=_require_boolean(
-            row[9],
-            "original Greenplum reader schema USAGE privilege",
-        ),
+        reader_has_select=reader_has_select,
+        reader_has_insert=reader_has_insert,
+        reader_has_update=reader_has_update,
+        reader_has_delete=reader_has_delete,
+        reader_has_truncate=reader_has_truncate,
+        reader_has_schema_usage=reader_has_schema_usage,
     )
     _require_relation_privileges(
         catalog.reader_has_select,
+        catalog.reader_has_insert,
+        catalog.reader_has_update,
+        catalog.reader_has_delete,
+        catalog.reader_has_truncate,
         catalog.reader_has_schema_usage,
         request,
     )
@@ -530,7 +613,7 @@ def parse_greengage_relation_catalog(
     request: GreenplumRelationRequest,
 ) -> GreengageRelationCatalog:
     row = _require_single_row(rows, "Greengage relation catalog")
-    _require_field_count(row, 16, "Greengage relation catalog row")
+    _require_field_count(row, 21, "Greengage relation catalog row")
     schema_name = _require_text(row[2], "Greengage relation schema")
     relation_name = _require_text(row[3], "Greengage relation name")
     _require_requested_relation(schema_name, relation_name, request)
@@ -543,6 +626,23 @@ def parse_greengage_relation_catalog(
             "Greengage relation has no distribution policy: "
             f"relation={request.schema_name!r}.{request.relation_name!r}"
         )
+    access_method = _require_text(row[8], "Greengage relation access method")
+    is_append_optimized = _require_boolean(row[9], "Greengage append-only flag")
+    storage_profile = _parse_greengage_storage_profile(
+        access_method,
+        is_append_optimized,
+        row[16],
+        request,
+    )
+    reader_has_select = _require_boolean(row[14], "Greengage reader SELECT privilege")
+    reader_has_schema_usage = _require_boolean(
+        row[15],
+        "Greengage reader schema USAGE privilege",
+    )
+    reader_has_insert = _require_boolean(row[17], "Greengage reader INSERT privilege")
+    reader_has_update = _require_boolean(row[18], "Greengage reader UPDATE privilege")
+    reader_has_delete = _require_boolean(row[19], "Greengage reader DELETE privilege")
+    reader_has_truncate = _require_boolean(row[20], "Greengage reader TRUNCATE privilege")
     catalog = GreengageRelationCatalog(
         relation_oid=_require_bounded_integer(
             row[0],
@@ -562,8 +662,10 @@ def parse_greengage_relation_catalog(
         persistence_code=_require_code(row[5], "Greengage relation persistence"),
         row_security_enabled=_require_boolean(row[6], "Greengage row-security flag"),
         row_security_forced=_require_boolean(row[7], "Greengage forced row-security flag"),
-        access_method=_require_text(row[8], "Greengage relation access method"),
-        is_append_optimized=_require_boolean(row[9], "Greengage append-only flag"),
+        access_method=access_method,
+        is_append_optimized=is_append_optimized,
+        storage_kind=storage_profile.kind,
+        storage_profile=storage_profile,
         has_distribution_policy=has_distribution_policy,
         distribution_policy_type=_require_code(
             row[11],
@@ -579,18 +681,253 @@ def parse_greengage_relation_catalog(
             row[13],
             "Greengage distribution attributes",
         ),
-        reader_has_select=_require_boolean(row[14], "Greengage reader SELECT privilege"),
-        reader_has_schema_usage=_require_boolean(
-            row[15],
-            "Greengage reader schema USAGE privilege",
-        ),
+        reader_has_select=reader_has_select,
+        reader_has_insert=reader_has_insert,
+        reader_has_update=reader_has_update,
+        reader_has_delete=reader_has_delete,
+        reader_has_truncate=reader_has_truncate,
+        reader_has_schema_usage=reader_has_schema_usage,
     )
     _require_relation_privileges(
         catalog.reader_has_select,
+        catalog.reader_has_insert,
+        catalog.reader_has_update,
+        catalog.reader_has_delete,
+        catalog.reader_has_truncate,
         catalog.reader_has_schema_usage,
         request,
     )
     return catalog
+
+
+def _original_greenplum_storage_kind(
+    storage_code: str,
+    request: GreenplumRelationRequest,
+) -> GreenplumStorageKind:
+    kinds = {
+        "h": GreenplumStorageKind.HEAP,
+        "a": GreenplumStorageKind.APPEND_OPTIMIZED_ROW,
+        "c": GreenplumStorageKind.APPEND_OPTIMIZED_COLUMN,
+    }
+    kind = kinds.get(storage_code)
+    if kind is None:
+        raise GreenplumCatalogMetadataError(
+            "original Greenplum relation uses an unsupported physical storage code: "
+            f"relation={request.schema_name!r}.{request.relation_name!r}, "
+            f"storage_code={storage_code!r}"
+        )
+    return kind
+
+
+def _parse_original_greenplum_storage_profile(
+    storage_code: str,
+    append_only_catalog_value: object,
+    block_size_value: object,
+    compression_type_value: object,
+    compression_level_value: object,
+    checksum_value: object,
+    column_store_value: object,
+    request: GreenplumRelationRequest,
+) -> GreenplumStorageProfile:
+    kind = _original_greenplum_storage_kind(storage_code, request)
+    append_only_catalog_present = _require_boolean(
+        append_only_catalog_value,
+        "original Greenplum append-only catalog presence",
+    )
+    if kind is GreenplumStorageKind.HEAP:
+        option_values = (
+            block_size_value,
+            compression_type_value,
+            compression_level_value,
+            checksum_value,
+            column_store_value,
+        )
+        if append_only_catalog_present or any(value is not None for value in option_values):
+            raise GreenplumCatalogMetadataError(
+                "original Greenplum heap relation exposes append-only storage metadata: "
+                f"relation={request.schema_name!r}.{request.relation_name!r}, "
+                f"append_only_catalog_present={append_only_catalog_present}, "
+                f"option_presence={tuple(value is not None for value in option_values)!r}"
+            )
+        return GreenplumStorageProfile(
+            kind=kind,
+            append_only_catalog_present=False,
+            relation_options=(),
+            block_size_bytes=None,
+            compression_type=None,
+            compression_level=None,
+            checksum=None,
+            column_store=None,
+        )
+    if not append_only_catalog_present:
+        raise GreenplumCatalogMetadataError(
+            "original Greenplum append-optimized relation is absent from pg_appendonly: "
+            f"relation={request.schema_name!r}.{request.relation_name!r}, "
+            f"storage_kind={kind.value!r}"
+        )
+    block_size_bytes = _require_integer(
+        block_size_value,
+        "original Greenplum append-only block size",
+    )
+    compression_type = _require_text_allow_empty(
+        compression_type_value,
+        "original Greenplum append-only compression type",
+    )
+    compression_level = _require_integer(
+        compression_level_value,
+        "original Greenplum append-only compression level",
+    )
+    checksum = _require_boolean(
+        checksum_value,
+        "original Greenplum append-only checksum flag",
+    )
+    column_store = _require_boolean(
+        column_store_value,
+        "original Greenplum append-only column-store flag",
+    )
+    expected_column_store = kind is GreenplumStorageKind.APPEND_OPTIMIZED_COLUMN
+    if column_store is not expected_column_store:
+        raise GreenplumCatalogMetadataError(
+            "original Greenplum append-optimized storage orientation contradicts relstorage: "
+            f"relation={request.schema_name!r}.{request.relation_name!r}, "
+            f"storage_kind={kind.value!r}, column_store={column_store}, "
+            f"required_column_store={expected_column_store}"
+        )
+    return GreenplumStorageProfile(
+        kind=kind,
+        append_only_catalog_present=True,
+        relation_options=(),
+        block_size_bytes=block_size_bytes,
+        compression_type=compression_type,
+        compression_level=compression_level,
+        checksum=checksum,
+        column_store=column_store,
+    )
+
+
+def _greengage_storage_kind(
+    access_method: str,
+    is_append_optimized: bool,
+    request: GreenplumRelationRequest,
+) -> GreenplumStorageKind:
+    kinds = {
+        ("heap", False): GreenplumStorageKind.HEAP,
+        ("ao_row", True): GreenplumStorageKind.APPEND_OPTIMIZED_ROW,
+        ("ao_column", True): GreenplumStorageKind.APPEND_OPTIMIZED_COLUMN,
+    }
+    kind = kinds.get((access_method, is_append_optimized))
+    if kind is None:
+        raise GreenplumCatalogMetadataError(
+            "Greengage relation uses an unsupported physical storage profile: "
+            f"relation={request.schema_name!r}.{request.relation_name!r}, "
+            f"access_method={access_method!r}, "
+            f"is_append_optimized={is_append_optimized}"
+        )
+    return kind
+
+
+def _parse_greengage_storage_profile(
+    access_method: str,
+    append_only_catalog_present: bool,
+    reloptions_value: object,
+    request: GreenplumRelationRequest,
+) -> GreenplumStorageProfile:
+    kind = _greengage_storage_kind(
+        access_method,
+        append_only_catalog_present,
+        request,
+    )
+    relation_options = _parse_greengage_reloptions(reloptions_value)
+    if kind is GreenplumStorageKind.HEAP:
+        return GreenplumStorageProfile(
+            kind=kind,
+            append_only_catalog_present=False,
+            relation_options=relation_options,
+            block_size_bytes=None,
+            compression_type=None,
+            compression_level=None,
+            checksum=None,
+            column_store=None,
+        )
+    option_values = dict(relation_options)
+    return GreenplumStorageProfile(
+        kind=kind,
+        append_only_catalog_present=True,
+        relation_options=relation_options,
+        block_size_bytes=_parse_optional_greengage_integer_option(
+            option_values,
+            "blocksize",
+        ),
+        compression_type=option_values.get("compresstype"),
+        compression_level=_parse_optional_greengage_integer_option(
+            option_values,
+            "compresslevel",
+        ),
+        checksum=_parse_optional_greengage_boolean_option(
+            option_values,
+            "checksum",
+        ),
+        column_store=kind is GreenplumStorageKind.APPEND_OPTIMIZED_COLUMN,
+    )
+
+
+def _parse_greengage_reloptions(value: object) -> tuple[tuple[str, str], ...]:
+    if value is None:
+        return ()
+    if type(value) is not list:
+        raise GreenplumCatalogDataError(
+            "Greengage relation reloptions must be a text array or NULL"
+        )
+    raw_options = cast(list[object], value)
+    options: dict[str, str] = {}
+    for index, item in enumerate(raw_options):
+        text = _require_text(item, f"Greengage reloption at index {index}")
+        name, separator, option_value = text.partition("=")
+        if separator != "=" or not name:
+            raise GreenplumCatalogDataError(
+                "Greengage reloption must contain a non-empty name and an equals sign: "
+                f"index={index}, value={text!r}"
+            )
+        if name in options:
+            raise GreenplumCatalogDataError(
+                f"Greengage relation reloptions contain a duplicate option: name={name!r}"
+            )
+        options[name] = option_value
+    return tuple(sorted(options.items()))
+
+
+def _parse_optional_greengage_integer_option(
+    options: dict[str, str],
+    option_name: str,
+) -> int | None:
+    value = options.get(option_name)
+    if value is None:
+        return None
+    try:
+        return int(value, 10)
+    except ValueError as error:
+        raise GreenplumCatalogDataError(
+            "Greengage integer relation option has a non-integer value: "
+            f"option_name={option_name!r}, value={value!r}"
+        ) from error
+
+
+def _parse_optional_greengage_boolean_option(
+    options: dict[str, str],
+    option_name: str,
+) -> bool | None:
+    value = options.get(option_name)
+    if value is None:
+        return None
+    normalized = value.strip().lower()
+    if normalized in ("true", "yes", "on", "1"):
+        return True
+    if normalized in ("false", "no", "off", "0"):
+        return False
+    raise GreenplumCatalogDataError(
+        "Greengage boolean relation option has a non-boolean value: "
+        f"option_name={option_name!r}, value={value!r}"
+    )
 
 
 def parse_greenplum_type_probe(
@@ -1014,6 +1351,10 @@ def _validate_hash_capability(
 
 def _require_relation_privileges(
     reader_has_select: bool,
+    reader_has_insert: bool,
+    reader_has_update: bool,
+    reader_has_delete: bool,
+    reader_has_truncate: bool,
     reader_has_schema_usage: bool,
     request: GreenplumRelationRequest,
 ) -> None:
@@ -1022,6 +1363,13 @@ def _require_relation_privileges(
             "Greenplum reader lacks required relation privileges: "
             f"relation={request.schema_name!r}.{request.relation_name!r}, "
             f"select={reader_has_select}, schema_usage={reader_has_schema_usage}"
+        )
+    if reader_has_insert or reader_has_update or reader_has_delete or reader_has_truncate:
+        raise GreenplumCatalogMetadataError(
+            "Greenplum reader has prohibited relation write privileges: "
+            f"relation={request.schema_name!r}.{request.relation_name!r}, "
+            f"insert={reader_has_insert}, update={reader_has_update}, "
+            f"delete={reader_has_delete}, truncate={reader_has_truncate}"
         )
 
 
@@ -1139,6 +1487,14 @@ def _require_text(value: object, label: str) -> str:
     return value
 
 
+def _require_text_allow_empty(value: object, label: str) -> str:
+    if type(value) is not str:
+        raise GreenplumCatalogDataError(f"{label} must be text")
+    if "\x00" in value:
+        raise GreenplumCatalogDataError(f"{label} must not contain U+0000")
+    return value
+
+
 def _require_code(value: object, label: str) -> str:
     code = _require_text(value, label)
     if len(code) != 1:
@@ -1149,6 +1505,12 @@ def _require_code(value: object, label: str) -> str:
 def _require_boolean(value: object, label: str) -> bool:
     if type(value) is not bool:
         raise GreenplumCatalogDataError(f"{label} must be boolean")
+    return value
+
+
+def _require_integer(value: object, label: str) -> int:
+    if type(value) is not int:
+        raise GreenplumCatalogDataError(f"{label} must be an integer")
     return value
 
 

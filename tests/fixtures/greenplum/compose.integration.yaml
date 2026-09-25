@@ -6,6 +6,9 @@ services:
       - source: dfe-greengage-reader-password
         target: dfe-greengage-reader-password
         mode: 0400
+      - source: dfe-greengage-writer-password
+        target: dfe-greengage-writer-password
+        mode: 0400
     healthcheck:
       test:
         - CMD-SHELL
@@ -20,6 +23,9 @@ services:
       - source: dfe-original-greenplum-reader-password
         target: dfe-original-greenplum-reader-password
         mode: 0400
+      - source: dfe-original-greenplum-writer-password
+        target: dfe-original-greenplum-writer-password
+        mode: 0400
     healthcheck:
       test:
         - CMD-SHELL
@@ -30,5 +36,9 @@ services:
 secrets:
   dfe-greengage-reader-password:
     file: ${DFE_GREENGAGE_READER_PASSWORD_FILE:?set DFE_GREENGAGE_READER_PASSWORD_FILE}
+  dfe-greengage-writer-password:
+    file: ${DFE_GREENGAGE_WRITER_PASSWORD_FILE:?set DFE_GREENGAGE_WRITER_PASSWORD_FILE}
   dfe-original-greenplum-reader-password:
     file: ${DFE_ORIGINAL_GREENPLUM_READER_PASSWORD_FILE:?set DFE_ORIGINAL_GREENPLUM_READER_PASSWORD_FILE}
+  dfe-original-greenplum-writer-password:
+    file: ${DFE_ORIGINAL_GREENPLUM_WRITER_PASSWORD_FILE:?set DFE_ORIGINAL_GREENPLUM_WRITER_PASSWORD_FILE}

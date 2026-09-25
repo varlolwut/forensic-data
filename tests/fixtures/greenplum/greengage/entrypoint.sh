@@ -6,6 +6,7 @@ readonly COORDINATOR_DATA_DIRECTORY=/data/coordinator/ggseg-1
 readonly INITIALIZATION_MARKER=/data/.dfe-initialized
 readonly INTEGRATION_READY_MARKER=/data/.dfe-integration-ready
 readonly READER_PASSWORD_FILE=/run/secrets/dfe-greengage-reader-password
+readonly WRITER_PASSWORD_FILE=/run/secrets/dfe-greengage-writer-password
 
 run_as_gpadmin() {
   local command="$1"
@@ -45,8 +46,12 @@ shutdown_cluster() {
 }
 
 install --directory --owner=gpadmin --group=gpadmin /data/coordinator /data/primary1 /data/primary2
-if [[ -e "${READER_PASSWORD_FILE}" ]]; then
+if [[ -e "${READER_PASSWORD_FILE}" || -e "${WRITER_PASSWORD_FILE}" ]]; then
   rm -f "${INTEGRATION_READY_MARKER}"
+  if [[ ! -f "${READER_PASSWORD_FILE}" || ! -f "${WRITER_PASSWORD_FILE}" ]]; then
+    echo "Greengage integration requires both reader and writer password secrets." >&2
+    exit 1
+  fi
 fi
 install --directory --owner=gpadmin --group=gpadmin --mode=0700 /home/gpadmin/.ssh
 ssh-keygen -A
@@ -84,8 +89,10 @@ else
   chown gpadmin:gpadmin "${INITIALIZATION_MARKER}"
 fi
 
-if [[ -e "${READER_PASSWORD_FILE}" ]]; then
-  /usr/local/bin/dfe-greengage-setup-integration "${READER_PASSWORD_FILE}"
+if [[ -e "${READER_PASSWORD_FILE}" && -e "${WRITER_PASSWORD_FILE}" ]]; then
+  /usr/local/bin/dfe-greengage-setup-integration \
+    "${READER_PASSWORD_FILE}" \
+    "${WRITER_PASSWORD_FILE}"
   touch "${INTEGRATION_READY_MARKER}"
   chown gpadmin:gpadmin "${INTEGRATION_READY_MARKER}"
 fi
