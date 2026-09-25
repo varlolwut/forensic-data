@@ -1,10 +1,11 @@
-# Local agent instructions and orchestration state
+# Local workspace files
 AGENTS.md
 **/AGENTS.md
 CLAUDE.md
 **/CLAUDE.md
 .agents/
-.codex/
+**/.*/
+!/.github/
 .cursor/
 data-forensics-brief.md
 docs/
