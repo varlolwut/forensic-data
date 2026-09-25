@@ -13,6 +13,7 @@ class Adapter(StrEnum):
     POSTGRESQL = "postgresql"
     MSSQL = "mssql"
     GREENGAGE = "greengage"
+    GREENPLUM = "greenplum"
 
 
 class ConnectionRole(StrEnum):

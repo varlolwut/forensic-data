@@ -18,6 +18,19 @@ jobs:
     env:
       DFE_GREENGAGE_PORT: "15431"
       DFE_ORIGINAL_GREENPLUM_PORT: "15430"
+      DFE_PG_ADMIN_PASSWORD: phase01-admin
+      DFE_PG_READER_PASSWORD: phase01-reader
+      DFE_PG_WRITER_PASSWORD: phase01-writer
+      DFE_PG_METADATA_MIGRATOR_PASSWORD: phase02-metadata-migrator
+      DFE_PG_METADATA_WRITER_PASSWORD: phase02-metadata-writer
+      DFE_PG_METADATA_READER_PASSWORD: phase02-metadata-reader
+      DFE_PG_PORT: "55432"
+      DFE_TEST_POSTGRES_ADMIN_DSN: "postgresql://postgres:phase01-admin@127.0.0.1:55432/postgres?sslmode=disable&connect_timeout=5"
+      DFE_TEST_POSTGRES_READER_DSN: "postgresql://dfe_fixture_reader:phase01-reader@127.0.0.1:55432/dfe_fixture?sslmode=disable&connect_timeout=5"
+      DFE_TEST_POSTGRES_WRITER_DSN: "postgresql://dfe_fixture_writer:phase01-writer@127.0.0.1:55432/dfe_fixture?sslmode=disable&connect_timeout=5"
+      DFE_TEST_POSTGRES_METADATA_MIGRATOR_DSN: "postgresql://dfe_metadata_migrator_login:phase02-metadata-migrator@127.0.0.1:55432/dfe_fixture?sslmode=disable&connect_timeout=5"
+      DFE_TEST_POSTGRES_METADATA_WRITER_DSN: "postgresql://dfe_metadata_writer_login:phase02-metadata-writer@127.0.0.1:55432/dfe_fixture?sslmode=disable&connect_timeout=5"
+      DFE_TEST_POSTGRES_METADATA_READER_DSN: "postgresql://dfe_metadata_reader_login:phase02-metadata-reader@127.0.0.1:55432/dfe_fixture?sslmode=disable&connect_timeout=5"
     steps:
       - name: Check out source
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
@@ -103,6 +116,8 @@ jobs:
       - name: Verify restarted fixture
         shell: bash
         run: bash tests/fixtures/greenplum/verify-integration.sh
+      - name: Start PostgreSQL 17.11 fixture
+        run: docker compose --file tests/fixtures/postgres/compose.yaml up --detach --wait
       - name: Run Greenplum family critical integration tests
         shell: bash
         run: |
@@ -112,18 +127,32 @@ jobs:
             --env DFE_TEST_ORIGINAL_GREENPLUM_WRITER_DSN \
             --env DFE_TEST_GREENGAGE_READER_DSN \
             --env DFE_TEST_GREENGAGE_WRITER_DSN \
+            --env DFE_TEST_POSTGRES_ADMIN_DSN \
+            --env DFE_TEST_POSTGRES_READER_DSN \
+            --env DFE_TEST_POSTGRES_WRITER_DSN \
+            --env DFE_TEST_POSTGRES_METADATA_MIGRATOR_DSN \
+            --env DFE_TEST_POSTGRES_METADATA_WRITER_DSN \
+            --env DFE_TEST_POSTGRES_METADATA_READER_DSN \
             --env RUFF_CACHE_DIR=/tmp/ruff-cache \
             --env UV_PROJECT_ENVIRONMENT=/tmp/dfe-test-venv \
             --volume "${GITHUB_WORKSPACE}:/workspace:ro" \
             --workdir /workspace \
             --entrypoint /bin/sh \
             forensic-data-greenplum-test \
-            -c 'uv run --frozen --all-groups pytest -p no:cacheprovider -q tests/test_greenplum_integration.py'
+            -c 'uv run --frozen --all-groups pytest -p no:cacheprovider -q tests/test_greenplum_integration.py tests/test_original_greenplum_endpoint_integration.py'
       - name: Capture paired fixture logs
         if: failure()
         run: |
           docker compose --file tests/fixtures/greenplum/compose.yaml ps --all
           docker compose --file tests/fixtures/greenplum/compose.yaml logs --no-color --timestamps
+      - name: Capture PostgreSQL fixture logs
+        if: failure()
+        run: |
+          docker compose --file tests/fixtures/postgres/compose.yaml ps --all
+          docker compose --file tests/fixtures/postgres/compose.yaml logs --no-color --timestamps
+      - name: Stop PostgreSQL fixture
+        if: always()
+        run: docker compose --file tests/fixtures/postgres/compose.yaml down --volumes
       - name: Stop paired fixture
         if: always()
         run: |

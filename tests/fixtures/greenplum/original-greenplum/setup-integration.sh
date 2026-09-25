@@ -15,6 +15,8 @@ readonly READER_HBA_LINE='host dfe_fixture dfe_original_greenplum_reader samenet
 readonly WRITER_HBA_LINE='host dfe_fixture dfe_original_greenplum_writer samenet md5'
 readonly EXPECTED_COLUMNS=$'record_id|bigint|t\namount|numeric(38,4)|t\nactive|boolean|t\nlabel|text|t\nbusiness_date|date|t\nlocal_time|timestamp(6) without time zone|t\ninstant_time|timestamp(6) with time zone|t\nignored_payload|bytea|f'
 readonly EXPECTED_CANONICAL_COLUMNS=$'distribution_id|bigint|t\nid|bigint|t\namount|numeric(38,3)|t\nactive|boolean|t\nlabel|text|t\nbusiness_date|date|t\nlocal_time|timestamp(6) without time zone|t\ninstant_time|timestamp(6) with time zone|t'
+readonly EXPECTED_ENDPOINT_COLUMNS=$'order_id|bigint|t\nbusiness_date|date|t\nprecise_amount|numeric(38,7)|f\nlocal_time|timestamp(6) without time zone|t\ninstant_time|timestamp(6) with time zone|t'
+readonly EXPECTED_ENDPOINT_MANIFEST_COLUMNS=$'dataset_id|text|t\nscope_digest|text|t\nbatch_id|text|t\nstate|text|t\nbusiness_date|date|t\nsource_cut|text|f\ndataset_version|text|f\ncompleted_at|timestamp(6) with time zone|f'
 readonly -a SNAPSHOT_RELATIONS=(snapshot_heap_values snapshot_ao_values snapshot_aoco_values)
 readonly -a SNAPSHOT_STORAGE_CLAUSES=(
   'WITH (appendonly=false)'
@@ -104,7 +106,7 @@ esac
 printf "ALTER ROLE %s WITH LOGIN NOSUPERUSER NOCREATEDB NOCREATEROLE NOINHERIT PASSWORD '%s';\n" \
   "${READER_ROLE}" "${reader_password_verifier}" \
   | psql_as_gpadmin template1
-printf "ALTER ROLE %s SET default_transaction_read_only = 'on';\n" "${READER_ROLE}" \
+printf "ALTER ROLE %s SET default_transaction_read_only = 'off';\n" "${READER_ROLE}" \
   | psql_as_gpadmin template1
 
 role_count="$(query_scalar template1 \
@@ -326,6 +328,148 @@ SQL
   fi
 done
 
+comparison_orders_count="$(query_scalar "${FIXTURE_DATABASE}" \
+  "SELECT count(*) FROM pg_class c JOIN pg_namespace n ON n.oid = c.relnamespace WHERE n.nspname = 'dfe_fixture' AND c.relname = 'comparison_orders' AND c.relkind = 'r';")"
+case "${comparison_orders_count}" in
+  0)
+    psql_as_gpadmin "${FIXTURE_DATABASE}" <<'SQL'
+CREATE TABLE dfe_fixture.comparison_orders (
+  order_id bigint NOT NULL,
+  business_date date NOT NULL,
+  precise_amount numeric(38, 7) NULL,
+  local_time timestamp(6) without time zone NOT NULL,
+  instant_time timestamp(6) with time zone NOT NULL,
+  PRIMARY KEY (order_id)
+) WITH (appendonly=false) DISTRIBUTED BY (order_id);
+SQL
+    ;;
+  1) ;;
+  *) fail "comparison_orders catalog lookup returned ${comparison_orders_count} rows" ;;
+esac
+
+comparison_manifest_count="$(query_scalar "${FIXTURE_DATABASE}" \
+  "SELECT count(*) FROM pg_class c JOIN pg_namespace n ON n.oid = c.relnamespace WHERE n.nspname = 'dfe_fixture' AND c.relname = 'comparison_batch_manifest' AND c.relkind = 'r';")"
+case "${comparison_manifest_count}" in
+  0)
+    psql_as_gpadmin "${FIXTURE_DATABASE}" <<'SQL'
+CREATE TABLE dfe_fixture.comparison_batch_manifest (
+  dataset_id text NOT NULL,
+  scope_digest text NOT NULL,
+  batch_id text NOT NULL,
+  state text NOT NULL,
+  business_date date NOT NULL,
+  source_cut text NULL,
+  dataset_version text NULL,
+  completed_at timestamp(6) with time zone NULL,
+  PRIMARY KEY (dataset_id, scope_digest)
+) WITH (appendonly=false) DISTRIBUTED BY (dataset_id, scope_digest);
+SQL
+    ;;
+  1) ;;
+  *) fail "comparison_batch_manifest catalog lookup returned ${comparison_manifest_count} rows" ;;
+esac
+
+observed_comparison_columns="$(query_scalar "${FIXTURE_DATABASE}" \
+  "SELECT a.attname || '|' || format_type(a.atttypid, a.atttypmod) || '|' || CASE WHEN a.attnotnull THEN 't' ELSE 'f' END FROM pg_attribute a JOIN pg_class c ON c.oid = a.attrelid JOIN pg_namespace n ON n.oid = c.relnamespace WHERE n.nspname = 'dfe_fixture' AND c.relname = 'comparison_orders' AND a.attnum > 0 AND NOT a.attisdropped ORDER BY a.attnum;")"
+if [[ "${observed_comparison_columns}" != "${EXPECTED_ENDPOINT_COLUMNS}" ]]; then
+  fail 'comparison_orders has an unexpected physical schema'
+fi
+comparison_physical_attribute_count="$(query_scalar "${FIXTURE_DATABASE}" \
+  "SELECT count(*) FROM pg_attribute WHERE attrelid = 'dfe_fixture.comparison_orders'::regclass AND attnum > 0;")"
+require_count "${comparison_physical_attribute_count}" 5 \
+  'comparison_orders physical attribute count including dropped columns'
+comparison_owner="$(query_scalar "${FIXTURE_DATABASE}" \
+  "SELECT pg_get_userbyid(relowner) FROM pg_class WHERE oid = 'dfe_fixture.comparison_orders'::regclass;")"
+if [[ "${comparison_owner}" != gpadmin ]]; then
+  fail "comparison_orders owner must be gpadmin, observed ${comparison_owner}"
+fi
+comparison_storage_code="$(query_scalar "${FIXTURE_DATABASE}" \
+  "SELECT relstorage FROM pg_class WHERE oid = 'dfe_fixture.comparison_orders'::regclass;")"
+if [[ "${comparison_storage_code}" != h ]]; then
+  fail "comparison_orders must use heap storage, observed storage code ${comparison_storage_code}"
+fi
+comparison_appendonly_count="$(query_scalar "${FIXTURE_DATABASE}" \
+  "SELECT count(*) FROM pg_appendonly WHERE relid = 'dfe_fixture.comparison_orders'::regclass;")"
+require_count "${comparison_appendonly_count}" 0 'comparison_orders pg_appendonly row count'
+comparison_distribution_key="$(query_scalar "${FIXTURE_DATABASE}" \
+  "SELECT array_to_string(attrnums, ',') FROM gp_distribution_policy WHERE localoid = 'dfe_fixture.comparison_orders'::regclass;")"
+if [[ "${comparison_distribution_key}" != 1 ]]; then
+  fail "comparison_orders must be distributed by order_id, observed policy key ${comparison_distribution_key}"
+fi
+comparison_default_count="$(query_scalar "${FIXTURE_DATABASE}" \
+  "SELECT count(*) FROM pg_attrdef WHERE adrelid = 'dfe_fixture.comparison_orders'::regclass;")"
+require_count "${comparison_default_count}" 0 'comparison_orders column default count'
+comparison_constraint_count="$(query_scalar "${FIXTURE_DATABASE}" \
+  "SELECT count(*) FROM pg_constraint WHERE conrelid = 'dfe_fixture.comparison_orders'::regclass;")"
+require_count "${comparison_constraint_count}" 1 'comparison_orders table constraint count'
+comparison_index_count="$(query_scalar "${FIXTURE_DATABASE}" \
+  "SELECT count(*) FROM pg_index WHERE indrelid = 'dfe_fixture.comparison_orders'::regclass;")"
+require_count "${comparison_index_count}" 1 'comparison_orders index count'
+comparison_primary_constraint_count="$(query_scalar "${FIXTURE_DATABASE}" \
+  "SELECT count(*) FROM pg_constraint WHERE conrelid = 'dfe_fixture.comparison_orders'::regclass AND conname = 'comparison_orders_pkey' AND contype = 'p' AND conkey::text = '{1}' AND NOT condeferrable AND NOT condeferred;")"
+require_count "${comparison_primary_constraint_count}" 1 \
+  'comparison_orders primary key constraint definition count'
+comparison_primary_index_count="$(query_scalar "${FIXTURE_DATABASE}" \
+  "SELECT count(*) FROM pg_index index_record JOIN pg_class index_relation ON index_relation.oid = index_record.indexrelid JOIN pg_namespace index_namespace ON index_namespace.oid = index_relation.relnamespace JOIN pg_am access_method ON access_method.oid = index_relation.relam WHERE index_record.indrelid = 'dfe_fixture.comparison_orders'::regclass AND index_namespace.nspname = 'dfe_fixture' AND index_relation.relname = 'comparison_orders_pkey' AND index_record.indnatts = 1 AND index_record.indkey::text = '1' AND index_record.indisunique AND index_record.indisprimary AND index_record.indisvalid AND index_record.indisready AND index_record.indexprs IS NULL AND index_record.indpred IS NULL AND access_method.amname = 'btree' AND pg_get_userbyid(index_relation.relowner) = 'gpadmin';")"
+require_count "${comparison_primary_index_count}" 1 \
+  'comparison_orders primary B-tree index definition count'
+
+observed_comparison_manifest_columns="$(query_scalar "${FIXTURE_DATABASE}" \
+  "SELECT a.attname || '|' || format_type(a.atttypid, a.atttypmod) || '|' || CASE WHEN a.attnotnull THEN 't' ELSE 'f' END FROM pg_attribute a JOIN pg_class c ON c.oid = a.attrelid JOIN pg_namespace n ON n.oid = c.relnamespace WHERE n.nspname = 'dfe_fixture' AND c.relname = 'comparison_batch_manifest' AND a.attnum > 0 AND NOT a.attisdropped ORDER BY a.attnum;")"
+if [[ "${observed_comparison_manifest_columns}" != "${EXPECTED_ENDPOINT_MANIFEST_COLUMNS}" ]]; then
+  fail 'comparison_batch_manifest has an unexpected physical schema'
+fi
+comparison_manifest_physical_attribute_count="$(query_scalar "${FIXTURE_DATABASE}" \
+  "SELECT count(*) FROM pg_attribute WHERE attrelid = 'dfe_fixture.comparison_batch_manifest'::regclass AND attnum > 0;")"
+require_count "${comparison_manifest_physical_attribute_count}" 8 \
+  'comparison_batch_manifest physical attribute count including dropped columns'
+comparison_manifest_owner="$(query_scalar "${FIXTURE_DATABASE}" \
+  "SELECT pg_get_userbyid(relowner) FROM pg_class WHERE oid = 'dfe_fixture.comparison_batch_manifest'::regclass;")"
+if [[ "${comparison_manifest_owner}" != gpadmin ]]; then
+  fail "comparison_batch_manifest owner must be gpadmin, observed ${comparison_manifest_owner}"
+fi
+comparison_manifest_storage_code="$(query_scalar "${FIXTURE_DATABASE}" \
+  "SELECT relstorage FROM pg_class WHERE oid = 'dfe_fixture.comparison_batch_manifest'::regclass;")"
+if [[ "${comparison_manifest_storage_code}" != h ]]; then
+  fail "comparison_batch_manifest must use heap storage, observed storage code ${comparison_manifest_storage_code}"
+fi
+comparison_manifest_appendonly_count="$(query_scalar "${FIXTURE_DATABASE}" \
+  "SELECT count(*) FROM pg_appendonly WHERE relid = 'dfe_fixture.comparison_batch_manifest'::regclass;")"
+require_count "${comparison_manifest_appendonly_count}" 0 \
+  'comparison_batch_manifest pg_appendonly row count'
+comparison_manifest_distribution_key="$(query_scalar "${FIXTURE_DATABASE}" \
+  "SELECT array_to_string(attrnums, ',') FROM gp_distribution_policy WHERE localoid = 'dfe_fixture.comparison_batch_manifest'::regclass;")"
+if [[ "${comparison_manifest_distribution_key}" != 1,2 ]]; then
+  fail "comparison_batch_manifest must be distributed by dataset_id and scope_digest, observed policy key ${comparison_manifest_distribution_key}"
+fi
+comparison_manifest_default_count="$(query_scalar "${FIXTURE_DATABASE}" \
+  "SELECT count(*) FROM pg_attrdef WHERE adrelid = 'dfe_fixture.comparison_batch_manifest'::regclass;")"
+require_count "${comparison_manifest_default_count}" 0 \
+  'comparison_batch_manifest column default count'
+comparison_manifest_constraint_count="$(query_scalar "${FIXTURE_DATABASE}" \
+  "SELECT count(*) FROM pg_constraint WHERE conrelid = 'dfe_fixture.comparison_batch_manifest'::regclass;")"
+require_count "${comparison_manifest_constraint_count}" 1 \
+  'comparison_batch_manifest table constraint count'
+comparison_manifest_index_count="$(query_scalar "${FIXTURE_DATABASE}" \
+  "SELECT count(*) FROM pg_index WHERE indrelid = 'dfe_fixture.comparison_batch_manifest'::regclass;")"
+require_count "${comparison_manifest_index_count}" 1 \
+  'comparison_batch_manifest index count'
+comparison_manifest_primary_constraint_count="$(query_scalar "${FIXTURE_DATABASE}" \
+  "SELECT count(*) FROM pg_constraint WHERE conrelid = 'dfe_fixture.comparison_batch_manifest'::regclass AND conname = 'comparison_batch_manifest_pkey' AND contype = 'p' AND conkey::text = '{1,2}' AND NOT condeferrable AND NOT condeferred;")"
+require_count "${comparison_manifest_primary_constraint_count}" 1 \
+  'comparison_batch_manifest primary key constraint definition count'
+comparison_manifest_primary_index_count="$(query_scalar "${FIXTURE_DATABASE}" \
+  "SELECT count(*) FROM pg_index index_record JOIN pg_class index_relation ON index_relation.oid = index_record.indexrelid JOIN pg_namespace index_namespace ON index_namespace.oid = index_relation.relnamespace JOIN pg_am access_method ON access_method.oid = index_relation.relam WHERE index_record.indrelid = 'dfe_fixture.comparison_batch_manifest'::regclass AND index_namespace.nspname = 'dfe_fixture' AND index_relation.relname = 'comparison_batch_manifest_pkey' AND index_record.indnatts = 2 AND index_record.indkey::text = '1 2' AND index_record.indisunique AND index_record.indisprimary AND index_record.indisvalid AND index_record.indisready AND index_record.indexprs IS NULL AND index_record.indpred IS NULL AND access_method.amname = 'btree' AND pg_get_userbyid(index_relation.relowner) = 'gpadmin';")"
+require_count "${comparison_manifest_primary_index_count}" 1 \
+  'comparison_batch_manifest primary B-tree index definition count'
+
+psql_as_gpadmin "${FIXTURE_DATABASE}" <<'SQL'
+BEGIN;
+TRUNCATE TABLE dfe_fixture.comparison_orders;
+TRUNCATE TABLE dfe_fixture.comparison_batch_manifest;
+COMMIT;
+SQL
+
 psql_as_gpadmin "${FIXTURE_DATABASE}" <<'SQL'
 TRUNCATE TABLE dfe_fixture.capability_types;
 INSERT INTO dfe_fixture.capability_types (
@@ -467,6 +611,13 @@ require_count "${canonical_primary_count}" "${primary_count}" \
 canonical_empty_count="$(query_scalar "${FIXTURE_DATABASE}" \
   'SELECT count(*) FROM dfe_fixture.canonical_empty_values;')"
 require_count "${canonical_empty_count}" 0 'canonical_empty_values row count'
+comparison_orders_row_count="$(query_scalar "${FIXTURE_DATABASE}" \
+  'SELECT count(*) FROM dfe_fixture.comparison_orders;')"
+require_count "${comparison_orders_row_count}" 0 'comparison_orders initial row count'
+comparison_manifest_row_count="$(query_scalar "${FIXTURE_DATABASE}" \
+  'SELECT count(*) FROM dfe_fixture.comparison_batch_manifest;')"
+require_count "${comparison_manifest_row_count}" 0 \
+  'comparison_batch_manifest initial row count'
 
 for relation_name in "${SNAPSHOT_RELATIONS[@]}"; do
   snapshot_row_count="$(query_scalar "${FIXTURE_DATABASE}" \
@@ -519,6 +670,16 @@ REVOKE ALL PRIVILEGES ON TABLE dfe_fixture.canonical_empty_values FROM PUBLIC;
 REVOKE ALL PRIVILEGES ON TABLE dfe_fixture.canonical_empty_values FROM ${READER_ROLE};
 REVOKE ALL PRIVILEGES ON TABLE dfe_fixture.canonical_empty_values FROM ${WRITER_ROLE};
 GRANT SELECT ON TABLE dfe_fixture.canonical_empty_values TO ${READER_ROLE};
+REVOKE ALL PRIVILEGES ON TABLE dfe_fixture.comparison_orders FROM PUBLIC;
+REVOKE ALL PRIVILEGES ON TABLE dfe_fixture.comparison_orders FROM ${READER_ROLE};
+REVOKE ALL PRIVILEGES ON TABLE dfe_fixture.comparison_orders FROM ${WRITER_ROLE};
+GRANT SELECT ON TABLE dfe_fixture.comparison_orders TO ${READER_ROLE};
+GRANT SELECT, INSERT, UPDATE, DELETE ON TABLE dfe_fixture.comparison_orders TO ${WRITER_ROLE};
+REVOKE ALL PRIVILEGES ON TABLE dfe_fixture.comparison_batch_manifest FROM PUBLIC;
+REVOKE ALL PRIVILEGES ON TABLE dfe_fixture.comparison_batch_manifest FROM ${READER_ROLE};
+REVOKE ALL PRIVILEGES ON TABLE dfe_fixture.comparison_batch_manifest FROM ${WRITER_ROLE};
+GRANT SELECT ON TABLE dfe_fixture.comparison_batch_manifest TO ${READER_ROLE};
+GRANT SELECT, INSERT, UPDATE, DELETE ON TABLE dfe_fixture.comparison_batch_manifest TO ${WRITER_ROLE};
 REVOKE ALL PRIVILEGES ON TABLE dfe_fixture.snapshot_heap_values FROM PUBLIC;
 REVOKE ALL PRIVILEGES ON TABLE dfe_fixture.snapshot_heap_values FROM ${READER_ROLE};
 REVOKE ALL PRIVILEGES ON TABLE dfe_fixture.snapshot_heap_values FROM ${WRITER_ROLE};
@@ -554,6 +715,14 @@ if [[ "${canonical_privilege_state}" != t ]]; then
   fail 'reader or writer privileges on canonical relations do not match the required state'
 fi
 
+for relation_name in comparison_orders comparison_batch_manifest; do
+  comparison_privilege_state="$(query_scalar "${FIXTURE_DATABASE}" \
+    "SELECT has_table_privilege('${READER_ROLE}', 'dfe_fixture.${relation_name}', 'SELECT') AND NOT has_table_privilege('${READER_ROLE}', 'dfe_fixture.${relation_name}', 'INSERT') AND NOT has_table_privilege('${READER_ROLE}', 'dfe_fixture.${relation_name}', 'UPDATE') AND NOT has_table_privilege('${READER_ROLE}', 'dfe_fixture.${relation_name}', 'DELETE') AND NOT has_table_privilege('${READER_ROLE}', 'dfe_fixture.${relation_name}', 'TRUNCATE') AND NOT has_table_privilege('${READER_ROLE}', 'dfe_fixture.${relation_name}', 'REFERENCES') AND NOT has_table_privilege('${READER_ROLE}', 'dfe_fixture.${relation_name}', 'TRIGGER') AND has_table_privilege('${WRITER_ROLE}', 'dfe_fixture.${relation_name}', 'SELECT') AND has_table_privilege('${WRITER_ROLE}', 'dfe_fixture.${relation_name}', 'INSERT') AND has_table_privilege('${WRITER_ROLE}', 'dfe_fixture.${relation_name}', 'UPDATE') AND has_table_privilege('${WRITER_ROLE}', 'dfe_fixture.${relation_name}', 'DELETE') AND NOT has_table_privilege('${WRITER_ROLE}', 'dfe_fixture.${relation_name}', 'TRUNCATE') AND NOT has_table_privilege('${WRITER_ROLE}', 'dfe_fixture.${relation_name}', 'REFERENCES') AND NOT has_table_privilege('${WRITER_ROLE}', 'dfe_fixture.${relation_name}', 'TRIGGER');")"
+  if [[ "${comparison_privilege_state}" != t ]]; then
+    fail "reader or writer privileges on ${relation_name} do not match the required state"
+  fi
+done
+
 for relation_name in "${SNAPSHOT_RELATIONS[@]}"; do
   snapshot_privilege_state="$(query_scalar "${FIXTURE_DATABASE}" \
     "SELECT has_table_privilege('${READER_ROLE}', 'dfe_fixture.${relation_name}', 'SELECT') AND NOT has_table_privilege('${READER_ROLE}', 'dfe_fixture.${relation_name}', 'INSERT') AND NOT has_table_privilege('${READER_ROLE}', 'dfe_fixture.${relation_name}', 'UPDATE') AND NOT has_table_privilege('${READER_ROLE}', 'dfe_fixture.${relation_name}', 'DELETE') AND NOT has_table_privilege('${READER_ROLE}', 'dfe_fixture.${relation_name}', 'TRUNCATE') AND has_table_privilege('${WRITER_ROLE}', 'dfe_fixture.${relation_name}', 'SELECT') AND has_table_privilege('${WRITER_ROLE}', 'dfe_fixture.${relation_name}', 'INSERT') AND has_table_privilege('${WRITER_ROLE}', 'dfe_fixture.${relation_name}', 'DELETE') AND NOT has_table_privilege('${WRITER_ROLE}', 'dfe_fixture.${relation_name}', 'UPDATE') AND NOT has_table_privilege('${WRITER_ROLE}', 'dfe_fixture.${relation_name}', 'TRUNCATE') AND NOT has_table_privilege('${WRITER_ROLE}', 'dfe_fixture.${relation_name}', 'REFERENCES') AND NOT has_table_privilege('${WRITER_ROLE}', 'dfe_fixture.${relation_name}', 'TRIGGER');")"
@@ -563,9 +732,9 @@ for relation_name in "${SNAPSHOT_RELATIONS[@]}"; do
 done
 
 reader_role_state="$(query_scalar template1 \
-  "SELECT rolcanlogin AND NOT rolsuper AND NOT rolcreatedb AND NOT rolcreaterole AND NOT rolinherit AND array_to_string(rolconfig, ',') LIKE '%default_transaction_read_only=on%' FROM pg_roles WHERE rolname = '${READER_ROLE}';")"
+  "SELECT rolcanlogin AND NOT rolsuper AND NOT rolcreatedb AND NOT rolcreaterole AND NOT rolinherit AND array_to_string(rolconfig, ',') LIKE '%default_transaction_read_only=off%' FROM pg_roles WHERE rolname = '${READER_ROLE}';")"
 if [[ "${reader_role_state}" != t ]]; then
-  fail 'reader role attributes do not match the required read-only state'
+  fail 'reader role attributes do not match the required non-admin login state'
 fi
 writer_role_state="$(query_scalar template1 \
   "SELECT rolcanlogin AND NOT rolsuper AND NOT rolcreatedb AND NOT rolcreaterole AND NOT rolinherit AND array_to_string(rolconfig, ',') LIKE '%default_transaction_read_only=off%' FROM pg_roles WHERE rolname = '${WRITER_ROLE}';")"

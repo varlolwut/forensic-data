@@ -24,6 +24,8 @@ from forensic_data.application import (
     HistoryRequest,
     MssqlGreengageExecutionServices,
     MssqlPostgresExecutionServices,
+    OriginalGreenplumGreengageExecutionServices,
+    OriginalGreenplumPostgresExecutionServices,
     PlanCheckRequest,
     PostgresExecutionServices,
     PostgresGreengageExecutionServices,
@@ -223,7 +225,7 @@ def run_cli(
     except PostgresConnectorError as error:
         return _write_error(stderr, output_json, "postgres_error", str(error))
     except GreenplumConnectorError as error:
-        return _write_error(stderr, output_json, "greengage_error", str(error))
+        return _write_error(stderr, output_json, "greenplum_error", str(error))
     except ValidationError:
         return _write_error(
             stderr,
@@ -692,6 +694,8 @@ def _execution_services(
     | MssqlPostgresExecutionServices
     | PostgresGreengageExecutionServices
     | MssqlGreengageExecutionServices
+    | OriginalGreenplumPostgresExecutionServices
+    | OriginalGreenplumGreengageExecutionServices
 ):
     statement_timeout = config.execution.statement_timeout_milliseconds
     if statement_timeout < 2:
@@ -700,7 +704,7 @@ def _execution_services(
         )
     if target.adapter not in (Adapter.POSTGRESQL, Adapter.GREENGAGE):
         raise CliInputError(f"target connection adapter {target.adapter.value!r} is unsupported")
-    if reference.adapter not in (Adapter.POSTGRESQL, Adapter.MSSQL):
+    if reference.adapter not in (Adapter.POSTGRESQL, Adapter.MSSQL, Adapter.GREENPLUM):
         raise CliInputError(
             f"reference connection adapter {reference.adapter.value!r} is unsupported"
         )
@@ -724,6 +728,46 @@ def _execution_services(
         _MAX_PROTECTED_LOCK_TIMEOUT_MILLISECONDS,
         statement_timeout - 1,
     )
+    if reference.adapter is Adapter.GREENPLUM and target.adapter is Adapter.GREENGAGE:
+        return OriginalGreenplumGreengageExecutionServices(
+            reference_connection_id=reference.connection_id,
+            reference_settings=_connection_settings(
+                reference,
+                environment,
+                statement_timeout,
+                "dfe-cli-check-reference",
+            ),
+            target_connection_id=target.connection_id,
+            target_settings=target_settings,
+            metadata_connection_id=config.metadata.connection.connection_id,
+            metadata_settings=metadata_settings,
+            reference_retry_policy=_retry_policy(),
+            target_retry_policy=_retry_policy(),
+            metadata_retry_policy=_retry_policy(),
+            protected_lock_timeout_milliseconds=protected_lock_timeout_milliseconds,
+            metadata_record_bytes=metadata_record_bytes,
+            metadata_total_bytes=config.execution.max_coordinator_memory_bytes,
+        )
+    if reference.adapter is Adapter.GREENPLUM:
+        return OriginalGreenplumPostgresExecutionServices(
+            reference_connection_id=reference.connection_id,
+            reference_settings=_connection_settings(
+                reference,
+                environment,
+                statement_timeout,
+                "dfe-cli-check-reference",
+            ),
+            target_connection_id=target.connection_id,
+            target_settings=target_settings,
+            metadata_connection_id=config.metadata.connection.connection_id,
+            metadata_settings=metadata_settings,
+            reference_retry_policy=_retry_policy(),
+            target_retry_policy=_retry_policy(),
+            metadata_retry_policy=_retry_policy(),
+            protected_lock_timeout_milliseconds=protected_lock_timeout_milliseconds,
+            metadata_record_bytes=metadata_record_bytes,
+            metadata_total_bytes=config.execution.max_coordinator_memory_bytes,
+        )
     if reference.adapter is Adapter.MSSQL and target.adapter is Adapter.GREENGAGE:
         return MssqlGreengageExecutionServices(
             reference_connection_id=reference.connection_id,

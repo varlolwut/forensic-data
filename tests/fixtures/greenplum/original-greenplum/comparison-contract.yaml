@@ -1,0 +1,225 @@
+version: 1
+connections:
+  reference_original:
+    adapter: greenplum
+    driver: psycopg2
+    profile: original_greenplum
+    roles: [source, target]
+    secret_ref: env:DFE_ORIGINAL_GREENPLUM_REFERENCE_DSN
+  target_postgres:
+    adapter: postgresql
+    driver: psycopg
+    profile: postgresql_17
+    roles: [target]
+    secret_ref: env:DFE_POSTGRES_TARGET_DSN
+  target_greengage:
+    adapter: greengage
+    driver: psycopg
+    profile: greengage
+    roles: [target]
+    secret_ref: env:DFE_GREENGAGE_TARGET_DSN
+  metadata_pg:
+    adapter: postgresql
+    driver: psycopg
+    profile: postgresql_17
+    roles: [metadata]
+    secret_ref: env:DFE_METADATA_DSN
+schemas:
+  endpoint_order_v1:
+    fields:
+      - name: order_id
+        type: {kind: int64}
+        nullable: false
+        normalization: none
+        equality: {kind: exact}
+      - name: business_date
+        type: {kind: date}
+        nullable: false
+        normalization: none
+        equality: {kind: exact}
+      - name: precise_amount
+        type: {kind: decimal, precision: 38, scale: 7}
+        nullable: true
+        normalization: none
+        equality: {kind: exact}
+      - name: local_time
+        type: {kind: timestamp_local, precision: 6}
+        nullable: false
+        normalization: none
+        equality: {kind: exact}
+      - name: instant_time
+        type: {kind: timestamp_instant, precision: 6}
+        nullable: false
+        normalization: none
+        equality: {kind: exact}
+datasets:
+  original_reference_orders:
+    connection: reference_original
+    relation: {catalog: null, schema: dfe_fixture, name: comparison_orders}
+    logical_schema: endpoint_order_v1
+    projection:
+      - {field: order_id, column: order_id}
+      - {field: business_date, column: business_date}
+      - {field: precise_amount, column: precise_amount}
+      - {field: local_time, column: local_time}
+      - {field: instant_time, column: instant_time}
+    grain: [order_id]
+  postgres_target_orders:
+    connection: target_postgres
+    relation: {catalog: null, schema: dfe_endpoint, name: target_orders}
+    logical_schema: endpoint_order_v1
+    projection:
+      - {field: order_id, column: order_id}
+      - {field: business_date, column: business_date}
+      - {field: precise_amount, column: precise_amount}
+      - {field: local_time, column: local_time}
+      - {field: instant_time, column: instant_time}
+    grain: [order_id]
+  greengage_target_orders:
+    connection: target_greengage
+    relation: {catalog: null, schema: dfe_endpoint, name: target_orders}
+    logical_schema: endpoint_order_v1
+    projection:
+      - {field: order_id, column: order_id}
+      - {field: business_date, column: business_date}
+      - {field: precise_amount, column: precise_amount}
+      - {field: local_time, column: local_time}
+      - {field: instant_time, column: instant_time}
+    grain: [order_id]
+scopes:
+  original_to_postgres_daily_scope:
+    parameters:
+      business_date: {type: {kind: date}}
+    bindings:
+      original_reference_orders:
+        {column: business_date, operator: eq, parameter: business_date}
+      postgres_target_orders:
+        {column: business_date, operator: eq, parameter: business_date}
+    null_partition: reject
+  original_to_greengage_daily_scope:
+    parameters:
+      business_date: {type: {kind: date}}
+    bindings:
+      original_reference_orders:
+        {column: business_date, operator: eq, parameter: business_date}
+      greengage_target_orders:
+        {column: business_date, operator: eq, parameter: business_date}
+    null_partition: reject
+checks:
+  original_to_postgres_orders:
+    revision: 1
+    invariant: row_equivalence
+    reference: original_reference_orders
+    target: postgres_target_orders
+    comparison_schema: endpoint_order_v1
+    key: [order_id]
+    scope_ref: original_to_postgres_daily_scope
+    consistency_policy: original_to_postgres_daily_cut
+    assurance_policy: fingerprint_allowed
+  original_to_greengage_orders:
+    revision: 1
+    invariant: row_equivalence
+    reference: original_reference_orders
+    target: greengage_target_orders
+    comparison_schema: endpoint_order_v1
+    key: [order_id]
+    scope_ref: original_to_greengage_daily_scope
+    consistency_policy: original_to_greengage_daily_cut
+    assurance_policy: fingerprint_allowed
+consistency:
+  original_to_postgres_daily_cut:
+    minimum_evidence: verified
+    alignment_fields: [business_date, source_cut]
+    late_arrivals: next_batch
+    datasets:
+      original_reference_orders:
+        readiness:
+          kind: relation_manifest
+          relation:
+            {catalog: null, schema: dfe_fixture, name: comparison_batch_manifest}
+          columns:
+            dataset_id: dataset_id
+            scope_digest: scope_digest
+            batch_id: batch_id
+            state: state
+            business_date: business_date
+            source_cut: source_cut
+            dataset_version: dataset_version
+            completed_at: completed_at
+        stable_read: {kind: transaction_snapshot}
+      postgres_target_orders:
+        readiness:
+          kind: relation_manifest
+          relation: {catalog: null, schema: dfe_endpoint, name: batch_manifest}
+          columns:
+            dataset_id: dataset_id
+            scope_digest: scope_digest
+            batch_id: batch_id
+            state: state
+            business_date: business_date
+            source_cut: source_cut
+            dataset_version: dataset_version
+            completed_at: completed_at
+        stable_read: {kind: transaction_snapshot}
+  original_to_greengage_daily_cut:
+    minimum_evidence: verified
+    alignment_fields: [business_date, source_cut]
+    late_arrivals: next_batch
+    datasets:
+      original_reference_orders:
+        readiness:
+          kind: relation_manifest
+          relation:
+            {catalog: null, schema: dfe_fixture, name: comparison_batch_manifest}
+          columns:
+            dataset_id: dataset_id
+            scope_digest: scope_digest
+            batch_id: batch_id
+            state: state
+            business_date: business_date
+            source_cut: source_cut
+            dataset_version: dataset_version
+            completed_at: completed_at
+        stable_read: {kind: transaction_snapshot}
+      greengage_target_orders:
+        readiness:
+          kind: relation_manifest
+          relation: {catalog: null, schema: dfe_endpoint, name: batch_manifest}
+          columns:
+            dataset_id: dataset_id
+            scope_digest: scope_digest
+            batch_id: batch_id
+            state: state
+            business_date: business_date
+            source_cut: source_cut
+            dataset_version: dataset_version
+            completed_at: completed_at
+        stable_read: {kind: transaction_snapshot}
+execution:
+  version: 1
+  max_queries: 200
+  max_fetched_records: 120000
+  max_application_result_bytes: 33554432
+  max_evidence_rows: 50
+  max_evidence_bytes: 65536
+  max_fingerprint_nodes: 64
+  max_coordinator_memory_bytes: 67108864
+  max_depth: 8
+  max_full_scans_per_side: 10
+  statement_timeout_milliseconds: 60000
+  run_timeout_milliseconds: 300000
+  max_attempts: 2
+  max_checks_concurrency: 1
+  max_source_concurrency: 1
+metadata:
+  connection: metadata_pg
+evidence:
+  sql_capture: disabled
+  ddl_capture: enabled
+  fields:
+    order_id: store
+    business_date: omit
+    precise_amount: store
+    local_time: store
+    instant_time: store
+  unspecified_fields: omit

@@ -66,6 +66,12 @@ from forensic_data.mssql import (
     UnsupportedMssqlProfileError,
 )
 from forensic_data.mssql_profile import MssqlRuntimeProfile
+from forensic_data.original_greenplum_endpoint import (
+    OriginalGreenplumAcquisitionRaceError,
+    OriginalGreenplumBudgetExceededError,
+    OriginalGreenplumProtectedReadContext,
+    OriginalGreenplumProtectedRelationInspection,
+)
 from forensic_data.planning import ResolvedScope
 from forensic_data.postgres import (
     PostgresAcquisitionRaceError,
@@ -145,12 +151,16 @@ _DECODE_FIELD_RESERVATION_BYTES = (
 )
 
 type ComparisonReadContext = (
-    PostgresProtectedReadContext | MssqlProtectedReadContext | GreengageProtectedReadContext
+    PostgresProtectedReadContext
+    | MssqlProtectedReadContext
+    | GreengageProtectedReadContext
+    | OriginalGreenplumProtectedReadContext
 )
 type ComparisonRelation = (
     PostgresProtectedRelationInspection
     | MssqlInspectedRelation
     | GreengageProtectedRelationInspection
+    | OriginalGreenplumProtectedRelationInspection
 )
 
 
@@ -897,6 +907,7 @@ class _ExactSideReservation:
 class _ExactFrontierReservation:
     reference: _ExactSideReservation
     target: _ExactSideReservation
+    setup_result_bytes: int
     coordinator_peak_bytes: int
 
 
@@ -1132,7 +1143,10 @@ def _execute_postgres_integer_key_comparison(
         additional_queries=4,
         additional_records=4,
         additional_result_bytes=(
-            reference_summary_bytes + target_summary_bytes + (2 * _SESSION_SETUP_RECORD_BYTES)
+            reference_summary_bytes
+            + target_summary_bytes
+            + _session_setup_record_bytes(reference_context)
+            + _session_setup_record_bytes(target_context)
         ),
         coordinator_bytes=summary_coordinator_peak,
     )
@@ -1720,6 +1734,7 @@ def _interruption_reason_code(cause: ComparisonInterruptionCause) -> ReasonCode:
         (
             ComparisonBudgetExceededError,
             GreengageBudgetExceededError,
+            OriginalGreenplumBudgetExceededError,
             MssqlQueryTimeoutError,
             PostgresReadDeadlineExceededError,
             PostgresResultLimitError,
@@ -1741,6 +1756,7 @@ def _interruption_reason_code(cause: ComparisonInterruptionCause) -> ReasonCode:
             MssqlMetadataError,
             GreenplumContextLostError,
             GreengageAcquisitionRaceError,
+            OriginalGreenplumAcquisitionRaceError,
         ),
     ):
         return ReasonCode.SNAPSHOT_LOST
@@ -1822,6 +1838,18 @@ def _validate_inputs(
     input_cut: InputCutDefinition,
     budgets: ExecutionBudgets,
 ) -> _ValidatedInputs:
+    adapter_pair = (
+        check.reference.connection.adapter,
+        check.target.connection.adapter,
+    )
+    if Adapter.GREENPLUM in adapter_pair and adapter_pair not in (
+        (Adapter.GREENPLUM, Adapter.POSTGRESQL),
+        (Adapter.GREENPLUM, Adapter.GREENGAGE),
+    ):
+        raise UnsupportedComparisonError(
+            "original Greenplum is supported only as a reference source with a PostgreSQL or "
+            "Greengage target"
+        )
     if len(check.key) != 1:
         raise UnsupportedComparisonError(
             "integer-range comparison requires exactly one logical key field"
@@ -1979,6 +2007,39 @@ def _validate_dataset_relation(
         if actual_fields != expected_fields:
             raise ComparisonProtocolError(
                 f"{direction} SQL Server inspection schema does not match the dataset"
+            )
+        return
+    if isinstance(relation, OriginalGreenplumProtectedRelationInspection):
+        if dataset.connection.adapter is not Adapter.GREENPLUM:
+            raise ComparisonProtocolError(
+                f"{direction} original Greenplum inspection is bound to a non-Greenplum dataset"
+            )
+        if dataset.locator.relation_scope is not RelationScope.PHYSICAL_ONLY:
+            raise UnsupportedComparisonError(
+                f"{direction} original Greenplum comparison requires physical_only relation scope"
+            )
+        if relation.acquisition.relation_scope is not RelationScope.PHYSICAL_ONLY:
+            raise ComparisonProtocolError(
+                f"{direction} original Greenplum acquisition is not physical_only"
+            )
+        expected_relation = (dataset.locator.schema, dataset.locator.name)
+        if relation.acquisition.relation.components != expected_relation:
+            raise ComparisonProtocolError(
+                f"{direction} original Greenplum acquisition does not match the contract relation"
+            )
+        if relation.inspection.relation.components != expected_relation:
+            raise ComparisonProtocolError(
+                f"{direction} original Greenplum inspection resolved outside the contract relation"
+            )
+        if relation.acquisition.schema != dataset.logical_schema.schema:
+            raise ComparisonProtocolError(
+                f"{direction} original Greenplum acquisition schema does not match the dataset "
+                "schema"
+            )
+        expected_columns = tuple(item.column_name for item in dataset.projection)
+        if relation.acquisition.column_names != expected_columns:
+            raise ComparisonProtocolError(
+                f"{direction} original Greenplum acquisition projection does not match the dataset"
             )
         return
     if isinstance(relation, GreengageProtectedRelationInspection):
@@ -2337,11 +2398,11 @@ def _plan_fingerprint_level(
     target_provenance_bytes = (
         _provenance_bytes(target_member_count) + target_aggregate_presence_bytes
     )
-    reference_result_reservation = _greengage_fingerprint_result_budget(
+    reference_result_reservation = _greenplum_fingerprint_result_budget(
         reference_context,
         len(requests),
     )
-    target_result_reservation = _greengage_fingerprint_result_budget(
+    target_result_reservation = _greenplum_fingerprint_result_budget(
         target_context,
         len(requests),
     )
@@ -2457,6 +2518,21 @@ def _read_integer_key_summary(
             deadline,
             full_scans,
         )
+    if isinstance(context, OriginalGreenplumProtectedReadContext):
+        if not isinstance(relation, OriginalGreenplumProtectedRelationInspection):
+            raise ComparisonProtocolError(
+                "original Greenplum comparison context received a relation from another engine"
+            )
+        return context.read_integer_key_summary(
+            relation,
+            key_field_index,
+            scope,
+            max_encoded_envelope_bytes,
+            max_record_bytes,
+            max_total_bytes,
+            deadline,
+            full_scans,
+        )
     if not isinstance(relation, MssqlInspectedRelation):
         raise ComparisonProtocolError(
             "SQL Server comparison context received a PostgreSQL relation"
@@ -2489,8 +2565,14 @@ def _read_fingerprint_level(
     source_budget: PostgresSourceBudgetAttempt,
     plan: _FingerprintLevelPlan,
 ) -> tuple[PostgresRangeFingerprintRead, PostgresRangeFingerprintRead, _Usage]:
-    reference_plan_budget = _greengage_fingerprint_plan_budget(reference_context)
-    target_plan_budget = _greengage_fingerprint_plan_budget(target_context)
+    reference_plan_budget = _greenplum_fingerprint_plan_budget(
+        reference_context,
+        len(plan.requests),
+    )
+    target_plan_budget = _greenplum_fingerprint_plan_budget(
+        target_context,
+        len(plan.requests),
+    )
     plan_coordinator_peak_bytes = plan.coordinator_peak_bytes + max(
         reference_plan_budget[3],
         target_plan_budget[3],
@@ -2510,7 +2592,8 @@ def _read_fingerprint_level(
         additional_result_bytes=(
             plan.reference_result_bytes
             + plan.target_result_bytes
-            + (2 * _SESSION_SETUP_RECORD_BYTES)
+            + _session_setup_record_bytes(reference_context)
+            + _session_setup_record_bytes(target_context)
             + reference_plan_budget[2]
             + target_plan_budget[2]
         ),
@@ -2551,9 +2634,21 @@ def _read_fingerprint_level(
     return reference_read, target_read, next_usage
 
 
-def _greengage_fingerprint_plan_budget(
+def _greenplum_fingerprint_plan_budget(
     context: ComparisonReadContext,
+    range_count: int,
 ) -> tuple[int, int, int, int]:
+    if isinstance(context, OriginalGreenplumProtectedReadContext):
+        reservation = context.fingerprint_plan_reservation(
+            range_count,
+            _session_setup_record_bytes(context),
+        )
+        return (
+            reservation.additional_queries,
+            reservation.max_fetched_records,
+            reservation.max_result_bytes,
+            reservation.max_coordinator_bytes,
+        )
     if not isinstance(context, GreengageProtectedReadContext):
         return (0, 0, 0, 0)
     reservation = context.fingerprint_plan_reservation
@@ -2565,11 +2660,20 @@ def _greengage_fingerprint_plan_budget(
     )
 
 
-def _greengage_fingerprint_result_budget(
+def _session_setup_record_bytes(context: ComparisonReadContext) -> int:
+    if isinstance(context, OriginalGreenplumProtectedReadContext):
+        return context.session_invariant_record_bytes
+    return _SESSION_SETUP_RECORD_BYTES
+
+
+def _greenplum_fingerprint_result_budget(
     context: ComparisonReadContext,
     range_count: int,
 ) -> tuple[int, int, int]:
-    if not isinstance(context, GreengageProtectedReadContext):
+    if not isinstance(
+        context,
+        (GreengageProtectedReadContext, OriginalGreenplumProtectedReadContext),
+    ):
         return (0, 0, 0)
     reservation = context.fingerprint_result_reservation(range_count)
     return (
@@ -2611,6 +2715,22 @@ def _read_integer_range_fingerprints(
         if not isinstance(relation, GreengageProtectedRelationInspection):
             raise ComparisonProtocolError(
                 "Greengage comparison context received a relation from another engine"
+            )
+        return context.read_integer_range_fingerprints(
+            relation,
+            key_field_index,
+            scope,
+            ranges,
+            max_encoded_envelope_bytes,
+            max_record_bytes,
+            max_total_bytes,
+            deadline,
+            full_scans,
+        )
+    if isinstance(context, OriginalGreenplumProtectedReadContext):
+        if not isinstance(relation, OriginalGreenplumProtectedRelationInspection):
+            raise ComparisonProtocolError(
+                "original Greenplum comparison context received a relation from another engine"
             )
         return context.read_integer_range_fingerprints(
             relation,
@@ -2703,7 +2823,7 @@ def _exact_frontier_fits(
         remaining.queries >= 4
         and remaining.fetched_records
         >= reservation.reference.raw_records + reservation.target.raw_records + 2
-        and remaining.result_bytes >= reserved_result_bytes + (2 * _SESSION_SETUP_RECORD_BYTES)
+        and remaining.result_bytes >= reserved_result_bytes + reservation.setup_result_bytes
         and reservation.coordinator_peak_bytes <= budgets.max_coordinator_memory_bytes
         and remaining.reference_full_scans >= reservation.reference.full_scans
         and remaining.target_full_scans >= reservation.target.full_scans
@@ -2742,7 +2862,7 @@ def _read_exact_frontier(
         additional_result_bytes=(
             reservation.reference.raw_result_bytes
             + reservation.target.raw_result_bytes
-            + (2 * _SESSION_SETUP_RECORD_BYTES)
+            + reservation.setup_result_bytes
         ),
         coordinator_bytes=reservation.coordinator_peak_bytes,
     )
@@ -2840,6 +2960,23 @@ def _read_integer_range_rows(
         if not isinstance(relation, GreengageProtectedRelationInspection):
             raise ComparisonProtocolError(
                 "Greengage comparison context received a relation from another engine"
+            )
+        return context.read_integer_range_rows(
+            relation,
+            key_field_index,
+            scope,
+            ranges,
+            max_encoded_envelope_bytes,
+            max_records,
+            max_record_bytes,
+            max_total_bytes,
+            deadline,
+            full_scans,
+        )
+    if isinstance(context, OriginalGreenplumProtectedReadContext):
+        if not isinstance(relation, OriginalGreenplumProtectedRelationInspection):
+            raise ComparisonProtocolError(
+                "original Greenplum comparison context received a relation from another engine"
             )
         return context.read_integer_range_rows(
             relation,
@@ -3672,11 +3809,10 @@ def _mssql_2022_exact_side_reservation(
     )
 
 
-def _greengage_exact_side_reservation(
+def _greenplum_exact_side_reservation(
     reservation: _ExactSideReservation,
-    nodes: tuple[_FingerprintNode, ...],
+    key_envelope_bytes: int,
 ) -> _ExactSideReservation:
-    key_envelope_bytes = sum(node.target.key_envelope_bytes for node in nodes)
     maximum_key_value_bytes = reservation.records * _MAX_INT64_TEXT_BYTES
     return replace(
         reservation,
@@ -3687,6 +3823,20 @@ def _greengage_exact_side_reservation(
         raw_integer_value_count=(
             reservation.member_count * reservation.raw_records + reservation.records
         ),
+    )
+
+
+def _original_greenplum_exact_side_reservation(
+    reservation: _ExactSideReservation,
+    key_envelope_bytes: int,
+    empty_witness_null_bytes: int,
+) -> _ExactSideReservation:
+    adjusted = _greenplum_exact_side_reservation(reservation, key_envelope_bytes)
+    if adjusted.records != 0:
+        return adjusted
+    return replace(
+        adjusted,
+        raw_result_bytes=adjusted.raw_result_bytes + empty_witness_null_bytes,
     )
 
 
@@ -3791,8 +3941,17 @@ def _exact_frontier_reservation(
             reference,
             reference_relation,
         )
+    if isinstance(reference_context, OriginalGreenplumProtectedReadContext):
+        reference = _original_greenplum_exact_side_reservation(
+            reference,
+            sum(node.reference.key_envelope_bytes for node in nodes),
+            reference_context.empty_exact_witness_null_bytes,
+        )
     if isinstance(target_context, GreengageProtectedReadContext):
-        target = _greengage_exact_side_reservation(target, nodes)
+        target = _greenplum_exact_side_reservation(
+            target,
+            sum(node.target.key_envelope_bytes for node in nodes),
+        )
     reference_parsed = _exact_parsed_side_memory_bytes(
         reference,
         budgets,
@@ -3842,6 +4001,10 @@ def _exact_frontier_reservation(
     return _ExactFrontierReservation(
         reference=reference,
         target=target,
+        setup_result_bytes=(
+            _session_setup_record_bytes(reference_context)
+            + _session_setup_record_bytes(target_context)
+        ),
         coordinator_peak_bytes=max(
             reference_query_peak,
             target_query_peak,
@@ -4073,6 +4236,7 @@ def _require_comparison_context(
             PostgresProtectedReadContext,
             MssqlProtectedReadContext,
             GreengageProtectedReadContext,
+            OriginalGreenplumProtectedReadContext,
         ),
     ):
         raise TypeError(f"{context} must be a supported protected read context")
@@ -4089,6 +4253,7 @@ def _require_comparison_relation(
             PostgresProtectedRelationInspection,
             MssqlInspectedRelation,
             GreengageProtectedRelationInspection,
+            OriginalGreenplumProtectedRelationInspection,
         ),
     ):
         raise TypeError(f"{context} must be a supported protected relation inspection")
@@ -4100,6 +4265,8 @@ def _comparison_context_is_active(context: ComparisonReadContext) -> bool:
         return context.state is ReadContextState.ACTIVE
     if isinstance(context, GreengageProtectedReadContext):
         return context.state is ReadContextState.ACTIVE
+    if isinstance(context, OriginalGreenplumProtectedReadContext):
+        return context.state is ReadContextState.ACTIVE
     return context.state is MssqlReadContextState.ACTIVE
 
 
@@ -4108,13 +4275,19 @@ def _relation_member_count(relation: ComparisonRelation) -> int:
         return len(relation.query_relations())
     if isinstance(relation, GreengageProtectedRelationInspection):
         return 1
+    if isinstance(relation, OriginalGreenplumProtectedRelationInspection):
+        return 1
     return 3 + len(relation.bindings)
 
 
 def _aggregate_presence_bytes(relation: ComparisonRelation) -> int:
     if isinstance(
         relation,
-        (PostgresProtectedRelationInspection, GreengageProtectedRelationInspection),
+        (
+            PostgresProtectedRelationInspection,
+            GreengageProtectedRelationInspection,
+            OriginalGreenplumProtectedRelationInspection,
+        ),
     ):
         return 0
     return _HAS_DATA_BYTES
@@ -4124,6 +4297,8 @@ def _relation_physical_scan_count(relation: ComparisonRelation) -> int:
     if isinstance(relation, PostgresProtectedRelationInspection):
         return relation.physical_scan_count()
     if isinstance(relation, GreengageProtectedRelationInspection):
+        return relation.physical_scan_count()
+    if isinstance(relation, OriginalGreenplumProtectedRelationInspection):
         return relation.physical_scan_count()
     return 1
 

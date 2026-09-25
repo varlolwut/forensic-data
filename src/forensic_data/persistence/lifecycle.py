@@ -77,8 +77,13 @@ from forensic_data.greenplum_catalog import (
     GreenplumSegment,
     GreenplumStorageProfile,
     GreenplumTopology,
+    OriginalGreenplumHashCapability,
 )
-from forensic_data.greenplum_profile import GreenplumRuntimeProfile
+from forensic_data.greenplum_profile import (
+    ORIGINAL_GREENPLUM_DRIVER,
+    ORIGINAL_GREENPLUM_PROFILE,
+    GreenplumRuntimeProfile,
+)
 from forensic_data.mssql import MssqlProtectedReadContext, MssqlReadContextState
 from forensic_data.mssql_sql import (
     MssqlFieldBinding,
@@ -86,6 +91,10 @@ from forensic_data.mssql_sql import (
     MssqlPhysicalField,
     MssqlUtf8HelperBinding,
     validate_mssql_inspection,
+)
+from forensic_data.original_greenplum_endpoint import (
+    OriginalGreenplumProtectedReadContext,
+    OriginalGreenplumProtectedRelationInspection,
 )
 from forensic_data.persistence.errors import (
     ActiveRunAttemptError,
@@ -229,12 +238,16 @@ _READER_ROLE: Final[str] = "dfe_metadata_reader"
 _CANONICAL_PROTOCOL: Final[str] = "dfe_canon_v1"
 _FINGERPRINT_PROTOCOL: Final[str] = "sha256_sum32_v1"
 type _ProtectedReadContext = (
-    PostgresProtectedReadContext | MssqlProtectedReadContext | GreengageProtectedReadContext
+    PostgresProtectedReadContext
+    | MssqlProtectedReadContext
+    | GreengageProtectedReadContext
+    | OriginalGreenplumProtectedReadContext
 )
 type _ProtectedRelationInspection = (
     PostgresProtectedRelationInspection
     | MssqlInspectedRelation
     | GreengageProtectedRelationInspection
+    | OriginalGreenplumProtectedRelationInspection
 )
 _STRUCTURAL_SUMMARY_PARAMETER_NAMES: Final[tuple[str, ...]] = (
     "reference_row_count",
@@ -585,6 +598,10 @@ class ReadContextPersistence:
                 raise ValueError("only an active protected context can be persisted")
         elif isinstance(context, GreengageProtectedReadContext):
             _greengage_context_relations(context)
+            if context.state is not ReadContextState.ACTIVE:
+                raise ValueError("only an active protected context can be persisted")
+        elif isinstance(context, OriginalGreenplumProtectedReadContext):
+            _original_greenplum_context_relations(context)
             if context.state is not ReadContextState.ACTIVE:
                 raise ValueError("only an active protected context can be persisted")
         else:
@@ -4799,6 +4816,8 @@ def _validate_context_definition(
             raise ValueError("initial lifecycle read contexts require engine='postgresql'")
     elif isinstance(context, GreengageProtectedReadContext):
         _validate_greengage_context_definition(context)
+    elif isinstance(context, OriginalGreenplumProtectedReadContext):
+        _validate_original_greenplum_context_definition(context)
     else:
         evidence = context.evidence
         profile = context.profile
@@ -4857,12 +4876,11 @@ def _validate_greengage_context_definition(
         or reader.can_create_role is not False
         or reader.can_create_database is not False
         or reader.can_login is not True
-        or reader.default_transaction_read_only is not True
         or reader.transaction_read_only is not True
     ):
         raise ValueError(
-            "Greengage lifecycle read context requires a non-admin login role whose default "
-            "and current transactions are read-only"
+            "Greengage lifecycle read context requires a non-admin login role in a read-only "
+            "transaction"
         )
     if (
         type(hash_capability.function_oid) is not int
@@ -5017,6 +5035,189 @@ def _validate_greengage_context_definition(
         )
 
 
+def _validate_original_greenplum_context_definition(
+    context: OriginalGreenplumProtectedReadContext,
+) -> None:
+    evidence = context.evidence
+    server = context.server
+    reader = context.reader
+    topology = context.topology
+    hash_capability = context.hash_capability
+    _require_instance(
+        context.driver,
+        GreenplumDriverEvidence,
+        "original Greenplum driver evidence",
+    )
+    _require_instance(server, GreenplumServerProfile, "original Greenplum server profile")
+    _require_instance(reader, GreenplumReaderIdentity, "original Greenplum reader identity")
+    _require_instance(topology, GreenplumTopology, "original Greenplum topology")
+    _require_instance(
+        hash_capability,
+        OriginalGreenplumHashCapability,
+        "original Greenplum hash capability",
+    )
+    _require_nonblank_text(reader.user_name, "original Greenplum reader role name")
+    if "\x00" in reader.user_name:
+        raise ValueError("original Greenplum reader role name must not contain U+0000")
+    if (
+        reader.is_superuser is not False
+        or reader.can_create_role is not False
+        or reader.can_create_database is not False
+        or reader.can_login is not True
+        or reader.transaction_read_only is not True
+    ):
+        raise ValueError(
+            "original Greenplum lifecycle read context requires a non-admin login role in a "
+            "read-only transaction"
+        )
+    if (
+        type(hash_capability.function_oid) is not int
+        or not 1 <= hash_capability.function_oid <= (1 << 32) - 1
+        or hash_capability.schema_name != "dfe_ext"
+        or hash_capability.function_name != "digest"
+        or hash_capability.argument_type_oids != (17, 25)
+        or hash_capability.result_type_oid != 17
+        or hash_capability.volatility_code != "i"
+        or hash_capability.is_strict is not True
+        or hash_capability.reader_has_execute is not True
+        or hash_capability.reader_has_schema_usage is not True
+        or hash_capability.selected_strategy != "unpackaged_contrib_sql"
+        or hash_capability.canonical_sha256_verified is not True
+    ):
+        raise ValueError(
+            "original Greenplum lifecycle read context requires the exact safe immutable strict "
+            "dfe_ext.digest(bytea, text) capability with reader EXECUTE, schema USAGE, and a "
+            "protected-snapshot SHA-256 known-answer proof"
+        )
+    if type(topology.segments) is not tuple or not topology.segments:
+        raise ValueError(
+            "original Greenplum lifecycle topology must contain segment configuration rows"
+        )
+    for index, segment in enumerate(topology.segments):
+        if type(segment) is not GreenplumSegment:
+            raise TypeError(
+                "original Greenplum lifecycle topology must contain exact GreenplumSegment "
+                f"values: segment_index={index}"
+            )
+        if type(segment.content_id) is not int or not -1 <= segment.content_id <= (1 << 63) - 1:
+            raise ValueError(
+                "original Greenplum lifecycle topology content ID is outside its exact catalog "
+                f"domain: segment_index={index}"
+            )
+        for code, label in (
+            (segment.role, "role"),
+            (segment.preferred_role, "preferred role"),
+            (segment.status, "status"),
+        ):
+            if type(code) is not str or len(code) != 1 or "\x00" in code:
+                raise ValueError(
+                    "original Greenplum lifecycle topology requires one-character catalog codes: "
+                    f"segment_index={index}, code={label!r}"
+                )
+    if len(set(topology.segments)) != len(topology.segments):
+        raise ValueError("original Greenplum lifecycle topology contains duplicate segment rows")
+    active_primaries = tuple(
+        segment for segment in topology.segments if segment.role == "p" and segment.status == "u"
+    )
+    coordinator_rows = tuple(segment for segment in active_primaries if segment.content_id == -1)
+    primary_content_ids = tuple(
+        sorted(segment.content_id for segment in active_primaries if segment.content_id >= 0)
+    )
+    if len(coordinator_rows) != 1:
+        raise ValueError(
+            "original Greenplum lifecycle topology requires exactly one active coordinator"
+        )
+    if not primary_content_ids or len(set(primary_content_ids)) != len(primary_content_ids):
+        raise ValueError(
+            "original Greenplum lifecycle topology requires distinct active primary contents"
+        )
+    if (
+        type(topology.primary_content_ids) is not tuple
+        or topology.primary_content_ids != primary_content_ids
+    ):
+        raise ValueError(
+            "original Greenplum lifecycle topology active primary contents differ from its "
+            "segment rows"
+        )
+    _require_uuid(evidence.context_id, "original Greenplum read context id")
+    _require_utc_datetime(evidence.started_at, "original Greenplum read context started_at")
+    _require_nonblank_text(evidence.snapshot_locator, "original Greenplum snapshot locator")
+    if type(evidence.limitations) is not tuple:
+        raise TypeError("original Greenplum read context limitations must be an immutable tuple")
+    for limitation in evidence.limitations:
+        _require_nonblank_text(limitation, "original Greenplum read context limitation")
+    if type(evidence.relation_locks) is not tuple:
+        raise TypeError("original Greenplum relation locks must be an immutable tuple")
+    for lock in evidence.relation_locks:
+        _require_instance(
+            lock,
+            GreenplumRelationLockEvidence,
+            "original Greenplum relation lock evidence",
+        )
+    if (
+        evidence.runtime_profile is not GreenplumRuntimeProfile.ORIGINAL_GREENPLUM
+        or server.runtime_profile is not GreenplumRuntimeProfile.ORIGINAL_GREENPLUM
+    ):
+        raise ValueError(
+            "original Greenplum lifecycle read context requires the original_greenplum "
+            "runtime profile"
+        )
+    if context.driver.driver_name != ORIGINAL_GREENPLUM_DRIVER:
+        raise ValueError("original Greenplum lifecycle read context requires the psycopg2 driver")
+    if context.source_direction is not PostgresSourceDirection.REFERENCE:
+        raise ValueError("original Greenplum lifecycle read context is supported only as a source")
+    if evidence.strategy != "protected_read_only_serializable_distributed":
+        raise ValueError(
+            "original Greenplum lifecycle read context requires the protected distributed "
+            "Serializable strategy"
+        )
+    if (
+        evidence.snapshot_locator != server.snapshot_locator
+        or evidence.backend_process_id != server.backend_process_id
+    ):
+        raise ValueError(
+            "original Greenplum lifecycle read context evidence differs from its server profile"
+        )
+    if (
+        server.transaction_isolation != "serializable"
+        or server.transaction_read_only is not True
+        or evidence.allowed_concurrency != 1
+        or evidence.acquired_before_snapshot is not True
+    ):
+        raise ValueError(
+            "original Greenplum lifecycle read context must be a protected read-only Serializable "
+            "transaction"
+        )
+    relations = _original_greenplum_context_relations(context)
+    expected_locks = tuple(
+        sorted(
+            (
+                relation.catalog.relation_oid,
+                relation.catalog.schema_name,
+                relation.catalog.relation_name,
+                "AccessShareLock",
+            )
+            for relation in relations
+        )
+    )
+    actual_locks = tuple(
+        sorted(
+            (
+                lock.relation_oid,
+                lock.schema_name,
+                lock.relation_name,
+                lock.lock_mode,
+            )
+            for lock in evidence.relation_locks
+        )
+    )
+    if actual_locks != expected_locks:
+        raise ValueError(
+            "original Greenplum protected context relations must exactly match its retained "
+            "lock evidence"
+        )
+
+
 def _context_storage_identity(context: _ProtectedReadContext) -> _ContextStorageIdentity:
     if isinstance(context, PostgresProtectedReadContext):
         profile = context.profile
@@ -5026,7 +5227,10 @@ def _context_storage_identity(context: _ProtectedReadContext) -> _ContextStorage
             server_version_number=profile.server_version_number,
             backend_process_id=context.evidence.backend_process_id,
         )
-    if isinstance(context, GreengageProtectedReadContext):
+    if isinstance(
+        context,
+        (GreengageProtectedReadContext, OriginalGreenplumProtectedReadContext),
+    ):
         return _ContextStorageIdentity(
             driver_version=context.driver.driver_version,
             server_version=context.server.product_version,
@@ -5045,6 +5249,8 @@ def _context_storage_identity(context: _ProtectedReadContext) -> _ContextStorage
 def _context_engine(context: _ProtectedReadContext) -> str:
     if isinstance(context, GreengageProtectedReadContext):
         return "greengage"
+    if isinstance(context, OriginalGreenplumProtectedReadContext):
+        return "greenplum"
     return context.evidence.engine
 
 
@@ -5055,6 +5261,7 @@ def _require_supported_read_context(value: object, context: str) -> _ProtectedRe
             PostgresProtectedReadContext,
             MssqlProtectedReadContext,
             GreengageProtectedReadContext,
+            OriginalGreenplumProtectedReadContext,
         ),
     ):
         return value
@@ -5083,6 +5290,8 @@ def _require_context_relation(
         return _require_instance(value, PostgresProtectedRelationInspection, label)
     if isinstance(context, GreengageProtectedReadContext):
         return _require_instance(value, GreengageProtectedRelationInspection, label)
+    if isinstance(context, OriginalGreenplumProtectedReadContext):
+        return _require_instance(value, OriginalGreenplumProtectedRelationInspection, label)
     return _require_instance(value, MssqlInspectedRelation, label)
 
 
@@ -5175,6 +5384,77 @@ def _greengage_context_relations(
     return relations
 
 
+def _original_greenplum_context_relations(
+    context: OriginalGreenplumProtectedReadContext,
+) -> tuple[OriginalGreenplumProtectedRelationInspection, ...]:
+    relations = context.protected_relations
+    if type(relations) is not tuple or not relations:
+        raise ValueError("original Greenplum protected context must contain inspected relations")
+    expected_storage_kinds = {
+        "h": "heap",
+        "a": "append_optimized_row",
+        "c": "append_optimized_column",
+    }
+    seen_relation_oids: set[int] = set()
+    for index, relation in enumerate(relations):
+        if type(relation) is not OriginalGreenplumProtectedRelationInspection:
+            raise TypeError(
+                "original Greenplum protected context relations must contain "
+                "OriginalGreenplumProtectedRelationInspection values: "
+                f"relation_index={index}"
+            )
+        catalog = relation.catalog
+        if relation.inspection.context_id != context.evidence.context_id:
+            raise ValueError(
+                "original Greenplum protected relation belongs to a different read context: "
+                f"relation_index={index}"
+            )
+        expected_storage_kind = expected_storage_kinds.get(catalog.storage_code)
+        if (
+            (catalog.schema_name, catalog.relation_name) != relation.acquisition.relation.components
+            or catalog.relation_kind != "r"
+            or expected_storage_kind is None
+            or catalog.storage_kind.value != expected_storage_kind
+            or catalog.storage_profile.kind is not catalog.storage_kind
+            or not catalog.has_distribution_policy
+            or catalog.reader_has_select is not True
+            or catalog.reader_has_schema_usage is not True
+            or catalog.reader_has_insert is not False
+            or catalog.reader_has_update is not False
+            or catalog.reader_has_delete is not False
+            or catalog.reader_has_truncate is not False
+            or relation.lock_mode != "access_share"
+            or relation.acquired_before_snapshot is not True
+        ):
+            raise ValueError(
+                "original Greenplum protected relation differs from its physical protected "
+                f"profile: relation_index={index}"
+            )
+        if type(catalog.distribution_attribute_numbers) is not tuple or any(
+            type(attribute_number) is not int or attribute_number < 1
+            for attribute_number in catalog.distribution_attribute_numbers
+        ):
+            raise ValueError(
+                "original Greenplum protected relation has invalid distribution attributes: "
+                f"relation_index={index}"
+            )
+        if len(set(catalog.distribution_attribute_numbers)) != len(
+            catalog.distribution_attribute_numbers
+        ):
+            raise ValueError(
+                "original Greenplum protected relation has duplicate distribution attributes: "
+                f"relation_index={index}"
+            )
+        relation_oid = catalog.relation_oid
+        if relation_oid in seen_relation_oids:
+            raise ValueError(
+                "original Greenplum protected context contains a duplicate physical relation: "
+                f"relation_oid={relation_oid}"
+            )
+        seen_relation_oids.add(relation_oid)
+    return relations
+
+
 def _context_relations(
     context: _ProtectedReadContext,
 ) -> tuple[_ProtectedRelationInspection, ...]:
@@ -5182,13 +5462,18 @@ def _context_relations(
         return context.protected_relations
     if isinstance(context, GreengageProtectedReadContext):
         return _greengage_context_relations(context)
+    if isinstance(context, OriginalGreenplumProtectedReadContext):
+        return _original_greenplum_context_relations(context)
     return _mssql_context_relations(context)
 
 
 def _context_is_active(context: _ProtectedReadContext) -> bool:
     if isinstance(context, PostgresProtectedReadContext):
         return context.state is ReadContextState.ACTIVE
-    if isinstance(context, GreengageProtectedReadContext):
+    if isinstance(
+        context,
+        (GreengageProtectedReadContext, OriginalGreenplumProtectedReadContext),
+    ):
         return context.state is ReadContextState.ACTIVE
     return context.state is MssqlReadContextState.ACTIVE
 
@@ -5197,6 +5482,8 @@ def _relation_context_id(relation: _ProtectedRelationInspection) -> UUID:
     if isinstance(relation, PostgresProtectedRelationInspection):
         return relation.inspection.context_id
     if isinstance(relation, GreengageProtectedRelationInspection):
+        return relation.inspection.context_id
+    if isinstance(relation, OriginalGreenplumProtectedRelationInspection):
         return relation.inspection.context_id
     return relation.context_id
 
@@ -5208,6 +5495,8 @@ def _relation_physical_identity(
         return ("postgresql", 0, relation.inspection.relation_oid)
     if isinstance(relation, GreengageProtectedRelationInspection):
         return ("greengage", 0, relation.inspection.relation_oid)
+    if isinstance(relation, OriginalGreenplumProtectedRelationInspection):
+        return ("greenplum", 0, relation.inspection.relation_oid)
     return ("mssql", relation.database_id, relation.object_id)
 
 
@@ -5219,6 +5508,8 @@ def _relation_components(relation: _ProtectedRelationInspection) -> tuple[str, s
         return (components[0], components[1])
     if isinstance(relation, GreengageProtectedRelationInspection):
         return relation.acquisition.relation.components
+    if isinstance(relation, OriginalGreenplumProtectedRelationInspection):
+        return relation.acquisition.relation.components
     return (relation.relation.schema_name, relation.relation.table_name)
 
 
@@ -5226,6 +5517,8 @@ def _relation_column_names(relation: _ProtectedRelationInspection) -> tuple[str,
     if isinstance(relation, PostgresProtectedRelationInspection):
         return relation.acquisition.column_names
     if isinstance(relation, GreengageProtectedRelationInspection):
+        return relation.acquisition.column_names
+    if isinstance(relation, OriginalGreenplumProtectedRelationInspection):
         return relation.acquisition.column_names
     return tuple(binding.column_name for binding in relation.bindings)
 
@@ -5237,6 +5530,8 @@ def _observation_schema_digest(
     if isinstance(relation, PostgresProtectedRelationInspection):
         return schema_digest_hex(relation.acquisition.schema)
     if isinstance(relation, GreengageProtectedRelationInspection):
+        return schema_digest_hex(relation.acquisition.schema)
+    if isinstance(relation, OriginalGreenplumProtectedRelationInspection):
         return schema_digest_hex(relation.acquisition.schema)
     schema = _dataset_canonical_schema(definition.dataset)
     validate_mssql_inspection(schema, relation)
@@ -5330,6 +5625,13 @@ def _require_protected_context_active(context: _ProtectedReadContext) -> None:
             raise RunLifecycleStateError(
                 f"protected Greengage context relation closure is invalid: reason={error}"
             ) from None
+    elif isinstance(context, OriginalGreenplumProtectedReadContext):
+        try:
+            _validate_original_greenplum_context_definition(context)
+        except (TypeError, ValueError) as error:
+            raise RunLifecycleStateError(
+                f"protected original Greenplum context relation closure is invalid: reason={error}"
+            ) from None
     else:
         try:
             _mssql_context_relations(context)
@@ -5390,6 +5692,8 @@ def _require_dataset_relation_closure(
     if isinstance(protected, PostgresProtectedRelationInspection):
         actual_scope = protected.acquisition.relation_scope
     elif isinstance(protected, GreengageProtectedRelationInspection):
+        actual_scope = protected.acquisition.relation_scope
+    elif isinstance(protected, OriginalGreenplumProtectedRelationInspection):
         actual_scope = protected.acquisition.relation_scope
     else:
         actual_scope = RelationScope.PHYSICAL_ONLY
@@ -5556,6 +5860,14 @@ def _require_stable_read_context(
         if snapshot_locator is None or not snapshot_locator.strip():
             raise ValueError("Greengage readiness context lacks a transaction snapshot locator")
         expected_kind = "greengage_protected_relations"
+    elif isinstance(context, OriginalGreenplumProtectedReadContext):
+        if strategy != "protected_read_only_serializable_distributed":
+            raise ValueError("readiness context does not provide the contract transaction snapshot")
+        if snapshot_locator is None or not snapshot_locator.strip():
+            raise ValueError(
+                "original Greenplum readiness context lacks a transaction snapshot locator"
+            )
+        expected_kind = "original_greenplum_protected_relations"
     else:
         if strategy != "transaction_snapshot":
             raise ValueError("readiness context does not provide the contract transaction snapshot")
@@ -5626,6 +5938,18 @@ def _acquisition_evidence_semantic_value(
                 ],
             },
         }
+    if isinstance(context, OriginalGreenplumProtectedReadContext):
+        return {
+            "evidence_version": 1,
+            "kind": "original_greenplum_protected_relations",
+            "payload": {
+                **_original_greenplum_context_provenance_semantic_value(context),
+                "relations": [
+                    _original_greenplum_relation_semantic_value(item)
+                    for item in _original_greenplum_context_relations(context)
+                ],
+            },
+        }
     evidence = context.evidence
     return {
         "evidence_version": 1,
@@ -5688,6 +6012,28 @@ def _physical_binding_semantic_value(
                 "readiness_relation": _greengage_relation_semantic_value(readiness_relation),
             },
         }
+    if isinstance(context, OriginalGreenplumProtectedReadContext):
+        dataset_relation = _require_instance(
+            definition.dataset_relation,
+            OriginalGreenplumProtectedRelationInspection,
+            "original Greenplum dataset relation",
+        )
+        readiness_relation = _require_instance(
+            definition.readiness_relation,
+            OriginalGreenplumProtectedRelationInspection,
+            "original Greenplum readiness relation",
+        )
+        return {
+            "binding_version": 1,
+            "engine": "greenplum",
+            "payload": {
+                **_original_greenplum_context_provenance_semantic_value(context),
+                "dataset_relation": _original_greenplum_relation_semantic_value(dataset_relation),
+                "readiness_relation": _original_greenplum_relation_semantic_value(
+                    readiness_relation
+                ),
+            },
+        }
     dataset_relation = _require_instance(
         definition.dataset_relation,
         PostgresProtectedRelationInspection,
@@ -5715,6 +6061,8 @@ def _relation_semantic_value(
         return _protected_relation_semantic_value(relation)
     if isinstance(relation, GreengageProtectedRelationInspection):
         return _greengage_relation_semantic_value(relation)
+    if isinstance(relation, OriginalGreenplumProtectedRelationInspection):
+        return _original_greenplum_relation_semantic_value(relation)
     return _mssql_relation_semantic_value(relation)
 
 
@@ -5985,6 +6333,116 @@ def _greengage_relation_semantic_value(
         "resolved_relation": list(inspection.relation.components),
         "row_security_enabled": catalog.row_security_enabled,
         "row_security_forced": catalog.row_security_forced,
+        "storage_kind": catalog.storage_kind.value,
+        "storage_profile": _greenplum_storage_profile_semantic_value(catalog.storage_profile),
+    }
+
+
+def _original_greenplum_context_provenance_semantic_value(
+    context: OriginalGreenplumProtectedReadContext,
+) -> dict[str, SemanticValue]:
+    return {
+        "context": _original_greenplum_context_semantic_value(context),
+        "driver": _greenplum_driver_semantic_value(context.driver),
+        "hash_capability": _original_greenplum_hash_capability_semantic_value(
+            context.hash_capability
+        ),
+        "profile": _original_greenplum_profile_semantic_value(context.server),
+        "reader": _greenplum_reader_semantic_value(context.reader),
+        "topology": _greenplum_topology_semantic_value(context.topology),
+    }
+
+
+def _original_greenplum_context_semantic_value(
+    context: OriginalGreenplumProtectedReadContext,
+) -> dict[str, SemanticValue]:
+    evidence = context.evidence
+    return {
+        "acquired_before_snapshot": evidence.acquired_before_snapshot,
+        "allowed_concurrency": evidence.allowed_concurrency,
+        "backend_process_id": evidence.backend_process_id,
+        "context_id": str(evidence.context_id),
+        "engine": "greenplum",
+        "limitations": list(evidence.limitations),
+        "relation_locks": [
+            _greenplum_relation_lock_semantic_value(lock) for lock in evidence.relation_locks
+        ],
+        "runtime_profile": evidence.runtime_profile.value,
+        "snapshot_locator": evidence.snapshot_locator,
+        "started_at": evidence.started_at.astimezone(UTC).isoformat(),
+        "strategy": evidence.strategy,
+    }
+
+
+def _original_greenplum_profile_semantic_value(
+    profile: GreenplumServerProfile,
+) -> dict[str, SemanticValue]:
+    return {
+        "backend_process_id": profile.backend_process_id,
+        "client_encoding": profile.client_encoding,
+        "compatibility_version": profile.compatibility_version,
+        "compatibility_version_number": profile.compatibility_version_number,
+        "database_name": profile.database_name,
+        "full_version": profile.full_version,
+        "gp_role": profile.gp_role,
+        "gp_session_role": profile.gp_session_role,
+        "integer_datetimes": profile.integer_datetimes,
+        "max_identifier_utf8_bytes": profile.max_identifier_utf8_bytes,
+        "product": ORIGINAL_GREENPLUM_PROFILE,
+        "product_version": profile.product_version,
+        "runtime_profile": profile.runtime_profile.value,
+        "server_encoding": profile.server_encoding,
+        "snapshot_locator": profile.snapshot_locator,
+        "timezone": profile.timezone,
+        "transaction_isolation": profile.transaction_isolation,
+        "transaction_read_only": profile.transaction_read_only,
+    }
+
+
+def _original_greenplum_hash_capability_semantic_value(
+    capability: OriginalGreenplumHashCapability,
+) -> dict[str, SemanticValue]:
+    return {
+        "argument_type_oids": list(capability.argument_type_oids),
+        "canonical_sha256_verified": capability.canonical_sha256_verified,
+        "function_name": capability.function_name,
+        "function_oid": capability.function_oid,
+        "is_strict": capability.is_strict,
+        "reader_has_execute": capability.reader_has_execute,
+        "reader_has_schema_usage": capability.reader_has_schema_usage,
+        "result_type_oid": capability.result_type_oid,
+        "schema_name": capability.schema_name,
+        "selected_strategy": capability.selected_strategy,
+        "volatility_code": capability.volatility_code,
+    }
+
+
+def _original_greenplum_relation_semantic_value(
+    protected: OriginalGreenplumProtectedRelationInspection,
+) -> dict[str, SemanticValue]:
+    inspection = protected.inspection
+    catalog = protected.catalog
+    return {
+        "acquired_before_snapshot": protected.acquired_before_snapshot,
+        "columns": [_binding_semantic_value(item) for item in inspection.bindings],
+        "context_id": str(inspection.context_id),
+        "distribution_attribute_numbers": list(catalog.distribution_attribute_numbers),
+        "has_distribution_policy": catalog.has_distribution_policy,
+        "lock_mode": protected.lock_mode,
+        "max_identifier_utf8_bytes": inspection.max_identifier_utf8_bytes,
+        "reader_has_delete": catalog.reader_has_delete,
+        "reader_has_insert": catalog.reader_has_insert,
+        "reader_has_schema_usage": catalog.reader_has_schema_usage,
+        "reader_has_select": catalog.reader_has_select,
+        "reader_has_truncate": catalog.reader_has_truncate,
+        "reader_has_update": catalog.reader_has_update,
+        "relation_kind": catalog.relation_kind,
+        "relation_oid": inspection.relation_oid,
+        "relation_row_type_oid": inspection.relation_row_type_oid,
+        "relation_scope": protected.acquisition.relation_scope.value,
+        "requested_relation": list(protected.acquisition.relation.components),
+        "resolved_relation": list(inspection.relation.components),
+        "storage_code": catalog.storage_code,
         "storage_kind": catalog.storage_kind.value,
         "storage_profile": _greenplum_storage_profile_semantic_value(catalog.storage_profile),
     }

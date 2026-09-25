@@ -308,6 +308,16 @@ def parse_original_greenplum_fingerprint_plan(
         row_subquery_index + 1,
         "source-and-topology-seed append below the partial segment aggregate",
     )
+    source_row_subquery_indices = tuple(
+        index
+        for index in range(row_subquery_index + 1, source_append_index)
+        if shape.lines[index].strip() == "{SUBQUERYSCAN"
+    )
+    if len(source_row_subquery_indices) > 1:
+        raise GreenplumCatalogMetadataError(
+            "Original Greenplum canonical fingerprint serialized plan contains an ambiguous "
+            "source-row subquery chain below the hashed-row subquery"
+        )
     relation_scan_index = _find_serialized_plan_node(
         shape.lines,
         _original_greenplum_serialized_relation_scan_node(storage_kind),
@@ -356,6 +366,19 @@ def parse_original_greenplum_fingerprint_plan(
         row_subquery_index,
         "hashed-row subquery",
     )
+    source_append_expected_parent_id = row_subquery_node_id
+    if source_row_subquery_indices:
+        source_row_subquery_node_id, source_row_subquery_parent_id = _serialized_plan_node_identity(
+            shape.lines,
+            source_row_subquery_indices[0],
+            "source-row subquery",
+        )
+        if source_row_subquery_parent_id != row_subquery_node_id:
+            raise GreenplumCatalogMetadataError(
+                "Original Greenplum canonical fingerprint serialized source-row subquery "
+                "does not descend directly from the hashed-row subquery"
+            )
+        source_append_expected_parent_id = source_row_subquery_node_id
     source_append_node_id, source_append_parent_id = _serialized_plan_node_identity(
         shape.lines,
         source_append_index,
@@ -393,7 +416,7 @@ def parse_original_greenplum_fingerprint_plan(
         segment_aggregate_node_id,
         redistribute_node_id,
         partial_aggregate_node_id,
-        row_subquery_node_id,
+        source_append_expected_parent_id,
         source_append_node_id,
         source_append_node_id,
         topology_subquery_node_id,

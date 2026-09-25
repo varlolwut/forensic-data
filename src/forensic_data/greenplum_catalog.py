@@ -233,6 +233,7 @@ class OriginalGreenplumHashCapability:
     reader_has_execute: bool
     reader_has_schema_usage: bool
     selected_strategy: str
+    canonical_sha256_verified: bool
 
 
 @final
@@ -504,10 +505,11 @@ def parse_greenplum_reader_identity(row: DatabaseRow) -> GreenplumReaderIdentity
         raise GreenplumCatalogMetadataError(
             f"Greenplum reader role cannot log in: user={identity.user_name!r}"
         )
-    if not identity.default_transaction_read_only or not identity.transaction_read_only:
+    if not identity.transaction_read_only:
         raise GreenplumCatalogMetadataError(
-            "Greenplum reader role must default to and currently use read-only transactions: "
-            f"user={identity.user_name!r}"
+            "Greenplum reader must currently use a read-only transaction: "
+            f"user={identity.user_name!r}, "
+            f"default_transaction_read_only={identity.default_transaction_read_only}"
         )
     return identity
 
@@ -1023,6 +1025,7 @@ def parse_original_greenplum_hash_capability(
             "original Greenplum hash schema USAGE privilege",
         ),
         selected_strategy="unpackaged_contrib_sql",
+        canonical_sha256_verified=False,
     )
     _validate_hash_capability(
         capability.schema_name,

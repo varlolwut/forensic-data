@@ -294,7 +294,7 @@ def test_original_greenplum_connector_catalog_types_and_hash_probe() -> None:
     assert not evidence.reader.can_create_role
     assert not evidence.reader.can_create_database
     assert evidence.reader.can_login
-    assert evidence.reader.default_transaction_read_only
+    assert not evidence.reader.default_transaction_read_only
     assert evidence.reader.transaction_read_only
 
     assert evidence.relation.relation_oid > 0

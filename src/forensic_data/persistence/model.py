@@ -34,7 +34,12 @@ from forensic_data.contracts.semantics import (
     canonical_semantic_json,
     semantic_value_from_json,
 )
-from forensic_data.greenplum_profile import GREENGAGE_DRIVER, GREENGAGE_PROFILE
+from forensic_data.greenplum_profile import (
+    GREENGAGE_DRIVER,
+    GREENGAGE_PROFILE,
+    ORIGINAL_GREENPLUM_DRIVER,
+    ORIGINAL_GREENPLUM_PROFILE,
+)
 
 _SQL_ARTIFACT_KIND = "sql"
 _SQL_CAPTURE_DISABLED = "sql_capture_disabled"
@@ -208,7 +213,12 @@ class DatasetVersionDefinition:
         _require_sha256(self.logical_schema_digest, "dataset logical schema digest")
         _require_nonblank_text(self.connection_id, "dataset connection id")
         _require_enum(self.adapter, Adapter, "dataset adapter")
-        if self.adapter not in (Adapter.POSTGRESQL, Adapter.MSSQL, Adapter.GREENGAGE):
+        if self.adapter not in (
+            Adapter.POSTGRESQL,
+            Adapter.MSSQL,
+            Adapter.GREENGAGE,
+            Adapter.GREENPLUM,
+        ):
             raise ValueError(f"dataset adapter is unsupported: adapter={self.adapter.value!r}")
         _require_nonblank_text(self.driver, "dataset driver")
         _require_nonblank_text(self.profile, "dataset profile")
@@ -219,6 +229,15 @@ class DatasetVersionDefinition:
             raise ValueError(
                 "Greengage dataset requires exact driver/profile pair: "
                 f"required=({GREENGAGE_DRIVER!r}, {GREENGAGE_PROFILE!r}), "
+                f"actual=({self.driver!r}, {self.profile!r})"
+            )
+        if self.adapter is Adapter.GREENPLUM and (
+            self.driver,
+            self.profile,
+        ) != (ORIGINAL_GREENPLUM_DRIVER, ORIGINAL_GREENPLUM_PROFILE):
+            raise ValueError(
+                "Original Greenplum dataset requires exact driver/profile pair: "
+                f"required=({ORIGINAL_GREENPLUM_DRIVER!r}, {ORIGINAL_GREENPLUM_PROFILE!r}), "
                 f"actual=({self.driver!r}, {self.profile!r})"
             )
         _require_enum(self.locator_kind, DatasetLocatorKind, "dataset locator kind")
@@ -243,6 +262,11 @@ class DatasetVersionDefinition:
             or self.relation_scope is not RelationScope.PHYSICAL_ONLY
         ):
             raise ValueError("Greengage datasets require a physical_only relation locator")
+        if self.adapter is Adapter.GREENPLUM and (
+            self.locator_kind is not DatasetLocatorKind.RELATION
+            or self.relation_scope is not RelationScope.PHYSICAL_ONLY
+        ):
+            raise ValueError("Original Greenplum datasets require a physical_only relation locator")
         _require_canonical_object_json(self.semantic_payload_json, "dataset semantic payload")
         _require_digest_matches_json(
             self.semantic_digest,
@@ -837,6 +861,13 @@ def _require_dataset_body_shape(
         GREENGAGE_PROFILE,
     ):
         raise ValueError(f"{context} Greengage connection requires exact driver/profile pair")
+    if adapter is Adapter.GREENPLUM and (driver, profile) != (
+        ORIGINAL_GREENPLUM_DRIVER,
+        ORIGINAL_GREENPLUM_PROFILE,
+    ):
+        raise ValueError(
+            f"{context} original Greenplum connection requires exact driver/profile pair"
+        )
     _semantic_text(body["dataset_id"], f"{context} dataset id")
     grain = _require_nonnullable_field_names(
         body["grain"],
@@ -866,12 +897,12 @@ def _require_dataset_body_shape(
     locator_kind = _semantic_text(locator.get("kind"), f"{context} locator kind")
     if locator_kind == DatasetLocatorKind.RELATION.value:
         relation_scope = _require_dataset_relation_locator(locator, f"{context} locator")
-        if adapter in (Adapter.MSSQL, Adapter.GREENGAGE) and (
+        if adapter in (Adapter.MSSQL, Adapter.GREENGAGE, Adapter.GREENPLUM) and (
             relation_scope is not RelationScope.PHYSICAL_ONLY
         ):
             raise ValueError(f"{context} {adapter.value} relation requires physical_only scope")
     elif locator_kind == DatasetLocatorKind.SQL.value:
-        if adapter in (Adapter.MSSQL, Adapter.GREENGAGE):
+        if adapter in (Adapter.MSSQL, Adapter.GREENGAGE, Adapter.GREENPLUM):
             raise ValueError(f"{context} {adapter.value} dataset requires a relation locator")
         _sql_artifact_identity(locator, f"{context} locator")
     else:
@@ -1256,7 +1287,7 @@ def _readiness_artifact_identity(
 ) -> _SqlArtifactIdentity | None:
     kind = _semantic_text(readiness.get("kind"), f"{context} kind")
     if kind == _SQL_ARTIFACT_KIND:
-        if expected_adapter in (Adapter.MSSQL, Adapter.GREENGAGE):
+        if expected_adapter in (Adapter.MSSQL, Adapter.GREENGAGE, Adapter.GREENPLUM):
             raise ValueError(
                 f"{context} {expected_adapter.value} readiness requires a relation manifest"
             )
@@ -1429,7 +1460,12 @@ def _require_dataset_adapter(value: SemanticValue, context: str) -> Adapter:
         adapter = Adapter(adapter_text)
     except ValueError:
         raise ValueError(f"{context} is unsupported: adapter={adapter_text!r}") from None
-    if adapter not in (Adapter.POSTGRESQL, Adapter.MSSQL, Adapter.GREENGAGE):
+    if adapter not in (
+        Adapter.POSTGRESQL,
+        Adapter.MSSQL,
+        Adapter.GREENGAGE,
+        Adapter.GREENPLUM,
+    ):
         raise ValueError(f"{context} is unsupported: adapter={adapter_text!r}")
     return adapter
 

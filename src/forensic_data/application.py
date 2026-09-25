@@ -99,6 +99,16 @@ from forensic_data.mssql import (
 from forensic_data.mssql_legacy import open_mssql_2016_protected_read_context
 from forensic_data.mssql_profile import MssqlRuntimeProfile, match_mssql_runtime_profile
 from forensic_data.mssql_sql import MssqlLoweringError, MssqlRelation
+from forensic_data.original_greenplum_endpoint import (
+    OriginalGreenplumAcquisitionRaceError,
+    OriginalGreenplumBudgetExceededError,
+    OriginalGreenplumProtectedReadContext,
+    OriginalGreenplumProtectedRelationInspection,
+    OriginalGreenplumRelation,
+    OriginalGreenplumRelationAcquisition,
+    OriginalGreenplumResultLimitError,
+    open_original_greenplum_protected_read_context,
+)
 from forensic_data.persistence.definitions import build_metadata_registration_definition
 from forensic_data.persistence.errors import (
     CompletedComparisonNotFoundError,
@@ -211,6 +221,8 @@ __all__: Final[tuple[str, ...]] = (
     "HistoryRequest",
     "MssqlGreengageExecutionServices",
     "MssqlPostgresExecutionServices",
+    "OriginalGreenplumGreengageExecutionServices",
+    "OriginalGreenplumPostgresExecutionServices",
     "PlanCheckRequest",
     "PostgresExecutionServices",
     "PostgresGreengageExecutionServices",
@@ -460,6 +472,100 @@ class PostgresGreengageExecutionServices:
 
 @final
 @dataclass(frozen=True, slots=True)
+class OriginalGreenplumPostgresExecutionServices:
+    reference_connection_id: str
+    reference_settings: PostgresConnectionSettings
+    target_connection_id: str
+    target_settings: PostgresConnectionSettings
+    metadata_connection_id: str
+    metadata_settings: PostgresConnectionSettings
+    reference_retry_policy: PostgresRetryPolicy
+    target_retry_policy: PostgresRetryPolicy
+    metadata_retry_policy: PostgresRetryPolicy
+    protected_lock_timeout_milliseconds: int
+    metadata_record_bytes: int
+    metadata_total_bytes: int
+
+    def __post_init__(self) -> None:
+        for value, context in (
+            (self.reference_connection_id, "reference connection id"),
+            (self.target_connection_id, "target connection id"),
+            (self.metadata_connection_id, "metadata connection id"),
+        ):
+            _require_nonblank(value, context)
+        for value, context in (
+            (self.reference_settings, "reference connection settings"),
+            (self.target_settings, "target connection settings"),
+            (self.metadata_settings, "metadata connection settings"),
+        ):
+            if not isinstance(cast(object, value), PostgresConnectionSettings):
+                raise TypeError(f"{context} must be PostgresConnectionSettings")
+        for value, context in (
+            (self.reference_retry_policy, "reference retry policy"),
+            (self.target_retry_policy, "target retry policy"),
+            (self.metadata_retry_policy, "metadata retry policy"),
+        ):
+            if not isinstance(cast(object, value), PostgresRetryPolicy):
+                raise TypeError(f"{context} must be PostgresRetryPolicy")
+        _require_positive_integer(
+            self.protected_lock_timeout_milliseconds,
+            "protected lock timeout milliseconds",
+        )
+        _require_positive_integer(self.metadata_record_bytes, "metadata record bytes")
+        _require_positive_integer(self.metadata_total_bytes, "metadata total bytes")
+        if self.metadata_record_bytes > self.metadata_total_bytes:
+            raise ValueError("metadata record bytes cannot exceed metadata total bytes")
+
+
+@final
+@dataclass(frozen=True, slots=True)
+class OriginalGreenplumGreengageExecutionServices:
+    reference_connection_id: str
+    reference_settings: PostgresConnectionSettings
+    target_connection_id: str
+    target_settings: PostgresConnectionSettings
+    metadata_connection_id: str
+    metadata_settings: PostgresConnectionSettings
+    reference_retry_policy: PostgresRetryPolicy
+    target_retry_policy: PostgresRetryPolicy
+    metadata_retry_policy: PostgresRetryPolicy
+    protected_lock_timeout_milliseconds: int
+    metadata_record_bytes: int
+    metadata_total_bytes: int
+
+    def __post_init__(self) -> None:
+        for value, context in (
+            (self.reference_connection_id, "reference connection id"),
+            (self.target_connection_id, "target connection id"),
+            (self.metadata_connection_id, "metadata connection id"),
+        ):
+            _require_nonblank(value, context)
+        for value, context in (
+            (self.reference_settings, "reference connection settings"),
+            (self.target_settings, "target connection settings"),
+            (self.metadata_settings, "metadata connection settings"),
+        ):
+            if not isinstance(cast(object, value), PostgresConnectionSettings):
+                raise TypeError(f"{context} must be PostgresConnectionSettings")
+        for value, context in (
+            (self.reference_retry_policy, "reference retry policy"),
+            (self.target_retry_policy, "target retry policy"),
+            (self.metadata_retry_policy, "metadata retry policy"),
+        ):
+            if not isinstance(cast(object, value), PostgresRetryPolicy):
+                raise TypeError(f"{context} must be PostgresRetryPolicy")
+        _require_positive_integer(
+            self.protected_lock_timeout_milliseconds,
+            "protected lock timeout milliseconds",
+        )
+        _require_positive_integer(self.metadata_record_bytes, "metadata record bytes")
+        _require_positive_integer(self.metadata_total_bytes, "metadata total bytes")
+        if self.metadata_record_bytes > self.metadata_total_bytes:
+            raise ValueError("metadata record bytes cannot exceed metadata total bytes")
+
+
+@final
+@dataclass(frozen=True, slots=True)
 class MssqlGreengageExecutionServices:
     reference_connection_id: str
     reference_settings: MssqlConnectionSettings
@@ -511,15 +617,21 @@ type ExecutionServices = (
     PostgresExecutionServices
     | MssqlPostgresExecutionServices
     | PostgresGreengageExecutionServices
+    | OriginalGreenplumPostgresExecutionServices
+    | OriginalGreenplumGreengageExecutionServices
     | MssqlGreengageExecutionServices
 )
 type ProtectedReadContext = (
-    PostgresProtectedReadContext | MssqlProtectedReadContext | GreengageProtectedReadContext
+    PostgresProtectedReadContext
+    | MssqlProtectedReadContext
+    | GreengageProtectedReadContext
+    | OriginalGreenplumProtectedReadContext
 )
 type ProtectedRelation = (
     PostgresProtectedRelationInspection
     | MssqlInspectedRelation
     | GreengageProtectedRelationInspection
+    | OriginalGreenplumProtectedRelationInspection
 )
 
 
@@ -747,6 +859,7 @@ def _execute_attempt(
     artifact: CompletedComparisonArtifact | CompletedStructuralComparisonArtifact | None = None
     persisted_cut: PersistedInputCut | None = None
     failure: _AttemptFailure | None = None
+    greenplum_endpoint_direction: PlanDirection | None = PlanDirection.REFERENCE
     try:
         reference = _open_side(check, PlanDirection.REFERENCE, source_budget, services)
         resources.append(_AttemptResource(reference, None))
@@ -772,6 +885,7 @@ def _execute_attempt(
                 _result_metrics_from_source_budget(source_budget),
             )
         else:
+            greenplum_endpoint_direction = PlanDirection.TARGET
             target = _open_side(check, PlanDirection.TARGET, source_budget, services)
             resources.append(_AttemptResource(target, None))
             target_receipt = _persist_context(
@@ -796,6 +910,7 @@ def _execute_attempt(
                     _result_metrics_from_source_budget(source_budget),
                 )
             else:
+                greenplum_endpoint_direction = None
                 input_cut = build_input_cut_definition(
                     reference_readiness,
                     target_readiness,
@@ -892,9 +1007,22 @@ def _execute_attempt(
             persisted_cut is not None,
             source_budget,
         )
+    except OriginalGreenplumResultLimitError as error:
+        failure = _failure_from_error(
+            ExecutionStatus.INCOMPLETE,
+            ReasonCode.BUDGET_EXHAUSTED,
+            "read_source",
+            "a bounded source read exceeded its configured result budget",
+            error,
+            False,
+            resources,
+            persisted_cut is not None,
+            source_budget,
+        )
     except (
         ComparisonBudgetExceededError,
         GreengageBudgetExceededError,
+        OriginalGreenplumBudgetExceededError,
         PostgresReadDeadlineExceededError,
         PostgresSourceBudgetExceededError,
     ) as error:
@@ -966,6 +1094,7 @@ def _execute_attempt(
         MssqlMetadataError,
         GreenplumContextLostError,
         GreengageAcquisitionRaceError,
+        OriginalGreenplumAcquisitionRaceError,
     ) as error:
         failure = _failure_from_error(
             ExecutionStatus.INCOMPLETE,
@@ -1023,11 +1152,22 @@ def _execute_attempt(
             source_budget,
         )
     except (UnsupportedGreenplumProfileError, GreenplumMetadataError) as error:
+        if greenplum_endpoint_direction is PlanDirection.REFERENCE:
+            operation = "open_reference"
+            message = (
+                "the original Greenplum reference does not satisfy the required runtime capability"
+            )
+        elif greenplum_endpoint_direction is PlanDirection.TARGET:
+            operation = "open_target"
+            message = "the Greengage target does not satisfy the required runtime capability"
+        else:
+            operation = "compare"
+            message = "a Greenplum-family endpoint does not satisfy the required runtime capability"
         failure = _failure_from_error(
             ExecutionStatus.ERROR,
             ReasonCode.UNSUPPORTED_CAPABILITY,
-            "open_target",
-            "the Greengage target does not satisfy the required runtime capability",
+            operation,
+            message,
             error,
             False,
             resources,
@@ -1152,6 +1292,14 @@ def _open_side(
         )
     if dataset.connection.adapter is Adapter.MSSQL:
         return _open_mssql_side(
+            dataset,
+            readiness,
+            direction,
+            source_budget,
+            services,
+        )
+    if dataset.connection.adapter is Adapter.GREENPLUM:
+        return _open_original_greenplum_side(
             dataset,
             readiness,
             direction,
@@ -1349,7 +1497,11 @@ def _open_greengage_side(
         )
     if not isinstance(
         services,
-        (PostgresGreengageExecutionServices, MssqlGreengageExecutionServices),
+        (
+            PostgresGreengageExecutionServices,
+            MssqlGreengageExecutionServices,
+            OriginalGreenplumGreengageExecutionServices,
+        ),
     ):
         raise TypeError("Greengage target execution requires Greengage execution services")
     locator = dataset.locator
@@ -1406,6 +1558,87 @@ def _open_greengage_side(
         context=context,
         dataset_relation=_protected_greengage_relation(context, dataset_relation),
         readiness_relation=_protected_greengage_relation(context, readiness_relation),
+    )
+
+
+def _open_original_greenplum_side(
+    dataset: DatasetDefinition,
+    readiness: RelationManifestReadiness,
+    direction: PlanDirection,
+    source_budget: PostgresSourceBudgetAttempt,
+    services: ExecutionServices,
+) -> _ProtectedSide:
+    if direction is not PlanDirection.REFERENCE:
+        raise UnsupportedGreenplumProfileError(
+            "original Greenplum endpoint execution is implemented only for the reference direction"
+        )
+    if not isinstance(
+        services,
+        (
+            OriginalGreenplumPostgresExecutionServices,
+            OriginalGreenplumGreengageExecutionServices,
+        ),
+    ):
+        raise TypeError(
+            "original Greenplum reference execution requires original Greenplum execution services"
+        )
+    locator = dataset.locator
+    if not isinstance(locator, RelationLocator):
+        raise UnsupportedComparisonError(
+            "original Greenplum reference execution requires a physical relation"
+        )
+    if locator.relation_scope is not RelationScope.PHYSICAL_ONLY:
+        raise UnsupportedComparisonError(
+            "original Greenplum reference execution requires physical_only relation scope"
+        )
+    if (
+        match_greenplum_runtime_profile(
+            dataset.connection.driver,
+            dataset.connection.profile,
+        )
+        is not GreenplumRuntimeProfile.ORIGINAL_GREENPLUM
+    ):
+        raise UnsupportedGreenplumProfileError(
+            "declared original Greenplum reference requires "
+            "driver='psycopg2' and profile='original_greenplum'"
+        )
+    dataset_relation = OriginalGreenplumRelation(
+        components=(locator.schema, locator.name),
+    )
+    readiness_relation = OriginalGreenplumRelation(
+        components=(readiness.relation.schema, readiness.relation.name),
+    )
+    acquisitions = (
+        OriginalGreenplumRelationAcquisition(
+            schema=dataset.logical_schema.schema,
+            relation=dataset_relation,
+            relation_scope=locator.relation_scope,
+            column_names=tuple(field.column_name for field in dataset.projection),
+            max_metadata_record_bytes=services.metadata_record_bytes,
+            max_metadata_total_bytes=services.metadata_total_bytes,
+        ),
+        OriginalGreenplumRelationAcquisition(
+            schema=_manifest_schema(),
+            relation=readiness_relation,
+            relation_scope=RelationScope.PHYSICAL_ONLY,
+            column_names=readiness.columns.values(),
+            max_metadata_record_bytes=services.metadata_record_bytes,
+            max_metadata_total_bytes=services.metadata_total_bytes,
+        ),
+    )
+    context = open_original_greenplum_protected_read_context(
+        services.reference_settings,
+        services.reference_retry_policy,
+        acquisitions,
+        services.protected_lock_timeout_milliseconds,
+        source_budget,
+        PostgresSourceDirection.REFERENCE,
+    )
+    return _ProtectedSide(
+        direction=direction,
+        context=context,
+        dataset_relation=_protected_original_greenplum_relation(context, dataset_relation),
+        readiness_relation=_protected_original_greenplum_relation(context, readiness_relation),
     )
 
 
@@ -1488,6 +1721,20 @@ def _read_relation_manifest(
         if not isinstance(relation, GreengageProtectedRelationInspection):
             raise ApplicationStateError(
                 "Greengage protected context is paired with another engine's readiness relation"
+            )
+        return context.read_relation_manifest(
+            relation,
+            columns,
+            dataset_id,
+            scope_digest,
+            max_record_bytes,
+            max_total_bytes,
+        )
+    if isinstance(context, OriginalGreenplumProtectedReadContext):
+        if not isinstance(relation, OriginalGreenplumProtectedRelationInspection):
+            raise ApplicationStateError(
+                "original Greenplum protected context is paired with another engine's "
+                "readiness relation"
             )
         return context.read_relation_manifest(
             relation,
@@ -2051,6 +2298,7 @@ def _failure_from_comparison_interruption(
         (
             ComparisonBudgetExceededError,
             GreengageBudgetExceededError,
+            OriginalGreenplumBudgetExceededError,
             PostgresReadDeadlineExceededError,
             PostgresResultLimitError,
             PostgresSourceBudgetExceededError,
@@ -2082,6 +2330,7 @@ def _failure_from_comparison_interruption(
             MssqlMetadataError,
             GreenplumContextLostError,
             GreengageAcquisitionRaceError,
+            OriginalGreenplumAcquisitionRaceError,
         ),
     ):
         execution_status = ExecutionStatus.INCOMPLETE
@@ -2134,8 +2383,8 @@ def _failure_from_comparison_interruption(
         execution_status = ExecutionStatus.ERROR
         reason = _reason(
             ReasonCode.UNSUPPORTED_CAPABILITY,
-            "open_target",
-            "the Greengage target does not satisfy the required runtime capability",
+            "compare",
+            "a Greenplum-family endpoint does not satisfy the required runtime capability",
             (SafeParameter(name="error_type", value=type(cause).__name__),),
         )
         retryable = False
@@ -2285,7 +2534,10 @@ def _source_error_parameters(error: Exception) -> tuple[SafeParameter, ...]:
                 SafeParameter(name="error_category", value=error.error_category),
             )
         )
-    if isinstance(error, GreengageBudgetExceededError):
+    if isinstance(
+        error,
+        (GreengageBudgetExceededError, OriginalGreenplumBudgetExceededError),
+    ):
         parameters.append(SafeParameter(name="budget_detail", value=str(error)))
     return tuple(parameters)
 
@@ -2932,7 +3184,11 @@ def _postgres_settings(
 ) -> PostgresConnectionSettings:
     if direction is PlanDirection.TARGET and isinstance(
         services,
-        (PostgresExecutionServices, MssqlPostgresExecutionServices),
+        (
+            PostgresExecutionServices,
+            MssqlPostgresExecutionServices,
+            OriginalGreenplumPostgresExecutionServices,
+        ),
     ):
         return services.target_settings
     if direction is PlanDirection.REFERENCE and isinstance(
@@ -2951,7 +3207,7 @@ def _postgres_retry_policy(
         return services.source_retry_policy
     if direction is PlanDirection.TARGET and isinstance(
         services,
-        MssqlPostgresExecutionServices,
+        (MssqlPostgresExecutionServices, OriginalGreenplumPostgresExecutionServices),
     ):
         return services.target_retry_policy
     if direction is PlanDirection.REFERENCE and isinstance(
@@ -3000,6 +3256,21 @@ def _protected_greengage_relation(
     if len(matches) != 1:
         raise GreenplumMetadataError(
             "protected Greengage relation set does not contain exactly one requested relation"
+        )
+    return matches[0]
+
+
+def _protected_original_greenplum_relation(
+    context: OriginalGreenplumProtectedReadContext,
+    relation: OriginalGreenplumRelation,
+) -> OriginalGreenplumProtectedRelationInspection:
+    matches = tuple(
+        item for item in context.protected_relations if item.acquisition.relation == relation
+    )
+    if len(matches) != 1:
+        raise GreenplumMetadataError(
+            "protected original Greenplum relation set does not contain exactly one requested "
+            "relation"
         )
     return matches[0]
 
@@ -3090,6 +3361,14 @@ def _validate_service_closure(
         if not isinstance(services, PostgresGreengageExecutionServices):
             raise TypeError("PostgreSQL to Greengage execution requires matching services")
         return
+    if pair == (Adapter.GREENPLUM, Adapter.POSTGRESQL):
+        if not isinstance(services, OriginalGreenplumPostgresExecutionServices):
+            raise TypeError("original Greenplum to PostgreSQL execution requires matching services")
+        return
+    if pair == (Adapter.GREENPLUM, Adapter.GREENGAGE):
+        if not isinstance(services, OriginalGreenplumGreengageExecutionServices):
+            raise TypeError("original Greenplum to Greengage execution requires matching services")
+        return
     raise UnsupportedComparisonError(
         "execution adapter pair is not implemented: "
         f"reference={pair[0].value!r}, target={pair[1].value!r}"
@@ -3122,6 +3401,15 @@ def _validate_runtime_profiles(
             raise UnsupportedPostgresProfileError(
                 "declared PostgreSQL reference driver/profile is unsupported: "
                 f"driver={reference.driver!r}, profile={reference.profile!r}"
+            )
+    elif reference.adapter is Adapter.GREENPLUM:
+        if (
+            match_greenplum_runtime_profile(reference.driver, reference.profile)
+            is not GreenplumRuntimeProfile.ORIGINAL_GREENPLUM
+        ):
+            raise UnsupportedGreenplumProfileError(
+                "original Greenplum reference requires "
+                "driver='psycopg2' and profile='original_greenplum'"
             )
     else:
         raise UnsupportedComparisonError(

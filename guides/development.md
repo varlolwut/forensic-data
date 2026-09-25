@@ -8,7 +8,7 @@ Run all commands from the repository root. Passing protocol-only tests does not 
 
 - Python 3.12
 - [uv](https://docs.astral.sh/uv/) 0.12.18
-- Docker with Compose for PostgreSQL and SQL Server integration tests
+- Docker with Compose for PostgreSQL, SQL Server, and Greenplum-family integration tests
 
 The locked PostgreSQL drivers are C extensions built from source. A direct host installation
 therefore needs a C toolchain plus `pg_config` and matching libpq development headers. The
@@ -80,6 +80,13 @@ The hosted `SQL Server 2016 compatibility` workflow is also explicitly dispatche
 ref. It installs a disposable Windows guest. A green ordinary CI run does not by itself establish
 database compatibility or Docker delivery. Retain each separate integration result and its commit
 SHA. Full version-matrix testing is separate from these targeted checks.
+
+The hosted `Greenplum family artifact fixture` workflow is explicitly dispatched as well. It
+builds and verifies the exact original Greenplum and Greengage artifacts, proves their clean
+restart over retained volumes, starts PostgreSQL 17.11, and runs the critical original-Greenplum
+heap-source comparisons to PostgreSQL and Greengage. See the
+[Greenplum-family guide](greenplum.md) for the exact provenance and endpoint limits; ordinary CI
+does not make this compatibility claim.
 
 PostgreSQL applies these credentials only when its data volume is initialized. If the fixture was
 previously started with different values, run the cleanup command below before starting it again.

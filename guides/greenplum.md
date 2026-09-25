@@ -1,17 +1,18 @@
-# Greengage target and Greenplum-family artifacts
+# Original Greenplum source and Greengage target
 
 [README](../README.md) · [Docker quickstart](docker-quickstart.md) · [CLI and contracts](cli-and-contracts.md) · [PostgreSQL](postgresql.md) · [SQL Server](sql-server.md) · [Greenplum family](greenplum.md) · [Development](development.md)
 
 Forensic Data Engine provides a verified Greengage 7.5 target endpoint for durable integer-key
-comparisons from PostgreSQL 17.11 and SQL Server 2022 sources. The contract must select
-`adapter: greengage`, `driver: psycopg`, and `profile: greengage` explicitly. Version entries here
-record verification evidence rather than a runtime allowlist; admission depends on the required
-SQL, catalog, encoding, type, topology, and snapshot capabilities.
+comparisons from PostgreSQL 17.11, SQL Server 2022, and the exact original Greenplum artifact
+identified as `4.3.99.00 build dev`. That original Greenplum artifact is also a verified source to
+PostgreSQL 17.11. Contracts select each adapter, driver, and profile explicitly. Version entries
+here record verification evidence rather than a runtime allowlist; admission depends on the
+required SQL, catalog, encoding, type, topology, storage, and snapshot capabilities.
 
-The verified endpoint evidence currently covers physical heap relations, a relation-manifest
-readiness cut, and the canonical integer, decimal, date, local-timestamp, and instant-timestamp
-values exercised by the verified contract. It does not claim Greengage as a source endpoint.
-Original Greenplum source admission and execution also remain unverified.
+The verified endpoint evidence covers physical heap relations, a relation-manifest readiness cut,
+and exact `int64`, decimal, date, local-timestamp, and instant-timestamp values. It does not claim
+Greengage as a source endpoint or original Greenplum as a target endpoint. Append-optimized row
+and column endpoint behavior has not been verified.
 
 ## Using the Greengage target
 
@@ -35,6 +36,30 @@ Run the selected check through `forensics check` or the typed Python API, then i
 result with `forensics history` and page retained row differences with `forensics diff`. See
 [CLI and contracts](cli-and-contracts.md) for invocation, output, and pagination details.
 
+## Using original Greenplum as a source
+
+The complete [original Greenplum source contract](../tests/fixtures/greenplum/original-greenplum/comparison-contract.yaml)
+contains the verified original-Greenplum-to-PostgreSQL and original-Greenplum-to-Greengage checks.
+It selects `adapter: greenplum`, `driver: psycopg2`, and `profile: original_greenplum` explicitly.
+The fixture connection declares both source and target roles to prove that source admission accepts
+additional declared roles, but both executed checks use that connection only as their reference
+source. Original Greenplum target execution is not implemented or verified.
+
+Before opening the protected snapshot, the source adapter completes read-only catalog and type
+discovery. It then starts a native `SERIALIZABLE READ ONLY` transaction and acquires
+`ACCESS SHARE` locks for the complete deterministic dataset-and-manifest relation set before its
+first protected `SELECT`. The adapter records the actual relation bindings and OIDs, seals that
+closure, and uses the same snapshot for relation-manifest readiness, fingerprints, and exact rows.
+There is no weaker isolation fallback.
+
+The verified heap contract covers an `int64` key, `decimal(38,7)`, date, microsecond local
+timestamp, and microsecond instant timestamp. Migration `0008_greenplum_dataset_adapter.sql`
+admits the explicit Greenplum profile and physical-relation scope in the durable metadata schema;
+runtime lifecycle persistence records the concrete binding and OIDs. Both verified target pairs
+execute through the CLI, replay the same request idempotently through the typed API, retain the
+exact mismatch evidence in PostgreSQL metadata, and can replay history and differences after the
+live source and manifest change.
+
 ## Functions-based miniature load boundary
 
 The current real PostgreSQL source and Greengage target fixtures each use a native
@@ -48,11 +73,16 @@ issues load DML; it only compares a batch after both completion records are visi
 therefore remains outside the DFE runtime, while the fixture verifies the writer/reader boundary
 on the supported PostgreSQL-to-Greengage example.
 
+The original Greenplum source fixture has a separate, narrowly privileged writer used only by the
+test harness to seed and later mutate its heap relation and completion manifest. That fixture path
+does not install or claim a load stored function, and the DFE runtime receives only the read-only
+source connection.
+
 ## Verified artifact pair
 
 | Product | Exact artifact | Verified fixture behavior |
 |---|---|---|
-| Original Greenplum | `greenplum-db/gpdb-archive` commit `62378f1767f22217f7f0474260abfeeb5c2615b9`, committed 2016-12-30, source identity `4.3.99.00 build dev` | Source-built coordinator, two primaries, two mirrors, catalog topology, and distributed execution across both primary content IDs |
+| Original Greenplum | `greenplum-db/gpdb-archive` commit `62378f1767f22217f7f0474260abfeeb5c2615b9`, committed 2016-12-30, source identity `4.3.99.00 build dev` | Source-built coordinator, two primaries, two mirrors, catalog topology, distributed execution across both primary content IDs, and a verified heap source endpoint to PostgreSQL 17.11 and Greengage 7.5 |
 | Greengage | Official Ubuntu 22.04 amd64 package `greengage7=7.5.0`, source commit `677398e45766110a32e318266f186cf0cbe720a5` | Coordinator, two primaries, catalog topology, and distributed execution across both primary content IDs |
 
 The original Greenplum artifact is a development snapshot and is not a GA 4.3 release. Greengage
@@ -85,9 +115,10 @@ writers remain outside the reader path.
 
 The separately dispatched `Greenplum family artifact fixture` workflow builds, starts, verifies,
 stops cleanly, recreates both containers over retained volumes, proves volume persistence, verifies
-again, and removes both fixtures. The normal push and pull-request gates remain light. Artifact
-startup alone does not establish endpoint support; connector, catalog, type, read-consistency, and
-cross-engine evidence are separate gates. The heap, append-optimized row, and append-optimized
-column snapshot probes in this artifact fixture are snapshot evidence only. End-to-end Greengage
-target verification currently covers physical heap relations; AO and AOCO target endpoint behavior
-has not yet been verified.
+again, starts the PostgreSQL 17.11 fixture, and runs the critical endpoint comparisons before
+removing all three fixtures. The normal push and pull-request gates remain light. Artifact startup
+alone does not establish endpoint support; connector, catalog, type, read-consistency, durable
+evidence, and cross-engine execution are separate gates. The heap, append-optimized row, and
+append-optimized column snapshot probes are artifact-level snapshot evidence only and do not imply
+endpoint verification. End-to-end original Greenplum source and Greengage target verification
+currently covers physical heap relations; AO and AOCO endpoint behavior has not been verified.

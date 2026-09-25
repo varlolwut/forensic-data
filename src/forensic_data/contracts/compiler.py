@@ -71,6 +71,8 @@ from forensic_data.contracts.source import (
 from forensic_data.greenplum_profile import (
     GREENGAGE_DRIVER,
     GREENGAGE_PROFILE,
+    ORIGINAL_GREENPLUM_DRIVER,
+    ORIGINAL_GREENPLUM_PROFILE,
     GreenplumRuntimeProfile,
     match_greenplum_runtime_profile,
 )
@@ -243,6 +245,20 @@ def _compile_connection(source: ConnectionSource) -> ConnectionDefinition:
             raise UnsupportedContractError(
                 f"connection {connection_id!r} profile {profile!r} must declare role 'target'"
             )
+    if adapter is Adapter.GREENPLUM:
+        if (
+            match_greenplum_runtime_profile(driver, profile)
+            is not GreenplumRuntimeProfile.ORIGINAL_GREENPLUM
+        ):
+            raise UnsupportedContractError(
+                f"connection {connection_id!r} original Greenplum endpoint requires exact "
+                "driver/profile pair "
+                f"({ORIGINAL_GREENPLUM_DRIVER!r}, {ORIGINAL_GREENPLUM_PROFILE!r})"
+            )
+        if ConnectionRole.SOURCE not in roles:
+            raise UnsupportedContractError(
+                f"connection {connection_id!r} profile {profile!r} must declare role 'source'"
+            )
     return ConnectionDefinition(
         connection_id=connection_id,
         adapter=adapter,
@@ -373,7 +389,7 @@ def _compile_dataset_locator(
                 f"relation_scope={source.relation_scope!r}"
             ) from None
         if (
-            connection.adapter in (Adapter.MSSQL, Adapter.GREENGAGE)
+            connection.adapter in (Adapter.MSSQL, Adapter.GREENGAGE, Adapter.GREENPLUM)
             and relation_scope is not RelationScope.PHYSICAL_ONLY
         ):
             raise UnsupportedContractError(
@@ -685,6 +701,11 @@ def _compile_check(
     target = _required_reference(datasets, source.target_ref, f"{context} target")
     if reference.dataset_id == target.dataset_id:
         raise ContractValidationError(f"{context} reference and target datasets must differ")
+    if target.connection.adapter is Adapter.GREENPLUM:
+        raise UnsupportedContractError(
+            f"{context} target connection {target.connection.connection_id!r} profile "
+            f"{target.connection.profile!r} is source-only"
+        )
     if ConnectionRole.SOURCE not in reference.connection.roles:
         raise ContractValidationError(
             f"{context} reference connection {reference.connection.connection_id!r} "
