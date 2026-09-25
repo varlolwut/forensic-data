@@ -6,6 +6,8 @@ readonly DEMO_ROOT=/workspace/gpdb/gpAux/gpdemo
 readonly DATA_ROOT=/home/gpadmin/gpdemo-data
 readonly MASTER_DATA_DIRECTORY=/home/gpadmin/gpdemo-data/qddir/demoDataDir-1
 readonly INITIALIZATION_MARKER=/home/gpadmin/gpdemo-data/.dfe-initialized
+readonly INTEGRATION_READY_MARKER=/home/gpadmin/gpdemo-data/.dfe-integration-ready
+readonly READER_PASSWORD_FILE=/run/secrets/dfe-original-greenplum-reader-password
 export MASTER_DATA_DIRECTORY
 
 run_as_gpadmin() {
@@ -47,6 +49,9 @@ shutdown_cluster() {
 
 test "$(/workspace/gpdb/getversion)" = "4.3.99.00 build dev"
 install --directory --owner=gpadmin --group=gpadmin "${DATA_ROOT}"
+if [[ -e "${READER_PASSWORD_FILE}" ]]; then
+  rm -f "${INTEGRATION_READY_MARKER}"
+fi
 install --directory --owner=gpadmin --group=gpadmin --mode=0700 /home/gpadmin/.ssh
 ssh-keygen -A
 if [[ ! -f /home/gpadmin/.ssh/id_ed25519 ]]; then
@@ -79,6 +84,12 @@ else
   run_as_gpadmin /usr/local/bin/dfe-original-greenplum-healthcheck
   touch "${INITIALIZATION_MARKER}"
   chown gpadmin:gpadmin "${INITIALIZATION_MARKER}"
+fi
+
+if [[ -e "${READER_PASSWORD_FILE}" ]]; then
+  /usr/local/bin/dfe-original-greenplum-setup-integration "${READER_PASSWORD_FILE}"
+  touch "${INTEGRATION_READY_MARKER}"
+  chown gpadmin:gpadmin "${INTEGRATION_READY_MARKER}"
 fi
 
 run_as_gpadmin /usr/local/bin/dfe-original-greenplum-healthcheck

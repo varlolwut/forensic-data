@@ -4,6 +4,8 @@ set -euo pipefail
 readonly GREENGAGE_HOME=/opt/greengagedb/greengage7
 readonly COORDINATOR_DATA_DIRECTORY=/data/coordinator/ggseg-1
 readonly INITIALIZATION_MARKER=/data/.dfe-initialized
+readonly INTEGRATION_READY_MARKER=/data/.dfe-integration-ready
+readonly READER_PASSWORD_FILE=/run/secrets/dfe-greengage-reader-password
 
 run_as_gpadmin() {
   local command="$1"
@@ -43,6 +45,9 @@ shutdown_cluster() {
 }
 
 install --directory --owner=gpadmin --group=gpadmin /data/coordinator /data/primary1 /data/primary2
+if [[ -e "${READER_PASSWORD_FILE}" ]]; then
+  rm -f "${INTEGRATION_READY_MARKER}"
+fi
 install --directory --owner=gpadmin --group=gpadmin --mode=0700 /home/gpadmin/.ssh
 ssh-keygen -A
 if [[ ! -f /home/gpadmin/.ssh/id_ed25519 ]]; then
@@ -77,6 +82,12 @@ else
   run_as_gpadmin /usr/local/bin/dfe-greengage-healthcheck
   touch "${INITIALIZATION_MARKER}"
   chown gpadmin:gpadmin "${INITIALIZATION_MARKER}"
+fi
+
+if [[ -e "${READER_PASSWORD_FILE}" ]]; then
+  /usr/local/bin/dfe-greengage-setup-integration "${READER_PASSWORD_FILE}"
+  touch "${INTEGRATION_READY_MARKER}"
+  chown gpadmin:gpadmin "${INTEGRATION_READY_MARKER}"
 fi
 
 run_as_gpadmin /usr/local/bin/dfe-greengage-healthcheck

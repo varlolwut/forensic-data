@@ -89,6 +89,14 @@ RUN test "$(./getversion)" = "4.3.99.00 build dev" \
     && source /usr/local/gpdb/greenplum_path.sh \
     && python -c 'import gppylib.gphostcache'
 
+RUN make -C contrib/pgcrypto -j4 \
+    && make -C contrib/pgcrypto install \
+    && test -s /usr/local/gpdb/lib/postgresql/pgcrypto.so \
+    && test -s /usr/local/gpdb/share/postgresql/contrib/pgcrypto.sql \
+    && test "$(grep --fixed-strings --line-regexp --count \
+        'SET search_path = public;' \
+        /usr/local/gpdb/share/postgresql/contrib/pgcrypto.sql)" = 1
+
 RUN groupadd --gid 1000 gpadmin \
     && useradd --uid 1000 --gid gpadmin --create-home --shell /bin/bash gpadmin \
     && install --directory --owner=gpadmin --group=gpadmin --mode=0700 /home/gpadmin/.ssh \
@@ -106,12 +114,14 @@ RUN groupadd --gid 1000 gpadmin \
 COPY original-greenplum/gpadmin-limits.conf /etc/security/limits.d/90-dfe-gpadmin.conf
 COPY original-greenplum/entrypoint.sh /usr/local/bin/dfe-original-greenplum-entrypoint
 COPY original-greenplum/healthcheck.sh /usr/local/bin/dfe-original-greenplum-healthcheck
+COPY original-greenplum/setup-integration.sh /usr/local/bin/dfe-original-greenplum-setup-integration
 COPY original-greenplum/verify.sh /usr/local/bin/dfe-original-greenplum-verify
 
 RUN chmod 0644 /etc/security/limits.d/90-dfe-gpadmin.conf \
     && chmod 0755 \
         /usr/local/bin/dfe-original-greenplum-entrypoint \
         /usr/local/bin/dfe-original-greenplum-healthcheck \
+        /usr/local/bin/dfe-original-greenplum-setup-integration \
         /usr/local/bin/dfe-original-greenplum-verify
 
 ENV GPHOME=/usr/local/gpdb

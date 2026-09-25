@@ -1,0 +1,34 @@
+services:
+  greengage:
+    ports:
+      - 127.0.0.1:${DFE_GREENGAGE_PORT:?set DFE_GREENGAGE_PORT}:5432
+    secrets:
+      - source: dfe-greengage-reader-password
+        target: dfe-greengage-reader-password
+        mode: 0400
+    healthcheck:
+      test:
+        - CMD-SHELL
+        - >-
+          test -f /data/.dfe-integration-ready &&
+          exec runuser --user gpadmin -- /usr/local/bin/dfe-greengage-healthcheck
+
+  original-greenplum:
+    ports:
+      - 127.0.0.1:${DFE_ORIGINAL_GREENPLUM_PORT:?set DFE_ORIGINAL_GREENPLUM_PORT}:15432
+    secrets:
+      - source: dfe-original-greenplum-reader-password
+        target: dfe-original-greenplum-reader-password
+        mode: 0400
+    healthcheck:
+      test:
+        - CMD-SHELL
+        - >-
+          test -f /home/gpadmin/gpdemo-data/.dfe-integration-ready &&
+          exec runuser --user gpadmin -- /usr/local/bin/dfe-original-greenplum-healthcheck
+
+secrets:
+  dfe-greengage-reader-password:
+    file: ${DFE_GREENGAGE_READER_PASSWORD_FILE:?set DFE_GREENGAGE_READER_PASSWORD_FILE}
+  dfe-original-greenplum-reader-password:
+    file: ${DFE_ORIGINAL_GREENPLUM_READER_PASSWORD_FILE:?set DFE_ORIGINAL_GREENPLUM_READER_PASSWORD_FILE}

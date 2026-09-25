@@ -97,7 +97,7 @@ jobs:
         run: uv run pytest -m "not integration" --ignore-glob="tests/*_integration.py"
       - name: Run database integration suite
         if: github.event_name == 'workflow_dispatch'
-        run: uv run pytest -m "not mssql_legacy"
+        run: uv run pytest -m "not mssql_legacy and not greenplum"
       - name: Stop database fixtures
         if: always() && github.event_name == 'workflow_dispatch'
         run: |

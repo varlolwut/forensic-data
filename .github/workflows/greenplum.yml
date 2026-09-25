@@ -12,48 +12,108 @@ concurrency:
 
 jobs:
   artifact-fixture:
-    name: Original Greenplum and Greengage
+    name: Original Greenplum and Greengage integration
     runs-on: ubuntu-24.04
     timeout-minutes: 90
+    env:
+      DFE_GREENGAGE_PORT: "15431"
+      DFE_ORIGINAL_GREENPLUM_PORT: "15430"
     steps:
       - name: Check out source
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
       - name: Acquire exact artifacts
         shell: bash
         run: bash tests/fixtures/greenplum/prepare-artifacts.sh
+      - name: Create ephemeral reader secrets
+        shell: bash
+        run: |
+          umask 077
+          original_greenplum_password_file="${RUNNER_TEMP}/dfe-original-greenplum-reader-password"
+          greengage_password_file="${RUNNER_TEMP}/dfe-greengage-reader-password"
+          original_greenplum_password="$(openssl rand -hex 32)"
+          greengage_password="$(openssl rand -hex 32)"
+          echo "::add-mask::${original_greenplum_password}"
+          echo "::add-mask::${greengage_password}"
+          printf '%s' "${original_greenplum_password}" > "${original_greenplum_password_file}"
+          printf '%s' "${greengage_password}" > "${greengage_password_file}"
+          {
+            echo "DFE_ORIGINAL_GREENPLUM_READER_PASSWORD_FILE=${original_greenplum_password_file}"
+            echo "DFE_GREENGAGE_READER_PASSWORD_FILE=${greengage_password_file}"
+            echo "DFE_TEST_ORIGINAL_GREENPLUM_READER_DSN=postgresql://dfe_original_greenplum_reader:${original_greenplum_password}@127.0.0.1:${DFE_ORIGINAL_GREENPLUM_PORT}/dfe_fixture?sslmode=disable&connect_timeout=5"
+            echo "DFE_TEST_GREENGAGE_READER_DSN=postgresql://dfe_greengage_reader:${greengage_password}@127.0.0.1:${DFE_GREENGAGE_PORT}/dfe_fixture?sslmode=disable&connect_timeout=5"
+          } >> "${GITHUB_ENV}"
       - name: Validate Compose model
-        run: docker compose --file tests/fixtures/greenplum/compose.yaml config --quiet
+        run: >-
+          docker compose
+          --file tests/fixtures/greenplum/compose.yaml
+          --file tests/fixtures/greenplum/compose.integration.yaml
+          config --quiet
       - name: Build paired fixture
-        run: docker compose --file tests/fixtures/greenplum/compose.yaml build
+        run: >-
+          docker compose
+          --file tests/fixtures/greenplum/compose.yaml
+          --file tests/fixtures/greenplum/compose.integration.yaml
+          build
       - name: Start paired fixture
-        run: docker compose --file tests/fixtures/greenplum/compose.yaml up --detach --wait
+        run: >-
+          docker compose
+          --file tests/fixtures/greenplum/compose.yaml
+          --file tests/fixtures/greenplum/compose.integration.yaml
+          up --detach --wait
       - name: Verify identities, topology, distribution, and isolation
         shell: bash
-        run: bash tests/fixtures/greenplum/verify.sh
+        run: bash tests/fixtures/greenplum/verify-integration.sh
       - name: Prove clean stop and persisted fixture recreation
         shell: bash
         run: |
+          compose_files=(
+            --file tests/fixtures/greenplum/compose.yaml
+            --file tests/fixtures/greenplum/compose.integration.yaml
+          )
           sentinel='phase04-volume-persistence'
-          docker compose --file tests/fixtures/greenplum/compose.yaml exec --no-TTY --user gpadmin \
+          docker compose "${compose_files[@]}" exec --no-TTY --user gpadmin \
             greengage sh -c "printf '%s\n' '${sentinel}' > /data/.dfe-restart-sentinel"
-          docker compose --file tests/fixtures/greenplum/compose.yaml exec --no-TTY --user gpadmin \
+          docker compose "${compose_files[@]}" exec --no-TTY --user gpadmin \
             original-greenplum sh -c "printf '%s\n' '${sentinel}' > /home/gpadmin/gpdemo-data/.dfe-restart-sentinel"
-          greengage_id="$(docker compose --file tests/fixtures/greenplum/compose.yaml ps --quiet greengage)"
-          original_greenplum_id="$(docker compose --file tests/fixtures/greenplum/compose.yaml ps --quiet original-greenplum)"
-          docker compose --file tests/fixtures/greenplum/compose.yaml stop
+          greengage_id="$(docker compose "${compose_files[@]}" ps --quiet greengage)"
+          original_greenplum_id="$(docker compose "${compose_files[@]}" ps --quiet original-greenplum)"
+          docker compose "${compose_files[@]}" stop
           docker logs "${greengage_id}" > greengage-stop.log 2>&1
           docker logs "${original_greenplum_id}" > original-greenplum-stop.log 2>&1
           cat greengage-stop.log
           cat original-greenplum-stop.log
           test "$(docker inspect --format '{{.State.ExitCode}}' "${greengage_id}")" = 0
           test "$(docker inspect --format '{{.State.ExitCode}}' "${original_greenplum_id}")" = 0
-          docker compose --file tests/fixtures/greenplum/compose.yaml rm --force
-          docker compose --file tests/fixtures/greenplum/compose.yaml up --detach --wait
-          test "$(docker compose --file tests/fixtures/greenplum/compose.yaml exec --no-TTY --user gpadmin greengage cat /data/.dfe-restart-sentinel)" = "${sentinel}"
-          test "$(docker compose --file tests/fixtures/greenplum/compose.yaml exec --no-TTY --user gpadmin original-greenplum cat /home/gpadmin/gpdemo-data/.dfe-restart-sentinel)" = "${sentinel}"
+          docker compose "${compose_files[@]}" rm --force
+          docker compose "${compose_files[@]}" up --detach --wait
+          test "$(docker compose "${compose_files[@]}" exec --no-TTY --user gpadmin greengage cat /data/.dfe-restart-sentinel)" = "${sentinel}"
+          test "$(docker compose "${compose_files[@]}" exec --no-TTY --user gpadmin original-greenplum cat /home/gpadmin/gpdemo-data/.dfe-restart-sentinel)" = "${sentinel}"
       - name: Verify restarted fixture
         shell: bash
-        run: bash tests/fixtures/greenplum/verify.sh
+        run: bash tests/fixtures/greenplum/verify-integration.sh
+      - name: Run Greenplum family critical integration tests
+        shell: bash
+        run: |
+          docker build --target build --tag forensic-data-greenplum-test .
+          docker run --rm --network host \
+            --env DFE_TEST_ORIGINAL_GREENPLUM_READER_DSN \
+            --env DFE_TEST_GREENGAGE_READER_DSN \
+            --env RUFF_CACHE_DIR=/tmp/ruff-cache \
+            --env UV_PROJECT_ENVIRONMENT=/tmp/dfe-test-venv \
+            --volume "${GITHUB_WORKSPACE}:/workspace:ro" \
+            --workdir /workspace \
+            --entrypoint /bin/sh \
+            forensic-data-greenplum-test \
+            -c 'uv run --frozen --all-groups pytest -p no:cacheprovider -q tests/test_greenplum_integration.py'
+      - name: Capture paired fixture logs
+        if: failure()
+        run: |
+          docker compose --file tests/fixtures/greenplum/compose.yaml ps --all
+          docker compose --file tests/fixtures/greenplum/compose.yaml logs --no-color --timestamps
       - name: Stop paired fixture
         if: always()
-        run: docker compose --file tests/fixtures/greenplum/compose.yaml down --volumes --remove-orphans
+        run: |
+          docker compose --file tests/fixtures/greenplum/compose.yaml down --volumes --remove-orphans
+          rm -f -- \
+            "${RUNNER_TEMP}/dfe-greengage-reader-password" \
+            "${RUNNER_TEMP}/dfe-original-greenplum-reader-password"

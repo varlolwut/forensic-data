@@ -79,6 +79,7 @@ COPY greengage/gpadmin-limits.conf /etc/security/limits.d/90-dfe-gpadmin.conf
 COPY --chown=gpadmin:gpadmin greengage/gpinitsystem_config /home/gpadmin/gpinitsystem_config
 COPY greengage/entrypoint.sh /usr/local/bin/dfe-greengage-entrypoint
 COPY greengage/healthcheck.sh /usr/local/bin/dfe-greengage-healthcheck
+COPY greengage/setup-integration.sh /usr/local/bin/dfe-greengage-setup-integration
 COPY greengage/verify.sh /usr/local/bin/dfe-greengage-verify
 
 RUN chmod 0644 \
@@ -87,6 +88,7 @@ RUN chmod 0644 \
     && chmod 0755 \
         /usr/local/bin/dfe-greengage-entrypoint \
         /usr/local/bin/dfe-greengage-healthcheck \
+        /usr/local/bin/dfe-greengage-setup-integration \
         /usr/local/bin/dfe-greengage-verify
 
 ENV LANG=en_US.UTF-8

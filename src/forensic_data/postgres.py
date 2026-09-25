@@ -1064,7 +1064,7 @@ class PostgresReadContext:
                     f"expected={len(column_names)}, actual={len(rows)}"
                 )
             bindings = tuple(
-                _binding_from_metadata_row(
+                postgres_field_binding_from_catalog_row(
                     field.name,
                     column_name,
                     index,
@@ -3219,7 +3219,12 @@ def _inspect_protected_member(
                 f"expected={len(acquisition.column_names)}, actual={len(metadata_rows)}"
             )
         bindings = tuple(
-            _binding_from_metadata_row(field.name, column_name, index, metadata_row)
+            postgres_field_binding_from_catalog_row(
+                field.name,
+                column_name,
+                index,
+                metadata_row,
+            )
             for index, (field, column_name, metadata_row) in enumerate(
                 zip(
                     acquisition.schema.fields,
@@ -3522,7 +3527,7 @@ def _metadata_query(
     return statement, tuple(parameters_list)
 
 
-def _binding_from_metadata_row(
+def postgres_field_binding_from_catalog_row(
     field_name: str,
     column_name: str,
     index: int,
