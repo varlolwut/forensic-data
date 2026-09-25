@@ -228,7 +228,7 @@ class _FieldLowering:
 
 @final
 @dataclass(frozen=True, slots=True)
-class _RowLowering:
+class PostgresCanonicalRowLowering:
     envelope: sql.Composable
     invalid_row: sql.Composable
     oversized_row: sql.Composable
@@ -255,11 +255,30 @@ def validate_postgres_inspection(
             inspection.max_identifier_utf8_bytes,
         )
 
-    if len(inspection.bindings) != len(schema.fields):
+    validate_postgres_field_bindings(
+        schema,
+        inspection.bindings,
+        inspection.max_identifier_utf8_bytes,
+    )
+
+
+def validate_postgres_field_bindings(
+    schema: CanonicalSchema,
+    bindings: tuple[PostgresFieldBinding, ...],
+    max_identifier_utf8_bytes: int,
+) -> None:
+    _require_canonical_schema(schema)
+    _require_binding_tuple(bindings)
+    _validate_positive_integer(
+        max_identifier_utf8_bytes,
+        "PostgreSQL max identifier UTF-8 byte length",
+        INT64_MAX,
+    )
+    if len(bindings) != len(schema.fields):
         raise PostgresLoweringError(
             "PostgreSQL field binding count must equal the logical schema field count"
         )
-    for index, (field, binding) in enumerate(zip(schema.fields, inspection.bindings, strict=True)):
+    for index, (field, binding) in enumerate(zip(schema.fields, bindings, strict=True)):
         _require_field_binding(binding, index)
         if field.name != binding.field_name:
             raise PostgresLoweringError(
@@ -269,21 +288,42 @@ def validate_postgres_inspection(
         _validate_identifier_byte_length(
             binding.column_name,
             f"PostgreSQL column identifier at field index {index}",
-            inspection.max_identifier_utf8_bytes,
+            max_identifier_utf8_bytes,
         )
         _validate_type_identity_byte_lengths(
             binding.physical.declared_type,
             "declared",
             index,
-            inspection.max_identifier_utf8_bytes,
+            max_identifier_utf8_bytes,
         )
         _validate_type_identity_byte_lengths(
             binding.physical.base_type,
             "base",
             index,
-            inspection.max_identifier_utf8_bytes,
+            max_identifier_utf8_bytes,
         )
         _validate_physical_mapping(field, binding.physical, index)
+
+
+def lower_postgres_canonical_row(
+    schema: CanonicalSchema,
+    bindings: tuple[PostgresFieldBinding, ...],
+    max_identifier_utf8_bytes: int,
+    max_encoded_envelope_bytes: int,
+    source_alias: str,
+) -> PostgresCanonicalRowLowering:
+    validate_postgres_field_bindings(schema, bindings, max_identifier_utf8_bytes)
+    _validate_positive_integer(
+        max_encoded_envelope_bytes,
+        "PostgreSQL max encoded envelope byte length",
+        INT64_MAX,
+    )
+    return _row_lowering_for_alias(
+        schema,
+        bindings,
+        max_encoded_envelope_bytes,
+        source_alias,
+    )
 
 
 def _single_query_relation(
@@ -1379,7 +1419,7 @@ def _row_lowering_for_alias(
     bindings: tuple[PostgresFieldBinding, ...],
     max_encoded_envelope_bytes: int,
     source_alias: str,
-) -> _RowLowering:
+) -> PostgresCanonicalRowLowering:
     _validate_identifier_text(source_alias, "PostgreSQL source alias")
     columns = tuple(sql.Identifier(source_alias, binding.column_name) for binding in bindings)
     return _row_lowering_from_columns(schema, columns, max_encoded_envelope_bytes)
@@ -1389,7 +1429,7 @@ def _row_lowering_from_columns(
     schema: CanonicalSchema,
     columns: tuple[sql.Identifier, ...],
     max_encoded_envelope_bytes: int,
-) -> _RowLowering:
+) -> PostgresCanonicalRowLowering:
     field_lowerings = tuple(
         _field_lowering(field, column) for field, column in zip(schema.fields, columns, strict=True)
     )
@@ -1427,7 +1467,7 @@ def _row_lowering_from_columns(
         exceeds_limit=exceeds_limit,
         encoded_envelope=encoded_envelope,
     )
-    return _RowLowering(
+    return PostgresCanonicalRowLowering(
         envelope=envelope,
         invalid_row=invalid_row,
         oversized_row=oversized_row,

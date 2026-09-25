@@ -2,7 +2,15 @@ from hashlib import sha256
 
 import pytest
 
-from forensic_data.greenplum import probe_greengage, probe_original_greenplum
+from forensic_data.canonical import Fingerprint, schema_from_metadata_json
+from forensic_data.greenplum import (
+    GreengageCanonicalRelationEvidence,
+    OriginalGreenplumCanonicalRelationEvidence,
+    probe_greengage,
+    probe_greengage_canonical_fingerprints,
+    probe_original_greenplum,
+    probe_original_greenplum_canonical_fingerprints,
+)
 from forensic_data.greenplum_catalog import (
     GreenplumColumnProbe,
     GreenplumDistributedHashPlan,
@@ -12,7 +20,9 @@ from forensic_data.greenplum_catalog import (
     GreenplumTypeProbe,
 )
 from forensic_data.greenplum_profile import GreenplumRuntimeProfile
+from forensic_data.greenplum_sql import GreenplumCanonicalProbeRequest
 from forensic_data.postgres import PostgresRetryPolicy
+from tests.canonical_vectors import vector_named
 from tests.postgres_support import required_connection_settings
 
 pytestmark = [pytest.mark.integration, pytest.mark.greenplum]
@@ -34,6 +44,23 @@ _CAPABILITY_REQUEST = GreenplumRelationProbeRequest(
     hash_row_limit=32,
 )
 _RETRY_POLICY = PostgresRetryPolicy(max_attempts=2, delay_seconds=0.1)
+_CANONICAL_MULTIPLICITY = 32_768
+_CANONICAL_VECTOR = vector_named("all_common_types")
+_CANONICAL_SCHEMA = schema_from_metadata_json(_CANONICAL_VECTOR.metadata_json)
+_CANONICAL_COLUMNS = tuple(
+    GreenplumColumnProbe(field_name=field.name, column_name=field.name)
+    for field in _CANONICAL_SCHEMA.fields
+)
+_CANONICAL_REQUESTS = tuple(
+    GreenplumCanonicalProbeRequest(
+        schema_name="dfe_fixture",
+        relation_name=relation_name,
+        columns=_CANONICAL_COLUMNS,
+        schema=_CANONICAL_SCHEMA,
+        max_encoded_envelope_bytes=4_096,
+    )
+    for relation_name in ("canonical_values", "canonical_empty_values")
+)
 
 
 def test_original_greenplum_connector_catalog_types_and_hash_probe() -> None:
@@ -42,6 +69,11 @@ def test_original_greenplum_connector_catalog_types_and_hash_probe() -> None:
         "dfe-phase04-original-greenplum-probe",
     )
     evidence = probe_original_greenplum(settings, _RETRY_POLICY, _CAPABILITY_REQUEST)
+    canonical_evidence = probe_original_greenplum_canonical_fingerprints(
+        settings,
+        _RETRY_POLICY,
+        _CANONICAL_REQUESTS,
+    )
 
     assert evidence.driver.driver_name == "psycopg2"
     assert evidence.driver.driver_version == "2.9.13"
@@ -118,6 +150,14 @@ def test_original_greenplum_connector_catalog_types_and_hash_probe() -> None:
         evidence.hash_plan,
         evidence.hash_rows,
     )
+    assert canonical_evidence.topology == evidence.topology
+    assert canonical_evidence.hash_capability == evidence.hash_capability
+    assert canonical_evidence.required_extensions == ()
+    _assert_canonical_evidence(
+        canonical_evidence.topology,
+        canonical_evidence.relations,
+        "original_greenplum_cte_segment_aggregate_below_motion",
+    )
 
 
 def test_greengage_connector_catalog_types_and_hash_probe() -> None:
@@ -126,6 +166,11 @@ def test_greengage_connector_catalog_types_and_hash_probe() -> None:
         "dfe-phase04-greengage-probe",
     )
     evidence = probe_greengage(settings, _RETRY_POLICY, _CAPABILITY_REQUEST)
+    canonical_evidence = probe_greengage_canonical_fingerprints(
+        settings,
+        _RETRY_POLICY,
+        _CANONICAL_REQUESTS,
+    )
 
     assert evidence.driver.driver_name == "psycopg"
     assert evidence.driver.driver_version == "3.3.6"
@@ -212,6 +257,18 @@ def test_greengage_connector_catalog_types_and_hash_probe() -> None:
         evidence.topology,
         evidence.hash_plan,
         evidence.hash_rows,
+    )
+    assert canonical_evidence.topology == evidence.topology
+    assert canonical_evidence.hash_capability == evidence.hash_capability
+    assert canonical_evidence.required_extensions == ()
+    assert all(
+        not relation.relation.row_security_enabled and not relation.relation.row_security_forced
+        for relation in canonical_evidence.relations
+    )
+    _assert_canonical_evidence(
+        canonical_evidence.topology,
+        canonical_evidence.relations,
+        "greengage_cte_segment_aggregate_below_motion",
     )
 
 
@@ -309,3 +366,123 @@ def _assert_distributed_hash_evidence(
     for row in rows:
         assert row.input_text == f"segment-hash-{row.record_id}"
         assert row.digest == sha256(row.input_text.encode("utf-8")).digest()
+
+
+def _assert_canonical_evidence(
+    topology: GreenplumTopology,
+    relations: tuple[OriginalGreenplumCanonicalRelationEvidence, ...]
+    | tuple[GreengageCanonicalRelationEvidence, ...],
+    expected_execution_locus: str,
+) -> None:
+    assert len(relations) == 2
+    values_relation, empty_relation = relations
+    assert values_relation.relation.relation_name == "canonical_values"
+    assert empty_relation.relation.relation_name == "canonical_empty_values"
+    _assert_canonical_relation(
+        topology,
+        values_relation,
+        _expected_repeated_golden_fingerprint(),
+        len(topology.primary_content_ids),
+        expected_execution_locus,
+    )
+    _assert_canonical_relation(
+        topology,
+        empty_relation,
+        Fingerprint(count=0, limb_sums=(0, 0, 0, 0, 0, 0, 0, 0)),
+        0,
+        expected_execution_locus,
+    )
+
+
+def _assert_canonical_relation(
+    topology: GreenplumTopology,
+    evidence: OriginalGreenplumCanonicalRelationEvidence | GreengageCanonicalRelationEvidence,
+    expected_fingerprint: Fingerprint,
+    expected_observed_segment_count: int,
+    expected_execution_locus: str,
+) -> None:
+    relation = evidence.relation
+    assert relation.relation_oid > 0
+    assert relation.relation_row_type_oid > 0
+    assert relation.schema_name == "dfe_fixture"
+    assert relation.relation_kind == "r"
+    assert relation.has_distribution_policy
+    assert relation.distribution_attribute_numbers == (1,)
+    assert relation.reader_has_select
+    assert relation.reader_has_schema_usage
+    _assert_canonical_type_bindings(evidence.types)
+
+    assert evidence.query.context.schema is _CANONICAL_SCHEMA
+    assert evidence.query.context.schema_digest_hex == _CANONICAL_VECTOR.schema_digest_hex
+    assert evidence.query.relation_row_type_oid == relation.relation_row_type_oid
+    assert evidence.query.relation_name == f"dfe_fixture.{relation.relation_name}"
+    assert evidence.query.primary_content_ids == topology.primary_content_ids
+
+    assert evidence.plan.lines
+    assert evidence.plan.scanned_relation == evidence.query.relation_name
+    assert evidence.plan.dispatched_primary_count == len(topology.primary_content_ids)
+    assert evidence.plan.topology_seeded
+    assert evidence.plan.execution_locus == expected_execution_locus
+    assert any("append" in line.lower() for line in evidence.plan.lines)
+    assert any("scan" in line.lower() and "gp_id" in line.lower() for line in evidence.plan.lines)
+    assert any(
+        "motion" in line.lower()
+        and f"segments: {len(topology.primary_content_ids)}" in line.lower()
+        for line in evidence.plan.lines
+    )
+    assert any(
+        "scan" in line.lower() and relation.relation_name in line.lower()
+        for line in evidence.plan.lines
+    )
+
+    fingerprint = evidence.fingerprint
+    assert fingerprint.relation_row_type_oid == relation.relation_row_type_oid
+    assert fingerprint.fingerprint == expected_fingerprint
+    assert fingerprint.invalid_row_count == 0
+    assert fingerprint.oversized_row_count == 0
+    assert fingerprint.topology_content_ids == topology.primary_content_ids
+    assert len(fingerprint.observed_content_ids) == expected_observed_segment_count
+    assert frozenset(fingerprint.observed_content_ids).issubset(fingerprint.topology_content_ids)
+
+
+def _assert_canonical_type_bindings(probe: GreenplumTypeProbe) -> None:
+    bindings = probe.bindings
+    assert tuple(binding.field_name for binding in bindings) == tuple(
+        field.name for field in _CANONICAL_SCHEMA.fields
+    )
+    assert tuple(binding.column_name for binding in bindings) == tuple(
+        field.name for field in _CANONICAL_SCHEMA.fields
+    )
+    assert "distribution_id" not in tuple(binding.column_name for binding in bindings)
+    assert tuple(binding.physical.formatted_type for binding in bindings) == (
+        "bigint",
+        "numeric(38,3)",
+        "boolean",
+        "text",
+        "date",
+        "timestamp(6) without time zone",
+        "timestamp(6) with time zone",
+    )
+    assert bindings[1].physical.numeric_precision == 38
+    assert bindings[1].physical.numeric_scale == 3
+    assert all(binding.physical.declared_type == binding.physical.base_type for binding in bindings)
+    assert all(binding.physical.base_type.schema_name == "pg_catalog" for binding in bindings)
+    assert all(not binding.physical.is_domain for binding in bindings)
+    assert all(binding.physical.array_dimensions == 0 for binding in bindings)
+
+
+def _expected_repeated_golden_fingerprint() -> Fingerprint:
+    limbs = _CANONICAL_VECTOR.limbs
+    return Fingerprint(
+        count=_CANONICAL_MULTIPLICITY,
+        limb_sums=(
+            _CANONICAL_MULTIPLICITY * limbs[0],
+            _CANONICAL_MULTIPLICITY * limbs[1],
+            _CANONICAL_MULTIPLICITY * limbs[2],
+            _CANONICAL_MULTIPLICITY * limbs[3],
+            _CANONICAL_MULTIPLICITY * limbs[4],
+            _CANONICAL_MULTIPLICITY * limbs[5],
+            _CANONICAL_MULTIPLICITY * limbs[6],
+            _CANONICAL_MULTIPLICITY * limbs[7],
+        ),
+    )

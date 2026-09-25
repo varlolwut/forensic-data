@@ -48,15 +48,11 @@ class GreenplumColumnProbe:
         _validate_identifier(self.column_name, "Greenplum column name")
 
 
-@final
 @dataclass(frozen=True, slots=True)
-class GreenplumRelationProbeRequest:
+class GreenplumRelationRequest:
     schema_name: str
     relation_name: str
     columns: tuple[GreenplumColumnProbe, ...]
-    hash_record_id_column: str
-    hash_input_column: str
-    hash_row_limit: int
 
     def __post_init__(self) -> None:
         _validate_identifier(self.schema_name, "Greenplum schema name")
@@ -80,6 +76,21 @@ class GreenplumRelationProbeRequest:
             raise ValueError("Greenplum relation probe logical field names must be unique")
         if len(set(column_names)) != len(column_names):
             raise ValueError("Greenplum relation probe column names must be unique")
+
+    def column_names(self) -> tuple[str, ...]:
+        return tuple(column.column_name for column in self.columns)
+
+
+@final
+@dataclass(frozen=True, slots=True)
+class GreenplumRelationProbeRequest(GreenplumRelationRequest):
+    hash_record_id_column: str
+    hash_input_column: str
+    hash_row_limit: int
+
+    def __post_init__(self) -> None:
+        GreenplumRelationRequest.__post_init__(self)
+        column_names = self.column_names()
         _validate_identifier(
             self.hash_record_id_column,
             "Greenplum distributed hash record ID column",
@@ -105,9 +116,6 @@ class GreenplumRelationProbeRequest:
                 "Greenplum distributed hash row limit must be an integer between "
                 f"1 and {_MAX_HASH_ROWS}"
             )
-
-    def column_names(self) -> tuple[str, ...]:
-        return tuple(column.column_name for column in self.columns)
 
 
 @final
@@ -301,7 +309,7 @@ GREENGAGE_HASH_CAPABILITY_QUERY = (
 
 def greenplum_type_catalog_query(
     relation_oid: int,
-    request: GreenplumRelationProbeRequest,
+    request: GreenplumRelationRequest,
 ) -> tuple[str, tuple[GreenplumCatalogParameter, ...]]:
     _require_bounded_integer(relation_oid, "Greenplum relation OID", 1, UINT32_MAX)
     requested_rows = ", ".join("(%s::integer, %s::text)" for _ in request.columns)
@@ -462,7 +470,7 @@ def parse_greenplum_reader_identity(row: DatabaseRow) -> GreenplumReaderIdentity
 
 def parse_original_greenplum_relation_catalog(
     rows: tuple[DatabaseRow, ...],
-    request: GreenplumRelationProbeRequest,
+    request: GreenplumRelationRequest,
 ) -> OriginalGreenplumRelationCatalog:
     row = _require_single_row(rows, "original Greenplum relation catalog")
     _require_field_count(row, 10, "original Greenplum relation catalog row")
@@ -519,7 +527,7 @@ def parse_original_greenplum_relation_catalog(
 
 def parse_greengage_relation_catalog(
     rows: tuple[DatabaseRow, ...],
-    request: GreenplumRelationProbeRequest,
+    request: GreenplumRelationRequest,
 ) -> GreengageRelationCatalog:
     row = _require_single_row(rows, "Greengage relation catalog")
     _require_field_count(row, 16, "Greengage relation catalog row")
@@ -587,7 +595,7 @@ def parse_greengage_relation_catalog(
 
 def parse_greenplum_type_probe(
     rows: tuple[DatabaseRow, ...],
-    request: GreenplumRelationProbeRequest,
+    request: GreenplumRelationRequest,
 ) -> GreenplumTypeProbe:
     if len(rows) != len(request.columns):
         raise GreenplumCatalogMetadataError(
@@ -1007,7 +1015,7 @@ def _validate_hash_capability(
 def _require_relation_privileges(
     reader_has_select: bool,
     reader_has_schema_usage: bool,
-    request: GreenplumRelationProbeRequest,
+    request: GreenplumRelationRequest,
 ) -> None:
     if not reader_has_select or not reader_has_schema_usage:
         raise GreenplumCatalogMetadataError(
@@ -1020,7 +1028,7 @@ def _require_relation_privileges(
 def _require_requested_relation(
     schema_name: str,
     relation_name: str,
-    request: GreenplumRelationProbeRequest,
+    request: GreenplumRelationRequest,
 ) -> None:
     if schema_name != request.schema_name or relation_name != request.relation_name:
         raise GreenplumCatalogDataError(
