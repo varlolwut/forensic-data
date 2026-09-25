@@ -332,6 +332,7 @@ def test_original_greenplum_connector_catalog_types_and_hash_probe() -> None:
     )
     assert canonical_evidence.topology == evidence.topology
     assert canonical_evidence.hash_capability == evidence.hash_capability
+    assert canonical_evidence.planning_settings == ()
     assert canonical_evidence.required_extensions == ()
     _assert_canonical_evidence(
         canonical_evidence.topology,
@@ -371,6 +372,7 @@ def test_original_greenplum_connector_catalog_types_and_hash_probe() -> None:
         assert context.evidence.backend_process_id == context.server.backend_process_id
         assert context.evidence.backend_process_id > 0
         assert context.evidence.allowed_concurrency == 1
+        assert context.evidence.planning_settings == ()
         assert context.evidence.limitations
 
         initial_relations = context.read_canonical_fingerprints()
@@ -515,6 +517,13 @@ def test_greengage_connector_catalog_types_and_hash_probe() -> None:
     )
     assert canonical_evidence.topology == evidence.topology
     assert canonical_evidence.hash_capability == evidence.hash_capability
+    assert tuple(
+        (setting.name, setting.value) for setting in canonical_evidence.planning_settings
+    ) == (
+        ("optimizer", "off"),
+        ("gp_enable_multiphase_agg", "on"),
+        ("gp_eager_two_phase_agg", "on"),
+    )
     assert canonical_evidence.required_extensions == ()
     assert all(
         not relation.relation.row_security_enabled and not relation.relation.row_security_forced
@@ -558,6 +567,13 @@ def test_greengage_connector_catalog_types_and_hash_probe() -> None:
         assert context.evidence.backend_process_id == context.server.backend_process_id
         assert context.evidence.backend_process_id > 0
         assert context.evidence.allowed_concurrency == 1
+        assert tuple(
+            (setting.name, setting.value) for setting in context.evidence.planning_settings
+        ) == (
+            ("optimizer", "off"),
+            ("gp_enable_multiphase_agg", "on"),
+            ("gp_eager_two_phase_agg", "on"),
+        )
         assert context.evidence.limitations
 
         initial_relations = context.read_canonical_fingerprints()

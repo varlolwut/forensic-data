@@ -81,6 +81,7 @@ _MAX_TOPOLOGY_ROWS = 2048
 _MAX_EXPLAIN_ROWS = 2048
 _MAX_CANONICAL_EXPLAIN_ROWS = 50_000
 _MAX_CANONICAL_RELATIONS = 8
+_UNDEFINED_OBJECT_SQLSTATE = "42704"
 
 ORIGINAL_GREENPLUM_PROFILE_QUERY = (
     "SELECT pg_catalog.version(), pg_catalog.current_setting('server_version'), "
@@ -113,6 +114,12 @@ GREENGAGE_PROFILE_QUERY = (
     "pg_catalog.current_setting('transaction_isolation'), "
     "pg_catalog.current_setting('transaction_read_only') = 'on', "
     "pg_catalog.txid_current_snapshot()::text"
+)
+
+GREENGAGE_CANONICAL_PLANNING_SETTINGS_QUERY = (
+    "SELECT pg_catalog.current_setting('optimizer'), "
+    "pg_catalog.current_setting('gp_enable_multiphase_agg'), "
+    "pg_catalog.current_setting('gp_eager_two_phase_agg')"
 )
 
 _SESSION_SETUP_QUERY = (
@@ -273,6 +280,13 @@ class GreenplumRelationLockEvidence:
 
 @final
 @dataclass(frozen=True, slots=True)
+class GreenplumSessionSettingEvidence:
+    name: str
+    value: str
+
+
+@final
+@dataclass(frozen=True, slots=True)
 class GreenplumCanonicalReadContextEvidence:
     context_id: UUID
     runtime_profile: GreenplumRuntimeProfile
@@ -281,6 +295,7 @@ class GreenplumCanonicalReadContextEvidence:
     started_at: datetime
     backend_process_id: int
     allowed_concurrency: int
+    planning_settings: tuple[GreenplumSessionSettingEvidence, ...]
     relation_locks: tuple[GreenplumRelationLockEvidence, ...]
     acquired_before_snapshot: bool
     limitations: tuple[str, ...]
@@ -329,6 +344,7 @@ class OriginalGreenplumCanonicalProbeEvidence:
     topology: GreenplumTopology
     hash_capability: OriginalGreenplumHashCapability
     relations: tuple[OriginalGreenplumCanonicalRelationEvidence, ...]
+    planning_settings: tuple[GreenplumSessionSettingEvidence, ...]
     required_extensions: tuple[str, ...]
 
 
@@ -343,6 +359,7 @@ class GreengageCanonicalProbeEvidence:
     topology: GreenplumTopology
     hash_capability: GreengageHashCapability
     relations: tuple[GreengageCanonicalRelationEvidence, ...]
+    planning_settings: tuple[GreenplumSessionSettingEvidence, ...]
     required_extensions: tuple[str, ...]
 
 
@@ -489,8 +506,16 @@ class _GreengageSession:
                 for statement in _canonical_setup_statements(statement_timeout_milliseconds):
                     cursor.execute(cast(LiteralString, statement))
                 cursor.execute("SET LOCAL row_security TO off")
+                cursor.execute("SET LOCAL optimizer TO off")
+                cursor.execute("SET LOCAL gp_enable_multiphase_agg TO on")
+                cursor.execute("SET LOCAL gp_eager_two_phase_agg TO on")
                 cursor.execute(cast(LiteralString, lock_statement))
         except psycopg.Error as error:
+            if error.sqlstate == _UNDEFINED_OBJECT_SQLSTATE:
+                raise UnsupportedGreenplumProfileError(
+                    "Greengage canonical planning capability is unavailable: "
+                    f"sqlstate={error.sqlstate!r}, detail={str(error).strip()!r}"
+                ) from None
             raise GreenplumConnectionError(
                 "Greengage canonical snapshot setup failed: "
                 "strategy='read_only_repeatable_read', "
@@ -716,6 +741,7 @@ def probe_original_greenplum_canonical_fingerprints(
             topology=context.topology,
             hash_capability=context.hash_capability,
             relations=relations,
+            planning_settings=context.evidence.planning_settings,
             required_extensions=(),
         )
 
@@ -741,6 +767,7 @@ def probe_greengage_canonical_fingerprints(
             topology=context.topology,
             hash_capability=context.hash_capability,
             relations=relations,
+            planning_settings=context.evidence.planning_settings,
             required_extensions=(),
         )
 
@@ -1055,6 +1082,7 @@ def open_original_greenplum_canonical_read_context(
             started_at=started_at,
             backend_process_id=server.backend_process_id,
             allowed_concurrency=1,
+            planning_settings=(),
             relation_locks=relation_locks,
             acquired_before_snapshot=True,
             limitations=(
@@ -1106,6 +1134,7 @@ def open_greengage_canonical_read_context(
             settings.statement_timeout_milliseconds,
             _canonical_lock_statement(requests),
         )
+        planning_settings = _probe_greengage_canonical_planning_settings(session)
         driver = _greengage_driver_evidence()
         server = _probe_greengage_profile(session, settings)
         _validate_canonical_snapshot_profile(
@@ -1163,6 +1192,7 @@ def open_greengage_canonical_read_context(
             started_at=started_at,
             backend_process_id=server.backend_process_id,
             allowed_concurrency=1,
+            planning_settings=planning_settings,
             relation_locks=relation_locks,
             acquired_before_snapshot=True,
             limitations=(
@@ -1452,6 +1482,52 @@ def _probe_greengage_profile(
     )
     _validate_server_profile(profile, settings)
     return profile
+
+
+def _probe_greengage_canonical_planning_settings(
+    session: _GreenplumProbeSession,
+) -> tuple[GreenplumSessionSettingEvidence, ...]:
+    rows = session.fetch_rows(
+        GREENGAGE_CANONICAL_PLANNING_SETTINGS_QUERY,
+        (),
+        2,
+        "greengage_canonical_planning_settings",
+    )
+    row = _require_single_row(rows, "Greengage canonical planning settings")
+    if len(row) != 3:
+        raise GreenplumDataValidationError(
+            "Greengage canonical planning settings must return exactly three fields: "
+            f"actual={len(row)}"
+        )
+    settings = (
+        GreenplumSessionSettingEvidence(
+            name="optimizer",
+            value=_require_text(row[0], "Greengage optimizer setting"),
+        ),
+        GreenplumSessionSettingEvidence(
+            name="gp_enable_multiphase_agg",
+            value=_require_text(row[1], "Greengage gp_enable_multiphase_agg setting"),
+        ),
+        GreenplumSessionSettingEvidence(
+            name="gp_eager_two_phase_agg",
+            value=_require_text(row[2], "Greengage gp_eager_two_phase_agg setting"),
+        ),
+    )
+    required = (
+        GreenplumSessionSettingEvidence(name="optimizer", value="off"),
+        GreenplumSessionSettingEvidence(name="gp_enable_multiphase_agg", value="on"),
+        GreenplumSessionSettingEvidence(name="gp_eager_two_phase_agg", value="on"),
+    )
+    if settings != required:
+        actual = tuple((setting.name, setting.value) for setting in settings)
+        raise UnsupportedGreenplumProfileError(
+            "Greengage canonical planning settings differ from the required distributed "
+            f"aggregation profile: actual={actual!r}, required=("
+            "('optimizer', 'off'), "
+            "('gp_enable_multiphase_agg', 'on'), "
+            "('gp_eager_two_phase_agg', 'on'))"
+        )
+    return settings
 
 
 def _build_server_profile(
