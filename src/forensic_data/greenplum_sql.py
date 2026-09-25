@@ -1,3 +1,4 @@
+import re
 from collections.abc import Callable
 from dataclasses import dataclass
 from typing import final
@@ -264,22 +265,22 @@ def parse_original_greenplum_fingerprint_plan(
                 "Original Greenplum canonical fingerprint plan omits an exact limb "
                 f"aggregate target: limb_index={index}"
             )
-    append_index = _find_serialized_plan_node(
+    gather_index = _find_serialized_plan_node(
         shape.lines,
-        "{APPEND",
+        "{MOTION",
         0,
-        "topology-seeded append",
+        "distributed gather motion",
     )
-    data_subquery_index = _find_serialized_plan_node(
+    member_subquery_index = _find_serialized_plan_node(
         shape.lines,
         "{SUBQUERYSCAN",
-        append_index + 1,
-        "data aggregate subquery below the topology-seeded append",
+        gather_index + 1,
+        "segment member subquery below the distributed gather",
     )
     segment_aggregate_index = _find_serialized_plan_node(
         shape.lines,
         "{AGG",
-        data_subquery_index + 1,
+        member_subquery_index + 1,
         "segment aggregate above redistribution",
     )
     redistribute_index = _find_serialized_plan_node(
@@ -300,21 +301,39 @@ def parse_original_greenplum_fingerprint_plan(
         partial_aggregate_index + 1,
         "hashed-row subquery below the partial segment aggregate",
     )
+    source_append_index = _find_serialized_plan_node(
+        shape.lines,
+        "{APPEND",
+        row_subquery_index + 1,
+        "source-and-topology-seed append below the partial segment aggregate",
+    )
     relation_scan_index = _find_serialized_plan_node(
         shape.lines,
         _original_greenplum_serialized_relation_scan_node(storage_kind),
-        row_subquery_index + 1,
+        source_append_index + 1,
         "canonical relation scan below the partial segment aggregate",
     )
-    append_node_id, _ = _serialized_plan_node_identity(
+    topology_subquery_index = _find_serialized_plan_node(
         shape.lines,
-        append_index,
-        "topology-seeded append",
+        "{SUBQUERYSCAN",
+        relation_scan_index + 1,
+        "topology seed subquery beside the canonical relation scan",
     )
-    data_subquery_node_id, data_subquery_parent_id = _serialized_plan_node_identity(
+    topology_scan_index = _find_serialized_plan_node(
         shape.lines,
-        data_subquery_index,
-        "data aggregate subquery",
+        "{SEQSCAN",
+        topology_subquery_index + 1,
+        "topology seed gp_id scan",
+    )
+    gather_node_id, _ = _serialized_plan_node_identity(
+        shape.lines,
+        gather_index,
+        "distributed gather motion",
+    )
+    member_subquery_node_id, member_subquery_parent_id = _serialized_plan_node_identity(
+        shape.lines,
+        member_subquery_index,
+        "segment member subquery",
     )
     segment_aggregate_node_id, segment_aggregate_parent_id = _serialized_plan_node_identity(
         shape.lines,
@@ -336,31 +355,52 @@ def parse_original_greenplum_fingerprint_plan(
         row_subquery_index,
         "hashed-row subquery",
     )
+    source_append_node_id, source_append_parent_id = _serialized_plan_node_identity(
+        shape.lines,
+        source_append_index,
+        "source-and-topology-seed append",
+    )
     _, relation_scan_parent_id = _serialized_plan_node_identity(
         shape.lines,
         relation_scan_index,
         "canonical relation scan",
     )
+    topology_subquery_node_id, topology_subquery_parent_id = _serialized_plan_node_identity(
+        shape.lines,
+        topology_subquery_index,
+        "topology seed subquery",
+    )
+    _, topology_scan_parent_id = _serialized_plan_node_identity(
+        shape.lines,
+        topology_scan_index,
+        "topology seed gp_id scan",
+    )
     actual_parent_ids = (
-        data_subquery_parent_id,
+        member_subquery_parent_id,
         segment_aggregate_parent_id,
         redistribute_parent_id,
         partial_aggregate_parent_id,
         row_subquery_parent_id,
+        source_append_parent_id,
         relation_scan_parent_id,
+        topology_subquery_parent_id,
+        topology_scan_parent_id,
     )
     expected_parent_ids = (
-        append_node_id,
-        data_subquery_node_id,
+        gather_node_id,
+        member_subquery_node_id,
         segment_aggregate_node_id,
         redistribute_node_id,
         partial_aggregate_node_id,
         row_subquery_node_id,
+        source_append_node_id,
+        source_append_node_id,
+        topology_subquery_node_id,
     )
     if actual_parent_ids != expected_parent_ids:
         raise GreenplumCatalogMetadataError(
             "Original Greenplum canonical fingerprint serialized plan does not preserve the "
-            "required append-to-relation-scan parent chain: "
+            "required gather-to-source-and-topology-seed parent chains: "
             f"expected_parent_ids={expected_parent_ids!r}, "
             f"actual_parent_ids={actual_parent_ids!r}"
         )
@@ -411,25 +451,36 @@ def parse_greengage_fingerprint_plan(
         primary_count,
         _greengage_relation_scan_label(storage_kind),
     )
-    if "sha256(" not in shape.lower_aggregate_subtree:
+    unquoted_lower_subtree = _greenplum_plan_unquoted_text(shape.lower_aggregate_subtree)
+    if "sha256(" not in unquoted_lower_subtree:
         raise GreenplumCatalogMetadataError(
             "Greengage canonical fingerprint plan does not hash below Motion"
         )
-    if (
-        shape.lower_aggregate_subtree.count("sum(") < 8
-        or shape.lower_aggregate_subtree.count("get_byte(") < 32
-        or "numeric(38,0)" not in shape.lower_aggregate_subtree
-    ):
-        raise GreenplumCatalogMetadataError(
-            "Greengage canonical fingerprint plan does not expose eight exact numeric limb "
-            "sums below Motion"
+    limb_sum_expressions = _greengage_limb_sum_expressions(unquoted_lower_subtree)
+    for index, expression in enumerate(limb_sum_expressions):
+        hash_byte_offsets = tuple(
+            int(offset)
+            for offset in re.findall(
+                r"get_byte\(\(case when .*? end\), ([0-9]+)\)",
+                expression,
+                flags=re.DOTALL,
+            )
         )
-    full_plan = "\n".join(shape.lines).lower()
-    for index in range(8):
-        if f"limb_{index}" not in full_plan:
+        expected_offsets = tuple(range(index * 4, index * 4 + 4))
+        hash_byte_marker_count = expression.count("get_byte(")
+        numeric_marker_count = expression.count("numeric(38,0)")
+        if (
+            hash_byte_offsets != expected_offsets
+            or hash_byte_marker_count != 4
+            or numeric_marker_count != 2
+        ):
             raise GreenplumCatalogMetadataError(
-                "Greengage canonical fingerprint plan omits an exact limb aggregate "
-                f"target: limb_index={index}"
+                "Greengage canonical fingerprint plan has an invalid exact limb sum below "
+                "Motion: "
+                f"limb_index={index}, expected_hash_byte_offsets={expected_offsets!r}, "
+                f"actual_hash_byte_offsets={hash_byte_offsets!r}, "
+                f"hash_byte_marker_count={hash_byte_marker_count}, "
+                f"numeric_38_0_marker_count={numeric_marker_count}"
             )
     return _canonical_fingerprint_plan(
         shape.lines,
@@ -437,6 +488,98 @@ def parse_greengage_fingerprint_plan(
         primary_count,
         "greengage_cte_segment_aggregate_below_motion",
     )
+
+
+def _greenplum_plan_unquoted_text(plan_text: str) -> str:
+    characters: list[str] = []
+    position = 0
+    quote: str | None = None
+    quote_start = 0
+    escape_string = False
+    while position < len(plan_text):
+        character = plan_text[position]
+        if quote is None:
+            if character not in {"'", '"'}:
+                characters.append(character)
+                position += 1
+                continue
+            quote = character
+            quote_start = position
+            escape_string = (
+                character == "'"
+                and position > 0
+                and plan_text[position - 1] in {"e", "E"}
+                and (
+                    position < 2
+                    or (
+                        not plan_text[position - 2].isalnum()
+                        and plan_text[position - 2] not in {"_", "$"}
+                    )
+                )
+            )
+            characters.append(" ")
+            position += 1
+            continue
+        characters.append(" ")
+        if quote == "'" and escape_string and character == "\\":
+            if position + 1 < len(plan_text):
+                characters.append(" ")
+                position += 2
+                continue
+        elif character == quote:
+            if position + 1 < len(plan_text) and plan_text[position + 1] == quote:
+                characters.append(" ")
+                position += 2
+                continue
+            quote = None
+            escape_string = False
+        position += 1
+    if quote is not None:
+        quote_kind = "string literal" if quote == "'" else "quoted identifier"
+        raise GreenplumCatalogMetadataError(
+            "Greenplum canonical fingerprint plan contains unterminated quoted text: "
+            f"quote_kind={quote_kind!r}, start_offset={quote_start}"
+        )
+    return "".join(characters)
+
+
+def _greengage_limb_sum_expressions(
+    unquoted_lower_aggregate_subtree: str,
+) -> tuple[str, ...]:
+    marker = "sum("
+    expressions: list[str] = []
+    search_start = 0
+    while True:
+        start = unquoted_lower_aggregate_subtree.find(marker, search_start)
+        if start < 0:
+            break
+        if start > 0:
+            preceding = unquoted_lower_aggregate_subtree[start - 1]
+            if preceding.isalnum() or preceding == "_":
+                search_start = start + len(marker)
+                continue
+        depth = 0
+        for position in range(start + len("sum"), len(unquoted_lower_aggregate_subtree)):
+            character = unquoted_lower_aggregate_subtree[position]
+            if character == "(":
+                depth += 1
+            elif character == ")":
+                depth -= 1
+                if depth == 0:
+                    expressions.append(unquoted_lower_aggregate_subtree[start : position + 1])
+                    search_start = position + 1
+                    break
+        else:
+            raise GreenplumCatalogMetadataError(
+                "Greengage canonical fingerprint plan contains an unbalanced lower-subtree "
+                f"limb sum expression: limb_index={len(expressions)}, start_offset={start}"
+            )
+    if len(expressions) != 8:
+        raise GreenplumCatalogMetadataError(
+            "Greengage canonical fingerprint plan must contain exactly eight lower-subtree "
+            f"limb sum expressions: actual={len(expressions)}"
+        )
+    return tuple(expressions)
 
 
 def _build_greenplum_fingerprint_query(
@@ -466,9 +609,14 @@ def _build_greenplum_fingerprint_query(
     relation = sql.Identifier(request.schema_name, request.relation_name)
     source = sql.Identifier(source_alias)
     source_rows = sql.SQL(
-        "SELECT gp_segment_id::integer AS segment_id, {envelope} AS envelope, "
+        "SELECT gp_segment_id::integer AS segment_id, "
+        "CASE WHEN FALSE THEN ({source}.*) ELSE NULL END AS origin_type_seed, "
+        "TRUE AS has_data, {envelope} AS envelope, "
         "{invalid_row} AS invalid_row, {oversized_row} AS oversized_row "
-        "FROM ONLY {relation} AS {source}"
+        "FROM ONLY {relation} AS {source} "
+        "UNION ALL SELECT gp_segment_id::integer AS segment_id, "
+        "NULL AS origin_type_seed, FALSE AS has_data, NULL::text AS envelope, "
+        "FALSE AS invalid_row, FALSE AS oversized_row FROM gp_dist_random('gp_id')"
     ).format(
         envelope=row.envelope,
         invalid_row=row.invalid_row,
@@ -477,8 +625,11 @@ def _build_greenplum_fingerprint_query(
         source=source,
     )
     hashed_rows = sql.SQL(
-        "SELECT dfe_row.segment_id, dfe_row.invalid_row, dfe_row.oversized_row, "
-        "CASE WHEN dfe_row.envelope IS NULL THEN NULL::bytea "
+        "SELECT dfe_row.segment_id, "
+        "(pg_catalog.pg_typeof(dfe_row.origin_type_seed))::oid::bigint "
+        "AS relation_row_type_oid, dfe_row.has_data, dfe_row.invalid_row, "
+        "dfe_row.oversized_row, "
+        "CASE WHEN NOT dfe_row.has_data OR dfe_row.envelope IS NULL THEN NULL::bytea "
         "ELSE {digest} END AS row_hash FROM dfe_source AS dfe_row"
     ).format(digest=digest_expression)
     segment_limb_sums = sql.SQL(", ").join(
@@ -486,13 +637,20 @@ def _build_greenplum_fingerprint_query(
     )
     segment_aggregate = sql.SQL(
         "SELECT dfe_hash.segment_id, "
-        "count(CASE WHEN NOT dfe_hash.invalid_row AND NOT dfe_hash.oversized_row "
+        "max(dfe_hash.relation_row_type_oid)::bigint AS relation_row_type_oid, "
+        "count(CASE WHEN dfe_hash.has_data AND NOT dfe_hash.invalid_row "
+        "AND NOT dfe_hash.oversized_row "
         "THEN 1 ELSE NULL END)::numeric AS valid_row_count, "
         "{limb_sums}, "
-        "count(CASE WHEN dfe_hash.invalid_row THEN 1 ELSE NULL END)::numeric "
+        "count(CASE WHEN dfe_hash.has_data AND dfe_hash.invalid_row "
+        "THEN 1 ELSE NULL END)::numeric "
         "AS invalid_row_count, "
-        "count(CASE WHEN dfe_hash.oversized_row THEN 1 ELSE NULL END)::numeric "
-        "AS oversized_row_count "
+        "count(CASE WHEN dfe_hash.has_data AND dfe_hash.oversized_row "
+        "THEN 1 ELSE NULL END)::numeric AS oversized_row_count, "
+        "count(CASE WHEN dfe_hash.has_data THEN 1 ELSE NULL END)::numeric "
+        "AS source_row_count, "
+        "count(CASE WHEN NOT dfe_hash.has_data THEN 1 ELSE NULL END)::numeric "
+        "AS topology_seed_count "
         "FROM dfe_hashed AS dfe_hash GROUP BY dfe_hash.segment_id"
     ).format(limb_sums=segment_limb_sums)
     combined_limb_sums = sql.SQL(", ").join(
@@ -503,22 +661,15 @@ def _build_greenplum_fingerprint_query(
         "dfe_hashed AS ({hashed_rows}), "
         "dfe_segment AS ({segment_aggregate}), "
         "dfe_member AS ("
-        "SELECT dfe_segment.segment_id, dfe_segment.valid_row_count, "
+        "SELECT dfe_segment.segment_id, dfe_segment.relation_row_type_oid, "
+        "dfe_segment.valid_row_count, "
         "dfe_segment.limb_0, dfe_segment.limb_1, dfe_segment.limb_2, "
         "dfe_segment.limb_3, dfe_segment.limb_4, dfe_segment.limb_5, "
         "dfe_segment.limb_6, dfe_segment.limb_7, "
         "dfe_segment.invalid_row_count, dfe_segment.oversized_row_count, "
-        "1::integer AS member_kind FROM dfe_segment "
-        "UNION ALL SELECT gp_segment_id::integer AS segment_id, "
-        "0::numeric AS valid_row_count, 0::numeric(38, 0) AS limb_0, "
-        "0::numeric(38, 0) AS limb_1, 0::numeric(38, 0) AS limb_2, "
-        "0::numeric(38, 0) AS limb_3, 0::numeric(38, 0) AS limb_4, "
-        "0::numeric(38, 0) AS limb_5, 0::numeric(38, 0) AS limb_6, "
-        "0::numeric(38, 0) AS limb_7, 0::numeric AS invalid_row_count, "
-        "0::numeric AS oversized_row_count, 0::integer AS member_kind "
-        "FROM gp_dist_random('gp_id')) "
-        "SELECT (pg_catalog.pg_typeof(NULL::{relation}))::oid::bigint "
-        "AS relation_row_type_oid, "
+        "dfe_segment.source_row_count, dfe_segment.topology_seed_count "
+        "FROM dfe_segment) "
+        "SELECT max(dfe_member.relation_row_type_oid)::bigint AS relation_row_type_oid, "
         "coalesce(sum(dfe_member.valid_row_count::numeric), "
         "0::numeric)::text AS valid_row_count, {limb_sums}, "
         "coalesce(sum(dfe_member.invalid_row_count::numeric), "
@@ -526,18 +677,17 @@ def _build_greenplum_fingerprint_query(
         "coalesce(sum(dfe_member.oversized_row_count::numeric), "
         "0::numeric)::text AS oversized_row_count, "
         "coalesce(pg_catalog.array_to_string("
-        "pg_catalog.array_agg(CASE WHEN dfe_member.member_kind = 0 "
+        "pg_catalog.array_agg(CASE WHEN dfe_member.topology_seed_count = 1::numeric "
         "THEN dfe_member.segment_id ELSE NULL::integer END), ','), '') "
         "AS topology_content_ids, "
         "coalesce(pg_catalog.array_to_string("
-        "pg_catalog.array_agg(CASE WHEN dfe_member.member_kind = 1 "
+        "pg_catalog.array_agg(CASE WHEN dfe_member.source_row_count > 0::numeric "
         "THEN dfe_member.segment_id ELSE NULL::integer END), ','), '') "
         "AS observed_content_ids FROM dfe_member"
     ).format(
         source_rows=source_rows,
         hashed_rows=hashed_rows,
         segment_aggregate=segment_aggregate,
-        relation=relation,
         limb_sums=combined_limb_sums,
     )
     return GreenplumCanonicalFingerprintQuery(
@@ -600,73 +750,123 @@ def _parse_greenplum_fingerprint_plan_shape(
         outer_aggregate_index + 1,
         "distributed gather motion",
     )
-    append_index = _find_human_node(
+    final_segment_aggregate_index = _find_human_node(
         human_nodes,
-        lambda line: "append" in line.lower(),
+        lambda line: "aggregate" in line.lower(),
         motion_index + 1,
-        "topology-seeded append",
+        "final segment aggregate",
     )
-    relation_scan_index = _find_human_node(
+    redistribute_index = _find_human_node(
         human_nodes,
         lambda line: (
-            relation_scan_label in line.lower() and request.relation_name.lower() in line.lower()
+            "redistribute motion" in line.lower() and f"segments: {primary_count}" in line.lower()
         ),
-        append_index + 1,
-        f"canonical relation {relation_scan_label}",
+        final_segment_aggregate_index + 1,
+        "segment-key redistribution",
     )
-    topology_scan_index = _find_human_node(
+    partial_aggregate_index = _find_human_node(
         human_nodes,
-        lambda line: "seq scan" in line.lower() and "gp_id" in line.lower(),
-        append_index + 1,
-        "dynamic segment topology seed",
+        lambda line: "aggregate" in line.lower(),
+        redistribute_index + 1,
+        "partial segment aggregate",
     )
+    append_index = _find_human_node(
+        human_nodes,
+        lambda line: "append" in line.lower() and "append-only" not in line.lower(),
+        partial_aggregate_index + 1,
+        "source-and-topology-seed append",
+    )
+    append_subtree_end = _human_subtree_end(human_nodes, append_index, len(lines))
+    relation_scan_indexes = tuple(
+        index
+        for index, line in human_nodes
+        if append_index < index < append_subtree_end
+        and relation_scan_label in line.lower()
+        and request.relation_name.lower() in line.lower()
+    )
+    topology_scan_indexes = tuple(
+        index
+        for index, line in human_nodes
+        if append_index < index < append_subtree_end
+        and "seq scan" in line.lower()
+        and "gp_id" in line.lower()
+    )
+    if len(relation_scan_indexes) != 1 or len(topology_scan_indexes) != 1:
+        raise GreenplumCatalogMetadataError(
+            "Greenplum canonical fingerprint source append must contain exactly one canonical "
+            "relation scan and one dynamic topology seed scan: "
+            f"relation_scans={len(relation_scan_indexes)}, "
+            f"topology_seed_scans={len(topology_scan_indexes)}"
+        )
+    relation_scan_index = relation_scan_indexes[0]
+    topology_scan_index = topology_scan_indexes[0]
     outer_aggregate_indent = _indent(lines[outer_aggregate_index])
     motion_indent = _indent(lines[motion_index])
+    final_segment_aggregate_indent = _indent(lines[final_segment_aggregate_index])
+    redistribute_indent = _indent(lines[redistribute_index])
+    partial_aggregate_indent = _indent(lines[partial_aggregate_index])
     append_indent = _indent(lines[append_index])
     motion_subtree_end = _human_subtree_end(human_nodes, motion_index, len(lines))
-    append_subtree_end = _human_subtree_end(human_nodes, append_index, len(lines))
+    final_segment_subtree_end = _human_subtree_end(
+        human_nodes,
+        final_segment_aggregate_index,
+        len(lines),
+    )
+    redistribute_subtree_end = _human_subtree_end(human_nodes, redistribute_index, len(lines))
+    partial_aggregate_subtree_end = _human_subtree_end(
+        human_nodes,
+        partial_aggregate_index,
+        len(lines),
+    )
+    relation_scan_subtree_end = _human_subtree_end(
+        human_nodes,
+        relation_scan_index,
+        len(lines),
+    )
+    lower_motion_indexes = tuple(
+        index
+        for index, line in human_nodes
+        if partial_aggregate_index < index < append_subtree_end and "motion" in line.lower()
+    )
     if (
         motion_indent <= outer_aggregate_indent
+        or final_segment_aggregate_indent <= motion_indent
+        or redistribute_indent <= final_segment_aggregate_indent
+        or partial_aggregate_indent <= redistribute_indent
         or append_indent <= motion_indent
-        or append_index >= motion_subtree_end
+        or append_indent <= partial_aggregate_indent
+        or final_segment_aggregate_index >= motion_subtree_end
+        or redistribute_index >= final_segment_subtree_end
+        or partial_aggregate_index >= redistribute_subtree_end
+        or append_index >= partial_aggregate_subtree_end
         or relation_scan_index >= append_subtree_end
         or topology_scan_index >= append_subtree_end
         or _indent(lines[relation_scan_index]) <= append_indent
         or _indent(lines[topology_scan_index]) <= append_indent
+        or topology_scan_index < relation_scan_subtree_end
+        or lower_motion_indexes
     ):
         raise GreenplumCatalogMetadataError(
-            "Greenplum canonical fingerprint plan does not keep the data and dynamic "
-            "topology branches below distributed Motion"
+            "Greenplum canonical fingerprint plan does not preserve the required partial "
+            "aggregate over sibling relation and topology-seed branches below redistribution"
         )
-    aggregate_indexes = tuple(
+    append_indexes = tuple(
         index
         for index, line in human_nodes
-        if append_index < index < relation_scan_index
-        and "aggregate" in line.lower()
-        and _indent(line) > append_indent
+        if partial_aggregate_index < index < partial_aggregate_subtree_end
+        and "append" in line.lower()
+        and "append-only" not in line.lower()
     )
-    if not aggregate_indexes:
+    if append_indexes != (append_index,):
         raise GreenplumCatalogMetadataError(
-            "Greenplum canonical fingerprint plan does not aggregate on segments below Motion"
-        )
-    segment_aggregate_index = aggregate_indexes[0]
-    segment_aggregate_indent = _indent(lines[segment_aggregate_index])
-    if _indent(lines[relation_scan_index]) <= segment_aggregate_indent:
-        raise GreenplumCatalogMetadataError(
-            "Greenplum canonical relation scan is not below the segment aggregate"
-        )
-    lower_subtree_end = _human_subtree_end(
-        human_nodes,
-        segment_aggregate_index,
-        len(lines),
-    )
-    if relation_scan_index >= lower_subtree_end:
-        raise GreenplumCatalogMetadataError(
-            "Greenplum canonical relation scan is outside the segment aggregate subtree"
+            "Greenplum canonical fingerprint partial aggregate must contain exactly one "
+            "source-and-topology-seed append"
         )
     return _GreenplumCanonicalPlanShape(
         lines=lines,
-        lower_aggregate_subtree="\n".join(lines[segment_aggregate_index:lower_subtree_end]).lower(),
+        lower_aggregate_subtree="\n".join(
+            lines[partial_aggregate_index:partial_aggregate_subtree_end]
+        ).lower(),
     )
 
 
