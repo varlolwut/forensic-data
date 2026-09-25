@@ -101,6 +101,9 @@ _TARGET_CORRUPT_BATCH = "target-orders-corrupt"
 _REFERENCE_EMPTY_TARGET_BATCH = "reference-orders-empty-target"
 _TARGET_EMPTY_TARGET_BATCH = "target-orders-empty-target"
 _EMPTY_TARGET_SOURCE_CUT = "orders-cut-empty-target"
+_REFERENCE_FUNCTION_BATCH = "reference-orders-function-load"
+_TARGET_FUNCTION_BATCH = "target-orders-function-load"
+_FUNCTION_SOURCE_CUT = "orders-cut-function-load"
 _PRECISE_AMOUNT = "1234567890123456789012345678901.1234567"
 _PRECISE_AMOUNT_MODIFIED = "1234567890123456789012345678901.1234568"
 _LOCAL_TIME = "2026-09-23T11:22:33.123456"
@@ -384,6 +387,113 @@ def test_postgres_source_to_empty_greengage_target_retains_exact_missing_evidenc
                 "protected_read_only_repeatable_read",
             )
             _assert_empty_target_history_and_difference(
+                metadata_services,
+                check,
+                scope,
+                result,
+            )
+    finally:
+        _clear_greengage_target(greengage_writer)
+
+
+def test_writer_functions_publish_atomic_miniature_batch_for_read_only_dfe() -> None:
+    config = load_contract_config(_CONTRACT_PATH)
+    check = _check(config, "pg_to_greengage_orders")
+    scope = resolve_scope_values(check, {"business_date": "2026-09-23"})
+    metadata_request = required_metadata_database_settings()
+    postgres_request = pg_comparison._new_source_database_settings("reference")
+    greengage_reader = pg_comparison._with_statement_timeout(
+        required_connection_settings(
+            "DFE_TEST_GREENGAGE_READER_DSN",
+            "dfe-greengage-function-load-reader",
+        ),
+        60_000,
+    )
+    greengage_writer = pg_comparison._with_statement_timeout(
+        required_connection_settings(
+            "DFE_TEST_GREENGAGE_WRITER_DSN",
+            "dfe-greengage-function-load-writer",
+        ),
+        60_000,
+    )
+
+    _clear_greengage_target(greengage_writer)
+    try:
+        with (
+            disposable_metadata_database(metadata_request) as metadata,
+            pg_comparison._disposable_source_database(postgres_request) as postgres,
+        ):
+            migrate_postgres_metadata(metadata.migrator, _NO_POSTGRES_RETRY, 5_000)
+            metadata_services = PostgresMetadataServices(
+                connection_id=config.metadata.connection.connection_id,
+                settings=metadata.reader,
+                retry_policy=_NO_POSTGRES_RETRY,
+            )
+            _create_postgres_function_load_fixture(postgres.writer)
+            _assert_postgres_function_catalog(postgres.writer)
+            _assert_postgres_function_rollback(
+                postgres.writer,
+                check.reference.dataset_id,
+                scope.scope_digest,
+            )
+            _assert_greengage_function_rollback(
+                greengage_writer,
+                check.target.dataset_id,
+                scope.scope_digest,
+            )
+            _assert_postgres_reader_write_denials(
+                postgres.reader,
+                check.reference.dataset_id,
+                scope.scope_digest,
+            )
+            _assert_greengage_reader_write_denials(
+                greengage_reader,
+                check.target.dataset_id,
+                scope.scope_digest,
+            )
+            _publish_postgres_function_batch(
+                postgres.writer,
+                postgres.reader,
+                check.reference.dataset_id,
+                scope.scope_digest,
+            )
+            _publish_greengage_function_batch(
+                greengage_writer,
+                greengage_reader,
+                check.target.dataset_id,
+                scope.scope_digest,
+            )
+
+            result = execute_check(
+                config,
+                ExecuteCheckRequest(
+                    request_id=uuid4(),
+                    check_id=check.check_id,
+                    scope_values=_SCOPE_VALUES,
+                    reference_expected_batch_id=_REFERENCE_FUNCTION_BATCH,
+                    target_expected_batch_id=_TARGET_FUNCTION_BATCH,
+                    origin="greengage-function-load-exact-integration",
+                ),
+                _postgres_services(metadata, postgres, greengage_reader, check),
+            )
+            _assert_function_load_result(result, check, scope, config.execution)
+
+            _mutate_function_postgres_reference_after_publication(
+                postgres,
+                check.reference.dataset_id,
+                scope.scope_digest,
+            )
+            _assert_persisted_endpoint_provenance(
+                metadata.reader,
+                result,
+                check,
+                "postgresql",
+                "psycopg",
+                "postgresql_17",
+                "postgresql",
+                "protected_read_only_repeatable_read",
+            )
+            _assert_function_load_history_and_difference(
                 metadata_services,
                 check,
                 scope,
@@ -713,6 +823,555 @@ def _create_postgres_reference_relations(
     )
 
 
+def _create_postgres_function_load_fixture(
+    settings: PostgresConnectionSettings,
+) -> None:
+    with connect_writer(settings) as connection:
+        with connection.transaction():
+            _create_postgres_reference_relations(connection)
+            connection.execute(
+                """
+                CREATE FUNCTION dfe_control.publish_miniature_orders_batch(
+                  p_dataset_id text,
+                  p_scope_digest text,
+                  p_batch_id text,
+                  p_business_date date,
+                  p_source_cut text,
+                  p_dataset_version text,
+                  p_completed_at timestamp with time zone,
+                  p_second_amount numeric
+                )
+                RETURNS integer
+                LANGUAGE plpgsql
+                VOLATILE
+                SECURITY INVOKER
+                SET search_path = pg_catalog
+                AS $function$
+                BEGIN
+                  IF p_dataset_id IS NULL OR btrim(p_dataset_id) = '' THEN
+                    RAISE EXCEPTION 'dataset_id must be non-null and nonblank'
+                      USING ERRCODE = '22023';
+                  END IF;
+                  IF p_scope_digest IS NULL
+                     OR p_scope_digest !~ '^[0-9a-f]{64}$' THEN
+                    RAISE EXCEPTION
+                      'scope_digest must be exactly 64 lowercase hexadecimal characters'
+                      USING ERRCODE = '22023';
+                  END IF;
+                  IF p_batch_id IS NULL OR btrim(p_batch_id) = '' THEN
+                    RAISE EXCEPTION 'batch_id must be non-null and nonblank'
+                      USING ERRCODE = '22023';
+                  END IF;
+                  IF p_business_date IS NULL THEN
+                    RAISE EXCEPTION 'business_date must be non-null'
+                      USING ERRCODE = '22023';
+                  END IF;
+                  IF p_source_cut IS NULL OR btrim(p_source_cut) = '' THEN
+                    RAISE EXCEPTION 'source_cut must be non-null and nonblank'
+                      USING ERRCODE = '22023';
+                  END IF;
+                  IF p_dataset_version IS NULL OR btrim(p_dataset_version) = '' THEN
+                    RAISE EXCEPTION 'dataset_version must be non-null and nonblank'
+                      USING ERRCODE = '22023';
+                  END IF;
+                  IF p_completed_at IS NULL THEN
+                    RAISE EXCEPTION 'completed_at must be non-null'
+                      USING ERRCODE = '22023';
+                  END IF;
+                  IF p_second_amount IS NULL THEN
+                    RAISE EXCEPTION 'second_amount must be non-null'
+                      USING ERRCODE = '22023';
+                  END IF;
+
+                  INSERT INTO dfe_demo.source_orders (
+                    order_id,
+                    business_date,
+                    precise_amount,
+                    local_time,
+                    instant_time
+                  )
+                  VALUES
+                    (
+                      701,
+                      p_business_date,
+                      NULL,
+                      p_business_date + TIME '11:22:33.123456',
+                      (p_business_date + TIME '08:22:33.123456') AT TIME ZONE 'UTC'
+                    ),
+                    (
+                      702,
+                      p_business_date,
+                      p_second_amount,
+                      p_business_date + TIME '11:22:33.123456',
+                      (p_business_date + TIME '08:22:33.123456') AT TIME ZONE 'UTC'
+                    );
+
+                  INSERT INTO dfe_control.batch_manifest (
+                    dataset_id,
+                    scope_digest,
+                    batch_id,
+                    state,
+                    business_date,
+                    source_cut,
+                    dataset_version,
+                    completed_at
+                  )
+                  VALUES (
+                    p_dataset_id,
+                    p_scope_digest,
+                    p_batch_id,
+                    'complete',
+                    p_business_date,
+                    p_source_cut,
+                    p_dataset_version,
+                    p_completed_at
+                  );
+
+                  RETURN 2;
+                END;
+                $function$
+                """
+            )
+            connection.execute(
+                "REVOKE EXECUTE ON FUNCTION "
+                "dfe_control.publish_miniature_orders_batch("
+                "text, text, text, date, text, text, timestamp with time zone, numeric) "
+                "FROM PUBLIC"
+            )
+            connection.execute(
+                "REVOKE EXECUTE ON FUNCTION "
+                "dfe_control.publish_miniature_orders_batch("
+                "text, text, text, date, text, text, timestamp with time zone, numeric) "
+                "FROM dfe_fixture_reader"
+            )
+            connection.execute(
+                "GRANT EXECUTE ON FUNCTION "
+                "dfe_control.publish_miniature_orders_batch("
+                "text, text, text, date, text, text, timestamp with time zone, numeric) "
+                "TO dfe_fixture_writer"
+            )
+            connection.execute("GRANT USAGE ON SCHEMA dfe_demo, dfe_control TO dfe_fixture_reader")
+            connection.execute(
+                "GRANT SELECT ON dfe_demo.source_orders, dfe_control.batch_manifest "
+                "TO dfe_fixture_reader"
+            )
+
+
+def _assert_postgres_function_catalog(settings: PostgresConnectionSettings) -> None:
+    with connect_writer(settings) as connection:
+        observed = connection.execute(
+            "SELECT pg_get_userbyid(p.proowner), p.prorettype = 'integer'::regtype, "
+            "l.lanname, p.provolatile, p.prosecdef, p.proconfig, "
+            "has_function_privilege('dfe_fixture_writer', p.oid, 'EXECUTE'), "
+            "has_function_privilege('dfe_fixture_reader', p.oid, 'EXECUTE'), "
+            "NOT EXISTS ("
+            "SELECT 1 FROM pg_catalog.aclexplode("
+            "COALESCE(p.proacl, pg_catalog.acldefault('f', p.proowner))) AS privilege "
+            "WHERE privilege.privilege_type = 'EXECUTE' "
+            "AND privilege.grantee <> ("
+            "SELECT oid FROM pg_catalog.pg_roles "
+            "WHERE rolname = 'dfe_fixture_writer')) "
+            "FROM pg_catalog.pg_proc AS p "
+            "JOIN pg_catalog.pg_namespace AS n ON n.oid = p.pronamespace "
+            "JOIN pg_catalog.pg_language AS l ON l.oid = p.prolang "
+            "WHERE n.nspname = 'dfe_control' "
+            "AND p.proname = 'publish_miniature_orders_batch' "
+            "AND p.proargtypes = "
+            "'25 25 25 1082 25 25 1184 1700'::pg_catalog.oidvector"
+        ).fetchone()
+    assert observed == (
+        "dfe_fixture_writer",
+        True,
+        "plpgsql",
+        "v",
+        False,
+        ["search_path=pg_catalog"],
+        True,
+        False,
+        True,
+    )
+
+
+def _call_postgres_load_function(
+    cursor: psycopg.Cursor[DatabaseRow],
+    dataset_id: str,
+    scope_digest: str,
+    batch_id: str,
+    second_amount: str,
+) -> DatabaseRow:
+    cursor.execute(
+        "SELECT dfe_control.publish_miniature_orders_batch("
+        "%s, %s, %s, %s, %s, %s, %s, %s::numeric(38, 7))",
+        (
+            dataset_id,
+            scope_digest,
+            batch_id,
+            _BUSINESS_DATE,
+            _FUNCTION_SOURCE_CUT,
+            "pg-reference-orders-function-v1",
+            _BASELINE_COMPLETED_AT,
+            second_amount,
+        ),
+    )
+    result = cursor.fetchone()
+    if result is None:
+        raise AssertionError("PostgreSQL miniature-load function returned no result row")
+    return result
+
+
+def _call_greengage_load_function(
+    cursor: psycopg.Cursor[DatabaseRow],
+    dataset_id: str,
+    scope_digest: str,
+    batch_id: str,
+    second_amount: str,
+) -> DatabaseRow:
+    cursor.execute(
+        "SELECT dfe_endpoint.publish_miniature_orders_batch("
+        "%s, %s, %s, %s, %s, %s, %s, %s::numeric(38, 7))",
+        (
+            dataset_id,
+            scope_digest,
+            batch_id,
+            _BUSINESS_DATE,
+            _FUNCTION_SOURCE_CUT,
+            "greengage-target-orders-function-v1",
+            _BASELINE_COMPLETED_AT,
+            second_amount,
+        ),
+    )
+    result = cursor.fetchone()
+    if result is None:
+        raise AssertionError("Greengage miniature-load function returned no result row")
+    return result
+
+
+def _postgres_publication_state(
+    cursor: psycopg.Cursor[DatabaseRow],
+    dataset_id: str,
+    scope_digest: str,
+) -> DatabaseRow:
+    cursor.execute(
+        "SELECT "
+        "(SELECT count(*) FROM dfe_demo.source_orders "
+        "WHERE business_date = %s AND order_id IN (701, 702)), "
+        "(SELECT count(*) FROM dfe_control.batch_manifest "
+        "WHERE dataset_id = %s AND scope_digest = %s)",
+        (_BUSINESS_DATE, dataset_id, scope_digest),
+    )
+    result = cursor.fetchone()
+    if result is None:
+        raise AssertionError("PostgreSQL publication-state query returned no result row")
+    return result
+
+
+def _greengage_publication_state(
+    cursor: psycopg.Cursor[DatabaseRow],
+    dataset_id: str,
+    scope_digest: str,
+) -> DatabaseRow:
+    cursor.execute(
+        "SELECT "
+        "(SELECT count(*) FROM dfe_endpoint.target_orders "
+        "WHERE business_date = %s AND order_id IN (701, 702)), "
+        "(SELECT count(*) FROM dfe_endpoint.batch_manifest "
+        "WHERE dataset_id = %s AND scope_digest = %s)",
+        (_BUSINESS_DATE, dataset_id, scope_digest),
+    )
+    result = cursor.fetchone()
+    if result is None:
+        raise AssertionError("Greengage publication-state query returned no result row")
+    return result
+
+
+def _assert_postgres_function_rollback(
+    settings: PostgresConnectionSettings,
+    dataset_id: str,
+    scope_digest: str,
+) -> None:
+    with _connect_transactional_postgres(settings) as connection:
+        with connection.cursor() as cursor:
+            _configure_fixture_write(cursor)
+            cursor.execute(
+                "INSERT INTO dfe_control.batch_manifest ("
+                "dataset_id, scope_digest, batch_id, state, business_date, source_cut, "
+                "dataset_version, completed_at) "
+                "VALUES (%s, %s, 'postgres-function-atomicity-marker', 'blocked', "
+                "%s, 'orders-cut-function-marker', "
+                "'pg-reference-orders-function-marker', %s)",
+                (dataset_id, scope_digest, _BUSINESS_DATE, _CORRUPT_COMPLETED_AT),
+            )
+            connection.commit()
+
+            _configure_fixture_write(cursor)
+            try:
+                with pytest.raises(psycopg.errors.UniqueViolation) as failure:
+                    _call_postgres_load_function(
+                        cursor,
+                        dataset_id,
+                        scope_digest,
+                        _REFERENCE_FUNCTION_BATCH,
+                        _PRECISE_AMOUNT,
+                    )
+                assert failure.value.sqlstate == "23505"
+            finally:
+                connection.rollback()
+
+            _configure_fixture_write(cursor)
+            assert _postgres_publication_state(cursor, dataset_id, scope_digest) == (0, 1)
+            cursor.execute(
+                "SELECT batch_id, state, business_date, source_cut, dataset_version, "
+                "completed_at FROM dfe_control.batch_manifest "
+                "WHERE dataset_id = %s AND scope_digest = %s",
+                (dataset_id, scope_digest),
+            )
+            assert cursor.fetchone() == (
+                "postgres-function-atomicity-marker",
+                "blocked",
+                _BUSINESS_DATE,
+                "orders-cut-function-marker",
+                "pg-reference-orders-function-marker",
+                _CORRUPT_COMPLETED_AT,
+            )
+            cursor.execute(
+                "DELETE FROM dfe_control.batch_manifest "
+                "WHERE dataset_id = %s AND scope_digest = %s",
+                (dataset_id, scope_digest),
+            )
+            connection.commit()
+
+
+def _assert_greengage_function_rollback(
+    settings: PostgresConnectionSettings,
+    dataset_id: str,
+    scope_digest: str,
+) -> None:
+    with _connect_transactional_postgres(settings) as connection:
+        with connection.cursor() as cursor:
+            _configure_fixture_write(cursor)
+            cursor.execute(
+                "INSERT INTO dfe_endpoint.batch_manifest ("
+                "dataset_id, scope_digest, batch_id, state, business_date, source_cut, "
+                "dataset_version, completed_at) "
+                "VALUES (%s, %s, 'greengage-function-atomicity-marker', 'blocked', "
+                "%s, 'orders-cut-function-marker', "
+                "'greengage-target-orders-function-marker', %s)",
+                (dataset_id, scope_digest, _BUSINESS_DATE, _CORRUPT_COMPLETED_AT),
+            )
+            connection.commit()
+
+            _configure_fixture_write(cursor)
+            try:
+                with pytest.raises(psycopg.errors.UniqueViolation) as failure:
+                    _call_greengage_load_function(
+                        cursor,
+                        dataset_id,
+                        scope_digest,
+                        _TARGET_FUNCTION_BATCH,
+                        _PRECISE_AMOUNT_MODIFIED,
+                    )
+                assert failure.value.sqlstate == "23505"
+            finally:
+                connection.rollback()
+
+            _configure_fixture_write(cursor)
+            assert _greengage_publication_state(cursor, dataset_id, scope_digest) == (0, 1)
+            cursor.execute(
+                "SELECT batch_id, state, business_date, source_cut, dataset_version, "
+                "completed_at FROM dfe_endpoint.batch_manifest "
+                "WHERE dataset_id = %s AND scope_digest = %s",
+                (dataset_id, scope_digest),
+            )
+            assert cursor.fetchone() == (
+                "greengage-function-atomicity-marker",
+                "blocked",
+                _BUSINESS_DATE,
+                "orders-cut-function-marker",
+                "greengage-target-orders-function-marker",
+                _CORRUPT_COMPLETED_AT,
+            )
+            cursor.execute(
+                "DELETE FROM dfe_endpoint.batch_manifest "
+                "WHERE dataset_id = %s AND scope_digest = %s",
+                (dataset_id, scope_digest),
+            )
+            connection.commit()
+
+
+def _assert_postgres_reader_write_denials(
+    settings: PostgresConnectionSettings,
+    dataset_id: str,
+    scope_digest: str,
+) -> None:
+    with _connect_transactional_postgres(settings) as connection:
+        with connection.cursor() as cursor:
+            _configure_fixture_write(cursor)
+            try:
+                with pytest.raises(psycopg.errors.InsufficientPrivilege) as direct_denial:
+                    cursor.execute(
+                        "INSERT INTO dfe_demo.source_orders ("
+                        "order_id, business_date, precise_amount, local_time, instant_time) "
+                        "VALUES (799, %s, %s::numeric(38, 7), %s::timestamp(6), "
+                        "%s::timestamptz(6))",
+                        (_BUSINESS_DATE, _PRECISE_AMOUNT, _LOCAL_TIME, _INSTANT_TIME),
+                    )
+                assert direct_denial.value.sqlstate == "42501"
+            finally:
+                connection.rollback()
+
+            _configure_fixture_write(cursor)
+            try:
+                with pytest.raises(psycopg.errors.InsufficientPrivilege) as function_denial:
+                    _call_postgres_load_function(
+                        cursor,
+                        dataset_id,
+                        scope_digest,
+                        _REFERENCE_FUNCTION_BATCH,
+                        _PRECISE_AMOUNT,
+                    )
+                assert function_denial.value.sqlstate == "42501"
+            finally:
+                connection.rollback()
+
+            assert _postgres_publication_state(cursor, dataset_id, scope_digest) == (0, 0)
+
+
+def _assert_greengage_reader_write_denials(
+    settings: PostgresConnectionSettings,
+    dataset_id: str,
+    scope_digest: str,
+) -> None:
+    with _connect_transactional_postgres(settings) as connection:
+        with connection.cursor() as cursor:
+            _configure_fixture_write(cursor)
+            try:
+                with pytest.raises(psycopg.errors.InsufficientPrivilege) as direct_denial:
+                    cursor.execute(
+                        "INSERT INTO dfe_endpoint.target_orders ("
+                        "order_id, business_date, precise_amount, local_time, instant_time) "
+                        "VALUES (799, %s, %s::numeric(38, 7), %s::timestamp(6), "
+                        "%s::timestamptz(6))",
+                        (_BUSINESS_DATE, _PRECISE_AMOUNT, _LOCAL_TIME, _INSTANT_TIME),
+                    )
+                assert direct_denial.value.sqlstate == "42501"
+            finally:
+                connection.rollback()
+
+            _configure_fixture_write(cursor)
+            try:
+                with pytest.raises(psycopg.errors.InsufficientPrivilege) as function_denial:
+                    _call_greengage_load_function(
+                        cursor,
+                        dataset_id,
+                        scope_digest,
+                        _TARGET_FUNCTION_BATCH,
+                        _PRECISE_AMOUNT_MODIFIED,
+                    )
+                assert function_denial.value.sqlstate == "42501"
+            finally:
+                connection.rollback()
+
+            assert _greengage_publication_state(cursor, dataset_id, scope_digest) == (0, 0)
+
+
+def _publish_postgres_function_batch(
+    writer: PostgresConnectionSettings,
+    reader: PostgresConnectionSettings,
+    dataset_id: str,
+    scope_digest: str,
+) -> None:
+    with _connect_transactional_postgres(writer) as connection:
+        with connection.cursor() as cursor:
+            _configure_fixture_write(cursor)
+            assert _call_postgres_load_function(
+                cursor,
+                dataset_id,
+                scope_digest,
+                _REFERENCE_FUNCTION_BATCH,
+                _PRECISE_AMOUNT,
+            ) == (2,)
+            assert _postgres_publication_state(cursor, dataset_id, scope_digest) == (2, 1)
+            with connect_writer(reader) as observer:
+                with observer.cursor() as observer_cursor:
+                    assert _postgres_publication_state(
+                        observer_cursor,
+                        dataset_id,
+                        scope_digest,
+                    ) == (0, 0)
+            connection.commit()
+
+    with connect_writer(reader) as observer:
+        with observer.cursor() as observer_cursor:
+            assert _postgres_publication_state(
+                observer_cursor,
+                dataset_id,
+                scope_digest,
+            ) == (2, 1)
+            observer_cursor.execute(
+                "SELECT batch_id, state, business_date, source_cut, dataset_version, "
+                "completed_at FROM dfe_control.batch_manifest "
+                "WHERE dataset_id = %s AND scope_digest = %s",
+                (dataset_id, scope_digest),
+            )
+            assert observer_cursor.fetchone() == (
+                _REFERENCE_FUNCTION_BATCH,
+                "complete",
+                _BUSINESS_DATE,
+                _FUNCTION_SOURCE_CUT,
+                "pg-reference-orders-function-v1",
+                _BASELINE_COMPLETED_AT,
+            )
+
+
+def _publish_greengage_function_batch(
+    writer: PostgresConnectionSettings,
+    reader: PostgresConnectionSettings,
+    dataset_id: str,
+    scope_digest: str,
+) -> None:
+    with _connect_transactional_postgres(writer) as connection:
+        with connection.cursor() as cursor:
+            _configure_fixture_write(cursor)
+            assert _call_greengage_load_function(
+                cursor,
+                dataset_id,
+                scope_digest,
+                _TARGET_FUNCTION_BATCH,
+                _PRECISE_AMOUNT_MODIFIED,
+            ) == (2,)
+            assert _greengage_publication_state(cursor, dataset_id, scope_digest) == (2, 1)
+            with connect_writer(reader) as observer:
+                with observer.cursor() as observer_cursor:
+                    assert _greengage_publication_state(
+                        observer_cursor,
+                        dataset_id,
+                        scope_digest,
+                    ) == (0, 0)
+            connection.commit()
+
+    with connect_writer(reader) as observer:
+        with observer.cursor() as observer_cursor:
+            assert _greengage_publication_state(
+                observer_cursor,
+                dataset_id,
+                scope_digest,
+            ) == (2, 1)
+            observer_cursor.execute(
+                "SELECT batch_id, state, business_date, source_cut, dataset_version, "
+                "completed_at FROM dfe_endpoint.batch_manifest "
+                "WHERE dataset_id = %s AND scope_digest = %s",
+                (dataset_id, scope_digest),
+            )
+            assert observer_cursor.fetchone() == (
+                _TARGET_FUNCTION_BATCH,
+                "complete",
+                _BUSINESS_DATE,
+                _FUNCTION_SOURCE_CUT,
+                "greengage-target-orders-function-v1",
+                _BASELINE_COMPLETED_AT,
+            )
+
+
 def _advance_postgres_reference_manifest(
     settings: pg_comparison._SourceDatabaseSettings,
     dataset_id: str,
@@ -793,7 +1452,36 @@ def _mutate_single_postgres_reference_after_publication(
             assert (updated, manifest_updated) == (1, 1)
 
 
-def _connect_greengage_writer(
+def _mutate_function_postgres_reference_after_publication(
+    settings: pg_comparison._SourceDatabaseSettings,
+    dataset_id: str,
+    scope_digest: str,
+) -> None:
+    with connect_writer(settings.writer) as connection:
+        with connection.transaction():
+            updated = connection.execute(
+                "UPDATE dfe_demo.source_orders "
+                "SET precise_amount = 777.7777777::numeric(38, 7) "
+                "WHERE business_date = %s AND order_id = 702",
+                (_BUSINESS_DATE,),
+            ).rowcount
+            manifest_updated = connection.execute(
+                "UPDATE dfe_control.batch_manifest SET batch_id = %s, source_cut = %s, "
+                "dataset_version = %s, completed_at = %s "
+                "WHERE dataset_id = %s AND scope_digest = %s",
+                (
+                    "reference-orders-function-after-publication",
+                    "orders-cut-function-after-publication",
+                    "pg-reference-orders-function-v2",
+                    _MUTATED_COMPLETED_AT,
+                    dataset_id,
+                    scope_digest,
+                ),
+            ).rowcount
+            assert (updated, manifest_updated) == (1, 1)
+
+
+def _connect_transactional_postgres(
     settings: PostgresConnectionSettings,
 ) -> psycopg.Connection[DatabaseRow]:
     return psycopg.connect(
@@ -810,15 +1498,15 @@ def _connect_greengage_writer(
     )
 
 
-def _configure_greengage_write(cursor: psycopg.Cursor[DatabaseRow]) -> None:
+def _configure_fixture_write(cursor: psycopg.Cursor[DatabaseRow]) -> None:
     cursor.execute("SET TRANSACTION ISOLATION LEVEL READ COMMITTED READ WRITE")
     cursor.execute("SET LOCAL statement_timeout = '60000ms'")
 
 
 def _clear_greengage_target(settings: PostgresConnectionSettings) -> None:
-    with _connect_greengage_writer(settings) as connection:
+    with _connect_transactional_postgres(settings) as connection:
         with connection.cursor() as cursor:
-            _configure_greengage_write(cursor)
+            _configure_fixture_write(cursor)
             cursor.execute("DELETE FROM dfe_endpoint.target_orders")
             cursor.execute("DELETE FROM dfe_endpoint.batch_manifest")
 
@@ -828,9 +1516,9 @@ def _seed_greengage_target(
     dataset_id: str,
     scope_digest: str,
 ) -> None:
-    with _connect_greengage_writer(settings) as connection:
+    with _connect_transactional_postgres(settings) as connection:
         with connection.cursor() as cursor:
-            _configure_greengage_write(cursor)
+            _configure_fixture_write(cursor)
             cursor.execute(
                 "INSERT INTO dfe_endpoint.target_orders ("
                 "order_id, business_date, precise_amount, local_time, instant_time) "
@@ -883,9 +1571,9 @@ def _seed_empty_greengage_target_manifest(
     dataset_id: str,
     scope_digest: str,
 ) -> None:
-    with _connect_greengage_writer(settings) as connection:
+    with _connect_transactional_postgres(settings) as connection:
         with connection.cursor() as cursor:
-            _configure_greengage_write(cursor)
+            _configure_fixture_write(cursor)
             cursor.execute(
                 "INSERT INTO dfe_endpoint.batch_manifest ("
                 "dataset_id, scope_digest, batch_id, state, business_date, source_cut, "
@@ -913,9 +1601,9 @@ def _corrupt_greengage_target(
     dataset_id: str,
     scope_digest: str,
 ) -> None:
-    with _connect_greengage_writer(settings) as connection:
+    with _connect_transactional_postgres(settings) as connection:
         with connection.cursor() as cursor:
-            _configure_greengage_write(cursor)
+            _configure_fixture_write(cursor)
             cursor.execute(
                 "DELETE FROM dfe_endpoint.target_orders "
                 "WHERE business_date = %s AND order_id BETWEEN 1000 AND 1040",
@@ -1189,6 +1877,33 @@ def _assert_empty_target_result(
     assert tuple(reason.code for reason in result.reasons) == (ReasonCode.DATA_MISMATCH,)
 
 
+def _assert_function_load_result(
+    result: RunResult,
+    check: RowCheckDefinition,
+    scope: ResolvedScope,
+    execution_policy: ExecutionBudgets,
+) -> None:
+    pg_comparison._assert_common_completed_result(result, check, scope, execution_policy)
+    assert result.verdict is Verdict.MISMATCH
+    assert result.guarantee is Guarantee.EXACT
+    assert exit_code_for_result(result) is ExitCode.MISMATCH
+    assert result.comparison_coverage.resolved_segments == 1
+    assert result.comparison_coverage.pruned_segments == 0
+    assert result.comparison_coverage.exact_segments == 1
+    assert result.metrics.fingerprint_nodes == 1
+    assert result.totals == ComparisonTotals(
+        matched=ExactTotal(precision="exact", value="1"),
+        missing=ExactTotal(precision="exact", value="0"),
+        extra=ExactTotal(precision="exact", value="0"),
+        modified=ExactTotal(precision="exact", value="1"),
+    )
+    assert result.evidence_coverage.found_records == 1
+    assert result.evidence_coverage.found_bytes > 0
+    assert result.evidence_coverage.retained_records == 1
+    assert result.evidence_coverage.retained_bytes == result.evidence_coverage.found_bytes
+    assert tuple(reason.code for reason in result.reasons) == (ReasonCode.DATA_MISMATCH,)
+
+
 def _assert_empty_target_history_and_difference(
     services: PostgresMetadataServices,
     check: RowCheckDefinition,
@@ -1233,6 +1948,52 @@ def _assert_empty_target_history_and_difference(
     _assert_stored_value(detail.key_values[0], "order_id", LogicalType.INT64, "42")
     _assert_retained_side(detail.reference_values, _PRECISE_AMOUNT)
     assert detail.target_values == ()
+
+
+def _assert_function_load_history_and_difference(
+    services: PostgresMetadataServices,
+    check: RowCheckDefinition,
+    scope: ResolvedScope,
+    result: RunResult,
+) -> None:
+    history = read_history(
+        HistoryRequest(
+            check_id=check.check_id,
+            scope_digest=scope.scope_digest,
+            limit=1,
+            cursor=None,
+        ),
+        services,
+    )
+    assert len(history.items) == 1
+    assert history.items[0].status is HistoryAttemptStatus.COMPLETED
+    assert history.items[0].stored_result == result
+    assert history.next_cursor is None
+
+    page = read_diff(
+        DiffRequest(
+            run_id=result.run_id,
+            attempt_id=result.attempt_id,
+            limit=1,
+            cursor=None,
+        ),
+        services,
+    )
+    assert page.detail_availability is DetailAvailability.AVAILABLE
+    assert page.stored_result == result
+    assert page.found_records == 1
+    assert page.retained_records == 1
+    assert page.next_cursor is None
+    assert len(page.details) == 1
+    detail = page.details[0]
+    assert detail.sequence == 0
+    assert detail.kind is DifferenceKind.MODIFIED
+    assert detail.key_availability is KeyAvailability.AVAILABLE
+    assert detail.omitted_field_names == ("business_date",)
+    assert len(detail.key_values) == 1
+    _assert_stored_value(detail.key_values[0], "order_id", LogicalType.INT64, "702")
+    _assert_retained_side(detail.reference_values, _PRECISE_AMOUNT)
+    _assert_retained_side(detail.target_values, _PRECISE_AMOUNT_MODIFIED)
 
 
 def _assert_retained_difference_details(details: tuple[DifferenceRecord, ...]) -> None:

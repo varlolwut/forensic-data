@@ -16,6 +16,7 @@ readonly EXPECTED_COLUMNS=$'record_id|bigint|t\namount|numeric(38,4)|t\nactive|b
 readonly EXPECTED_CANONICAL_COLUMNS=$'distribution_id|bigint|t\nid|bigint|t\namount|numeric(38,3)|t\nactive|boolean|t\nlabel|text|t\nbusiness_date|date|t\nlocal_time|timestamp(6) without time zone|t\ninstant_time|timestamp(6) with time zone|t'
 readonly EXPECTED_ENDPOINT_COLUMNS=$'order_id|bigint|t\nbusiness_date|date|t\nprecise_amount|numeric(38,7)|f\nlocal_time|timestamp(6) without time zone|t\ninstant_time|timestamp(6) with time zone|t'
 readonly EXPECTED_ENDPOINT_MANIFEST_COLUMNS=$'dataset_id|text|t\nscope_digest|text|t\nbatch_id|text|t\nstate|text|t\nbusiness_date|date|t\nsource_cut|text|f\ndataset_version|text|f\ncompleted_at|timestamp(6) with time zone|f'
+readonly ENDPOINT_LOAD_FUNCTION='dfe_endpoint.publish_miniature_orders_batch(text,text,text,date,text,text,timestamp with time zone,numeric)'
 readonly -a SNAPSHOT_RELATIONS=(snapshot_heap_values snapshot_ao_values snapshot_aoco_values)
 readonly -a SNAPSHOT_STORAGE_CLAUSES=(
   'USING heap'
@@ -232,6 +233,108 @@ endpoint_manifest_distribution_policy="$(query_scalar "${FIXTURE_DATABASE}" \
   "SELECT policytype || '|' || numsegments::text || '|' || distkey::text FROM gp_distribution_policy WHERE localoid = 'dfe_endpoint.batch_manifest'::regclass;")"
 if [[ "${endpoint_manifest_distribution_policy}" != "p|${primary_count}|1 2" ]]; then
   fail "batch_manifest must be distributed by dataset_id and scope_digest, observed policy ${endpoint_manifest_distribution_policy}"
+fi
+
+psql_as_gpadmin "${FIXTURE_DATABASE}" <<SQL
+CREATE OR REPLACE FUNCTION dfe_endpoint.publish_miniature_orders_batch(
+  p_dataset_id text,
+  p_scope_digest text,
+  p_batch_id text,
+  p_business_date date,
+  p_source_cut text,
+  p_dataset_version text,
+  p_completed_at timestamp with time zone,
+  p_second_amount numeric
+)
+RETURNS integer
+LANGUAGE plpgsql
+VOLATILE
+SECURITY INVOKER
+SET search_path = pg_catalog
+AS \$function\$
+BEGIN
+  IF p_dataset_id IS NULL OR btrim(p_dataset_id) = '' THEN
+    RAISE EXCEPTION 'dataset_id must be non-null and nonblank' USING ERRCODE = '22023';
+  END IF;
+  IF p_scope_digest IS NULL OR p_scope_digest !~ '^[0-9a-f]{64}\$' THEN
+    RAISE EXCEPTION 'scope_digest must be exactly 64 lowercase hexadecimal characters' USING ERRCODE = '22023';
+  END IF;
+  IF p_batch_id IS NULL OR btrim(p_batch_id) = '' THEN
+    RAISE EXCEPTION 'batch_id must be non-null and nonblank' USING ERRCODE = '22023';
+  END IF;
+  IF p_business_date IS NULL THEN
+    RAISE EXCEPTION 'business_date must be non-null' USING ERRCODE = '22023';
+  END IF;
+  IF p_source_cut IS NULL OR btrim(p_source_cut) = '' THEN
+    RAISE EXCEPTION 'source_cut must be non-null and nonblank' USING ERRCODE = '22023';
+  END IF;
+  IF p_dataset_version IS NULL OR btrim(p_dataset_version) = '' THEN
+    RAISE EXCEPTION 'dataset_version must be non-null and nonblank' USING ERRCODE = '22023';
+  END IF;
+  IF p_completed_at IS NULL THEN
+    RAISE EXCEPTION 'completed_at must be non-null' USING ERRCODE = '22023';
+  END IF;
+  IF p_second_amount IS NULL THEN
+    RAISE EXCEPTION 'second_amount must be non-null' USING ERRCODE = '22023';
+  END IF;
+
+  INSERT INTO dfe_endpoint.target_orders (
+    order_id,
+    business_date,
+    precise_amount,
+    local_time,
+    instant_time
+  )
+  VALUES
+    (
+      701,
+      p_business_date,
+      NULL,
+      p_business_date + TIME '11:22:33.123456',
+      (p_business_date + TIME '08:22:33.123456') AT TIME ZONE 'UTC'
+    ),
+    (
+      702,
+      p_business_date,
+      p_second_amount,
+      p_business_date + TIME '11:22:33.123456',
+      (p_business_date + TIME '08:22:33.123456') AT TIME ZONE 'UTC'
+    );
+
+  INSERT INTO dfe_endpoint.batch_manifest (
+    dataset_id,
+    scope_digest,
+    batch_id,
+    state,
+    business_date,
+    source_cut,
+    dataset_version,
+    completed_at
+  )
+  VALUES (
+    p_dataset_id,
+    p_scope_digest,
+    p_batch_id,
+    'complete',
+    p_business_date,
+    p_source_cut,
+    p_dataset_version,
+    p_completed_at
+  );
+
+  RETURN 2;
+END;
+\$function\$;
+ALTER FUNCTION ${ENDPOINT_LOAD_FUNCTION} OWNER TO ${WRITER_ROLE};
+REVOKE EXECUTE ON FUNCTION ${ENDPOINT_LOAD_FUNCTION} FROM PUBLIC;
+REVOKE EXECUTE ON FUNCTION ${ENDPOINT_LOAD_FUNCTION} FROM ${READER_ROLE};
+GRANT EXECUTE ON FUNCTION ${ENDPOINT_LOAD_FUNCTION} TO ${WRITER_ROLE};
+SQL
+
+endpoint_load_function_state="$(query_scalar "${FIXTURE_DATABASE}" \
+  "SELECT count(*) = 1 AND bool_and(pg_get_userbyid(p.proowner) = '${WRITER_ROLE}' AND p.prorettype = 'integer'::regtype AND l.lanname = 'plpgsql' AND p.provolatile = 'v' AND NOT p.prosecdef AND p.proconfig = ARRAY['search_path=pg_catalog']::text[]) FROM pg_proc p JOIN pg_namespace n ON n.oid = p.pronamespace JOIN pg_language l ON l.oid = p.prolang WHERE n.nspname = 'dfe_endpoint' AND p.proname = 'publish_miniature_orders_batch' AND p.proargtypes = '25 25 25 1082 25 25 1184 1700'::oidvector;")"
+if [[ "${endpoint_load_function_state}" != t ]]; then
+  fail 'publish_miniature_orders_batch metadata does not match the required state'
 fi
 
 psql_as_gpadmin "${FIXTURE_DATABASE}" <<'SQL'
@@ -613,7 +716,7 @@ if [[ "${writer_scope_state}" != t ]]; then
   fail 'writer database, schema, or capability-table privileges exceed the required scope'
 fi
 endpoint_privilege_state="$(query_scalar "${FIXTURE_DATABASE}" \
-  "SELECT has_schema_privilege('${READER_ROLE}', 'dfe_endpoint', 'USAGE') AND NOT has_schema_privilege('${READER_ROLE}', 'dfe_endpoint', 'CREATE') AND has_schema_privilege('${WRITER_ROLE}', 'dfe_endpoint', 'USAGE') AND NOT has_schema_privilege('${WRITER_ROLE}', 'dfe_endpoint', 'CREATE') AND has_table_privilege('${READER_ROLE}', 'dfe_endpoint.target_orders', 'SELECT') AND NOT has_table_privilege('${READER_ROLE}', 'dfe_endpoint.target_orders', 'INSERT') AND NOT has_table_privilege('${READER_ROLE}', 'dfe_endpoint.target_orders', 'UPDATE') AND NOT has_table_privilege('${READER_ROLE}', 'dfe_endpoint.target_orders', 'DELETE') AND has_table_privilege('${WRITER_ROLE}', 'dfe_endpoint.target_orders', 'SELECT') AND has_table_privilege('${WRITER_ROLE}', 'dfe_endpoint.target_orders', 'INSERT') AND has_table_privilege('${WRITER_ROLE}', 'dfe_endpoint.target_orders', 'UPDATE') AND has_table_privilege('${WRITER_ROLE}', 'dfe_endpoint.target_orders', 'DELETE') AND NOT has_table_privilege('${WRITER_ROLE}', 'dfe_endpoint.target_orders', 'TRUNCATE') AND has_table_privilege('${READER_ROLE}', 'dfe_endpoint.batch_manifest', 'SELECT') AND NOT has_table_privilege('${READER_ROLE}', 'dfe_endpoint.batch_manifest', 'INSERT') AND has_table_privilege('${WRITER_ROLE}', 'dfe_endpoint.batch_manifest', 'SELECT') AND has_table_privilege('${WRITER_ROLE}', 'dfe_endpoint.batch_manifest', 'INSERT') AND has_table_privilege('${WRITER_ROLE}', 'dfe_endpoint.batch_manifest', 'UPDATE') AND has_table_privilege('${WRITER_ROLE}', 'dfe_endpoint.batch_manifest', 'DELETE') AND NOT has_table_privilege('${WRITER_ROLE}', 'dfe_endpoint.batch_manifest', 'TRUNCATE');")"
+  "SELECT has_schema_privilege('${READER_ROLE}', 'dfe_endpoint', 'USAGE') AND NOT has_schema_privilege('${READER_ROLE}', 'dfe_endpoint', 'CREATE') AND has_schema_privilege('${WRITER_ROLE}', 'dfe_endpoint', 'USAGE') AND NOT has_schema_privilege('${WRITER_ROLE}', 'dfe_endpoint', 'CREATE') AND has_table_privilege('${READER_ROLE}', 'dfe_endpoint.target_orders', 'SELECT') AND NOT has_table_privilege('${READER_ROLE}', 'dfe_endpoint.target_orders', 'INSERT') AND NOT has_table_privilege('${READER_ROLE}', 'dfe_endpoint.target_orders', 'UPDATE') AND NOT has_table_privilege('${READER_ROLE}', 'dfe_endpoint.target_orders', 'DELETE') AND has_table_privilege('${WRITER_ROLE}', 'dfe_endpoint.target_orders', 'SELECT') AND has_table_privilege('${WRITER_ROLE}', 'dfe_endpoint.target_orders', 'INSERT') AND has_table_privilege('${WRITER_ROLE}', 'dfe_endpoint.target_orders', 'UPDATE') AND has_table_privilege('${WRITER_ROLE}', 'dfe_endpoint.target_orders', 'DELETE') AND NOT has_table_privilege('${WRITER_ROLE}', 'dfe_endpoint.target_orders', 'TRUNCATE') AND has_table_privilege('${READER_ROLE}', 'dfe_endpoint.batch_manifest', 'SELECT') AND NOT has_table_privilege('${READER_ROLE}', 'dfe_endpoint.batch_manifest', 'INSERT') AND has_table_privilege('${WRITER_ROLE}', 'dfe_endpoint.batch_manifest', 'SELECT') AND has_table_privilege('${WRITER_ROLE}', 'dfe_endpoint.batch_manifest', 'INSERT') AND has_table_privilege('${WRITER_ROLE}', 'dfe_endpoint.batch_manifest', 'UPDATE') AND has_table_privilege('${WRITER_ROLE}', 'dfe_endpoint.batch_manifest', 'DELETE') AND NOT has_table_privilege('${WRITER_ROLE}', 'dfe_endpoint.batch_manifest', 'TRUNCATE') AND NOT has_function_privilege('${READER_ROLE}', '${ENDPOINT_LOAD_FUNCTION}', 'EXECUTE') AND has_function_privilege('${WRITER_ROLE}', '${ENDPOINT_LOAD_FUNCTION}', 'EXECUTE') AND NOT EXISTS (SELECT 1 FROM pg_proc p CROSS JOIN LATERAL aclexplode(COALESCE(p.proacl, acldefault('f', p.proowner))) privilege WHERE p.oid = '${ENDPOINT_LOAD_FUNCTION}'::regprocedure AND privilege.privilege_type = 'EXECUTE' AND privilege.grantee <> (SELECT oid FROM pg_roles WHERE rolname = '${WRITER_ROLE}'));")"
 if [[ "${endpoint_privilege_state}" != t ]]; then
   fail 'reader or writer endpoint-table privileges do not match the required state'
 fi
@@ -645,10 +748,19 @@ for role_name in "${READER_ROLE}" "${WRITER_ROLE}"; do
   membership_count="$(query_scalar postgres \
     "SELECT count(*) FROM pg_auth_members WHERE member = (SELECT oid FROM pg_roles WHERE rolname = '${role_name}') OR roleid = (SELECT oid FROM pg_roles WHERE rolname = '${role_name}');")"
   require_count "${membership_count}" 0 "${role_name} role membership count"
-  owned_object_count="$(query_scalar "${FIXTURE_DATABASE}" \
-    "SELECT (SELECT count(*) FROM pg_namespace WHERE nspowner = (SELECT oid FROM pg_roles WHERE rolname = '${role_name}')) + (SELECT count(*) FROM pg_class WHERE relowner = (SELECT oid FROM pg_roles WHERE rolname = '${role_name}')) + (SELECT count(*) FROM pg_proc WHERE proowner = (SELECT oid FROM pg_roles WHERE rolname = '${role_name}'));")"
-  require_count "${owned_object_count}" 0 "${role_name}-owned object count"
 done
+reader_owned_object_count="$(query_scalar "${FIXTURE_DATABASE}" \
+  "SELECT (SELECT count(*) FROM pg_namespace WHERE nspowner = (SELECT oid FROM pg_roles WHERE rolname = '${READER_ROLE}')) + (SELECT count(*) FROM pg_class WHERE relowner = (SELECT oid FROM pg_roles WHERE rolname = '${READER_ROLE}')) + (SELECT count(*) FROM pg_proc WHERE proowner = (SELECT oid FROM pg_roles WHERE rolname = '${READER_ROLE}'));")"
+require_count "${reader_owned_object_count}" 0 "${READER_ROLE}-owned object count"
+writer_owned_schema_count="$(query_scalar "${FIXTURE_DATABASE}" \
+  "SELECT count(*) FROM pg_namespace WHERE nspowner = (SELECT oid FROM pg_roles WHERE rolname = '${WRITER_ROLE}');")"
+require_count "${writer_owned_schema_count}" 0 "${WRITER_ROLE}-owned schema count"
+writer_owned_relation_count="$(query_scalar "${FIXTURE_DATABASE}" \
+  "SELECT count(*) FROM pg_class WHERE relowner = (SELECT oid FROM pg_roles WHERE rolname = '${WRITER_ROLE}');")"
+require_count "${writer_owned_relation_count}" 0 "${WRITER_ROLE}-owned relation count"
+writer_owned_function_count="$(query_scalar "${FIXTURE_DATABASE}" \
+  "SELECT count(*) FROM pg_proc WHERE proowner = (SELECT oid FROM pg_roles WHERE rolname = '${WRITER_ROLE}');")"
+require_count "${writer_owned_function_count}" 1 "${WRITER_ROLE}-owned function count"
 
 for hba_line in "${READER_HBA_LINE}" "${WRITER_HBA_LINE}"; do
   if ! grep --fixed-strings --line-regexp --quiet "${hba_line}" "${HBA_FILE}"; then

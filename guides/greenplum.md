@@ -35,6 +35,19 @@ Run the selected check through `forensics check` or the typed Python API, then i
 result with `forensics history` and page retained row differences with `forensics diff`. See
 [CLI and contracts](cli-and-contracts.md) for invocation, output, and pagination details.
 
+## Functions-based miniature load boundary
+
+The current real PostgreSQL source and Greengage target fixtures each use a native
+`SECURITY INVOKER` stored function to publish a miniature batch. A fixture writer invokes its
+engine's function, which writes the batch rows and then its relation-manifest completion record
+atomically in one transaction. `EXECUTE` is revoked from `PUBLIC` and the DFE reader and granted
+only to the fixture writer.
+
+DFE connects through separate read-only reader DSNs. It neither calls these load functions nor
+issues load DML; it only compares a batch after both completion records are visible. Loading
+therefore remains outside the DFE runtime, while the fixture verifies the writer/reader boundary
+on the supported PostgreSQL-to-Greengage example.
+
 ## Verified artifact pair
 
 | Product | Exact artifact | Verified fixture behavior |
