@@ -14,6 +14,7 @@ from psycopg.conninfo import make_conninfo
 from psycopg.rows import tuple_row
 from psycopg2.extensions import connection as Psycopg2Connection
 
+from forensic_data import application, comparison
 from forensic_data.application import (
     DiffRequest,
     ExecuteCheckRequest,
@@ -28,10 +29,24 @@ from forensic_data.application import (
 )
 from forensic_data.cli import run_cli
 from forensic_data.contracts import load_contract_config
-from forensic_data.contracts.model import LoadedContractConfig, RowCheckDefinition
+from forensic_data.contracts.model import (
+    LoadedContractConfig,
+    RelationManifestReadiness,
+    RowCheckDefinition,
+)
+from forensic_data.original_greenplum_endpoint import (
+    OriginalGreenplumProtectedReadContext,
+    OriginalGreenplumProtectedRelationInspection,
+)
 from forensic_data.persistence.postgres import migrate_postgres_metadata
-from forensic_data.planning import ResolvedScope, resolve_scope_values
-from forensic_data.postgres import DatabaseRow, PostgresConnectionSettings, PostgresRetryPolicy
+from forensic_data.planning import PlanDirection, ResolvedScope, resolve_scope_values
+from forensic_data.postgres import (
+    DatabaseRow,
+    PostgresConnectionSettings,
+    PostgresReadMetrics,
+    PostgresRetryPolicy,
+)
+from forensic_data.postgres_sql import PostgresIntegerRangeRequest
 from forensic_data.reporting import (
     DetailAvailability,
     DifferenceKind,
@@ -58,7 +73,11 @@ from tests.metadata_postgres_support import (
     disposable_metadata_database,
     required_metadata_database_settings,
 )
-from tests.postgres_support import connect_writer, required_connection_settings
+from tests.postgres_support import (
+    connect_writer,
+    required_connection_settings,
+    source_budget_attempt,
+)
 
 pytestmark = [pytest.mark.integration, pytest.mark.greenplum, pytest.mark.postgres]
 
@@ -165,6 +184,7 @@ def test_original_greenplum_source_to_postgres_and_greengage_is_durable() -> Non
                 greengage_reader,
                 greengage_check,
             )
+            _assert_empty_original_greenplum_reads(postgres_check, postgres_services)
 
             postgres_result = _execute_through_cli_and_api(
                 config,
@@ -244,6 +264,72 @@ def _check(config: LoadedContractConfig, check_id: str) -> RowCheckDefinition:
             f"check_id={check_id!r}, matches={len(matches)}"
         )
     return matches[0]
+
+
+def _assert_empty_original_greenplum_reads(
+    check: RowCheckDefinition,
+    services: OriginalGreenplumPostgresExecutionServices,
+) -> None:
+    readiness = check.consistency.datasets[0].readiness
+    assert isinstance(readiness, RelationManifestReadiness)
+    empty_scope = resolve_scope_values(check, {"business_date": "2026-09-26"})
+    scope = comparison._scope_predicate_for_dataset(check, empty_scope, check.reference)
+    key_indexes = tuple(
+        index
+        for index, field in enumerate(check.comparison_schema.schema.fields)
+        if field.name == check.key[0]
+    )
+    assert len(key_indexes) == 1
+    source_budget = source_budget_attempt()
+    protected = application._open_original_greenplum_side(
+        check.reference,
+        readiness,
+        PlanDirection.REFERENCE,
+        source_budget,
+        services,
+    )
+    context = protected.context
+    relation = protected.dataset_relation
+    assert isinstance(context, OriginalGreenplumProtectedReadContext)
+    assert isinstance(relation, OriginalGreenplumProtectedRelationInspection)
+    try:
+        summary = context.read_integer_key_summary(
+            relation,
+            key_indexes[0],
+            scope,
+            1_048_576,
+            1_048_576,
+            1_048_576,
+            source_budget.read_deadline(source_budget.effective_statement_timeout_milliseconds()),
+            1,
+        )
+        assert (
+            summary.summary.row_count,
+            summary.summary.null_key_count,
+            summary.summary.invalid_key_count,
+            summary.summary.valid_key_count,
+            summary.summary.distinct_key_count,
+            summary.summary.minimum_key,
+            summary.summary.maximum_key,
+        ) == (0, 0, 0, 0, 0, None, None)
+        assert summary.metrics.fetched_records == 1
+
+        exact = context.read_integer_range_rows(
+            relation,
+            key_indexes[0],
+            scope,
+            (PostgresIntegerRangeRequest("empty", 0, 10),),
+            1_048_576,
+            1,
+            1_048_576,
+            1_048_576,
+            source_budget.read_deadline(source_budget.effective_statement_timeout_milliseconds()),
+            1,
+        )
+        assert exact.rows == ()
+        assert exact.metrics == PostgresReadMetrics(fetched_records=0, result_bytes=0)
+    finally:
+        context.close()
 
 
 def _execute_through_cli_and_api(

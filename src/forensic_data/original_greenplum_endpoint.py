@@ -1799,7 +1799,8 @@ def _manifest_statement(
     )
     names = tuple(_quote_identifier(value) for value in columns.values())
     return (
-        f"SELECT (pg_catalog.pg_typeof(NULL::{table}))::oid::bigint AS origin_type, "
+        "SELECT (pg_catalog.pg_typeof(CASE WHEN FALSE THEN (dfe_manifest.*) "
+        "ELSE NULL END))::oid::bigint AS origin_type, "
         f"dfe_manifest.{names[0]} AS dataset_id, "
         f"dfe_manifest.{names[1]} AS scope_digest, "
         f"dfe_manifest.{names[2]} AS batch_id, "

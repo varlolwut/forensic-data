@@ -70,9 +70,11 @@ def build_original_greenplum_integer_key_summary_query(
     scope_filter, scope_parameters = _scope_filter(bindings, scope, source_alias)
     relation = sql.Identifier(schema_name, relation_name)
     statement = sql.SQL(
-        "SELECT (pg_catalog.pg_typeof(NULL::{relation}))::oid::bigint AS origin_type, "
-        "count(*)::text AS row_count, "
-        "count(CASE WHEN {key_column} IS NULL THEN 1 ELSE NULL END)::text "
+        "SELECT max((pg_catalog.pg_typeof(CASE WHEN FALSE THEN ({source}.*) "
+        "ELSE NULL END))::oid::bigint) AS origin_type, "
+        "count({source}.tableoid)::text AS row_count, "
+        "count(CASE WHEN {source}.tableoid IS NOT NULL AND {key_column} IS NULL "
+        "THEN 1 ELSE NULL END)::text "
         "AS null_key_count, count(CASE WHEN {key_column} IS NOT NULL "
         "AND NOT ({key_valid}) THEN 1 ELSE NULL END)::text AS invalid_key_count, "
         "count(CASE WHEN {key_column} IS NOT NULL AND ({key_valid}) "
@@ -102,7 +104,8 @@ def build_original_greenplum_integer_key_summary_query(
         "AND NOT dfe_key_attribute.attisdropped AND dfe_index.indnatts >= 1 "
         "AND dfe_index.indisvalid AND dfe_index.indisready "
         "AND dfe_index.indpred IS NULL AND dfe_index.indexprs IS NULL) "
-        "AS usable_access_path FROM ONLY {relation} AS {source} WHERE {scope_filter}"
+        "AS usable_access_path FROM (SELECT 1 AS witness) AS dfe_witness "
+        "LEFT JOIN ONLY {relation} AS {source} ON ({scope_filter})"
     ).format(
         relation=relation,
         key_column=key_column,
@@ -326,8 +329,9 @@ def build_original_greenplum_integer_range_rows_query(
         "CASE WHEN dfe_provenance.has_data THEN dfe_provenance.invalid_row "
         "ELSE NULL::boolean END AS invalid_row, CASE WHEN dfe_provenance.has_data "
         "THEN dfe_provenance.oversized_row ELSE NULL::boolean END AS oversized_row "
-        "FROM (SELECT (pg_catalog.pg_typeof(NULL::{relation}))::oid::bigint "
-        "AS origin_type, dfe_origin.tableoid IS NOT NULL AS has_data, "
+        "FROM (SELECT (pg_catalog.pg_typeof(CASE WHEN FALSE THEN "
+        "(dfe_origin.*) ELSE NULL END))::oid::bigint AS origin_type, "
+        "dfe_origin.tableoid IS NOT NULL AS has_data, "
         "dfe_range.segment_id, dfe_range.ordinal, ({key_column})::bigint AS key_value, "
         "{row_envelope} AS row_envelope, {invalid_row} AS invalid_row, "
         "{oversized_row} AS oversized_row, sum(CASE WHEN dfe_origin.tableoid "
