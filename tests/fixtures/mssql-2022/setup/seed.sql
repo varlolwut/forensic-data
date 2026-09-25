@@ -102,31 +102,46 @@ INSERT INTO [dfe_fixture].[comparison_orders]
 (
     [order_id],
     [business_date],
-    [amount]
+    [amount],
+    [precise_amount],
+    [local_time],
+    [instant_time]
 )
 SELECT
     CONVERT(decimal(21, 2), [value] * 2),
     CONVERT(date, N'2026-09-23', 23),
-    CONVERT(decimal(18, 2), N'100.00')
+    CONVERT(decimal(18, 2), N'100.00'),
+    CONVERT(decimal(38, 7), N'1234567890123456789012345678901.1234567'),
+    CONVERT(datetime2(7), N'2026-09-23T11:22:33.1234560', 126),
+    CONVERT(datetimeoffset(7), N'2026-09-23T08:22:33.1234560+00:00', 127)
 FROM GENERATE_SERIES(1, 1000, 1)
 UNION ALL
 SELECT
     CONVERT(decimal(21, 2), 1000000 + [value]),
     CONVERT(date, N'2026-09-23', 23),
-    CONVERT(decimal(18, 2), N'100.00')
+    CONVERT(decimal(18, 2), N'100.00'),
+    CONVERT(decimal(38, 7), N'1234567890123456789012345678901.1234567'),
+    CONVERT(datetime2(7), N'2026-09-23T11:22:33.1234560', 126),
+    CONVERT(datetimeoffset(7), N'2026-09-23T08:22:33.1234560+00:00', 127)
 FROM GENERATE_SERIES(1, 999000, 1);
 
 INSERT INTO [dfe_fixture].[comparison_orders]
 (
     [order_id],
     [business_date],
-    [amount]
+    [amount],
+    [precise_amount],
+    [local_time],
+    [instant_time]
 )
 VALUES
 (
     CONVERT(decimal(21, 2), N'1.00'),
     CONVERT(date, N'2026-09-22', 23),
-    CONVERT(decimal(18, 2), N'900.00')
+    CONVERT(decimal(18, 2), N'900.00'),
+    CONVERT(decimal(38, 7), N'900.0000000'),
+    CONVERT(datetime2(7), N'2026-09-22T11:22:33.1234560', 126),
+    CONVERT(datetimeoffset(7), N'2026-09-22T08:22:33.1234560+00:00', 127)
 );
 
 INSERT INTO [dfe_fixture].[comparison_batch_manifest]

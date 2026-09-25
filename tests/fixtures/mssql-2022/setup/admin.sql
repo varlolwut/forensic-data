@@ -108,6 +108,9 @@ CREATE TABLE [dfe_fixture].[comparison_orders]
     [order_id] decimal(21, 2) NOT NULL,
     [business_date] date NOT NULL,
     [amount] decimal(18, 2) NULL,
+    [precise_amount] decimal(38, 7) NULL,
+    [local_time] datetime2(7) NOT NULL,
+    [instant_time] datetimeoffset(7) NOT NULL,
     CONSTRAINT [PK_dfe_fixture_comparison_orders] PRIMARY KEY ([order_id])
 );
 

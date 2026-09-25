@@ -12,6 +12,7 @@ _MIGRATION_RESOURCES: Final[tuple[tuple[int, str], ...]] = (
     (4, "0004_retained_anomalies.sql"),
     (5, "0005_frozen_physical_union.sql"),
     (6, "0006_mssql_dataset_adapter.sql"),
+    (7, "0007_greengage_dataset_adapter.sql"),
 )
 
 

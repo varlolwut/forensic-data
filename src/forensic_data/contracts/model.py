@@ -12,6 +12,7 @@ from forensic_data.contracts.errors import ContractValidationError
 class Adapter(StrEnum):
     POSTGRESQL = "postgresql"
     MSSQL = "mssql"
+    GREENGAGE = "greengage"
 
 
 class ConnectionRole(StrEnum):

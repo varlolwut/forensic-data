@@ -68,6 +68,12 @@ from forensic_data.contracts.source import (
     SqlArtifactSource,
     load_contract_source,
 )
+from forensic_data.greenplum_profile import (
+    GREENGAGE_DRIVER,
+    GREENGAGE_PROFILE,
+    GreenplumRuntimeProfile,
+    match_greenplum_runtime_profile,
+)
 from forensic_data.mssql_profile import (
     MSSQL_2016_DRIVER,
     MSSQL_2016_PROFILE,
@@ -224,6 +230,19 @@ def _compile_connection(source: ConnectionSource) -> ConnectionDefinition:
                 f"connection {connection_id!r} profile {profile!r} is source-only "
                 "and must declare exactly role 'source'"
             )
+    if adapter is Adapter.GREENGAGE:
+        if (
+            match_greenplum_runtime_profile(driver, profile)
+            is not GreenplumRuntimeProfile.GREENGAGE
+        ):
+            raise UnsupportedContractError(
+                f"connection {connection_id!r} Greengage endpoint requires exact "
+                f"driver/profile pair ({GREENGAGE_DRIVER!r}, {GREENGAGE_PROFILE!r})"
+            )
+        if ConnectionRole.TARGET not in roles:
+            raise UnsupportedContractError(
+                f"connection {connection_id!r} profile {profile!r} must declare role 'target'"
+            )
     return ConnectionDefinition(
         connection_id=connection_id,
         adapter=adapter,
@@ -354,11 +373,12 @@ def _compile_dataset_locator(
                 f"relation_scope={source.relation_scope!r}"
             ) from None
         if (
-            connection.adapter is Adapter.MSSQL
+            connection.adapter in (Adapter.MSSQL, Adapter.GREENGAGE)
             and relation_scope is not RelationScope.PHYSICAL_ONLY
         ):
             raise UnsupportedContractError(
-                f"dataset {dataset_id!r} MSSQL relation requires physical_only scope: "
+                f"dataset {dataset_id!r} {connection.adapter.value} relation requires "
+                "physical_only scope: "
                 f"relation_scope={relation_scope.value!r}"
             )
         return RelationLocator(

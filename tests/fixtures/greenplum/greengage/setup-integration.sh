@@ -14,6 +14,8 @@ readonly READER_HBA_LINE='host dfe_fixture dfe_greengage_reader samenet md5'
 readonly WRITER_HBA_LINE='host dfe_fixture dfe_greengage_writer samenet md5'
 readonly EXPECTED_COLUMNS=$'record_id|bigint|t\namount|numeric(38,4)|t\nactive|boolean|t\nlabel|text|t\nbusiness_date|date|t\nlocal_time|timestamp(6) without time zone|t\ninstant_time|timestamp(6) with time zone|t\nignored_payload|bytea|f'
 readonly EXPECTED_CANONICAL_COLUMNS=$'distribution_id|bigint|t\nid|bigint|t\namount|numeric(38,3)|t\nactive|boolean|t\nlabel|text|t\nbusiness_date|date|t\nlocal_time|timestamp(6) without time zone|t\ninstant_time|timestamp(6) with time zone|t'
+readonly EXPECTED_ENDPOINT_COLUMNS=$'order_id|bigint|t\nbusiness_date|date|t\nprecise_amount|numeric(38,7)|f\nlocal_time|timestamp(6) without time zone|t\ninstant_time|timestamp(6) with time zone|t'
+readonly EXPECTED_ENDPOINT_MANIFEST_COLUMNS=$'dataset_id|text|t\nscope_digest|text|t\nbatch_id|text|t\nstate|text|t\nbusiness_date|date|t\nsource_cut|text|f\ndataset_version|text|f\ncompleted_at|timestamp(6) with time zone|f'
 readonly -a SNAPSHOT_RELATIONS=(snapshot_heap_values snapshot_ao_values snapshot_aoco_values)
 readonly -a SNAPSHOT_STORAGE_CLAUSES=(
   'USING heap'
@@ -152,8 +154,90 @@ schema_owner="$(query_scalar "${FIXTURE_DATABASE}" \
 if [[ "${schema_owner}" != gpadmin ]]; then
   fail "schema dfe_fixture owner must be gpadmin, observed ${schema_owner}"
 fi
+endpoint_schema_count="$(query_scalar "${FIXTURE_DATABASE}" \
+  "SELECT count(*) FROM pg_namespace WHERE nspname = 'dfe_endpoint';")"
+case "${endpoint_schema_count}" in
+  0)
+    printf 'CREATE SCHEMA dfe_endpoint AUTHORIZATION gpadmin;\n' \
+      | psql_as_gpadmin "${FIXTURE_DATABASE}"
+    ;;
+  1) ;;
+  *) fail "dfe_endpoint schema catalog lookup returned ${endpoint_schema_count} rows" ;;
+esac
+endpoint_schema_owner="$(query_scalar "${FIXTURE_DATABASE}" \
+  "SELECT pg_get_userbyid(nspowner) FROM pg_namespace WHERE nspname = 'dfe_endpoint';")"
+if [[ "${endpoint_schema_owner}" != gpadmin ]]; then
+  fail "schema dfe_endpoint owner must be gpadmin, observed ${endpoint_schema_owner}"
+fi
 primary_count="$(query_scalar "${FIXTURE_DATABASE}" \
   "SELECT count(*) FROM gp_segment_configuration WHERE content >= 0 AND role = 'p' AND status = 'u';")"
+
+endpoint_table_count="$(query_scalar "${FIXTURE_DATABASE}" \
+  "SELECT count(*) FROM pg_class c JOIN pg_namespace n ON n.oid = c.relnamespace WHERE n.nspname = 'dfe_endpoint' AND c.relname = 'target_orders' AND c.relkind = 'r';")"
+case "${endpoint_table_count}" in
+  0)
+    psql_as_gpadmin "${FIXTURE_DATABASE}" <<'SQL'
+CREATE TABLE dfe_endpoint.target_orders (
+  order_id bigint NOT NULL,
+  business_date date NOT NULL,
+  precise_amount numeric(38, 7) NULL,
+  local_time timestamp(6) without time zone NOT NULL,
+  instant_time timestamp(6) with time zone NOT NULL,
+  PRIMARY KEY (order_id)
+) DISTRIBUTED BY (order_id);
+SQL
+    ;;
+  1) ;;
+  *) fail "target_orders catalog lookup returned ${endpoint_table_count} rows" ;;
+esac
+
+endpoint_manifest_count="$(query_scalar "${FIXTURE_DATABASE}" \
+  "SELECT count(*) FROM pg_class c JOIN pg_namespace n ON n.oid = c.relnamespace WHERE n.nspname = 'dfe_endpoint' AND c.relname = 'batch_manifest' AND c.relkind = 'r';")"
+case "${endpoint_manifest_count}" in
+  0)
+    psql_as_gpadmin "${FIXTURE_DATABASE}" <<'SQL'
+CREATE TABLE dfe_endpoint.batch_manifest (
+  dataset_id text NOT NULL,
+  scope_digest text NOT NULL,
+  batch_id text NOT NULL,
+  state text NOT NULL,
+  business_date date NOT NULL,
+  source_cut text NULL,
+  dataset_version text NULL,
+  completed_at timestamp(6) with time zone NULL,
+  PRIMARY KEY (dataset_id, scope_digest)
+) DISTRIBUTED BY (dataset_id, scope_digest);
+SQL
+    ;;
+  1) ;;
+  *) fail "batch_manifest catalog lookup returned ${endpoint_manifest_count} rows" ;;
+esac
+
+observed_endpoint_columns="$(query_scalar "${FIXTURE_DATABASE}" \
+  "SELECT a.attname || '|' || format_type(a.atttypid, a.atttypmod) || '|' || CASE WHEN a.attnotnull THEN 't' ELSE 'f' END FROM pg_attribute a JOIN pg_class c ON c.oid = a.attrelid JOIN pg_namespace n ON n.oid = c.relnamespace WHERE n.nspname = 'dfe_endpoint' AND c.relname = 'target_orders' AND a.attnum > 0 AND NOT a.attisdropped ORDER BY a.attnum;")"
+if [[ "${observed_endpoint_columns}" != "${EXPECTED_ENDPOINT_COLUMNS}" ]]; then
+  fail 'target_orders has an unexpected physical schema'
+fi
+observed_endpoint_manifest_columns="$(query_scalar "${FIXTURE_DATABASE}" \
+  "SELECT a.attname || '|' || format_type(a.atttypid, a.atttypmod) || '|' || CASE WHEN a.attnotnull THEN 't' ELSE 'f' END FROM pg_attribute a JOIN pg_class c ON c.oid = a.attrelid JOIN pg_namespace n ON n.oid = c.relnamespace WHERE n.nspname = 'dfe_endpoint' AND c.relname = 'batch_manifest' AND a.attnum > 0 AND NOT a.attisdropped ORDER BY a.attnum;")"
+if [[ "${observed_endpoint_manifest_columns}" != "${EXPECTED_ENDPOINT_MANIFEST_COLUMNS}" ]]; then
+  fail 'batch_manifest has an unexpected physical schema'
+fi
+endpoint_distribution_policy="$(query_scalar "${FIXTURE_DATABASE}" \
+  "SELECT policytype || '|' || numsegments::text || '|' || distkey::text FROM gp_distribution_policy WHERE localoid = 'dfe_endpoint.target_orders'::regclass;")"
+if [[ "${endpoint_distribution_policy}" != "p|${primary_count}|1" ]]; then
+  fail "target_orders must be distributed by order_id, observed policy ${endpoint_distribution_policy}"
+fi
+endpoint_manifest_distribution_policy="$(query_scalar "${FIXTURE_DATABASE}" \
+  "SELECT policytype || '|' || numsegments::text || '|' || distkey::text FROM gp_distribution_policy WHERE localoid = 'dfe_endpoint.batch_manifest'::regclass;")"
+if [[ "${endpoint_manifest_distribution_policy}" != "p|${primary_count}|1 2" ]]; then
+  fail "batch_manifest must be distributed by dataset_id and scope_digest, observed policy ${endpoint_manifest_distribution_policy}"
+fi
+
+psql_as_gpadmin "${FIXTURE_DATABASE}" <<'SQL'
+TRUNCATE TABLE dfe_endpoint.target_orders;
+TRUNCATE TABLE dfe_endpoint.batch_manifest;
+SQL
 
 table_count="$(query_scalar "${FIXTURE_DATABASE}" \
   "SELECT count(*) FROM pg_class c JOIN pg_namespace n ON n.oid = c.relnamespace WHERE n.nspname = 'dfe_fixture' AND c.relname = 'capability_types' AND c.relkind = 'r';")"
@@ -431,6 +515,12 @@ require_count "${canonical_primary_count}" "${primary_count}" \
 canonical_empty_count="$(query_scalar "${FIXTURE_DATABASE}" \
   'SELECT count(*) FROM dfe_fixture.canonical_empty_values;')"
 require_count "${canonical_empty_count}" 0 'canonical_empty_values row count'
+endpoint_row_count="$(query_scalar "${FIXTURE_DATABASE}" \
+  'SELECT count(*) FROM dfe_endpoint.target_orders;')"
+require_count "${endpoint_row_count}" 0 'target_orders initial row count'
+endpoint_manifest_row_count="$(query_scalar "${FIXTURE_DATABASE}" \
+  'SELECT count(*) FROM dfe_endpoint.batch_manifest;')"
+require_count "${endpoint_manifest_row_count}" 0 'batch_manifest initial row count'
 
 for relation_name in "${SNAPSHOT_RELATIONS[@]}"; do
   snapshot_row_count="$(query_scalar "${FIXTURE_DATABASE}" \
@@ -468,6 +558,21 @@ REVOKE ALL PRIVILEGES ON SCHEMA dfe_fixture FROM ${READER_ROLE};
 REVOKE ALL PRIVILEGES ON SCHEMA dfe_fixture FROM ${WRITER_ROLE};
 GRANT USAGE ON SCHEMA dfe_fixture TO ${READER_ROLE};
 GRANT USAGE ON SCHEMA dfe_fixture TO ${WRITER_ROLE};
+REVOKE ALL PRIVILEGES ON SCHEMA dfe_endpoint FROM PUBLIC;
+REVOKE ALL PRIVILEGES ON SCHEMA dfe_endpoint FROM ${READER_ROLE};
+REVOKE ALL PRIVILEGES ON SCHEMA dfe_endpoint FROM ${WRITER_ROLE};
+GRANT USAGE ON SCHEMA dfe_endpoint TO ${READER_ROLE};
+GRANT USAGE ON SCHEMA dfe_endpoint TO ${WRITER_ROLE};
+REVOKE ALL PRIVILEGES ON TABLE dfe_endpoint.target_orders FROM PUBLIC;
+REVOKE ALL PRIVILEGES ON TABLE dfe_endpoint.target_orders FROM ${READER_ROLE};
+REVOKE ALL PRIVILEGES ON TABLE dfe_endpoint.target_orders FROM ${WRITER_ROLE};
+GRANT SELECT ON TABLE dfe_endpoint.target_orders TO ${READER_ROLE};
+GRANT SELECT, INSERT, UPDATE, DELETE ON TABLE dfe_endpoint.target_orders TO ${WRITER_ROLE};
+REVOKE ALL PRIVILEGES ON TABLE dfe_endpoint.batch_manifest FROM PUBLIC;
+REVOKE ALL PRIVILEGES ON TABLE dfe_endpoint.batch_manifest FROM ${READER_ROLE};
+REVOKE ALL PRIVILEGES ON TABLE dfe_endpoint.batch_manifest FROM ${WRITER_ROLE};
+GRANT SELECT ON TABLE dfe_endpoint.batch_manifest TO ${READER_ROLE};
+GRANT SELECT, INSERT, UPDATE, DELETE ON TABLE dfe_endpoint.batch_manifest TO ${WRITER_ROLE};
 REVOKE ALL PRIVILEGES ON TABLE dfe_fixture.capability_types FROM PUBLIC;
 REVOKE ALL PRIVILEGES ON TABLE dfe_fixture.capability_types FROM ${READER_ROLE};
 REVOKE ALL PRIVILEGES ON TABLE dfe_fixture.capability_types FROM ${WRITER_ROLE};
@@ -506,6 +611,11 @@ writer_scope_state="$(query_scalar "${FIXTURE_DATABASE}" \
   "SELECT has_database_privilege('${WRITER_ROLE}', '${FIXTURE_DATABASE}', 'CONNECT') AND NOT has_database_privilege('${WRITER_ROLE}', '${FIXTURE_DATABASE}', 'CREATE') AND NOT has_database_privilege('${WRITER_ROLE}', '${FIXTURE_DATABASE}', 'TEMP') AND has_schema_privilege('${WRITER_ROLE}', 'dfe_fixture', 'USAGE') AND NOT has_schema_privilege('${WRITER_ROLE}', 'dfe_fixture', 'CREATE') AND NOT has_table_privilege('${WRITER_ROLE}', 'dfe_fixture.capability_types', 'SELECT') AND NOT has_table_privilege('${WRITER_ROLE}', 'dfe_fixture.capability_types', 'INSERT');")"
 if [[ "${writer_scope_state}" != t ]]; then
   fail 'writer database, schema, or capability-table privileges exceed the required scope'
+fi
+endpoint_privilege_state="$(query_scalar "${FIXTURE_DATABASE}" \
+  "SELECT has_schema_privilege('${READER_ROLE}', 'dfe_endpoint', 'USAGE') AND NOT has_schema_privilege('${READER_ROLE}', 'dfe_endpoint', 'CREATE') AND has_schema_privilege('${WRITER_ROLE}', 'dfe_endpoint', 'USAGE') AND NOT has_schema_privilege('${WRITER_ROLE}', 'dfe_endpoint', 'CREATE') AND has_table_privilege('${READER_ROLE}', 'dfe_endpoint.target_orders', 'SELECT') AND NOT has_table_privilege('${READER_ROLE}', 'dfe_endpoint.target_orders', 'INSERT') AND NOT has_table_privilege('${READER_ROLE}', 'dfe_endpoint.target_orders', 'UPDATE') AND NOT has_table_privilege('${READER_ROLE}', 'dfe_endpoint.target_orders', 'DELETE') AND has_table_privilege('${WRITER_ROLE}', 'dfe_endpoint.target_orders', 'SELECT') AND has_table_privilege('${WRITER_ROLE}', 'dfe_endpoint.target_orders', 'INSERT') AND has_table_privilege('${WRITER_ROLE}', 'dfe_endpoint.target_orders', 'UPDATE') AND has_table_privilege('${WRITER_ROLE}', 'dfe_endpoint.target_orders', 'DELETE') AND NOT has_table_privilege('${WRITER_ROLE}', 'dfe_endpoint.target_orders', 'TRUNCATE') AND has_table_privilege('${READER_ROLE}', 'dfe_endpoint.batch_manifest', 'SELECT') AND NOT has_table_privilege('${READER_ROLE}', 'dfe_endpoint.batch_manifest', 'INSERT') AND has_table_privilege('${WRITER_ROLE}', 'dfe_endpoint.batch_manifest', 'SELECT') AND has_table_privilege('${WRITER_ROLE}', 'dfe_endpoint.batch_manifest', 'INSERT') AND has_table_privilege('${WRITER_ROLE}', 'dfe_endpoint.batch_manifest', 'UPDATE') AND has_table_privilege('${WRITER_ROLE}', 'dfe_endpoint.batch_manifest', 'DELETE') AND NOT has_table_privilege('${WRITER_ROLE}', 'dfe_endpoint.batch_manifest', 'TRUNCATE');")"
+if [[ "${endpoint_privilege_state}" != t ]]; then
+  fail 'reader or writer endpoint-table privileges do not match the required state'
 fi
 canonical_privilege_state="$(query_scalar "${FIXTURE_DATABASE}" \
   "SELECT has_table_privilege('${READER_ROLE}', 'dfe_fixture.canonical_values', 'SELECT') AND NOT has_table_privilege('${READER_ROLE}', 'dfe_fixture.canonical_values', 'INSERT') AND has_table_privilege('${READER_ROLE}', 'dfe_fixture.canonical_empty_values', 'SELECT') AND NOT has_table_privilege('${READER_ROLE}', 'dfe_fixture.canonical_empty_values', 'INSERT') AND NOT has_table_privilege('${WRITER_ROLE}', 'dfe_fixture.canonical_values', 'SELECT') AND NOT has_table_privilege('${WRITER_ROLE}', 'dfe_fixture.canonical_values', 'INSERT') AND NOT has_table_privilege('${WRITER_ROLE}', 'dfe_fixture.canonical_values', 'DELETE') AND NOT has_table_privilege('${WRITER_ROLE}', 'dfe_fixture.canonical_empty_values', 'SELECT') AND NOT has_table_privilege('${WRITER_ROLE}', 'dfe_fixture.canonical_empty_values', 'INSERT') AND NOT has_table_privilege('${WRITER_ROLE}', 'dfe_fixture.canonical_empty_values', 'DELETE');")"

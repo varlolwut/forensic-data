@@ -256,6 +256,13 @@ IF (SELECT COUNT_BIG(*) FROM [dfe_fixture].[comparison_orders]) <> 1000001
        WHERE [order_id] = CONVERT(decimal(21, 2), N'1.00')
          AND [business_date] = CONVERT(date, N'2026-09-22', 23)
          AND [amount] = CONVERT(decimal(18, 2), N'900.00')
+         AND [precise_amount] = CONVERT(decimal(38, 7), N'900.0000000')
+         AND [local_time] = CONVERT(datetime2(7), N'2026-09-22T11:22:33.1234560', 126)
+         AND [instant_time] = CONVERT(
+             datetimeoffset(7),
+             N'2026-09-22T08:22:33.1234560+00:00',
+             127
+         )
    )
    OR EXISTS
    (
@@ -266,6 +273,16 @@ IF (SELECT COUNT_BIG(*) FROM [dfe_fixture].[comparison_orders]) <> 1000001
          (
              [amount] IS NULL
              OR [amount] <> CONVERT(decimal(18, 2), N'100.00')
+             OR [precise_amount] IS NULL
+             OR [precise_amount]
+                <> CONVERT(decimal(38, 7), N'1234567890123456789012345678901.1234567')
+             OR [local_time]
+                <> CONVERT(datetime2(7), N'2026-09-23T11:22:33.1234560', 126)
+             OR [instant_time] <> CONVERT(
+                 datetimeoffset(7),
+                 N'2026-09-23T08:22:33.1234560+00:00',
+                 127
+             )
              OR NOT
              (
                  ([order_id] BETWEEN 2 AND 2000 AND [order_id] % 2 = 0)

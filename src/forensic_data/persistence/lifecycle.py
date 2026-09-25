@@ -61,6 +61,24 @@ from forensic_data.contracts.semantics import (
     semantic_digest_hex,
     semantic_value_from_json,
 )
+from forensic_data.greengage_endpoint import (
+    GreengageProtectedReadContext,
+    GreengageProtectedRelationInspection,
+)
+from forensic_data.greenplum import (
+    GreenplumDriverEvidence,
+    GreenplumRelationLockEvidence,
+    GreenplumServerProfile,
+    GreenplumSessionSettingEvidence,
+)
+from forensic_data.greenplum_catalog import (
+    GreengageHashCapability,
+    GreenplumReaderIdentity,
+    GreenplumSegment,
+    GreenplumStorageProfile,
+    GreenplumTopology,
+)
+from forensic_data.greenplum_profile import GreenplumRuntimeProfile
 from forensic_data.mssql import MssqlProtectedReadContext, MssqlReadContextState
 from forensic_data.mssql_sql import (
     MssqlFieldBinding,
@@ -210,8 +228,14 @@ _WRITER_ROLE: Final[str] = "dfe_metadata_writer"
 _READER_ROLE: Final[str] = "dfe_metadata_reader"
 _CANONICAL_PROTOCOL: Final[str] = "dfe_canon_v1"
 _FINGERPRINT_PROTOCOL: Final[str] = "sha256_sum32_v1"
-type _ProtectedReadContext = PostgresProtectedReadContext | MssqlProtectedReadContext
-type _ProtectedRelationInspection = PostgresProtectedRelationInspection | MssqlInspectedRelation
+type _ProtectedReadContext = (
+    PostgresProtectedReadContext | MssqlProtectedReadContext | GreengageProtectedReadContext
+)
+type _ProtectedRelationInspection = (
+    PostgresProtectedRelationInspection
+    | MssqlInspectedRelation
+    | GreengageProtectedRelationInspection
+)
 _STRUCTURAL_SUMMARY_PARAMETER_NAMES: Final[tuple[str, ...]] = (
     "reference_row_count",
     "reference_null_key_count",
@@ -557,6 +581,10 @@ class ReadContextPersistence:
                 raise ValueError(
                     "protected context relations must exactly match its locked relation evidence"
                 )
+            if context.state is not ReadContextState.ACTIVE:
+                raise ValueError("only an active protected context can be persisted")
+        elif isinstance(context, GreengageProtectedReadContext):
+            _greengage_context_relations(context)
             if context.state is not ReadContextState.ACTIVE:
                 raise ValueError("only an active protected context can be persisted")
         else:
@@ -2262,7 +2290,7 @@ def _persist_context_once(
             expected.definition.direction.value,
             expected.definition.acquisition_operation_id,
             bytes.fromhex(expected.attempt.run.request.scope.scope_digest),
-            evidence.engine,
+            _context_engine(expected.definition.protected_context),
             storage_identity.driver_version,
             storage_identity.server_version,
             storage_identity.server_version_number,
@@ -4769,6 +4797,8 @@ def _validate_context_definition(
             raise ValueError("read context evidence and server profile versions must match")
         if evidence.engine != "postgresql":
             raise ValueError("initial lifecycle read contexts require engine='postgresql'")
+    elif isinstance(context, GreengageProtectedReadContext):
+        _validate_greengage_context_definition(context)
     else:
         evidence = context.evidence
         profile = context.profile
@@ -4795,11 +4825,196 @@ def _validate_context_definition(
             raise ValueError(
                 "SQL Server lifecycle read context evidence differs from its proven session"
             )
-    if definition.dataset.definition.adapter.value != context.evidence.engine:
+    if definition.dataset.definition.adapter.value != _context_engine(context):
         raise ValueError("read context engine differs from the registered dataset adapter")
     expected_dataset_id = _expected_batch(attempt.run.request, definition.direction).dataset_id
     if definition.dataset.definition.dataset_id != expected_dataset_id:
         raise ValueError("read context dataset is outside the run request direction closure")
+
+
+def _validate_greengage_context_definition(
+    context: GreengageProtectedReadContext,
+) -> None:
+    evidence = context.evidence
+    server = context.server
+    reader = context.reader
+    topology = context.topology
+    hash_capability = context.hash_capability
+    _require_instance(context.driver, GreenplumDriverEvidence, "Greengage driver evidence")
+    _require_instance(server, GreenplumServerProfile, "Greengage server profile")
+    _require_instance(reader, GreenplumReaderIdentity, "Greengage reader identity")
+    _require_instance(topology, GreenplumTopology, "Greengage topology")
+    _require_instance(
+        hash_capability,
+        GreengageHashCapability,
+        "Greengage hash capability",
+    )
+    _require_nonblank_text(reader.user_name, "Greengage reader role name")
+    if "\x00" in reader.user_name:
+        raise ValueError("Greengage reader role name must not contain U+0000")
+    if (
+        reader.is_superuser is not False
+        or reader.can_create_role is not False
+        or reader.can_create_database is not False
+        or reader.can_login is not True
+        or reader.default_transaction_read_only is not True
+        or reader.transaction_read_only is not True
+    ):
+        raise ValueError(
+            "Greengage lifecycle read context requires a non-admin login role whose default "
+            "and current transactions are read-only"
+        )
+    if (
+        type(hash_capability.function_oid) is not int
+        or not 1 <= hash_capability.function_oid <= (1 << 32) - 1
+        or hash_capability.schema_name != "pg_catalog"
+        or hash_capability.function_name != "sha256"
+        or hash_capability.argument_type_oids != (17,)
+        or hash_capability.result_type_oid != 17
+        or hash_capability.volatility_code != "i"
+        or hash_capability.is_strict is not True
+        or hash_capability.reader_has_execute is not True
+        or hash_capability.reader_has_schema_usage is not True
+        or hash_capability.selected_strategy != "pg_catalog_builtin"
+    ):
+        raise ValueError(
+            "Greengage lifecycle read context requires the exact safe immutable strict "
+            "pg_catalog.sha256(bytea) capability with reader EXECUTE and schema USAGE"
+        )
+    if type(topology.segments) is not tuple or not topology.segments:
+        raise ValueError("Greengage lifecycle topology must contain segment configuration rows")
+    for index, segment in enumerate(topology.segments):
+        if type(segment) is not GreenplumSegment:
+            raise TypeError(
+                "Greengage lifecycle topology must contain exact GreenplumSegment values: "
+                f"segment_index={index}"
+            )
+        if type(segment.content_id) is not int or not -1 <= segment.content_id <= (1 << 63) - 1:
+            raise ValueError(
+                "Greengage lifecycle topology content ID is outside its exact catalog "
+                f"domain: segment_index={index}"
+            )
+        for code, label in (
+            (segment.role, "role"),
+            (segment.preferred_role, "preferred role"),
+            (segment.status, "status"),
+        ):
+            if type(code) is not str or len(code) != 1 or "\x00" in code:
+                raise ValueError(
+                    "Greengage lifecycle topology requires one-character catalog codes: "
+                    f"segment_index={index}, code={label!r}"
+                )
+    if len(set(topology.segments)) != len(topology.segments):
+        raise ValueError("Greengage lifecycle topology contains duplicate segment rows")
+    active_primaries = tuple(
+        segment for segment in topology.segments if segment.role == "p" and segment.status == "u"
+    )
+    coordinator_rows = tuple(segment for segment in active_primaries if segment.content_id == -1)
+    primary_content_ids = tuple(
+        sorted(segment.content_id for segment in active_primaries if segment.content_id >= 0)
+    )
+    if len(coordinator_rows) != 1:
+        raise ValueError("Greengage lifecycle topology requires exactly one active coordinator")
+    if not primary_content_ids or len(set(primary_content_ids)) != len(primary_content_ids):
+        raise ValueError("Greengage lifecycle topology requires distinct active primary contents")
+    if (
+        type(topology.primary_content_ids) is not tuple
+        or topology.primary_content_ids != primary_content_ids
+    ):
+        raise ValueError(
+            "Greengage lifecycle topology active primary contents differ from its segment rows"
+        )
+    _require_uuid(evidence.context_id, "Greengage read context id")
+    _require_utc_datetime(evidence.started_at, "Greengage read context started_at")
+    _require_nonblank_text(evidence.snapshot_locator, "Greengage snapshot locator")
+    if type(evidence.limitations) is not tuple:
+        raise TypeError("Greengage read context limitations must be an immutable tuple")
+    for limitation in evidence.limitations:
+        _require_nonblank_text(limitation, "Greengage read context limitation")
+    if type(evidence.planning_settings) is not tuple:
+        raise TypeError("Greengage planning settings must be an immutable tuple")
+    for setting in evidence.planning_settings:
+        _require_instance(
+            setting,
+            GreenplumSessionSettingEvidence,
+            "Greengage planning setting evidence",
+        )
+    if type(evidence.relation_locks) is not tuple:
+        raise TypeError("Greengage relation locks must be an immutable tuple")
+    for lock in evidence.relation_locks:
+        _require_instance(
+            lock,
+            GreenplumRelationLockEvidence,
+            "Greengage relation lock evidence",
+        )
+    if (
+        evidence.runtime_profile is not GreenplumRuntimeProfile.GREENGAGE
+        or server.runtime_profile is not GreenplumRuntimeProfile.GREENGAGE
+    ):
+        raise ValueError("Greengage lifecycle read context requires the greengage runtime profile")
+    if context.driver.driver_name != "psycopg":
+        raise ValueError("Greengage lifecycle read context requires the psycopg driver")
+    if context.source_direction is not PostgresSourceDirection.TARGET:
+        raise ValueError("Greengage lifecycle read context is supported only as a target")
+    if evidence.strategy != "protected_read_only_repeatable_read_distributed":
+        raise ValueError(
+            "Greengage lifecycle read context requires the protected distributed "
+            "Repeatable Read strategy"
+        )
+    if (
+        evidence.snapshot_locator != server.snapshot_locator
+        or evidence.backend_process_id != server.backend_process_id
+    ):
+        raise ValueError(
+            "Greengage lifecycle read context evidence differs from its server profile"
+        )
+    if (
+        server.transaction_isolation != "repeatable read"
+        or server.transaction_read_only is not True
+        or evidence.allowed_concurrency != 1
+        or evidence.acquired_before_snapshot is not True
+    ):
+        raise ValueError(
+            "Greengage lifecycle read context must be a protected read-only Repeatable Read "
+            "transaction"
+        )
+    actual_planning = tuple((setting.name, setting.value) for setting in evidence.planning_settings)
+    expected_planning = (
+        ("optimizer", "off"),
+        ("gp_enable_multiphase_agg", "on"),
+        ("gp_eager_two_phase_agg", "on"),
+    )
+    if actual_planning != expected_planning:
+        raise ValueError(
+            "Greengage lifecycle read context lacks the required distributed planner settings"
+        )
+    relations = _greengage_context_relations(context)
+    expected_locks = tuple(
+        sorted(
+            (
+                relation.catalog.relation_oid,
+                relation.catalog.schema_name,
+                relation.catalog.relation_name,
+                "AccessShareLock",
+            )
+            for relation in relations
+        )
+    )
+    actual_locks = tuple(
+        sorted(
+            (
+                lock.relation_oid,
+                lock.schema_name,
+                lock.relation_name,
+                lock.lock_mode,
+            )
+            for lock in evidence.relation_locks
+        )
+    )
+    if actual_locks != expected_locks:
+        raise ValueError(
+            "Greengage protected context relations must exactly match its retained lock evidence"
+        )
 
 
 def _context_storage_identity(context: _ProtectedReadContext) -> _ContextStorageIdentity:
@@ -4811,6 +5026,13 @@ def _context_storage_identity(context: _ProtectedReadContext) -> _ContextStorage
             server_version_number=profile.server_version_number,
             backend_process_id=context.evidence.backend_process_id,
         )
+    if isinstance(context, GreengageProtectedReadContext):
+        return _ContextStorageIdentity(
+            driver_version=context.driver.driver_version,
+            server_version=context.server.product_version,
+            server_version_number=context.server.compatibility_version_number,
+            backend_process_id=context.evidence.backend_process_id,
+        )
     profile = context.profile
     return _ContextStorageIdentity(
         driver_version=profile.driver.pyodbc_version,
@@ -4820,10 +5042,23 @@ def _context_storage_identity(context: _ProtectedReadContext) -> _ContextStorage
     )
 
 
+def _context_engine(context: _ProtectedReadContext) -> str:
+    if isinstance(context, GreengageProtectedReadContext):
+        return "greengage"
+    return context.evidence.engine
+
+
 def _require_supported_read_context(value: object, context: str) -> _ProtectedReadContext:
-    if isinstance(value, (PostgresProtectedReadContext, MssqlProtectedReadContext)):
+    if isinstance(
+        value,
+        (
+            PostgresProtectedReadContext,
+            MssqlProtectedReadContext,
+            GreengageProtectedReadContext,
+        ),
+    ):
         return value
-    raise TypeError(f"{context} must be PostgresProtectedReadContext or MssqlProtectedReadContext")
+    raise TypeError(f"{context} must be a supported protected read context")
 
 
 def _require_context_direction(
@@ -4846,6 +5081,8 @@ def _require_context_relation(
 ) -> _ProtectedRelationInspection:
     if isinstance(context, PostgresProtectedReadContext):
         return _require_instance(value, PostgresProtectedRelationInspection, label)
+    if isinstance(context, GreengageProtectedReadContext):
+        return _require_instance(value, GreengageProtectedRelationInspection, label)
     return _require_instance(value, MssqlInspectedRelation, label)
 
 
@@ -4883,22 +5120,83 @@ def _mssql_context_relations(
     return relations
 
 
+def _greengage_context_relations(
+    context: GreengageProtectedReadContext,
+) -> tuple[GreengageProtectedRelationInspection, ...]:
+    relations = context.protected_relations
+    if type(relations) is not tuple or not relations:
+        raise ValueError("Greengage protected context must contain inspected relations")
+    seen_relation_oids: set[int] = set()
+    for index, relation in enumerate(relations):
+        if type(relation) is not GreengageProtectedRelationInspection:
+            raise TypeError(
+                "Greengage protected context relations must contain "
+                "GreengageProtectedRelationInspection values: "
+                f"relation_index={index}"
+            )
+        if relation.inspection.context_id != context.evidence.context_id:
+            raise ValueError(
+                "Greengage protected relation belongs to a different read context: "
+                f"relation_index={index}"
+            )
+        if (
+            (relation.catalog.schema_name, relation.catalog.relation_name)
+            != relation.acquisition.relation.components
+            or relation.catalog.relation_kind != "r"
+            or relation.catalog.persistence_code != "p"
+            or relation.catalog.row_security_enabled
+            or relation.catalog.row_security_forced
+            or not relation.catalog.has_distribution_policy
+            or relation.catalog.reader_has_select is not True
+            or relation.catalog.reader_has_schema_usage is not True
+            or relation.catalog.reader_has_insert is not False
+            or relation.catalog.reader_has_update is not False
+            or relation.catalog.reader_has_delete is not False
+            or relation.catalog.reader_has_truncate is not False
+            or relation.lock_mode != "access_share"
+            or relation.acquired_before_snapshot is not True
+        ):
+            raise ValueError(
+                "Greengage protected relation differs from its physical protected profile: "
+                f"relation_index={index}"
+            )
+        relation_oid = relation.catalog.relation_oid
+        if relation_oid in seen_relation_oids:
+            raise ValueError(
+                "Greengage protected context contains a duplicate physical relation: "
+                f"relation_oid={relation_oid}"
+            )
+        if relation.catalog.distribution_segment_count != len(context.topology.primary_content_ids):
+            raise ValueError(
+                "Greengage protected relation distribution differs from its retained topology: "
+                f"relation_oid={relation_oid}"
+            )
+        seen_relation_oids.add(relation_oid)
+    return relations
+
+
 def _context_relations(
     context: _ProtectedReadContext,
 ) -> tuple[_ProtectedRelationInspection, ...]:
     if isinstance(context, PostgresProtectedReadContext):
         return context.protected_relations
+    if isinstance(context, GreengageProtectedReadContext):
+        return _greengage_context_relations(context)
     return _mssql_context_relations(context)
 
 
 def _context_is_active(context: _ProtectedReadContext) -> bool:
     if isinstance(context, PostgresProtectedReadContext):
         return context.state is ReadContextState.ACTIVE
+    if isinstance(context, GreengageProtectedReadContext):
+        return context.state is ReadContextState.ACTIVE
     return context.state is MssqlReadContextState.ACTIVE
 
 
 def _relation_context_id(relation: _ProtectedRelationInspection) -> UUID:
     if isinstance(relation, PostgresProtectedRelationInspection):
+        return relation.inspection.context_id
+    if isinstance(relation, GreengageProtectedRelationInspection):
         return relation.inspection.context_id
     return relation.context_id
 
@@ -4908,6 +5206,8 @@ def _relation_physical_identity(
 ) -> tuple[str, int, int]:
     if isinstance(relation, PostgresProtectedRelationInspection):
         return ("postgresql", 0, relation.inspection.relation_oid)
+    if isinstance(relation, GreengageProtectedRelationInspection):
+        return ("greengage", 0, relation.inspection.relation_oid)
     return ("mssql", relation.database_id, relation.object_id)
 
 
@@ -4917,11 +5217,15 @@ def _relation_components(relation: _ProtectedRelationInspection) -> tuple[str, s
         if len(components) != 2:
             raise ValueError("protected PostgreSQL relation must have schema and relation names")
         return (components[0], components[1])
+    if isinstance(relation, GreengageProtectedRelationInspection):
+        return relation.acquisition.relation.components
     return (relation.relation.schema_name, relation.relation.table_name)
 
 
 def _relation_column_names(relation: _ProtectedRelationInspection) -> tuple[str, ...]:
     if isinstance(relation, PostgresProtectedRelationInspection):
+        return relation.acquisition.column_names
+    if isinstance(relation, GreengageProtectedRelationInspection):
         return relation.acquisition.column_names
     return tuple(binding.column_name for binding in relation.bindings)
 
@@ -4931,6 +5235,8 @@ def _observation_schema_digest(
 ) -> str:
     relation = definition.dataset_relation
     if isinstance(relation, PostgresProtectedRelationInspection):
+        return schema_digest_hex(relation.acquisition.schema)
+    if isinstance(relation, GreengageProtectedRelationInspection):
         return schema_digest_hex(relation.acquisition.schema)
     schema = _dataset_canonical_schema(definition.dataset)
     validate_mssql_inspection(schema, relation)
@@ -5017,6 +5323,13 @@ def _require_protected_context_active(context: _ProtectedReadContext) -> None:
             raise RunLifecycleStateError(
                 "protected source context relation closure changed before persistence"
             )
+    elif isinstance(context, GreengageProtectedReadContext):
+        try:
+            _validate_greengage_context_definition(context)
+        except (TypeError, ValueError) as error:
+            raise RunLifecycleStateError(
+                f"protected Greengage context relation closure is invalid: reason={error}"
+            ) from None
     else:
         try:
             _mssql_context_relations(context)
@@ -5075,6 +5388,8 @@ def _require_dataset_relation_closure(
     if expected_scope is None:
         raise ValueError("registered relation dataset must declare a relation scope")
     if isinstance(protected, PostgresProtectedRelationInspection):
+        actual_scope = protected.acquisition.relation_scope
+    elif isinstance(protected, GreengageProtectedRelationInspection):
         actual_scope = protected.acquisition.relation_scope
     else:
         actual_scope = RelationScope.PHYSICAL_ONLY
@@ -5235,6 +5550,12 @@ def _require_stable_read_context(
         if snapshot_locator is None or not snapshot_locator.strip():
             raise ValueError("readiness context lacks a transaction snapshot locator")
         expected_kind = "postgresql_protected_relations"
+    elif isinstance(context, GreengageProtectedReadContext):
+        if strategy != "protected_read_only_repeatable_read_distributed":
+            raise ValueError("readiness context does not provide the contract transaction snapshot")
+        if snapshot_locator is None or not snapshot_locator.strip():
+            raise ValueError("Greengage readiness context lacks a transaction snapshot locator")
+        expected_kind = "greengage_protected_relations"
     else:
         if strategy != "transaction_snapshot":
             raise ValueError("readiness context does not provide the contract transaction snapshot")
@@ -5293,6 +5614,18 @@ def _acquisition_evidence_semantic_value(
                 ],
             },
         }
+    if isinstance(context, GreengageProtectedReadContext):
+        return {
+            "evidence_version": 1,
+            "kind": "greengage_protected_relations",
+            "payload": {
+                **_greengage_context_provenance_semantic_value(context),
+                "relations": [
+                    _greengage_relation_semantic_value(item)
+                    for item in _greengage_context_relations(context)
+                ],
+            },
+        }
     evidence = context.evidence
     return {
         "evidence_version": 1,
@@ -5335,6 +5668,26 @@ def _physical_binding_semantic_value(
                 "readiness_relation": _mssql_relation_semantic_value(readiness_relation),
             },
         }
+    if isinstance(context, GreengageProtectedReadContext):
+        dataset_relation = _require_instance(
+            definition.dataset_relation,
+            GreengageProtectedRelationInspection,
+            "Greengage dataset relation",
+        )
+        readiness_relation = _require_instance(
+            definition.readiness_relation,
+            GreengageProtectedRelationInspection,
+            "Greengage readiness relation",
+        )
+        return {
+            "binding_version": 1,
+            "engine": "greengage",
+            "payload": {
+                **_greengage_context_provenance_semantic_value(context),
+                "dataset_relation": _greengage_relation_semantic_value(dataset_relation),
+                "readiness_relation": _greengage_relation_semantic_value(readiness_relation),
+            },
+        }
     dataset_relation = _require_instance(
         definition.dataset_relation,
         PostgresProtectedRelationInspection,
@@ -5360,6 +5713,8 @@ def _relation_semantic_value(
 ) -> dict[str, SemanticValue]:
     if isinstance(relation, PostgresProtectedRelationInspection):
         return _protected_relation_semantic_value(relation)
+    if isinstance(relation, GreengageProtectedRelationInspection):
+        return _greengage_relation_semantic_value(relation)
     return _mssql_relation_semantic_value(relation)
 
 
@@ -5453,6 +5808,202 @@ def _type_identity_semantic_value(identity: PostgresTypeIdentity) -> dict[str, S
         "oid": identity.oid,
         "schema_name": identity.schema_name,
         "type_name": identity.type_name,
+    }
+
+
+def _greengage_context_provenance_semantic_value(
+    context: GreengageProtectedReadContext,
+) -> dict[str, SemanticValue]:
+    return {
+        "context": _greengage_context_semantic_value(context),
+        "driver": _greenplum_driver_semantic_value(context.driver),
+        "hash_capability": _greengage_hash_capability_semantic_value(context.hash_capability),
+        "profile": _greengage_profile_semantic_value(context.server),
+        "reader": _greenplum_reader_semantic_value(context.reader),
+        "topology": _greenplum_topology_semantic_value(context.topology),
+    }
+
+
+def _greengage_context_semantic_value(
+    context: GreengageProtectedReadContext,
+) -> dict[str, SemanticValue]:
+    evidence = context.evidence
+    return {
+        "acquired_before_snapshot": evidence.acquired_before_snapshot,
+        "allowed_concurrency": evidence.allowed_concurrency,
+        "backend_process_id": evidence.backend_process_id,
+        "context_id": str(evidence.context_id),
+        "engine": "greengage",
+        "limitations": list(evidence.limitations),
+        "planning_settings": [
+            _greenplum_planning_setting_semantic_value(setting)
+            for setting in evidence.planning_settings
+        ],
+        "relation_locks": [
+            _greenplum_relation_lock_semantic_value(lock) for lock in evidence.relation_locks
+        ],
+        "runtime_profile": evidence.runtime_profile.value,
+        "snapshot_locator": evidence.snapshot_locator,
+        "started_at": evidence.started_at.astimezone(UTC).isoformat(),
+        "strategy": evidence.strategy,
+    }
+
+
+def _greenplum_driver_semantic_value(
+    driver: GreenplumDriverEvidence,
+) -> dict[str, SemanticValue]:
+    return {
+        "build_libpq_version": driver.build_libpq_version,
+        "driver_name": driver.driver_name,
+        "driver_version": driver.driver_version,
+        "runtime_libpq_version": driver.runtime_libpq_version,
+    }
+
+
+def _greengage_profile_semantic_value(
+    profile: GreenplumServerProfile,
+) -> dict[str, SemanticValue]:
+    return {
+        "backend_process_id": profile.backend_process_id,
+        "client_encoding": profile.client_encoding,
+        "compatibility_version": profile.compatibility_version,
+        "compatibility_version_number": profile.compatibility_version_number,
+        "database_name": profile.database_name,
+        "full_version": profile.full_version,
+        "gp_role": profile.gp_role,
+        "gp_session_role": profile.gp_session_role,
+        "integer_datetimes": profile.integer_datetimes,
+        "max_identifier_utf8_bytes": profile.max_identifier_utf8_bytes,
+        "product": "greengage",
+        "product_version": profile.product_version,
+        "runtime_profile": profile.runtime_profile.value,
+        "server_encoding": profile.server_encoding,
+        "snapshot_locator": profile.snapshot_locator,
+        "timezone": profile.timezone,
+        "transaction_isolation": profile.transaction_isolation,
+        "transaction_read_only": profile.transaction_read_only,
+    }
+
+
+def _greenplum_reader_semantic_value(
+    reader: GreenplumReaderIdentity,
+) -> dict[str, SemanticValue]:
+    return {
+        "can_create_database": reader.can_create_database,
+        "can_create_role": reader.can_create_role,
+        "can_login": reader.can_login,
+        "default_transaction_read_only": reader.default_transaction_read_only,
+        "is_superuser": reader.is_superuser,
+        "transaction_read_only": reader.transaction_read_only,
+        "user_name": reader.user_name,
+    }
+
+
+def _greenplum_topology_semantic_value(
+    topology: GreenplumTopology,
+) -> dict[str, SemanticValue]:
+    return {
+        "primary_content_ids": list(topology.primary_content_ids),
+        "segments": [_greenplum_segment_semantic_value(segment) for segment in topology.segments],
+    }
+
+
+def _greenplum_segment_semantic_value(
+    segment: GreenplumSegment,
+) -> dict[str, SemanticValue]:
+    return {
+        "content_id": segment.content_id,
+        "preferred_role": segment.preferred_role,
+        "role": segment.role,
+        "status": segment.status,
+    }
+
+
+def _greenplum_planning_setting_semantic_value(
+    setting: GreenplumSessionSettingEvidence,
+) -> dict[str, SemanticValue]:
+    return {"name": setting.name, "value": setting.value}
+
+
+def _greenplum_relation_lock_semantic_value(
+    lock: GreenplumRelationLockEvidence,
+) -> dict[str, SemanticValue]:
+    return {
+        "lock_mode": lock.lock_mode,
+        "relation_name": lock.relation_name,
+        "relation_oid": lock.relation_oid,
+        "schema_name": lock.schema_name,
+    }
+
+
+def _greengage_hash_capability_semantic_value(
+    capability: GreengageHashCapability,
+) -> dict[str, SemanticValue]:
+    return {
+        "argument_type_oids": list(capability.argument_type_oids),
+        "function_name": capability.function_name,
+        "function_oid": capability.function_oid,
+        "is_strict": capability.is_strict,
+        "reader_has_execute": capability.reader_has_execute,
+        "reader_has_schema_usage": capability.reader_has_schema_usage,
+        "result_type_oid": capability.result_type_oid,
+        "schema_name": capability.schema_name,
+        "selected_strategy": capability.selected_strategy,
+        "volatility_code": capability.volatility_code,
+    }
+
+
+def _greengage_relation_semantic_value(
+    protected: GreengageProtectedRelationInspection,
+) -> dict[str, SemanticValue]:
+    inspection = protected.inspection
+    catalog = protected.catalog
+    return {
+        "access_method": catalog.access_method,
+        "acquired_before_snapshot": protected.acquired_before_snapshot,
+        "columns": [_binding_semantic_value(item) for item in inspection.bindings],
+        "context_id": str(inspection.context_id),
+        "distribution_attribute_numbers": list(catalog.distribution_attribute_numbers),
+        "distribution_policy_type": catalog.distribution_policy_type,
+        "distribution_segment_count": catalog.distribution_segment_count,
+        "has_distribution_policy": catalog.has_distribution_policy,
+        "is_append_optimized": catalog.is_append_optimized,
+        "lock_mode": protected.lock_mode,
+        "max_identifier_utf8_bytes": inspection.max_identifier_utf8_bytes,
+        "persistence_code": catalog.persistence_code,
+        "reader_has_delete": catalog.reader_has_delete,
+        "reader_has_insert": catalog.reader_has_insert,
+        "reader_has_schema_usage": catalog.reader_has_schema_usage,
+        "reader_has_select": catalog.reader_has_select,
+        "reader_has_truncate": catalog.reader_has_truncate,
+        "reader_has_update": catalog.reader_has_update,
+        "relation_kind": catalog.relation_kind,
+        "relation_oid": inspection.relation_oid,
+        "relation_row_type_oid": inspection.relation_row_type_oid,
+        "relation_scope": protected.acquisition.relation_scope.value,
+        "requested_relation": list(protected.acquisition.relation.components),
+        "resolved_relation": list(inspection.relation.components),
+        "row_security_enabled": catalog.row_security_enabled,
+        "row_security_forced": catalog.row_security_forced,
+        "storage_kind": catalog.storage_kind.value,
+        "storage_profile": _greenplum_storage_profile_semantic_value(catalog.storage_profile),
+    }
+
+
+def _greenplum_storage_profile_semantic_value(
+    profile: GreenplumStorageProfile,
+) -> dict[str, SemanticValue]:
+    return {
+        "append_only_catalog_present": profile.append_only_catalog_present,
+        "block_size_bytes": profile.block_size_bytes,
+        "checksum": profile.checksum,
+        "column_store": profile.column_store,
+        "compression_level": profile.compression_level,
+        "compression_type": profile.compression_type,
+        "kind": profile.kind.value,
+        "relation_options": [
+            {"name": name, "value": value} for name, value in profile.relation_options
+        ],
     }
 
 
@@ -6234,7 +6785,7 @@ def _persisted_context_from_row(
         definition.direction.value,
         definition.acquisition_operation_id,
         bytes.fromhex(expected.attempt.run.request.scope.scope_digest),
-        evidence.engine,
+        _context_engine(definition.protected_context),
         storage_identity.driver_version,
         storage_identity.server_version,
         storage_identity.server_version_number,

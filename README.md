@@ -5,10 +5,11 @@ discrepancies, and preserves durable evidence that can still be reviewed after s
 changes. It refuses to silently round, normalize, or drop values.
 
 The current `0.1.0.dev0` package is a development release with a typed Python API and a `forensics`
-CLI. Source connections are read-only. It supports verified PostgreSQL comparisons and verified
-SQL Server 2016- and 2022-source-to-PostgreSQL workflows, with bounded reads, protected readiness
-acquisition, durable history, retained typed differences, and explicit completed, incomplete, or
-error outcomes.
+CLI. Source connections are read-only. It supports verified PostgreSQL comparisons, verified SQL
+Server 2016- and 2022-source-to-PostgreSQL workflows, and verified PostgreSQL 17.11- and SQL Server
+2022-source-to-Greengage 7.5 target workflows. Reads are bounded and protected by readiness
+acquisition, with durable history, retained typed differences, and explicit completed, incomplete,
+or error outcomes.
 
 There is no scheduler integration or background service yet. Static planning does not connect to a
 database or prove readiness, capability, schema presence, or data equality.
@@ -45,6 +46,7 @@ writes machine JSON to `.local/docker-quickstart/output/{check,history,diff}.jso
 | PostgreSQL 9.6.24 | Verified | Not yet verified |
 | SQL Server 2016 SP3 GDR `13.0.6500.1` | Verified | Not yet implemented or verified |
 | SQL Server 2022 Developer CU27 `16.0.4295.3` | Verified | Not yet implemented or verified |
+| Greengage 7.5.0 | Not yet verified | Verified |
 
 This matrix records tested configurations, not a version allowlist. Database connections are not
 rejected solely because their server version, edition, or driver patch is untested. The selected
@@ -53,10 +55,10 @@ The legacy PostgreSQL strategy can be selected for either comparison side. SQL S
 strategies are selected explicitly as `mssql_2016` or `mssql_2022`; there is no silent profile
 fallback. SQL Server 2017 and 2019 have not been verified.
 
-The manual [Greenplum-family artifact fixture](guides/greenplum.md) separately proves a real
-source-built original Greenplum `4.3.99.00 build dev` distributed cluster and an official Greengage
-7.5.0 distributed cluster. That is artifact and fixture evidence only; runtime source and target
-support for these products is not yet implemented or listed in this matrix.
+The [Greenplum-family guide](guides/greenplum.md) covers the verified Greengage 7.5 target endpoint,
+including its verified relation and type coverage, and separately records the real distributed
+artifact evidence for original Greenplum `4.3.99.00 build dev` and Greengage 7.5.0. Original
+Greenplum source admission and execution remain unverified.
 
 Runtime capability admission is wider than an exact verified conformance point and does not certify
 untested builds, editions, operating systems, or driver patches. See the
@@ -89,8 +91,8 @@ match exits `0`, a completed mismatch exits `1`, an error exits `2`, and an inco
 - [SQL Server source profiles](guides/sql-server.md) — the exact SQL Server 2016 and 2022
   conformance points, explicit strategies, owner-installed legacy helper, protected reads,
   fixtures, and resource limits.
-- [Greenplum-family artifact boundary](guides/greenplum.md) — exact original Greenplum and
-  Greengage provenance, real distributed fixtures, and the boundary before runtime support.
+- [Greengage target and Greenplum-family artifacts](guides/greenplum.md) — verified Greengage
+  target operation, current endpoint limits, and exact distributed artifact provenance.
 - [Development and verification](guides/development.md) — locked environment, real fixtures,
   required checks, cleanup, and package/container builds.
 

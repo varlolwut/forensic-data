@@ -1,6 +1,7 @@
 import re
 from collections.abc import Callable
 from dataclasses import dataclass
+from io import StringIO
 from typing import final
 
 from psycopg import sql
@@ -491,7 +492,7 @@ def parse_greengage_fingerprint_plan(
 
 
 def _greenplum_plan_unquoted_text(plan_text: str) -> str:
-    characters: list[str] = []
+    masked = StringIO(plan_text)
     position = 0
     quote: str | None = None
     quote_start = 0
@@ -500,7 +501,6 @@ def _greenplum_plan_unquoted_text(plan_text: str) -> str:
         character = plan_text[position]
         if quote is None:
             if character not in {"'", '"'}:
-                characters.append(character)
                 position += 1
                 continue
             quote = character
@@ -517,22 +517,22 @@ def _greenplum_plan_unquoted_text(plan_text: str) -> str:
                     )
                 )
             )
-            characters.append(" ")
             position += 1
             continue
-        characters.append(" ")
         if quote == "'" and escape_string and character == "\\":
             if position + 1 < len(plan_text):
-                characters.append(" ")
                 position += 2
                 continue
         elif character == quote:
             if position + 1 < len(plan_text) and plan_text[position + 1] == quote:
-                characters.append(" ")
                 position += 2
                 continue
             quote = None
             escape_string = False
+            position += 1
+            masked.seek(quote_start)
+            masked.write(" " * (position - quote_start))
+            continue
         position += 1
     if quote is not None:
         quote_kind = "string literal" if quote == "'" else "quoted identifier"
@@ -540,7 +540,7 @@ def _greenplum_plan_unquoted_text(plan_text: str) -> str:
             "Greenplum canonical fingerprint plan contains unterminated quoted text: "
             f"quote_kind={quote_kind!r}, start_offset={quote_start}"
         )
-    return "".join(characters)
+    return masked.getvalue()
 
 
 def _greengage_limb_sum_expressions(

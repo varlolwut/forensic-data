@@ -40,6 +40,7 @@ from forensic_data.mssql import (
     _snapshot_metadata_changed_error,
     _validated_relation_metadata,
 )
+from forensic_data.mssql_profile import MssqlRuntimeProfile
 from forensic_data.mssql_resources import (
     MSSQL_2016_CANONICAL_UTF8_HELPER_DEFINITION_SHA256,
     MSSQL_2016_CANONICAL_UTF8_HELPER_DEFINITION_UTF16_BYTES,
@@ -118,6 +119,10 @@ class Mssql2016ProtectedReadContext(MssqlProtectedReadContext):
             )
         super().__init__(read_context, acquisitions, source_budget, source_direction)
         self._helper = helper
+
+    @property
+    def runtime_profile(self) -> MssqlRuntimeProfile:
+        return MssqlRuntimeProfile.MSSQL_2016
 
     def _build_integer_key_summary_query(
         self,

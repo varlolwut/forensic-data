@@ -22,9 +22,11 @@ from forensic_data.application import (
     DiffRequest,
     ExecuteCheckRequest,
     HistoryRequest,
+    MssqlGreengageExecutionServices,
     MssqlPostgresExecutionServices,
     PlanCheckRequest,
     PostgresExecutionServices,
+    PostgresGreengageExecutionServices,
     PostgresMetadataServices,
     ScopeValue,
     execute_check,
@@ -49,6 +51,7 @@ from forensic_data.contracts.model import (
     RelationLocator,
     RowCheckDefinition,
 )
+from forensic_data.greenplum import GreenplumConnectorError
 from forensic_data.mssql import (
     MssqlConnectionSettings,
     MssqlRetryPolicy,
@@ -219,6 +222,8 @@ def run_cli(
         return _write_error(stderr, output_json, "metadata_error", str(error))
     except PostgresConnectorError as error:
         return _write_error(stderr, output_json, "postgres_error", str(error))
+    except GreenplumConnectorError as error:
+        return _write_error(stderr, output_json, "greengage_error", str(error))
     except ValidationError:
         return _write_error(
             stderr,
@@ -682,11 +687,22 @@ def _execution_services(
     reference: ConnectionDefinition,
     target: ConnectionDefinition,
     environment: Mapping[str, str],
-) -> PostgresExecutionServices | MssqlPostgresExecutionServices:
+) -> (
+    PostgresExecutionServices
+    | MssqlPostgresExecutionServices
+    | PostgresGreengageExecutionServices
+    | MssqlGreengageExecutionServices
+):
     statement_timeout = config.execution.statement_timeout_milliseconds
     if statement_timeout < 2:
         raise CliInputError(
             "execution statement_timeout_milliseconds must be at least 2 for protected reads"
+        )
+    if target.adapter not in (Adapter.POSTGRESQL, Adapter.GREENGAGE):
+        raise CliInputError(f"target connection adapter {target.adapter.value!r} is unsupported")
+    if reference.adapter not in (Adapter.POSTGRESQL, Adapter.MSSQL):
+        raise CliInputError(
+            f"reference connection adapter {reference.adapter.value!r} is unsupported"
         )
     metadata_record_bytes = min(
         config.execution.max_application_result_bytes,
@@ -708,6 +724,25 @@ def _execution_services(
         _MAX_PROTECTED_LOCK_TIMEOUT_MILLISECONDS,
         statement_timeout - 1,
     )
+    if reference.adapter is Adapter.MSSQL and target.adapter is Adapter.GREENGAGE:
+        return MssqlGreengageExecutionServices(
+            reference_connection_id=reference.connection_id,
+            reference_settings=_mssql_connection_settings(
+                reference,
+                environment,
+                "dfe-cli-check-reference",
+            ),
+            target_connection_id=target.connection_id,
+            target_settings=target_settings,
+            metadata_connection_id=config.metadata.connection.connection_id,
+            metadata_settings=metadata_settings,
+            reference_retry_policy=_mssql_retry_policy(),
+            target_retry_policy=_retry_policy(),
+            metadata_retry_policy=_retry_policy(),
+            protected_lock_timeout_milliseconds=protected_lock_timeout_milliseconds,
+            metadata_record_bytes=metadata_record_bytes,
+            metadata_total_bytes=config.execution.max_coordinator_memory_bytes,
+        )
     if reference.adapter is Adapter.MSSQL:
         return MssqlPostgresExecutionServices(
             reference_connection_id=reference.connection_id,
@@ -727,9 +762,25 @@ def _execution_services(
             metadata_record_bytes=metadata_record_bytes,
             metadata_total_bytes=config.execution.max_coordinator_memory_bytes,
         )
-    if reference.adapter is not Adapter.POSTGRESQL:
-        raise CliInputError(
-            f"reference connection adapter {reference.adapter.value!r} is unsupported"
+    if target.adapter is Adapter.GREENGAGE:
+        return PostgresGreengageExecutionServices(
+            reference_connection_id=reference.connection_id,
+            reference_settings=_connection_settings(
+                reference,
+                environment,
+                statement_timeout,
+                "dfe-cli-check-reference",
+            ),
+            target_connection_id=target.connection_id,
+            target_settings=target_settings,
+            metadata_connection_id=config.metadata.connection.connection_id,
+            metadata_settings=metadata_settings,
+            reference_retry_policy=_retry_policy(),
+            target_retry_policy=_retry_policy(),
+            metadata_retry_policy=_retry_policy(),
+            protected_lock_timeout_milliseconds=protected_lock_timeout_milliseconds,
+            metadata_record_bytes=metadata_record_bytes,
+            metadata_total_bytes=config.execution.max_coordinator_memory_bytes,
         )
     return PostgresExecutionServices(
         reference_connection_id=reference.connection_id,

@@ -1,10 +1,39 @@
-# Greenplum-family artifact boundary
+# Greengage target and Greenplum-family artifacts
 
 [README](../README.md) · [Docker quickstart](docker-quickstart.md) · [CLI and contracts](cli-and-contracts.md) · [PostgreSQL](postgresql.md) · [SQL Server](sql-server.md) · [Greenplum family](greenplum.md) · [Development](development.md)
 
-Greenplum-family runtime support is not implemented yet. This phase first establishes a legitimate,
-reproducible pair of real distributed database artifacts so later connector and comparison claims
-can be tested against the intended products rather than against PostgreSQL substitutes.
+Forensic Data Engine provides a verified Greengage 7.5 target endpoint for durable integer-key
+comparisons from PostgreSQL 17.11 and SQL Server 2022 sources. The contract must select
+`adapter: greengage`, `driver: psycopg`, and `profile: greengage` explicitly. Version entries here
+record verification evidence rather than a runtime allowlist; admission depends on the required
+SQL, catalog, encoding, type, topology, and snapshot capabilities.
+
+The verified endpoint evidence currently covers physical heap relations, a relation-manifest
+readiness cut, and the canonical integer, decimal, date, local-timestamp, and instant-timestamp
+values exercised by the verified contract. It does not claim Greengage as a source endpoint.
+Original Greenplum source admission and execution also remain unverified.
+
+## Using the Greengage target
+
+The complete [PostgreSQL/SQL Server to Greengage contract](../tests/fixtures/greenplum/greengage/comparison-contract.yaml)
+shows both verified source paths, their readiness manifests, bounded execution policy, and retained
+evidence fields. Its target connection is declared as:
+
+```yaml
+connections:
+  target_greengage:
+    adapter: greengage
+    driver: psycopg
+    profile: greengage
+    roles: [target]
+    secret_ref: env:DFE_GREENGAGE_TARGET_DSN
+```
+
+Apply the packaged metadata migrations through `forensics metadata migrate`; migration
+`0007_greengage_dataset_adapter.sql` records the Greengage dataset adapter and durable binding.
+Run the selected check through `forensics check` or the typed Python API, then inspect the durable
+result with `forensics history` and page retained row differences with `forensics diff`. See
+[CLI and contracts](cli-and-contracts.md) for invocation, output, and pagination details.
 
 ## Verified artifact pair
 
@@ -37,11 +66,15 @@ resolved package manifest.
 Both services have explicit 4 GiB memory, four-CPU, and 1 GiB shared-memory limits; publish no host
 ports; and use `restart: "no"`. Runtime startup generates the self-SSH material required by the
 distributed database tools, so generated private keys are not part of an image or build context.
-Verification also checks those isolation and resource properties. A later connector gate must add
-deliberate authentication and least-privilege database access before publishing an endpoint.
+Verification also checks those isolation and resource properties. Endpoint operation requires
+separate authenticated roles: the DFE reader is read-only and least-privileged, while fixture
+writers remain outside the reader path.
 
 The separately dispatched `Greenplum family artifact fixture` workflow builds, starts, verifies,
 stops cleanly, recreates both containers over retained volumes, proves volume persistence, verifies
 again, and removes both fixtures. The normal push and pull-request gates remain light. Artifact
-startup alone does not add a Greenplum or Greengage adapter to the product; connector, catalog,
-type, read-consistency, and cross-engine evidence are separate gates.
+startup alone does not establish endpoint support; connector, catalog, type, read-consistency, and
+cross-engine evidence are separate gates. The heap, append-optimized row, and append-optimized
+column snapshot probes in this artifact fixture are snapshot evidence only. End-to-end Greengage
+target verification currently covers physical heap relations; AO and AOCO target endpoint behavior
+has not yet been verified.

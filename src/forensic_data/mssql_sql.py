@@ -28,6 +28,14 @@ _MAX_INTEGER_RANGES = 524
 _MAX_LOB_BYTES = (1 << 31) - 1
 _UTF8_COLLATION = "Latin1_General_100_BIN2_UTF8"
 _INTEGER_RANGE_HASH_TABLE = "[#dfe_integer_range_hashes]"
+_INTEGER_RANGE_RAW_TABLE = "[#dfe_integer_range_raw]"
+_INTEGER_RANGE_RAW_FIXED_COLUMNS = 6
+_INTEGER_RANGE_RAW_RECORD_METADATA_BYTES = 24
+_MAX_INTEGER_RANGE_RAW_ROW_BYTES = 8_000
+_MAX_INTEGER_RANGE_SEGMENT_ID_BYTES = 128
+_MAX_INTEGER_RANGE_STAGED_FIELDS = (
+    MAX_COMPILED_RELATION_MEMBERS - _INTEGER_RANGE_RAW_FIXED_COLUMNS
+) // 2
 _BUILTIN_TYPE_IDS = {
     "date": 40,
     "datetime2": 42,
@@ -434,6 +442,24 @@ class _IntegerRangeSource:
     parameters: tuple[MssqlCanonicalParameter, ...]
 
 
+@final
+@dataclass(frozen=True, slots=True)
+class _IntegerRangeEncoding:
+    context: CanonicalEnvelopeContext
+    key_context: CanonicalEnvelopeContext
+    payload_clause: str
+    fields_valid: str
+    payload_bytes: str
+    frames: str
+    key_column: str
+    key_payload: _PayloadLowering
+    key_value: str
+    key_frame: str
+    effective_envelope_limit: int
+    bounded_envelope_bytes: int
+    fixed_bytes: int
+
+
 type _OriginCteBuilder = Callable[[MssqlInspectedRelation], str]
 type _PayloadLowerer = Callable[[FieldSchema, MssqlFieldBinding, int], _PayloadLowering]
 
@@ -734,15 +760,207 @@ def build_mssql_integer_range_fingerprint_query(
     ranges: tuple[MssqlIntegerRangeRequest, ...],
     max_encoded_envelope_bytes: int,
 ) -> MssqlCanonicalQuery:
-    return _build_mssql_integer_range_fingerprint_query(
+    _validate_canonical_inputs(schema, inspection, max_encoded_envelope_bytes)
+    _validate_single_integer_key(schema, key_field_index)
+    _validate_integer_ranges(ranges)
+    if not _supports_fixed_width_integer_range_staging(schema, inspection):
+        return _build_mssql_integer_range_fingerprint_query(
+            schema,
+            inspection,
+            key_field_index,
+            scope,
+            ranges,
+            max_encoded_envelope_bytes,
+            _origin_cte,
+            _payload_lowering,
+        )
+    return _build_mssql_materialized_integer_range_fingerprint_query(
         schema,
         inspection,
         key_field_index,
         scope,
         ranges,
         max_encoded_envelope_bytes,
-        _origin_cte,
+    )
+
+
+def _build_mssql_materialized_integer_range_fingerprint_query(
+    schema: CanonicalSchema,
+    inspection: MssqlInspectedRelation,
+    key_field_index: int,
+    scope: MssqlScopePredicate | None,
+    ranges: tuple[MssqlIntegerRangeRequest, ...],
+    max_encoded_envelope_bytes: int,
+) -> MssqlCanonicalQuery:
+    _validate_canonical_inputs(schema, inspection, max_encoded_envelope_bytes)
+    _validate_single_integer_key(schema, key_field_index)
+    _validate_integer_ranges(ranges)
+    encoding = _integer_range_encoding(
+        schema,
+        inspection,
+        key_field_index,
+        max_encoded_envelope_bytes,
         _payload_lowering,
+    )
+    scope_filter, scope_parameters = _scope_filter(
+        inspection,
+        scope,
+        _payload_lowering,
+    )
+    ranges_statement, range_parameters = _integer_range_values(ranges)
+    origin = _origin_cte(inspection)
+    validated_origin = _validated_origin_cte(inspection)
+    relation_source = _relation_source(inspection)
+    origin_identity = _identity_projection("dfe_origin", inspection)
+    rows_identity = _identity_projection("dfe_rows", inspection)
+    raw_fields = ", ".join(
+        f"[dfe_source].{_quote_identifier(f'dfe_field_{index}')} "
+        f"AS {_quote_identifier(f'dfe_field_{index}')}"
+        for index, _binding in enumerate(inspection.bindings)
+    )
+    raw_field_projection = f", {raw_fields}" if raw_fields else ""
+    raw_capture = (
+        f"WITH {origin}, {validated_origin}, "
+        "[dfe_ranges]([segment_id], [lower_inclusive], "
+        f"[upper_exclusive], [has_upper], [ordinal]) AS ({ranges_statement}) "
+        f"SELECT {origin_identity}, [dfe_ranges].[segment_id], "
+        "[dfe_ranges].[ordinal], [dfe_source].[dfe_has_data]"
+        f"{raw_field_projection} INTO {_INTEGER_RANGE_RAW_TABLE} "
+        "FROM [dfe_validated_origin] AS [dfe_origin] CROSS JOIN [dfe_ranges] "
+        f"LEFT JOIN ({relation_source}) AS [dfe_source] ON ({scope_filter}) "
+        f"AND {encoding.key_column} IS NOT NULL "
+        f"AND ({encoding.key_payload.is_valid}) "
+        f"AND {encoding.key_value} >= [dfe_ranges].[lower_inclusive] "
+        "AND ([dfe_ranges].[has_upper] = CONVERT(bit, 0) "
+        f"OR {encoding.key_value} < [dfe_ranges].[upper_exclusive]) "
+        "OPTION (FORCE ORDER)"
+    )
+    rows = _captured_integer_range_rows_cte(inspection, encoding)
+    limb_sums = ", ".join(_limb_sum_expression(index) for index in range(8))
+    provenance = _aggregate_provenance_projection("dfe_hash", inspection)
+    maximum_segment_id_bytes = max(len(item.segment_id.encode("ascii")) for item in ranges)
+    statement = (
+        f"DROP TABLE IF EXISTS {_INTEGER_RANGE_HASH_TABLE}; "
+        f"DROP TABLE IF EXISTS {_INTEGER_RANGE_RAW_TABLE}; SET NOCOUNT ON; "
+        f"{raw_capture}; WITH {rows} "
+        f"SELECT {rows_identity}, [dfe_rows].[segment_id], [dfe_rows].[ordinal], "
+        "[dfe_rows].[dfe_has_data], "
+        "CASE WHEN [dfe_rows].[row_envelope] IS NULL "
+        "THEN CONVERT(varbinary(32), NULL) "
+        "ELSE CONVERT(varbinary(32), HASHBYTES('SHA2_256', "
+        f"CONVERT(varbinary({encoding.bounded_envelope_bytes}), "
+        "[dfe_rows].[row_envelope]))) END AS [row_hash], "
+        "[dfe_rows].[invalid_row], [dfe_rows].[oversized_row], "
+        "[dfe_rows].[envelope_bytes], "
+        "CONVERT(bigint, DATALENGTH([dfe_rows].[key_envelope])) "
+        "AS [key_envelope_bytes] "
+        f"INTO {_INTEGER_RANGE_HASH_TABLE} FROM [dfe_rows] OPTION (FORCE ORDER); "
+        f"SELECT {provenance}, CONVERT(varbinary({maximum_segment_id_bytes}), "
+        "[dfe_hash].[segment_id]) AS [segment_id], "
+        "COUNT_BIG(CASE WHEN [dfe_hash].[row_hash] IS NOT NULL THEN 1 END) "
+        "AS [valid_row_count], "
+        f"{limb_sums}, "
+        "COUNT_BIG(CASE WHEN [dfe_hash].[dfe_has_data] = CONVERT(bit, 1) "
+        "AND [dfe_hash].[invalid_row] = CONVERT(bit, 1) THEN 1 END) "
+        "AS [invalid_row_count], "
+        "COUNT_BIG(CASE WHEN [dfe_hash].[dfe_has_data] = CONVERT(bit, 1) "
+        "AND [dfe_hash].[oversized_row] = CONVERT(bit, 1) THEN 1 END) "
+        "AS [oversized_row_count], "
+        "COALESCE(SUM(CASE WHEN [dfe_hash].[row_hash] IS NOT NULL "
+        "THEN [dfe_hash].[envelope_bytes] ELSE CONVERT(bigint, 0) END), 0) "
+        "AS [row_envelope_bytes], "
+        "COALESCE(SUM(CASE WHEN [dfe_hash].[row_hash] IS NOT NULL "
+        "THEN [dfe_hash].[key_envelope_bytes] "
+        "ELSE CONVERT(bigint, 0) END), 0) AS [key_envelope_bytes] "
+        f"FROM {_INTEGER_RANGE_HASH_TABLE} AS [dfe_hash] "
+        "GROUP BY [dfe_hash].[ordinal], [dfe_hash].[segment_id] "
+        "ORDER BY [dfe_hash].[ordinal]; "
+        f"DROP TABLE IF EXISTS {_INTEGER_RANGE_HASH_TABLE}; "
+        f"DROP TABLE IF EXISTS {_INTEGER_RANGE_RAW_TABLE}"
+    )
+    return MssqlCanonicalQuery(
+        statement=statement,
+        parameters=(
+            *range_parameters,
+            *scope_parameters,
+            encoding.context.row_header,
+            encoding.key_context.key_header,
+        ),
+        schema=schema,
+        context=encoding.context,
+        inspection=inspection,
+        max_encoded_envelope_bytes=max_encoded_envelope_bytes,
+        result_kind=MssqlCanonicalResultKind.INTEGER_RANGE_FINGERPRINTS,
+    )
+
+
+def _supports_fixed_width_integer_range_staging(
+    schema: CanonicalSchema,
+    inspection: MssqlInspectedRelation,
+) -> bool:
+    fields = tuple(zip(schema.fields, inspection.bindings, strict=True))
+    raw_column_count = (2 * len(fields)) + _INTEGER_RANGE_RAW_FIXED_COLUMNS
+    raw_record_bytes = (
+        sum(binding.physical.max_length for _field, binding in fields)
+        + (4 * (len(fields) + 4))
+        + 1
+        + _MAX_INTEGER_RANGE_SEGMENT_ID_BYTES
+        + _INTEGER_RANGE_RAW_RECORD_METADATA_BYTES
+        + ((raw_column_count + 7) // 8)
+    )
+    return (
+        len(fields) <= _MAX_INTEGER_RANGE_STAGED_FIELDS
+        and raw_record_bytes <= _MAX_INTEGER_RANGE_RAW_ROW_BYTES
+        and all(
+            field.logical_type is not LogicalType.STRING and binding.physical.max_length != -1
+            for field, binding in fields
+        )
+    )
+
+
+def _captured_integer_range_rows_cte(
+    inspection: MssqlInspectedRelation,
+    encoding: _IntegerRangeEncoding,
+) -> str:
+    source_identity = _identity_projection("dfe_source", inspection)
+    return (
+        "[dfe_rows] AS ("
+        f"SELECT {source_identity}, [dfe_source].[segment_id], "
+        "[dfe_source].[ordinal], "
+        "CASE WHEN [dfe_source].[dfe_has_data] IS NULL THEN CONVERT(bit, 0) "
+        "ELSE CONVERT(bit, 1) END AS [dfe_has_data], "
+        f"{encoding.key_value} AS [key_value], [dfe_key].[key_envelope], "
+        "[dfe_row].[row_envelope], [dfe_validation].[envelope_bytes], "
+        "[dfe_validation].[invalid_row], [dfe_row].[oversized_row] "
+        f"FROM {_INTEGER_RANGE_RAW_TABLE} AS [dfe_source] "
+        f"{encoding.payload_clause} "
+        "CROSS APPLY (SELECT "
+        "CASE WHEN [dfe_source].[dfe_has_data] IS NULL THEN CONVERT(bit, 0) "
+        f"WHEN {encoding.fields_valid} THEN CONVERT(bit, 0) "
+        "ELSE CONVERT(bit, 1) END AS [invalid_row], "
+        f"CONVERT(bigint, {encoding.fixed_bytes}) + "
+        f"(CONVERT(bigint, 2) * ({encoding.payload_bytes})) AS [envelope_bytes]"
+        ") AS [dfe_validation] "
+        "CROSS APPLY (SELECT "
+        "CASE WHEN [dfe_source].[dfe_has_data] IS NULL "
+        "OR [dfe_validation].[invalid_row] = CONVERT(bit, 1) "
+        f"OR [dfe_validation].[envelope_bytes] > "
+        f"CONVERT(bigint, {encoding.effective_envelope_limit}) "
+        f"THEN CONVERT(varchar({encoding.bounded_envelope_bytes}), NULL) "
+        f"ELSE CONVERT(varchar({encoding.bounded_envelope_bytes}), "
+        f"CONVERT(varchar({_ROW_HEADER_BYTES}), ?) + {encoding.frames}) "
+        "END AS [row_envelope], "
+        "CASE WHEN [dfe_source].[dfe_has_data] IS NOT NULL "
+        "AND [dfe_validation].[invalid_row] = CONVERT(bit, 0) "
+        f"AND [dfe_validation].[envelope_bytes] > "
+        f"CONVERT(bigint, {encoding.effective_envelope_limit}) "
+        "THEN CONVERT(bit, 1) ELSE CONVERT(bit, 0) END AS [oversized_row]"
+        ") AS [dfe_row] "
+        "CROSS APPLY (SELECT CASE WHEN [dfe_source].[dfe_has_data] IS NULL "
+        f"THEN CONVERT(varchar({_MAX_INT64_KEY_ENVELOPE_BYTES}), NULL) "
+        f"ELSE CONVERT(varchar({_MAX_INT64_KEY_ENVELOPE_BYTES}), "
+        f"CONVERT(varchar({_ROW_HEADER_BYTES}), ?) + {encoding.key_frame}) "
+        "END AS [key_envelope]) AS [dfe_key])"
     )
 
 
@@ -1061,6 +1279,48 @@ def _build_mssql_relation_manifest_query(
     )
 
 
+def _integer_range_encoding(
+    schema: CanonicalSchema,
+    inspection: MssqlInspectedRelation,
+    key_field_index: int,
+    max_encoded_envelope_bytes: int,
+    payload_lowerer: _PayloadLowerer,
+) -> _IntegerRangeEncoding:
+    context = prepare_envelope_context(schema)
+    key_field = schema.fields[key_field_index]
+    key_context = prepare_envelope_context(
+        CanonicalSchema(protocol=schema.protocol, fields=(key_field,))
+    )
+    payloads = tuple(
+        payload_lowerer(field, binding, index)
+        for index, (field, binding) in enumerate(
+            zip(schema.fields, inspection.bindings, strict=True)
+        )
+    )
+    effective_envelope_limit = min(
+        max_encoded_envelope_bytes,
+        _MAX_BOUNDED_VARCHAR_BYTES,
+    )
+    return _IntegerRangeEncoding(
+        context=context,
+        key_context=key_context,
+        payload_clause=_payload_clause(payloads),
+        fields_valid=_fields_valid_expression(schema, inspection.bindings, payloads),
+        payload_bytes=_payload_bytes_expression(inspection.bindings, payloads),
+        frames=_bounded_frames_expression(schema, inspection.bindings, payloads),
+        key_column=_qualified_column(key_field_index),
+        key_payload=payloads[key_field_index],
+        key_value=f"TRY_CONVERT(bigint, {_qualified_column(key_field_index)})",
+        key_frame=_single_key_frame_expression(key_field, key_field_index),
+        effective_envelope_limit=effective_envelope_limit,
+        bounded_envelope_bytes=min(
+            effective_envelope_limit,
+            _maximum_bounded_row_envelope_bytes(schema, inspection.bindings),
+        ),
+        fixed_bytes=_ROW_HEADER_BYTES + (_FIELD_FRAME_BYTES * len(schema.fields)),
+    )
+
+
 def _integer_range_source(
     schema: CanonicalSchema,
     inspection: MssqlInspectedRelation,
@@ -1289,7 +1549,7 @@ def _validate_integer_ranges(ranges: tuple[MssqlIntegerRangeRequest, ...]) -> No
             )
         if not item.segment_id.isascii():
             raise MssqlLoweringError("SQL Server integer-range segment ID must be ASCII")
-        if len(item.segment_id) > 128:
+        if len(item.segment_id) > _MAX_INTEGER_RANGE_SEGMENT_ID_BYTES:
             raise MssqlLoweringError("SQL Server integer-range segment ID exceeds 128 bytes")
         segment_ids.add(item.segment_id)
 

@@ -24,6 +24,7 @@ from forensic_data.canonical import (
     prepare_envelope_context,
 )
 from forensic_data.contracts.model import ReadinessManifestColumns, RelationScope
+from forensic_data.mssql_profile import MssqlRuntimeProfile
 from forensic_data.mssql_sql import (
     INT32_MAX,
     MAX_COMPILED_RELATION_MEMBERS,
@@ -2075,6 +2076,10 @@ class MssqlProtectedReadContext:
     @property
     def profile(self) -> MssqlServerProfile:
         return self._read_context.profile
+
+    @property
+    def runtime_profile(self) -> MssqlRuntimeProfile:
+        return MssqlRuntimeProfile.MSSQL_2022
 
     @property
     def evidence(self) -> MssqlReadContextEvidence:

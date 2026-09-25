@@ -1,14 +1,17 @@
 import re
 from collections.abc import Generator
+from concurrent.futures import Future, ThreadPoolExecutor
 from contextlib import contextmanager
 from dataclasses import dataclass, replace
 from datetime import UTC, date, datetime
 from decimal import Decimal
 from io import StringIO
 from pathlib import Path
+from time import monotonic, sleep
 from typing import Literal
 from uuid import UUID, uuid4
 
+import psycopg
 import pytest
 from psycopg import sql
 from psycopg.conninfo import make_conninfo
@@ -44,7 +47,7 @@ from forensic_data.persistence.lifecycle import (
 )
 from forensic_data.persistence.postgres import migrate_postgres_metadata, register_postgres_metadata
 from forensic_data.planning import PlanReport, ResolvedScope, resolve_scope_values
-from forensic_data.postgres import PostgresConnectionSettings, PostgresRetryPolicy
+from forensic_data.postgres import DatabaseRow, PostgresConnectionSettings, PostgresRetryPolicy
 from forensic_data.reporting import (
     DetailAvailability,
     DifferenceKind,
@@ -118,6 +121,104 @@ class _SourceDatabaseSettings:
     admin: PostgresConnectionSettings
     writer: PostgresConnectionSettings
     reader: PostgresConnectionSettings
+
+
+@dataclass(frozen=True, slots=True)
+class _BoundRetryAttempt:
+    run_id: UUID
+    attempt_id: UUID
+    cut_binding_operation_id: UUID
+    attempt_cut_operation_id: UUID
+    input_cut_digest: bytes
+    backend_process_id: int
+
+
+def test_postgres_application_retry_reuses_bound_cut_operation() -> None:
+    metadata_request = required_metadata_database_settings()
+    reference_request = _new_source_database_settings("reference")
+    target_request = _new_source_database_settings("target")
+    with (
+        disposable_metadata_database(metadata_request) as metadata,
+        _disposable_source_database(reference_request) as reference,
+        _disposable_source_database(target_request) as target,
+    ):
+        migrate_postgres_metadata(metadata.migrator, _NO_RETRY, 5_000)
+        loaded_config = load_contract_config(_CONTRACT_PATH)
+        config = replace(
+            loaded_config,
+            execution=replace(
+                loaded_config.execution,
+                max_queries=(
+                    loaded_config.execution.max_queries * loaded_config.execution.max_attempts
+                ),
+            ),
+        )
+        check = config.checks[0]
+        scope = resolve_scope_values(check, {"business_date": "2026-09-23"})
+        registration = register_postgres_metadata(
+            metadata.writer,
+            _NO_RETRY,
+            build_metadata_registration_definition(config.version, check, config.evidence),
+        )
+        _seed_source_database(
+            reference,
+            "reference_orders",
+            registration.reference_dataset.definition.dataset_id,
+            scope.scope_digest,
+            _REFERENCE_BASELINE_BATCH,
+            _BASELINE_SOURCE_CUT,
+            "reference-orders-retry",
+            "900.00",
+        )
+        _seed_source_database(
+            target,
+            "target_orders",
+            registration.target_dataset.definition.dataset_id,
+            scope.scope_digest,
+            _TARGET_BASELINE_BATCH,
+            _BASELINE_SOURCE_CUT,
+            "target-orders-retry",
+            "901.00",
+        )
+        request = ExecuteCheckRequest(
+            request_id=uuid4(),
+            check_id=check.check_id,
+            scope_values=_SCOPE_VALUES,
+            reference_expected_batch_id=_REFERENCE_BASELINE_BATCH,
+            target_expected_batch_id=_TARGET_BASELINE_BATCH,
+            origin="api-retry-after-bound-cut-integration",
+        )
+
+        with (
+            connect_writer(metadata.reader) as metadata_observer,
+            connect_writer(reference.admin) as source_observer,
+            ThreadPoolExecutor(max_workers=1) as executor,
+        ):
+            execution = executor.submit(
+                execute_check,
+                config,
+                request,
+                _execution_services(metadata, reference, target, check),
+            )
+            first_attempt = _terminate_reference_after_bound_cut(
+                metadata_observer,
+                source_observer,
+                reference,
+                request.request_id,
+                execution,
+                30.0,
+            )
+            result = execution.result(timeout=120.0)
+
+        assert result.run_id == first_attempt.run_id
+        assert result.attempt_id != first_attempt.attempt_id
+        _assert_baseline_result(result, check, scope, config.execution)
+        _assert_retry_after_bound_cut_receipts(
+            metadata,
+            result,
+            first_attempt,
+            config.execution,
+        )
 
 
 def test_postgres_application_cli_history_diff_and_structural_mismatch() -> None:
@@ -792,6 +893,205 @@ def test_postgres_application_cli_history_diff_and_structural_mismatch() -> None
             lossy_history.items[0].stored_result_availability is StoredResultAvailability.AVAILABLE
         )
         assert lossy_history.items[0].stored_result == lossy
+
+
+def _terminate_reference_after_bound_cut(
+    metadata_connection: psycopg.Connection[DatabaseRow],
+    source_connection: psycopg.Connection[DatabaseRow],
+    reference: _SourceDatabaseSettings,
+    request_id: UUID,
+    execution: Future[RunResult],
+    timeout_seconds: float,
+) -> _BoundRetryAttempt:
+    deadline = monotonic() + timeout_seconds
+    while monotonic() < deadline:
+        cut_row = metadata_connection.execute(
+            "SELECT r.run_id, a.attempt_id, r.cut_binding_operation_id, "
+            "a.cut_operation_id, r.bound_input_cut_digest, a.input_cut_digest "
+            "FROM dfe_metadata.runs AS r "
+            "JOIN dfe_metadata.run_attempts AS a ON a.run_id = r.run_id "
+            "WHERE r.request_id = %s AND a.ordinal = 1 "
+            "AND r.cut_binding_operation_id IS NOT NULL "
+            "AND a.cut_operation_id IS NOT NULL",
+            (request_id,),
+        ).fetchone()
+        if cut_row is not None:
+            backend_rows = source_connection.execute(
+                "SELECT pid FROM pg_catalog.pg_stat_activity "
+                "WHERE datname = pg_catalog.current_database() AND usename = %s "
+                "AND application_name = %s AND backend_type = 'client backend' "
+                "AND state = 'active' AND position('dfe_ranges' in query) > 0 "
+                "AND pid <> pg_catalog.pg_backend_pid() ORDER BY backend_start",
+                (reference.reader.user, reference.reader.application_name),
+            ).fetchall()
+            if len(backend_rows) == 1:
+                backend_process_id = backend_rows[0][0]
+                if type(backend_process_id) is not int:
+                    raise AssertionError("protected reference backend PID must be an integer")
+                termination = source_connection.execute(
+                    "SELECT pg_catalog.pg_terminate_backend(%s)",
+                    (backend_process_id,),
+                ).fetchone()
+                assert termination == (True,)
+                return _bound_retry_attempt(cut_row, backend_process_id)
+            if len(backend_rows) > 1:
+                raise AssertionError(
+                    "retry fixture found more than one protected reference backend: "
+                    f"backend_pids={tuple(row[0] for row in backend_rows)!r}"
+                )
+        if execution.done():
+            completed = execution.result()
+            raise AssertionError(
+                "comparison completed before the bound-cut backend termination: "
+                f"run_id={completed.run_id}, attempt_id={completed.attempt_id}"
+            )
+        sleep(0.001)
+    raise AssertionError(
+        "timed out waiting for a bound input cut and protected reference backend: "
+        f"request_id={request_id}, timeout_seconds={timeout_seconds}"
+    )
+
+
+def _bound_retry_attempt(row: tuple[object, ...], backend_process_id: int) -> _BoundRetryAttempt:
+    if len(row) != 6:
+        raise AssertionError(f"bound retry attempt row must contain six fields: actual={len(row)}")
+    run_id, attempt_id, binding_operation, attempt_operation, run_digest, attempt_digest = row
+    if not isinstance(run_id, UUID):
+        raise AssertionError("bound retry run id must be a UUID")
+    if not isinstance(attempt_id, UUID):
+        raise AssertionError("bound retry attempt id must be a UUID")
+    if not isinstance(binding_operation, UUID):
+        raise AssertionError("bound retry cut binding operation id must be a UUID")
+    if not isinstance(attempt_operation, UUID):
+        raise AssertionError("bound retry attempt cut operation id must be a UUID")
+    if type(run_digest) is not bytes or type(attempt_digest) is not bytes:
+        raise AssertionError("bound retry input cut digests must be bytes")
+    if run_digest != attempt_digest:
+        raise AssertionError("first attempt input cut digest must equal the run binding digest")
+    return _BoundRetryAttempt(
+        run_id=run_id,
+        attempt_id=attempt_id,
+        cut_binding_operation_id=binding_operation,
+        attempt_cut_operation_id=attempt_operation,
+        input_cut_digest=run_digest,
+        backend_process_id=backend_process_id,
+    )
+
+
+def _assert_retry_after_bound_cut_receipts(
+    metadata: MetadataDatabaseSettings,
+    result: RunResult,
+    first_attempt: _BoundRetryAttempt,
+    execution_policy: ExecutionBudgets,
+) -> None:
+    first_partial = read_postgres_partial_comparison(
+        metadata.reader,
+        _NO_RETRY,
+        first_attempt.run_id,
+        first_attempt.attempt_id,
+    )
+    with connect_writer(metadata.reader) as connection:
+        run_row = connection.execute(
+            "SELECT cut_binding_operation_id, bound_input_cut_digest, "
+            "selected_terminal_attempt_id FROM dfe_metadata.runs WHERE run_id = %s",
+            (result.run_id,),
+        ).fetchone()
+        attempt_rows = connection.execute(
+            "SELECT ordinal, attempt_id, start_operation_id, cut_operation_id, "
+            "input_cut_digest, status, terminal_reason_code, "
+            "terminal_reason ->> 'operation', terminal_reason ->> 'message', "
+            "terminal_reason ->> 'native_error_code', "
+            "(SELECT parameter ->> 'value' FROM "
+            "pg_catalog.jsonb_array_elements(terminal_reason -> 'safe_parameters') AS parameter "
+            "WHERE parameter ->> 'name' = 'error_type'), "
+            "(SELECT parameter ->> 'value' FROM "
+            "pg_catalog.jsonb_array_elements(terminal_reason -> 'safe_parameters') AS parameter "
+            "WHERE parameter ->> 'name' = 'cleanup_cut_aligned'), "
+            "(SELECT parameter ->> 'value' FROM "
+            "pg_catalog.jsonb_array_elements(terminal_reason -> 'safe_parameters') AS parameter "
+            "WHERE parameter ->> 'name' = 'cleanup_stable_reads') "
+            "FROM dfe_metadata.run_attempts WHERE run_id = %s ORDER BY ordinal",
+            (result.run_id,),
+        ).fetchall()
+        observation_rows = connection.execute(
+            "SELECT attempt_id, observation_id, observation_operation_id, "
+            "read_context_id, input_cut_digest "
+            "FROM dfe_metadata.dataset_observations WHERE run_id = %s "
+            "ORDER BY attempt_id, direction",
+            (result.run_id,),
+        ).fetchall()
+
+    assert run_row == (
+        first_attempt.cut_binding_operation_id,
+        first_attempt.input_cut_digest,
+        result.attempt_id,
+    )
+    assert len(attempt_rows) == 2
+    first_row, second_row = attempt_rows
+    assert first_row[0:2] == (1, first_attempt.attempt_id)
+    assert first_row[3:7] == (
+        first_attempt.attempt_cut_operation_id,
+        first_attempt.input_cut_digest,
+        "error",
+        ReasonCode.QUERY_ERROR.value,
+    )
+    assert second_row[0:2] == (2, result.attempt_id)
+    assert second_row[4:13] == (
+        first_attempt.input_cut_digest,
+        "completed",
+        None,
+        None,
+        None,
+        None,
+        None,
+        None,
+        None,
+    )
+    assert isinstance(first_row[2], UUID)
+    assert isinstance(second_row[2], UUID)
+    assert isinstance(second_row[3], UUID)
+    assert first_row[2] != second_row[2]
+    assert first_row[3] != second_row[3]
+
+    assert first_row[7:13] == (
+        "read_source",
+        "a source operation failed",
+        None,
+        "PostgresQueryError",
+        "1",
+        ConsistencyLevel.VERIFIED.value,
+    )
+
+    assert first_partial.run_id == result.run_id
+    assert first_partial.attempt_id == first_attempt.attempt_id
+    assert first_partial.execution_status is ExecutionStatus.ERROR
+    assert first_partial.consistency.stable_reads is ConsistencyLevel.VERIFIED
+    assert first_partial.consistency.cut_alignment is ConsistencyLevel.VERIFIED
+    assert first_partial.persistence.state is PersistenceState.CONFIRMED
+    assert tuple(reason.code for reason in first_partial.reasons) == (
+        ReasonCode.QUERY_ERROR,
+        ReasonCode.SNAPSHOT_LOST,
+    )
+    assert first_partial.metrics.queries > 0
+    assert first_partial.metrics.fetched_records > 0
+    assert first_partial.metrics.result_bytes > 0
+    assert first_partial.metrics.queries + result.metrics.queries <= execution_policy.max_queries
+
+    assert len(observation_rows) == 4
+    assert tuple(row[0] for row in observation_rows).count(first_attempt.attempt_id) == 2
+    assert tuple(row[0] for row in observation_rows).count(result.attempt_id) == 2
+    assert len({row[1] for row in observation_rows}) == 4
+    assert len({row[2] for row in observation_rows}) == 4
+    assert all(row[4] == first_attempt.input_cut_digest for row in observation_rows)
+    assert {row[3] for row in observation_rows if row[0] == first_attempt.attempt_id} == set(
+        first_partial.consistency.read_context_ids
+    )
+    assert {row[3] for row in observation_rows if row[0] == result.attempt_id} == set(
+        result.consistency.read_context_ids
+    )
+    assert set(first_partial.consistency.read_context_ids).isdisjoint(
+        result.consistency.read_context_ids
+    )
 
 
 def _invoke_cli(

@@ -49,6 +49,29 @@ from forensic_data.contracts.model import (
     RelationScope,
     RowCheckDefinition,
 )
+from forensic_data.greengage_endpoint import (
+    GreengageAcquisitionRaceError,
+    GreengageBudgetExceededError,
+    GreengageProtectedReadContext,
+    GreengageProtectedRelationInspection,
+    GreengageRelation,
+    GreengageRelationAcquisition,
+    open_greengage_protected_read_context,
+)
+from forensic_data.greenplum import (
+    GreenplumCloseError,
+    GreenplumConnectionError,
+    GreenplumContextClosedError,
+    GreenplumContextLostError,
+    GreenplumDataValidationError,
+    GreenplumMetadataError,
+    GreenplumQueryError,
+    UnsupportedGreenplumProfileError,
+)
+from forensic_data.greenplum_profile import (
+    GreenplumRuntimeProfile,
+    match_greenplum_runtime_profile,
+)
 from forensic_data.mssql import (
     MssqlCancellationConfirmedError,
     MssqlCancellationUnconfirmedError,
@@ -186,9 +209,11 @@ __all__: Final[tuple[str, ...]] = (
     "DiffRequest",
     "ExecuteCheckRequest",
     "HistoryRequest",
+    "MssqlGreengageExecutionServices",
     "MssqlPostgresExecutionServices",
     "PlanCheckRequest",
     "PostgresExecutionServices",
+    "PostgresGreengageExecutionServices",
     "PostgresMetadataServices",
     "ScopeValue",
     "execute_check",
@@ -386,9 +411,116 @@ class MssqlPostgresExecutionServices:
             raise ValueError("metadata record bytes cannot exceed metadata total bytes")
 
 
-type ExecutionServices = PostgresExecutionServices | MssqlPostgresExecutionServices
-type ProtectedReadContext = PostgresProtectedReadContext | MssqlProtectedReadContext
-type ProtectedRelation = PostgresProtectedRelationInspection | MssqlInspectedRelation
+@final
+@dataclass(frozen=True, slots=True)
+class PostgresGreengageExecutionServices:
+    reference_connection_id: str
+    reference_settings: PostgresConnectionSettings
+    target_connection_id: str
+    target_settings: PostgresConnectionSettings
+    metadata_connection_id: str
+    metadata_settings: PostgresConnectionSettings
+    reference_retry_policy: PostgresRetryPolicy
+    target_retry_policy: PostgresRetryPolicy
+    metadata_retry_policy: PostgresRetryPolicy
+    protected_lock_timeout_milliseconds: int
+    metadata_record_bytes: int
+    metadata_total_bytes: int
+
+    def __post_init__(self) -> None:
+        for value, context in (
+            (self.reference_connection_id, "reference connection id"),
+            (self.target_connection_id, "target connection id"),
+            (self.metadata_connection_id, "metadata connection id"),
+        ):
+            _require_nonblank(value, context)
+        for value, context in (
+            (self.reference_settings, "reference connection settings"),
+            (self.target_settings, "target connection settings"),
+            (self.metadata_settings, "metadata connection settings"),
+        ):
+            if not isinstance(cast(object, value), PostgresConnectionSettings):
+                raise TypeError(f"{context} must be PostgresConnectionSettings")
+        for value, context in (
+            (self.reference_retry_policy, "reference retry policy"),
+            (self.target_retry_policy, "target retry policy"),
+            (self.metadata_retry_policy, "metadata retry policy"),
+        ):
+            if not isinstance(cast(object, value), PostgresRetryPolicy):
+                raise TypeError(f"{context} must be PostgresRetryPolicy")
+        _require_positive_integer(
+            self.protected_lock_timeout_milliseconds,
+            "protected lock timeout milliseconds",
+        )
+        _require_positive_integer(self.metadata_record_bytes, "metadata record bytes")
+        _require_positive_integer(self.metadata_total_bytes, "metadata total bytes")
+        if self.metadata_record_bytes > self.metadata_total_bytes:
+            raise ValueError("metadata record bytes cannot exceed metadata total bytes")
+
+
+@final
+@dataclass(frozen=True, slots=True)
+class MssqlGreengageExecutionServices:
+    reference_connection_id: str
+    reference_settings: MssqlConnectionSettings
+    target_connection_id: str
+    target_settings: PostgresConnectionSettings
+    metadata_connection_id: str
+    metadata_settings: PostgresConnectionSettings
+    reference_retry_policy: MssqlRetryPolicy
+    target_retry_policy: PostgresRetryPolicy
+    metadata_retry_policy: PostgresRetryPolicy
+    protected_lock_timeout_milliseconds: int
+    metadata_record_bytes: int
+    metadata_total_bytes: int
+
+    def __post_init__(self) -> None:
+        for value, context in (
+            (self.reference_connection_id, "reference connection id"),
+            (self.target_connection_id, "target connection id"),
+            (self.metadata_connection_id, "metadata connection id"),
+        ):
+            _require_nonblank(value, context)
+        if not isinstance(cast(object, self.reference_settings), MssqlConnectionSettings):
+            raise TypeError("reference connection settings must be MssqlConnectionSettings")
+        for value, context in (
+            (self.target_settings, "target connection settings"),
+            (self.metadata_settings, "metadata connection settings"),
+        ):
+            if not isinstance(cast(object, value), PostgresConnectionSettings):
+                raise TypeError(f"{context} must be PostgresConnectionSettings")
+        if type(self.reference_retry_policy) is not MssqlRetryPolicy:
+            raise TypeError("reference retry policy must be MssqlRetryPolicy")
+        for value, context in (
+            (self.target_retry_policy, "target retry policy"),
+            (self.metadata_retry_policy, "metadata retry policy"),
+        ):
+            if not isinstance(cast(object, value), PostgresRetryPolicy):
+                raise TypeError(f"{context} must be PostgresRetryPolicy")
+        _require_positive_integer(
+            self.protected_lock_timeout_milliseconds,
+            "protected lock timeout milliseconds",
+        )
+        _require_positive_integer(self.metadata_record_bytes, "metadata record bytes")
+        _require_positive_integer(self.metadata_total_bytes, "metadata total bytes")
+        if self.metadata_record_bytes > self.metadata_total_bytes:
+            raise ValueError("metadata record bytes cannot exceed metadata total bytes")
+
+
+type ExecutionServices = (
+    PostgresExecutionServices
+    | MssqlPostgresExecutionServices
+    | PostgresGreengageExecutionServices
+    | MssqlGreengageExecutionServices
+)
+type ProtectedReadContext = (
+    PostgresProtectedReadContext | MssqlProtectedReadContext | GreengageProtectedReadContext
+)
+type ProtectedRelation = (
+    PostgresProtectedRelationInspection
+    | MssqlInspectedRelation
+    | GreengageProtectedRelationInspection
+)
 
 
 @final
@@ -548,6 +680,7 @@ def execute_check(
                 )
                 return _run_result_from_terminal_readback(check, scope, outcome)
 
+    cut_binding_operation_id = run.cut_binding_operation_id or uuid4()
     static_outcome = classify_check_acquisition(check)
     while True:
         attempt = _start_attempt(run, config, invocation_owner_token, services)
@@ -560,6 +693,7 @@ def execute_check(
                 attempt,
                 attempt_source_budget,
                 services,
+                cut_binding_operation_id,
             )
         else:
             attempt_result = _failure_from_early_outcome(
@@ -607,6 +741,7 @@ def _execute_attempt(
     attempt: RunAttemptRecord,
     source_budget: PostgresSourceBudgetAttempt,
     services: ExecutionServices,
+    cut_binding_operation_id: UUID,
 ) -> RunResult | _AttemptFailure:
     resources: list[_AttemptResource] = []
     artifact: CompletedComparisonArtifact | CompletedStructuralComparisonArtifact | None = None
@@ -685,6 +820,7 @@ def _execute_attempt(
                             registration,
                             ready_reference,
                             ready_target,
+                            cut_binding_operation_id,
                         ),
                     )
                     artifact = execute_integer_key_comparison(
@@ -758,6 +894,7 @@ def _execute_attempt(
         )
     except (
         ComparisonBudgetExceededError,
+        GreengageBudgetExceededError,
         PostgresReadDeadlineExceededError,
         PostgresSourceBudgetExceededError,
     ) as error:
@@ -827,6 +964,8 @@ def _execute_attempt(
         PostgresAcquisitionRaceError,
         MssqlContextLostError,
         MssqlMetadataError,
+        GreenplumContextLostError,
+        GreengageAcquisitionRaceError,
     ) as error:
         failure = _failure_from_error(
             ExecutionStatus.INCOMPLETE,
@@ -845,6 +984,8 @@ def _execute_attempt(
         PostgresMetadataError,
         MssqlConnectionError,
         MssqlQueryError,
+        GreenplumConnectionError,
+        GreenplumQueryError,
     ) as error:
         failure = _failure_from_error(
             ExecutionStatus.ERROR,
@@ -881,6 +1022,18 @@ def _execute_attempt(
             persisted_cut is not None,
             source_budget,
         )
+    except (UnsupportedGreenplumProfileError, GreenplumMetadataError) as error:
+        failure = _failure_from_error(
+            ExecutionStatus.ERROR,
+            ReasonCode.UNSUPPORTED_CAPABILITY,
+            "open_target",
+            "the Greengage target does not satisfy the required runtime capability",
+            error,
+            False,
+            resources,
+            persisted_cut is not None,
+            source_budget,
+        )
     except (
         AcquisitionValidationError,
         ComparisonProtocolError,
@@ -890,6 +1043,8 @@ def _execute_attempt(
         MssqlContextClosedError,
         MssqlDataValidationError,
         MssqlQueryContextError,
+        GreenplumContextClosedError,
+        GreenplumDataValidationError,
     ) as error:
         failure = _failure_from_error(
             ExecutionStatus.ERROR,
@@ -1003,6 +1158,14 @@ def _open_side(
             source_budget,
             services,
         )
+    if dataset.connection.adapter is Adapter.GREENGAGE:
+        return _open_greengage_side(
+            dataset,
+            readiness,
+            direction,
+            source_budget,
+            services,
+        )
     if dataset.connection.adapter is Adapter.POSTGRESQL:
         return _open_postgres_side(
             dataset,
@@ -1097,8 +1260,11 @@ def _open_mssql_side(
 ) -> _ProtectedSide:
     if direction is not PlanDirection.REFERENCE:
         raise UnsupportedMssqlProfileError("SQL Server is supported only as a reference source")
-    if not isinstance(services, MssqlPostgresExecutionServices):
-        raise TypeError("SQL Server reference execution requires MssqlPostgresExecutionServices")
+    if not isinstance(
+        services,
+        (MssqlPostgresExecutionServices, MssqlGreengageExecutionServices),
+    ):
+        raise TypeError("SQL Server reference execution requires mixed-engine execution services")
     locator = dataset.locator
     if not isinstance(locator, RelationLocator):
         raise UnsupportedComparisonError(
@@ -1167,6 +1333,79 @@ def _open_mssql_side(
         context=context,
         dataset_relation=_protected_mssql_relation(context, dataset_relation),
         readiness_relation=_protected_mssql_relation(context, readiness_relation),
+    )
+
+
+def _open_greengage_side(
+    dataset: DatasetDefinition,
+    readiness: RelationManifestReadiness,
+    direction: PlanDirection,
+    source_budget: PostgresSourceBudgetAttempt,
+    services: ExecutionServices,
+) -> _ProtectedSide:
+    if direction is not PlanDirection.TARGET:
+        raise UnsupportedGreenplumProfileError(
+            "Greengage endpoint execution is implemented only for the target direction"
+        )
+    if not isinstance(
+        services,
+        (PostgresGreengageExecutionServices, MssqlGreengageExecutionServices),
+    ):
+        raise TypeError("Greengage target execution requires Greengage execution services")
+    locator = dataset.locator
+    if not isinstance(locator, RelationLocator):
+        raise UnsupportedComparisonError("Greengage target execution requires a physical relation")
+    if locator.relation_scope is not RelationScope.PHYSICAL_ONLY:
+        raise UnsupportedComparisonError(
+            "Greengage target execution requires physical_only relation scope"
+        )
+    if (
+        match_greenplum_runtime_profile(
+            dataset.connection.driver,
+            dataset.connection.profile,
+        )
+        is not GreenplumRuntimeProfile.GREENGAGE
+    ):
+        raise UnsupportedGreenplumProfileError(
+            "declared Greengage target requires driver='psycopg' and profile='greengage'"
+        )
+    dataset_relation = GreengageRelation(
+        components=(locator.schema, locator.name),
+    )
+    readiness_relation = GreengageRelation(
+        components=(readiness.relation.schema, readiness.relation.name),
+    )
+    acquisitions = (
+        GreengageRelationAcquisition(
+            schema=dataset.logical_schema.schema,
+            relation=dataset_relation,
+            relation_scope=locator.relation_scope,
+            column_names=tuple(field.column_name for field in dataset.projection),
+            max_metadata_record_bytes=services.metadata_record_bytes,
+            max_metadata_total_bytes=services.metadata_total_bytes,
+        ),
+        GreengageRelationAcquisition(
+            schema=_manifest_schema(),
+            relation=readiness_relation,
+            relation_scope=RelationScope.PHYSICAL_ONLY,
+            column_names=readiness.columns.values(),
+            max_metadata_record_bytes=services.metadata_record_bytes,
+            max_metadata_total_bytes=services.metadata_total_bytes,
+        ),
+    )
+    context = open_greengage_protected_read_context(
+        services.target_settings,
+        services.target_retry_policy,
+        acquisitions,
+        services.protected_lock_timeout_milliseconds,
+        source_budget,
+        PostgresSourceDirection.TARGET,
+    )
+    return _ProtectedSide(
+        direction=direction,
+        context=context,
+        dataset_relation=_protected_greengage_relation(context, dataset_relation),
+        readiness_relation=_protected_greengage_relation(context, readiness_relation),
     )
 
 
@@ -1245,6 +1484,19 @@ def _read_relation_manifest(
             max_record_bytes,
             max_total_bytes,
         )
+    if isinstance(context, GreengageProtectedReadContext):
+        if not isinstance(relation, GreengageProtectedRelationInspection):
+            raise ApplicationStateError(
+                "Greengage protected context is paired with another engine's readiness relation"
+            )
+        return context.read_relation_manifest(
+            relation,
+            columns,
+            dataset_id,
+            scope_digest,
+            max_record_bytes,
+            max_total_bytes,
+        )
     if not isinstance(relation, MssqlInspectedRelation):
         raise ApplicationStateError(
             "SQL Server protected context is paired with a PostgreSQL readiness relation"
@@ -1264,10 +1516,11 @@ def _cut_persistence(
     registration: MetadataRegistration,
     reference: _ReadySide,
     target: _ReadySide,
+    cut_binding_operation_id: UUID,
 ) -> AlignedInputCutPersistence:
     recorded_at = datetime.now(UTC)
     return AlignedInputCutPersistence(
-        cut_binding_operation_id=uuid4(),
+        cut_binding_operation_id=cut_binding_operation_id,
         attempt_cut_operation_id=uuid4(),
         input_cut=input_cut,
         reference=_observation(
@@ -1315,7 +1568,7 @@ def _close_attempt_resources(
         close_failed = False
         try:
             resource.protected.context.close()
-        except (PostgresCloseError, MssqlCloseError):
+        except (PostgresCloseError, MssqlCloseError, GreenplumCloseError):
             close_failed = True
             context_lost = True
         was_active = _protected_context_state_is_active(state_before_close)
@@ -1797,6 +2050,7 @@ def _failure_from_comparison_interruption(
         cause,
         (
             ComparisonBudgetExceededError,
+            GreengageBudgetExceededError,
             PostgresReadDeadlineExceededError,
             PostgresResultLimitError,
             PostgresSourceBudgetExceededError,
@@ -1804,11 +2058,11 @@ def _failure_from_comparison_interruption(
         ),
     ):
         execution_status = ExecutionStatus.INCOMPLETE
-        reason = _reason(
+        reason = _reason_from_source_error(
             ReasonCode.BUDGET_EXHAUSTED,
             "compare",
             "the check exhausted an immutable execution budget",
-            (SafeParameter(name="error_type", value=type(cause).__name__),),
+            cause,
         )
         retryable = False
     elif isinstance(cause, MssqlCancellationConfirmedError):
@@ -1826,6 +2080,8 @@ def _failure_from_comparison_interruption(
             PostgresAcquisitionRaceError,
             MssqlContextLostError,
             MssqlMetadataError,
+            GreenplumContextLostError,
+            GreengageAcquisitionRaceError,
         ),
     ):
         execution_status = ExecutionStatus.INCOMPLETE
@@ -1844,14 +2100,16 @@ def _failure_from_comparison_interruption(
             PostgresMetadataError,
             MssqlConnectionError,
             MssqlQueryError,
+            GreenplumConnectionError,
+            GreenplumQueryError,
         ),
     ):
         execution_status = ExecutionStatus.ERROR
-        reason = _reason(
+        reason = _reason_from_source_error(
             ReasonCode.QUERY_ERROR,
             "read_source",
             "a source operation failed",
-            (SafeParameter(name="error_type", value=type(cause).__name__),),
+            cause,
         )
         retryable = True
     elif isinstance(cause, UnsupportedPostgresProfileError):
@@ -1872,6 +2130,15 @@ def _failure_from_comparison_interruption(
             (SafeParameter(name="error_type", value=type(cause).__name__),),
         )
         retryable = False
+    elif isinstance(cause, (UnsupportedGreenplumProfileError, GreenplumMetadataError)):
+        execution_status = ExecutionStatus.ERROR
+        reason = _reason(
+            ReasonCode.UNSUPPORTED_CAPABILITY,
+            "open_target",
+            "the Greengage target does not satisfy the required runtime capability",
+            (SafeParameter(name="error_type", value=type(cause).__name__),),
+        )
+        retryable = False
     elif isinstance(
         cause,
         (
@@ -1883,6 +2150,8 @@ def _failure_from_comparison_interruption(
             MssqlContextClosedError,
             MssqlDataValidationError,
             MssqlQueryContextError,
+            GreenplumContextClosedError,
+            GreenplumDataValidationError,
         ),
     ):
         execution_status = ExecutionStatus.ERROR
@@ -1973,11 +2242,11 @@ def _failure_from_error(
         execution_status=execution_status,
         verdict=Verdict.INCONCLUSIVE,
         reason=_reason_with_failure_consistency(
-            _reason(
+            _reason_from_source_error(
                 reason_code,
                 operation,
                 message,
-                (SafeParameter(name="error_type", value=type(error).__name__),),
+                error,
             ),
             state,
             metrics,
@@ -1993,6 +2262,32 @@ def _failure_from_error(
         partial_artifact=None,
         persisted_cut=None,
     )
+
+
+def _reason_from_source_error(
+    code: ReasonCode,
+    operation: str,
+    message: str,
+    error: Exception,
+) -> ResultReason:
+    reason = _reason(code, operation, message, _source_error_parameters(error))
+    if isinstance(error, GreenplumQueryError):
+        return reason.model_copy(update={"native_error_code": error.sqlstate})
+    return reason
+
+
+def _source_error_parameters(error: Exception) -> tuple[SafeParameter, ...]:
+    parameters = [SafeParameter(name="error_type", value=type(error).__name__)]
+    if isinstance(error, GreenplumQueryError):
+        parameters.extend(
+            (
+                SafeParameter(name="source_operation", value=error.operation),
+                SafeParameter(name="error_category", value=error.error_category),
+            )
+        )
+    if isinstance(error, GreengageBudgetExceededError):
+        parameters.append(SafeParameter(name="budget_detail", value=str(error)))
+    return tuple(parameters)
 
 
 def _actionable_mssql_error_message(
@@ -2635,11 +2930,17 @@ def _postgres_settings(
     services: ExecutionServices,
     direction: PlanDirection,
 ) -> PostgresConnectionSettings:
-    if direction is PlanDirection.TARGET:
+    if direction is PlanDirection.TARGET and isinstance(
+        services,
+        (PostgresExecutionServices, MssqlPostgresExecutionServices),
+    ):
         return services.target_settings
-    if isinstance(services, PostgresExecutionServices):
+    if direction is PlanDirection.REFERENCE and isinstance(
+        services,
+        (PostgresExecutionServices, PostgresGreengageExecutionServices),
+    ):
         return services.reference_settings
-    raise TypeError("mixed-engine execution does not provide PostgreSQL reference settings")
+    raise TypeError("execution services do not provide PostgreSQL settings for this direction")
 
 
 def _postgres_retry_policy(
@@ -2648,9 +2949,19 @@ def _postgres_retry_policy(
 ) -> PostgresRetryPolicy:
     if isinstance(services, PostgresExecutionServices):
         return services.source_retry_policy
-    if direction is PlanDirection.TARGET:
+    if direction is PlanDirection.TARGET and isinstance(
+        services,
+        MssqlPostgresExecutionServices,
+    ):
         return services.target_retry_policy
-    raise TypeError("mixed-engine execution does not provide a PostgreSQL reference retry policy")
+    if direction is PlanDirection.REFERENCE and isinstance(
+        services,
+        PostgresGreengageExecutionServices,
+    ):
+        return services.reference_retry_policy
+    raise TypeError(
+        "execution services do not provide a PostgreSQL retry policy for this direction"
+    )
 
 
 def _protected_relation(
@@ -2675,6 +2986,20 @@ def _protected_mssql_relation(
     if len(matches) != 1:
         raise MssqlQueryContextError(
             "protected SQL Server relation set does not contain exactly one requested relation"
+        )
+    return matches[0]
+
+
+def _protected_greengage_relation(
+    context: GreengageProtectedReadContext,
+    relation: GreengageRelation,
+) -> GreengageProtectedRelationInspection:
+    matches = tuple(
+        item for item in context.protected_relations if item.acquisition.relation == relation
+    )
+    if len(matches) != 1:
+        raise GreenplumMetadataError(
+            "protected Greengage relation set does not contain exactly one requested relation"
         )
     return matches[0]
 
@@ -2745,14 +3070,30 @@ def _validate_service_closure(
             "execution service connection identities do not match the selected check closure: "
             f"expected={expected!r}, actual={actual!r}"
         )
-    if check.reference.connection.adapter is Adapter.MSSQL and not isinstance(
-        services, MssqlPostgresExecutionServices
-    ):
-        raise TypeError("SQL Server reference requires MssqlPostgresExecutionServices")
-    if check.reference.connection.adapter is Adapter.POSTGRESQL and not isinstance(
-        services, PostgresExecutionServices
-    ):
-        raise TypeError("PostgreSQL reference requires PostgresExecutionServices")
+    pair = (
+        check.reference.connection.adapter,
+        check.target.connection.adapter,
+    )
+    if pair == (Adapter.MSSQL, Adapter.POSTGRESQL):
+        if not isinstance(services, MssqlPostgresExecutionServices):
+            raise TypeError("MSSQL to PostgreSQL execution requires matching services")
+        return
+    if pair == (Adapter.MSSQL, Adapter.GREENGAGE):
+        if not isinstance(services, MssqlGreengageExecutionServices):
+            raise TypeError("MSSQL to Greengage execution requires matching services")
+        return
+    if pair == (Adapter.POSTGRESQL, Adapter.POSTGRESQL):
+        if not isinstance(services, PostgresExecutionServices):
+            raise TypeError("PostgreSQL endpoint execution requires matching services")
+        return
+    if pair == (Adapter.POSTGRESQL, Adapter.GREENGAGE):
+        if not isinstance(services, PostgresGreengageExecutionServices):
+            raise TypeError("PostgreSQL to Greengage execution requires matching services")
+        return
+    raise UnsupportedComparisonError(
+        "execution adapter pair is not implemented: "
+        f"reference={pair[0].value!r}, target={pair[1].value!r}"
+    )
 
 
 def _validate_runtime_profiles(
@@ -2787,13 +3128,23 @@ def _validate_runtime_profiles(
             f"declared reference adapter is unsupported: adapter={reference.adapter.value!r}"
         )
     target = check.target.connection
-    if (
-        target.adapter is not Adapter.POSTGRESQL
-        or match_postgres_runtime_profile(target.driver, target.profile) is None
-    ):
-        raise UnsupportedPostgresProfileError(
-            "PostgreSQL target requires an explicit supported driver/profile pair: "
-            "('psycopg', 'postgresql_17') or ('psycopg2', 'postgresql_9_6')"
+    if target.adapter is Adapter.POSTGRESQL:
+        if match_postgres_runtime_profile(target.driver, target.profile) is None:
+            raise UnsupportedPostgresProfileError(
+                "PostgreSQL target requires an explicit supported driver/profile pair: "
+                "('psycopg', 'postgresql_17') or ('psycopg2', 'postgresql_9_6')"
+            )
+    elif target.adapter is Adapter.GREENGAGE:
+        if (
+            match_greenplum_runtime_profile(target.driver, target.profile)
+            is not GreenplumRuntimeProfile.GREENGAGE
+        ):
+            raise UnsupportedGreenplumProfileError(
+                "Greengage target requires driver='psycopg' and profile='greengage'"
+            )
+    else:
+        raise UnsupportedComparisonError(
+            f"declared target adapter is unsupported: adapter={target.adapter.value!r}"
         )
     metadata = config.metadata.connection
     if (

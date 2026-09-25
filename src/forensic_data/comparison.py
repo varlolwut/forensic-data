@@ -33,6 +33,22 @@ from forensic_data.contracts.model import (
     StableReadKind,
 )
 from forensic_data.contracts.semantics import semantic_value_from_json
+from forensic_data.greengage_endpoint import (
+    GreengageAcquisitionRaceError,
+    GreengageBudgetExceededError,
+    GreengageProtectedReadContext,
+    GreengageProtectedRelationInspection,
+)
+from forensic_data.greenplum import (
+    GreenplumConnectionError,
+    GreenplumConnectorError,
+    GreenplumContextClosedError,
+    GreenplumContextLostError,
+    GreenplumDataValidationError,
+    GreenplumMetadataError,
+    GreenplumQueryError,
+    UnsupportedGreenplumProfileError,
+)
 from forensic_data.mssql import (
     MssqlCancellationConfirmedError,
     MssqlCancellationUnconfirmedError,
@@ -49,6 +65,7 @@ from forensic_data.mssql import (
     MssqlTransportError,
     UnsupportedMssqlProfileError,
 )
+from forensic_data.mssql_profile import MssqlRuntimeProfile
 from forensic_data.planning import ResolvedScope
 from forensic_data.postgres import (
     PostgresAcquisitionRaceError,
@@ -109,6 +126,7 @@ INT64_MAX = (1 << 63) - 1
 _SUMMARY_RECORD_BYTES = 136
 _SESSION_SETUP_RECORD_BYTES = 128
 _MAX_INT64_KEY_ENVELOPE_BYTES = 136
+_MAX_INT64_TEXT_BYTES = 20
 _EXACT_STATUS_BYTES = 2
 _MAX_ROW_TYPE_OID_BYTES = 10
 _HAS_DATA_BYTES = 1
@@ -126,8 +144,14 @@ _DECODE_FIELD_RESERVATION_BYTES = (
     (6 * _POINTER_BYTES) + _ASCII_TEXT_HEADER_BYTES + _BYTES_HEADER_BYTES + getsizeof(Decimal(0))
 )
 
-type ComparisonReadContext = PostgresProtectedReadContext | MssqlProtectedReadContext
-type ComparisonRelation = PostgresProtectedRelationInspection | MssqlInspectedRelation
+type ComparisonReadContext = (
+    PostgresProtectedReadContext | MssqlProtectedReadContext | GreengageProtectedReadContext
+)
+type ComparisonRelation = (
+    PostgresProtectedRelationInspection
+    | MssqlInspectedRelation
+    | GreengageProtectedRelationInspection
+)
 
 
 class ComparisonExecutionError(RuntimeError):
@@ -524,7 +548,10 @@ class PartialComparisonArtifact:
 
 
 type ComparisonInterruptionCause = (
-    ComparisonExecutionError | PostgresConnectorError | MssqlTransportError
+    ComparisonExecutionError
+    | PostgresConnectorError
+    | MssqlTransportError
+    | GreenplumConnectorError
 )
 
 
@@ -861,6 +888,8 @@ class _ExactSideReservation:
     segment_identifier_bytes: int
     member_count: int
     full_scans: int
+    raw_ascii_value_count: int
+    raw_integer_value_count: int
 
 
 @final
@@ -992,7 +1021,12 @@ def execute_integer_key_comparison(
                     CompletedComparisonArtifact | CompletedStructuralComparisonArtifact,
                     completed.value,
                 )
-    except (ComparisonExecutionError, PostgresConnectorError, MssqlTransportError) as cause:
+    except (
+        ComparisonExecutionError,
+        PostgresConnectorError,
+        MssqlTransportError,
+        GreenplumConnectorError,
+    ) as cause:
         artifact = _partial_comparison_artifact(
             check,
             scope,
@@ -1197,6 +1231,8 @@ def _execute_postgres_integer_key_comparison(
             pending,
             usage,
             budgets,
+            reference_context,
+            target_context,
             validated.reference_member_count,
             validated.target_member_count,
             validated.reference_aggregate_presence_bytes,
@@ -1278,6 +1314,9 @@ def _execute_postgres_integer_key_comparison(
 
         exact_reservation = _exact_frontier_reservation(
             mismatching,
+            reference_context,
+            reference_relation,
+            target_context,
             usage,
             budgets,
             validated.max_encoded_row_bytes,
@@ -1680,6 +1719,7 @@ def _interruption_reason_code(cause: ComparisonInterruptionCause) -> ReasonCode:
         cause,
         (
             ComparisonBudgetExceededError,
+            GreengageBudgetExceededError,
             MssqlQueryTimeoutError,
             PostgresReadDeadlineExceededError,
             PostgresResultLimitError,
@@ -1699,6 +1739,8 @@ def _interruption_reason_code(cause: ComparisonInterruptionCause) -> ReasonCode:
             PostgresAcquisitionRaceError,
             MssqlContextLostError,
             MssqlMetadataError,
+            GreenplumContextLostError,
+            GreengageAcquisitionRaceError,
         ),
     ):
         return ReasonCode.SNAPSHOT_LOST
@@ -1710,6 +1752,8 @@ def _interruption_reason_code(cause: ComparisonInterruptionCause) -> ReasonCode:
             UnsupportedComparisonError,
             UnsupportedPostgresProfileError,
             UnsupportedMssqlProfileError,
+            UnsupportedGreenplumProfileError,
+            GreenplumMetadataError,
         ),
     ):
         return ReasonCode.UNSUPPORTED_CAPABILITY
@@ -1723,10 +1767,20 @@ def _interruption_reason_code(cause: ComparisonInterruptionCause) -> ReasonCode:
             MssqlContextClosedError,
             MssqlDataValidationError,
             MssqlQueryContextError,
+            GreenplumContextClosedError,
+            GreenplumDataValidationError,
         ),
     ):
         return ReasonCode.PROTOCOL_VIOLATION
-    if isinstance(cause, (PostgresConnectorError, MssqlTransportError)):
+    if isinstance(
+        cause,
+        (
+            PostgresConnectorError,
+            MssqlTransportError,
+            GreenplumConnectionError,
+            GreenplumQueryError,
+        ),
+    ):
         return ReasonCode.QUERY_ERROR
     raise AssertionError(f"unhandled comparison interruption {type(cause).__name__}")
 
@@ -1925,6 +1979,36 @@ def _validate_dataset_relation(
         if actual_fields != expected_fields:
             raise ComparisonProtocolError(
                 f"{direction} SQL Server inspection schema does not match the dataset"
+            )
+        return
+    if isinstance(relation, GreengageProtectedRelationInspection):
+        if dataset.connection.adapter is not Adapter.GREENGAGE:
+            raise ComparisonProtocolError(
+                f"{direction} Greengage inspection is bound to a non-Greengage dataset"
+            )
+        if dataset.locator.relation_scope is not RelationScope.PHYSICAL_ONLY:
+            raise UnsupportedComparisonError(
+                f"{direction} Greengage comparison requires physical_only relation scope"
+            )
+        if relation.acquisition.relation_scope is not RelationScope.PHYSICAL_ONLY:
+            raise ComparisonProtocolError(f"{direction} Greengage acquisition is not physical_only")
+        expected_relation = (dataset.locator.schema, dataset.locator.name)
+        if relation.acquisition.relation.components != expected_relation:
+            raise ComparisonProtocolError(
+                f"{direction} Greengage acquisition does not match the contract relation"
+            )
+        if relation.inspection.relation.components != expected_relation:
+            raise ComparisonProtocolError(
+                f"{direction} Greengage inspection resolved outside the contract relation"
+            )
+        if relation.acquisition.schema != dataset.logical_schema.schema:
+            raise ComparisonProtocolError(
+                f"{direction} Greengage acquisition schema does not match the dataset schema"
+            )
+        expected_columns = tuple(item.column_name for item in dataset.projection)
+        if relation.acquisition.column_names != expected_columns:
+            raise ComparisonProtocolError(
+                f"{direction} Greengage acquisition projection does not match the dataset"
             )
         return
     if dataset.connection.adapter is not Adapter.POSTGRESQL:
@@ -2231,6 +2315,8 @@ def _plan_fingerprint_level(
     pending: tuple[_PendingSegment, ...],
     usage: _Usage,
     budgets: ExecutionBudgets,
+    reference_context: ComparisonReadContext,
+    target_context: ComparisonReadContext,
     reference_member_count: int,
     target_member_count: int,
     reference_aggregate_presence_bytes: int,
@@ -2251,16 +2337,38 @@ def _plan_fingerprint_level(
     target_provenance_bytes = (
         _provenance_bytes(target_member_count) + target_aggregate_presence_bytes
     )
-    reference_result_bytes = base_result_bytes + (len(requests) * reference_provenance_bytes)
-    target_result_bytes = base_result_bytes + (len(requests) * target_provenance_bytes)
+    reference_result_reservation = _greengage_fingerprint_result_budget(
+        reference_context,
+        len(requests),
+    )
+    target_result_reservation = _greengage_fingerprint_result_budget(
+        target_context,
+        len(requests),
+    )
+    reference_result_bytes = (
+        base_result_bytes
+        + (len(requests) * reference_provenance_bytes)
+        + reference_result_reservation[0]
+    )
+    target_result_bytes = (
+        base_result_bytes + (len(requests) * target_provenance_bytes) + target_result_reservation[0]
+    )
     return _FingerprintLevelPlan(
         requests=requests,
         payload_result_bytes=base_result_bytes,
         payload_record_bytes=base_record_bytes,
         reference_result_bytes=reference_result_bytes,
         target_result_bytes=target_result_bytes,
-        reference_full_scans=len(requests) * reference_physical_scan_count,
-        target_full_scans=len(requests) * target_physical_scan_count,
+        reference_full_scans=_fingerprint_full_scans(
+            reference_context,
+            len(requests),
+            reference_physical_scan_count,
+        ),
+        target_full_scans=_fingerprint_full_scans(
+            target_context,
+            len(requests),
+            target_physical_scan_count,
+        ),
         coordinator_peak_bytes=_fingerprint_phase_memory_bytes(
             usage,
             pending,
@@ -2270,10 +2378,24 @@ def _plan_fingerprint_level(
             target_member_count,
             reference_aggregate_presence_bytes,
             target_aggregate_presence_bytes,
+            reference_result_reservation[1],
+            target_result_reservation[1],
+            reference_result_reservation[2],
+            target_result_reservation[2],
             reference_result_bytes,
             target_result_bytes,
         ),
     )
+
+
+def _fingerprint_full_scans(
+    context: ComparisonReadContext,
+    range_count: int,
+    physical_scan_count: int,
+) -> int:
+    if isinstance(context, GreengageProtectedReadContext):
+        return physical_scan_count
+    return range_count * physical_scan_count
 
 
 def _require_mssql_range_batch_capacity(
@@ -2320,6 +2442,21 @@ def _read_integer_key_summary(
             deadline,
             full_scans,
         )
+    if isinstance(context, GreengageProtectedReadContext):
+        if not isinstance(relation, GreengageProtectedRelationInspection):
+            raise ComparisonProtocolError(
+                "Greengage comparison context received a relation from another engine"
+            )
+        return context.read_integer_key_summary(
+            relation,
+            key_field_index,
+            scope,
+            max_encoded_envelope_bytes,
+            max_record_bytes,
+            max_total_bytes,
+            deadline,
+            full_scans,
+        )
     if not isinstance(relation, MssqlInspectedRelation):
         raise ComparisonProtocolError(
             "SQL Server comparison context received a PostgreSQL relation"
@@ -2352,6 +2489,12 @@ def _read_fingerprint_level(
     source_budget: PostgresSourceBudgetAttempt,
     plan: _FingerprintLevelPlan,
 ) -> tuple[PostgresRangeFingerprintRead, PostgresRangeFingerprintRead, _Usage]:
+    reference_plan_budget = _greengage_fingerprint_plan_budget(reference_context)
+    target_plan_budget = _greengage_fingerprint_plan_budget(target_context)
+    plan_coordinator_peak_bytes = plan.coordinator_peak_bytes + max(
+        reference_plan_budget[3],
+        target_plan_budget[3],
+    )
     _require_full_scan_capacity(
         source_budget,
         reference_full_scans=plan.reference_full_scans,
@@ -2360,14 +2503,18 @@ def _read_fingerprint_level(
     _require_budget_capacity(
         source_budget,
         budgets,
-        additional_queries=4,
-        additional_records=(2 * len(plan.requests)) + 2,
+        additional_queries=4 + reference_plan_budget[0] + target_plan_budget[0],
+        additional_records=(
+            (2 * len(plan.requests)) + 2 + reference_plan_budget[1] + target_plan_budget[1]
+        ),
         additional_result_bytes=(
             plan.reference_result_bytes
             + plan.target_result_bytes
             + (2 * _SESSION_SETUP_RECORD_BYTES)
+            + reference_plan_budget[2]
+            + target_plan_budget[2]
         ),
-        coordinator_bytes=plan.coordinator_peak_bytes,
+        coordinator_bytes=plan_coordinator_peak_bytes,
     )
     _require_deadline(read_deadline.deadline_nanoseconds)
     reference_read = _read_integer_range_fingerprints(
@@ -2399,9 +2546,37 @@ def _read_fingerprint_level(
         usage,
         source_budget,
         fingerprint_nodes=len(plan.requests),
-        coordinator_peak_bytes=plan.coordinator_peak_bytes,
+        coordinator_peak_bytes=plan_coordinator_peak_bytes,
     )
     return reference_read, target_read, next_usage
+
+
+def _greengage_fingerprint_plan_budget(
+    context: ComparisonReadContext,
+) -> tuple[int, int, int, int]:
+    if not isinstance(context, GreengageProtectedReadContext):
+        return (0, 0, 0, 0)
+    reservation = context.fingerprint_plan_reservation
+    return (
+        reservation.additional_queries,
+        reservation.max_fetched_records,
+        reservation.max_result_bytes,
+        reservation.max_coordinator_bytes,
+    )
+
+
+def _greengage_fingerprint_result_budget(
+    context: ComparisonReadContext,
+    range_count: int,
+) -> tuple[int, int, int]:
+    if not isinstance(context, GreengageProtectedReadContext):
+        return (0, 0, 0)
+    reservation = context.fingerprint_result_reservation(range_count)
+    return (
+        reservation.additional_result_bytes,
+        reservation.additional_fields_per_record,
+        reservation.additional_ascii_values,
+    )
 
 
 def _read_integer_range_fingerprints(
@@ -2420,6 +2595,22 @@ def _read_integer_range_fingerprints(
         if not isinstance(relation, PostgresProtectedRelationInspection):
             raise ComparisonProtocolError(
                 "PostgreSQL comparison context received a SQL Server relation"
+            )
+        return context.read_integer_range_fingerprints(
+            relation,
+            key_field_index,
+            scope,
+            ranges,
+            max_encoded_envelope_bytes,
+            max_record_bytes,
+            max_total_bytes,
+            deadline,
+            full_scans,
+        )
+    if isinstance(context, GreengageProtectedReadContext):
+        if not isinstance(relation, GreengageProtectedRelationInspection):
+            raise ComparisonProtocolError(
+                "Greengage comparison context received a relation from another engine"
             )
         return context.read_integer_range_fingerprints(
             relation,
@@ -2632,6 +2823,23 @@ def _read_integer_range_rows(
         if not isinstance(relation, PostgresProtectedRelationInspection):
             raise ComparisonProtocolError(
                 "PostgreSQL comparison context received a SQL Server relation"
+            )
+        return context.read_integer_range_rows(
+            relation,
+            key_field_index,
+            scope,
+            ranges,
+            max_encoded_envelope_bytes,
+            max_records,
+            max_record_bytes,
+            max_total_bytes,
+            deadline,
+            full_scans,
+        )
+    if isinstance(context, GreengageProtectedReadContext):
+        if not isinstance(relation, GreengageProtectedRelationInspection):
+            raise ComparisonProtocolError(
+                "Greengage comparison context received a relation from another engine"
             )
         return context.read_integer_range_rows(
             relation,
@@ -3315,22 +3523,36 @@ def _fingerprint_phase_memory_bytes(
     target_member_count: int,
     reference_aggregate_presence_bytes: int,
     target_aggregate_presence_bytes: int,
+    reference_additional_fields_per_record: int,
+    target_additional_fields_per_record: int,
+    reference_additional_ascii_values: int,
+    target_additional_ascii_values: int,
     reference_result_bytes: int,
     target_result_bytes: int,
 ) -> int:
     parsed_side = _fingerprint_parsed_side_memory_bytes(requests, budgets)
     reference_raw = _raw_rows_memory_bytes(
         record_count=len(requests),
-        field_count=(reference_member_count + 14 + reference_aggregate_presence_bytes),
-        ascii_value_count=14 * len(requests),
+        field_count=(
+            reference_member_count
+            + 14
+            + reference_aggregate_presence_bytes
+            + reference_additional_fields_per_record
+        ),
+        ascii_value_count=(14 * len(requests)) + reference_additional_ascii_values,
         integer_value_count=reference_member_count * len(requests),
         result_bytes=reference_result_bytes,
         budgets=budgets,
     )
     target_raw = _raw_rows_memory_bytes(
         record_count=len(requests),
-        field_count=target_member_count + 14 + target_aggregate_presence_bytes,
-        ascii_value_count=14 * len(requests),
+        field_count=(
+            target_member_count
+            + 14
+            + target_aggregate_presence_bytes
+            + target_additional_fields_per_record
+        ),
+        ascii_value_count=(14 * len(requests)) + target_additional_ascii_values,
         integer_value_count=target_member_count * len(requests),
         result_bytes=target_result_bytes,
         budgets=budgets,
@@ -3397,6 +3619,8 @@ def _reference_exact_side_reservation(
         segment_identifier_bytes=segment_identifier_bytes,
         member_count=member_count,
         full_scans=max(1, len(nodes)) * physical_scan_count,
+        raw_ascii_value_count=3 * records,
+        raw_integer_value_count=member_count * raw_records,
     )
 
 
@@ -3425,6 +3649,44 @@ def _target_exact_side_reservation(
         segment_identifier_bytes=segment_identifier_bytes,
         member_count=member_count,
         full_scans=max(1, len(nodes)) * physical_scan_count,
+        raw_ascii_value_count=3 * records,
+        raw_integer_value_count=member_count * raw_records,
+    )
+
+
+def _mssql_2022_exact_side_reservation(
+    reservation: _ExactSideReservation,
+    relation: MssqlInspectedRelation,
+) -> _ExactSideReservation:
+    provenance_values = (
+        relation.database_id,
+        relation.schema_id,
+        relation.object_id,
+        *(binding.column_id for binding in relation.bindings),
+    )
+    provenance_bytes = sum(len(str(value).encode("ascii")) for value in provenance_values)
+    return replace(
+        reservation,
+        raw_result_bytes=reservation.result_bytes
+        + (reservation.raw_records * (provenance_bytes + _HAS_DATA_BYTES)),
+    )
+
+
+def _greengage_exact_side_reservation(
+    reservation: _ExactSideReservation,
+    nodes: tuple[_FingerprintNode, ...],
+) -> _ExactSideReservation:
+    key_envelope_bytes = sum(node.target.key_envelope_bytes for node in nodes)
+    maximum_key_value_bytes = reservation.records * _MAX_INT64_TEXT_BYTES
+    return replace(
+        reservation,
+        raw_result_bytes=(
+            reservation.raw_result_bytes - key_envelope_bytes + maximum_key_value_bytes
+        ),
+        raw_ascii_value_count=2 * reservation.records,
+        raw_integer_value_count=(
+            reservation.member_count * reservation.raw_records + reservation.records
+        ),
     )
 
 
@@ -3459,8 +3721,8 @@ def _exact_raw_side_memory_bytes(
     return _raw_rows_memory_bytes(
         record_count=reservation.raw_records,
         field_count=reservation.member_count + 6,
-        ascii_value_count=3 * reservation.records,
-        integer_value_count=reservation.member_count * reservation.raw_records,
+        ascii_value_count=reservation.raw_ascii_value_count,
+        integer_value_count=reservation.raw_integer_value_count,
         result_bytes=reservation.raw_result_bytes,
         budgets=budgets,
     )
@@ -3495,6 +3757,9 @@ def _exact_grouping_memory_bytes(
 
 def _exact_frontier_reservation(
     nodes: tuple[_FingerprintNode, ...],
+    reference_context: ComparisonReadContext,
+    reference_relation: ComparisonRelation,
+    target_context: ComparisonReadContext,
     usage: _Usage,
     budgets: ExecutionBudgets,
     max_encoded_row_bytes: int,
@@ -3514,6 +3779,20 @@ def _exact_frontier_reservation(
         target_member_count,
         target_physical_scan_count,
     )
+    if (
+        isinstance(reference_context, MssqlProtectedReadContext)
+        and reference_context.runtime_profile is MssqlRuntimeProfile.MSSQL_2022
+    ):
+        if not isinstance(reference_relation, MssqlInspectedRelation):
+            raise ComparisonProtocolError(
+                "SQL Server exact reservation received a relation from another engine"
+            )
+        reference = _mssql_2022_exact_side_reservation(
+            reference,
+            reference_relation,
+        )
+    if isinstance(target_context, GreengageProtectedReadContext):
+        target = _greengage_exact_side_reservation(target, nodes)
     reference_parsed = _exact_parsed_side_memory_bytes(
         reference,
         budgets,
@@ -3788,10 +4067,15 @@ def _require_comparison_context(
     value: object,
     context: str,
 ) -> ComparisonReadContext:
-    if not isinstance(value, (PostgresProtectedReadContext, MssqlProtectedReadContext)):
-        raise TypeError(
-            f"{context} must be a PostgresProtectedReadContext or MssqlProtectedReadContext"
-        )
+    if not isinstance(
+        value,
+        (
+            PostgresProtectedReadContext,
+            MssqlProtectedReadContext,
+            GreengageProtectedReadContext,
+        ),
+    ):
+        raise TypeError(f"{context} must be a supported protected read context")
     return value
 
 
@@ -3799,15 +4083,22 @@ def _require_comparison_relation(
     value: object,
     context: str,
 ) -> ComparisonRelation:
-    if not isinstance(value, (PostgresProtectedRelationInspection, MssqlInspectedRelation)):
-        raise TypeError(
-            f"{context} must be a PostgresProtectedRelationInspection or MssqlInspectedRelation"
-        )
+    if not isinstance(
+        value,
+        (
+            PostgresProtectedRelationInspection,
+            MssqlInspectedRelation,
+            GreengageProtectedRelationInspection,
+        ),
+    ):
+        raise TypeError(f"{context} must be a supported protected relation inspection")
     return value
 
 
 def _comparison_context_is_active(context: ComparisonReadContext) -> bool:
     if isinstance(context, PostgresProtectedReadContext):
+        return context.state is ReadContextState.ACTIVE
+    if isinstance(context, GreengageProtectedReadContext):
         return context.state is ReadContextState.ACTIVE
     return context.state is MssqlReadContextState.ACTIVE
 
@@ -3815,17 +4106,24 @@ def _comparison_context_is_active(context: ComparisonReadContext) -> bool:
 def _relation_member_count(relation: ComparisonRelation) -> int:
     if isinstance(relation, PostgresProtectedRelationInspection):
         return len(relation.query_relations())
+    if isinstance(relation, GreengageProtectedRelationInspection):
+        return 1
     return 3 + len(relation.bindings)
 
 
 def _aggregate_presence_bytes(relation: ComparisonRelation) -> int:
-    if isinstance(relation, PostgresProtectedRelationInspection):
+    if isinstance(
+        relation,
+        (PostgresProtectedRelationInspection, GreengageProtectedRelationInspection),
+    ):
         return 0
     return _HAS_DATA_BYTES
 
 
 def _relation_physical_scan_count(relation: ComparisonRelation) -> int:
     if isinstance(relation, PostgresProtectedRelationInspection):
+        return relation.physical_scan_count()
+    if isinstance(relation, GreengageProtectedRelationInspection):
         return relation.physical_scan_count()
     return 1
 
