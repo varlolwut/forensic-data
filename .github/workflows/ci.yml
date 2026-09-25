@@ -42,6 +42,7 @@ jobs:
       DFE_MSSQL_READER_PASSWORD: Phase03-Mssql-Reader-2022!
       DFE_MSSQL_SETUP_WRITER_PASSWORD: Phase03-Mssql-Writer-2022!
       DFE_MSSQL_PORT: "51433"
+      DFE_CLICKHOUSE_HTTP_PORT: "18123"
     steps:
       - name: Check out source
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
@@ -71,6 +72,17 @@ jobs:
           rm /tmp/msodbcsql18_18.7.1.1-1_amd64.deb
       - name: Install locked dependencies
         run: uv sync --frozen --all-groups
+      - name: Create ephemeral ClickHouse fixture credentials
+        if: github.event_name == 'workflow_dispatch'
+        run: |
+          admin_password="$(openssl rand -hex 32)"
+          reader_password="$(openssl rand -hex 32)"
+          echo "::add-mask::${admin_password}"
+          echo "::add-mask::${reader_password}"
+          {
+            echo "DFE_CLICKHOUSE_ADMIN_PASSWORD=${admin_password}"
+            echo "DFE_CLICKHOUSE_READER_PASSWORD=${reader_password}"
+          } >> "${GITHUB_ENV}"
       - name: Lint
         run: uv run ruff check .
       - name: Check formatting
@@ -92,15 +104,26 @@ jobs:
           docker compose --file tests/fixtures/mssql-2022/compose.yaml run --rm setup-admin
           docker compose --file tests/fixtures/mssql-2022/compose.yaml run --rm setup-writer
           docker compose --file tests/fixtures/mssql-2022/compose.yaml run --rm verify
+      - name: Start ClickHouse 26.8.6.5 fixture
+        if: github.event_name == 'workflow_dispatch'
+        run: |
+          docker compose --file tests/fixtures/clickhouse/compose.yaml config --quiet
+          docker compose --file tests/fixtures/clickhouse/compose.yaml up --detach --wait
       - name: Run tests without database fixtures
         if: github.event_name != 'workflow_dispatch'
         run: uv run pytest -m "not integration" --ignore-glob="tests/*_integration.py"
       - name: Run database integration suite
         if: github.event_name == 'workflow_dispatch'
         run: uv run pytest -m "not mssql_legacy and not greenplum"
+      - name: Capture ClickHouse fixture logs
+        if: failure() && github.event_name == 'workflow_dispatch'
+        run: |
+          docker compose --file tests/fixtures/clickhouse/compose.yaml ps --all
+          docker compose --file tests/fixtures/clickhouse/compose.yaml logs --no-color --timestamps
       - name: Stop database fixtures
         if: always() && github.event_name == 'workflow_dispatch'
         run: |
+          docker compose --file tests/fixtures/clickhouse/compose.yaml down --volumes --remove-orphans
           docker compose --file tests/fixtures/mssql-2022/compose.yaml down --volumes --remove-orphans
           docker compose --file tests/fixtures/postgres-legacy/compose.yaml down --volumes
           docker compose --file tests/fixtures/postgres/compose.yaml down --volumes
@@ -158,6 +181,7 @@ jobs:
             --requirements /tmp/forensic-data-runtime.txt
           uv pip install --python .artifact-venv/bin/python --no-deps dist/*.whl
           .artifact-venv/bin/python -c "import forensic_data; print(forensic_data.__version__)"
+          .artifact-venv/bin/python -c "import clickhouse_connect; from forensic_data.clickhouse import ClickHouseConnectionSettings; from forensic_data.clickhouse_profile import ClickHouseRuntimeProfile; assert clickhouse_connect.__version__ == '1.9.0'; assert ClickHouseConnectionSettings and ClickHouseRuntimeProfile"
           .artifact-venv/bin/python -c "from forensic_data.mssql_resources import load_mssql_2016_canonical_utf8_helper_sql; load_mssql_2016_canonical_utf8_helper_sql()"
           .artifact-venv/bin/python -c "from importlib.resources import files; root = files('forensic_data.persistence'); assert root.joinpath('sql/migrations/0001_initial.sql').read_bytes(); assert root.joinpath('sql/migrations/0002_run_lifecycle.sql').read_bytes(); assert root.joinpath('sql/migrations/0003_completed_comparisons.sql').read_bytes(); assert root.joinpath('sql/migrations/0004_retained_anomalies.sql').read_bytes(); assert root.joinpath('sql/migrations/0005_frozen_physical_union.sql').read_bytes(); assert root.joinpath('sql/bootstrap.sql').read_bytes()"
           .artifact-venv/bin/forensics --help
@@ -190,6 +214,7 @@ jobs:
           docker image rm forensic-data:ci
           docker image load --input /tmp/forensic-data-ci.tar
           docker run --rm forensic-data:ci
+          docker run --rm --entrypoint /app/.venv/bin/python forensic-data:ci -c "import clickhouse_connect; from forensic_data.clickhouse import ClickHouseConnectionSettings; from forensic_data.clickhouse_profile import ClickHouseRuntimeProfile; assert clickhouse_connect.__version__ == '1.9.0'; assert ClickHouseConnectionSettings and ClickHouseRuntimeProfile"
           docker run --rm --entrypoint /app/.venv/bin/python forensic-data:ci -c "from forensic_data.mssql_resources import load_mssql_2016_canonical_utf8_helper_sql; load_mssql_2016_canonical_utf8_helper_sql()"
           test "$(docker run --rm --entrypoint id forensic-data:ci -u)" = "10001"
       - name: Start legacy box fixtures

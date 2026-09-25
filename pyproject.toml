@@ -9,6 +9,7 @@ description = "Typed, read-only data reconciliation foundations"
 readme = "README.md"
 requires-python = ">=3.12,<3.13"
 dependencies = [
+    "clickhouse-connect==1.9.0",
     "psycopg[c]==3.3.6",
     "psycopg2==2.9.13",
     "pydantic>=2.13.5,<3",
@@ -39,6 +40,7 @@ typeCheckingMode = "strict"
 [tool.pytest.ini_options]
 addopts = ["--strict-config", "--strict-markers", "-ra"]
 markers = [
+    "clickhouse: tests that require a real ClickHouse service",
     "integration: tests that require a real external service",
     "greenplum: tests that require real original Greenplum and Greengage services",
     "mssql: tests that require a real Microsoft SQL Server service",

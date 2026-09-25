@@ -1,0 +1,52 @@
+name: forensic-data-phase05-clickhouse
+
+x-clickhouse-image: &clickhouse-image
+  image: clickhouse:26.8.6.5@sha256:d4cb553ca09d0d403aa25995cf14f079b3aea06406ea1463665fc1f9c185375c
+  platform: linux/amd64
+
+services:
+  clickhouse:
+    <<: *clickhouse-image
+    hostname: forensic-data-phase05-clickhouse
+    environment:
+      CLICKHOUSE_DB: dfe_fixture
+      CLICKHOUSE_USER: dfe_fixture_admin
+      CLICKHOUSE_PASSWORD: ${DFE_CLICKHOUSE_ADMIN_PASSWORD:?set DFE_CLICKHOUSE_ADMIN_PASSWORD}
+      CLICKHOUSE_DEFAULT_ACCESS_MANAGEMENT: "1"
+      DFE_CLICKHOUSE_READER_PASSWORD: ${DFE_CLICKHOUSE_READER_PASSWORD:?set DFE_CLICKHOUSE_READER_PASSWORD}
+    ports:
+      - 127.0.0.1:${DFE_CLICKHOUSE_HTTP_PORT:?set DFE_CLICKHOUSE_HTTP_PORT}:8123
+    volumes:
+      - clickhouse-data:/var/lib/clickhouse
+      - ./init:/docker-entrypoint-initdb.d:ro
+    healthcheck:
+      test:
+        - CMD-SHELL
+        - >-
+          test "$$(clickhouse-client
+          --user dfe_fixture_reader
+          --password "$${DFE_CLICKHOUSE_READER_PASSWORD}"
+          --database dfe_fixture
+          --query="SELECT
+          version() = '26.8.6.5'
+          AND getSetting('readonly') = 1
+          AND getSetting('max_memory_usage') = 268435456
+          AND getSetting('max_threads') = 2
+          AND getSetting('max_execution_time') = 30
+          AND getSetting('max_result_rows') = 100000
+          AND getSetting('max_result_bytes') = 67108864
+          AND getSetting('result_overflow_mode') = 'throw'
+          AND (SELECT count() FROM fidelity_probe) = 3")" = "1"
+      interval: 2s
+      timeout: 5s
+      retries: 60
+      start_period: 10s
+    mem_limit: 2g
+    ulimits:
+      nofile:
+        soft: 262144
+        hard: 262144
+    restart: "no"
+
+volumes:
+  clickhouse-data:
