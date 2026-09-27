@@ -13,6 +13,7 @@ from forensic_data.canonical import (
     schema_digest_hex,
 )
 from forensic_data.clickhouse_profile import (
+    CLICKHOUSE_21_8_LTS_SOURCE_PROFILE,
     CLICKHOUSE_CONNECT_DRIVER,
     CLICKHOUSE_LTS_PROFILE,
     ClickHouseRuntimeProfile,
@@ -266,16 +267,22 @@ def _compile_connection(source: ConnectionSource) -> ConnectionDefinition:
                 f"connection {connection_id!r} profile {profile!r} must declare role 'source'"
             )
     if adapter is Adapter.CLICKHOUSE:
-        if match_clickhouse_runtime_profile(driver, profile) is not ClickHouseRuntimeProfile.LTS:
+        runtime_profile = match_clickhouse_runtime_profile(driver, profile)
+        if runtime_profile is None:
             raise UnsupportedContractError(
-                f"connection {connection_id!r} ClickHouse endpoint requires exact "
-                "driver/profile pair "
-                f"({CLICKHOUSE_CONNECT_DRIVER!r}, {CLICKHOUSE_LTS_PROFILE!r})"
+                f"connection {connection_id!r} ClickHouse endpoint requires driver "
+                f"{CLICKHOUSE_CONNECT_DRIVER!r} and profile {CLICKHOUSE_LTS_PROFILE!r} or "
+                f"{CLICKHOUSE_21_8_LTS_SOURCE_PROFILE!r}"
             )
-        if roles != [ConnectionRole.TARGET]:
+        expected_roles = (
+            [ConnectionRole.SOURCE]
+            if runtime_profile is ClickHouseRuntimeProfile.LEGACY_21_8_LTS_SOURCE
+            else [ConnectionRole.TARGET]
+        )
+        if roles != expected_roles:
             raise UnsupportedContractError(
-                f"connection {connection_id!r} profile {profile!r} is target-only "
-                "and must declare exactly role 'target'"
+                f"connection {connection_id!r} profile {profile!r} must declare exactly role "
+                f"{expected_roles[0].value!r}"
             )
     return ConnectionDefinition(
         connection_id=connection_id,
@@ -766,6 +773,13 @@ def _compile_check(
                 f"{context} ClickHouse target supports only PostgreSQL, MSSQL, or "
                 "original Greenplum references"
             )
+    if (
+        reference.connection.adapter is Adapter.CLICKHOUSE
+        and target.connection.adapter is not Adapter.POSTGRESQL
+    ):
+        raise UnsupportedContractError(
+            f"{context} ClickHouse reference supports only a PostgreSQL target"
+        )
     if ConnectionRole.SOURCE not in reference.connection.roles:
         raise ContractValidationError(
             f"{context} reference connection {reference.connection.connection_id!r} "

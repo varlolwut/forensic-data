@@ -1,0 +1,142 @@
+version: 1
+connections:
+  reference_clickhouse:
+    adapter: clickhouse
+    driver: clickhouse-connect
+    profile: clickhouse_21_8_lts
+    roles: [source]
+    secret_ref: file:/run/secrets/clickhouse-reference.json
+  target_pg:
+    adapter: postgresql
+    driver: psycopg
+    profile: postgresql_17
+    roles: [target]
+    secret_ref: file:/run/secrets/postgres-target-dsn
+  metadata_pg:
+    adapter: postgresql
+    driver: psycopg
+    profile: postgresql_17
+    roles: [metadata]
+    secret_ref: file:/run/secrets/metadata-writer-dsn
+schemas:
+  order_v1:
+    fields:
+      - name: order_id
+        type: {kind: int64}
+        nullable: false
+        normalization: none
+        equality: {kind: exact}
+      - name: business_date
+        type: {kind: date}
+        nullable: false
+        normalization: none
+        equality: {kind: exact}
+      - name: precise_amount
+        type: {kind: decimal, precision: 38, scale: 7}
+        nullable: false
+        normalization: none
+        equality: {kind: exact}
+datasets:
+  clickhouse_reference_orders:
+    connection: reference_clickhouse
+    relation:
+      {catalog: null, schema: archive, name: orders_v042, relation_scope: physical_only}
+    logical_schema: order_v1
+    projection:
+      - {field: order_id, column: order_id}
+      - {field: business_date, column: business_date}
+      - {field: precise_amount, column: precise_amount}
+    grain: [order_id]
+  postgres_target_orders:
+    connection: target_pg
+    relation:
+      {catalog: null, schema: warehouse, name: orders, relation_scope: physical_only}
+    logical_schema: order_v1
+    projection:
+      - {field: order_id, column: order_id}
+      - {field: business_date, column: business_date}
+      - {field: precise_amount, column: precise_amount}
+    grain: [order_id]
+scopes:
+  daily_scope:
+    parameters:
+      business_date: {type: {kind: date}}
+    bindings:
+      clickhouse_reference_orders:
+        {column: business_date, operator: eq, parameter: business_date}
+      postgres_target_orders:
+        {column: business_date, operator: eq, parameter: business_date}
+    null_partition: reject
+checks:
+  daily_orders:
+    revision: 1
+    invariant: row_equivalence
+    reference: clickhouse_reference_orders
+    target: postgres_target_orders
+    comparison_schema: order_v1
+    key: [order_id]
+    scope_ref: daily_scope
+    consistency_policy: immutable_archive_cut
+    assurance_policy: fingerprint_allowed
+consistency:
+  immutable_archive_cut:
+    minimum_evidence: asserted
+    alignment_fields: [business_date, source_cut]
+    late_arrivals: next_batch
+    datasets:
+      clickhouse_reference_orders:
+        readiness:
+          kind: relation_manifest
+          relation:
+            {catalog: null, schema: archive_control, name: immutable_version_readiness}
+          columns:
+            dataset_id: dataset_id
+            scope_digest: scope_digest
+            batch_id: batch_id
+            state: state
+            business_date: business_date
+            source_cut: source_cut
+            dataset_version: dataset_version
+            completed_at: completed_at
+        stable_read: {kind: immutable_named_version}
+      postgres_target_orders:
+        readiness:
+          kind: relation_manifest
+          relation:
+            {catalog: null, schema: warehouse_control, name: batch_manifest}
+          columns:
+            dataset_id: dataset_id
+            scope_digest: scope_digest
+            batch_id: batch_id
+            state: state
+            business_date: business_date
+            source_cut: source_cut
+            dataset_version: dataset_version
+            completed_at: completed_at
+        stable_read: {kind: transaction_snapshot}
+execution:
+  version: 1
+  max_queries: 200
+  max_fetched_records: 120000
+  max_application_result_bytes: 33554432
+  max_evidence_rows: 100
+  max_evidence_bytes: 1048576
+  max_fingerprint_nodes: 1000
+  max_coordinator_memory_bytes: 67108864
+  max_depth: 8
+  max_full_scans_per_side: 5
+  statement_timeout_milliseconds: 29000
+  run_timeout_milliseconds: 300000
+  max_attempts: 1
+  max_checks_concurrency: 1
+  max_source_concurrency: 1
+metadata:
+  connection: metadata_pg
+evidence:
+  sql_capture: disabled
+  ddl_capture: enabled
+  fields:
+    order_id: store
+    business_date: omit
+    precise_amount: store
+  unspecified_fields: omit

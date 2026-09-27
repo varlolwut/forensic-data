@@ -152,11 +152,11 @@ jobs:
           docker compose --file tests/fixtures/postgres/compose.yaml logs --no-color --timestamps
       - name: Stop PostgreSQL fixture
         if: always()
-        run: docker compose --file tests/fixtures/postgres/compose.yaml down --volumes
+        run: docker compose --file tests/fixtures/postgres/compose.yaml down
       - name: Stop paired fixture
         if: always()
         run: |
-          docker compose --file tests/fixtures/greenplum/compose.yaml down --volumes --remove-orphans
+          docker compose --file tests/fixtures/greenplum/compose.yaml down --remove-orphans
           rm -f -- \
             "${RUNNER_TEMP}/dfe-greengage-reader-password" \
             "${RUNNER_TEMP}/dfe-greengage-writer-password" \

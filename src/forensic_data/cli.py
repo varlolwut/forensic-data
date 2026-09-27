@@ -19,6 +19,7 @@ from pydantic import BaseModel, SecretStr, ValidationError
 
 from forensic_data.application import (
     ApplicationError,
+    ClickHousePostgresExecutionServices,
     DiffRequest,
     ExecuteCheckRequest,
     HistoryRequest,
@@ -52,9 +53,19 @@ from forensic_data.clickhouse import (
     ClickHouseTransportError,
     ClickHouseTransportSecurity,
 )
+from forensic_data.clickhouse_legacy import (
+    ClickHouseLegacyManifestError,
+    ClickHouseLegacySourceManifest,
+    parse_clickhouse_legacy_source_manifest,
+)
 from forensic_data.clickhouse_limits import build_clickhouse_execution_limits
+from forensic_data.clickhouse_profile import (
+    ClickHouseRuntimeProfile,
+    match_clickhouse_runtime_profile,
+)
 from forensic_data.clickhouse_readiness import (
     ClickHouseImmutableManifestError,
+    ClickHouseImmutableVersionManifest,
     parse_clickhouse_immutable_version_manifest,
 )
 from forensic_data.contracts.compiler import load_contract_config
@@ -168,6 +179,8 @@ _TRUSTED_ARGUMENT_NAMES: Final[frozenset[str]] = frozenset(
         "--lock-timeout-milliseconds",
         "--limit",
         "--reference-batch",
+        "--reference-manifest",
+        "--reference-manifest-issuer",
         "--request-id",
         "--run-id",
         "--secret-ref",
@@ -217,6 +230,8 @@ class _Arguments(argparse.Namespace):
     scope_json: str
     output: str
     reference_batch: str
+    reference_manifest: Path | None
+    reference_manifest_issuer: str | None
     target_batch: str
     target_manifest: Path | None
     target_manifest_issuer: str | None
@@ -260,7 +275,7 @@ def run_cli(
         return _write_error(stderr, output_json, "greenplum_error", str(error))
     except ClickHouseTransportError as error:
         return _write_error(stderr, output_json, "clickhouse_error", str(error))
-    except ClickHouseImmutableManifestError as error:
+    except (ClickHouseImmutableManifestError, ClickHouseLegacyManifestError) as error:
         return _write_error(stderr, output_json, "invalid_clickhouse_manifest", str(error))
     except ValidationError:
         return _write_error(
@@ -296,6 +311,15 @@ def _build_parser() -> _SafeArgumentParser:
     _add_check_scope_arguments(check_parser)
     check_parser.add_argument(
         "--reference-batch", required=True, help="expected reference batch ID"
+    )
+    check_parser.add_argument(
+        "--reference-manifest",
+        type=Path,
+        help="absolute immutable-version manifest path for a ClickHouse 21.8 reference source",
+    )
+    check_parser.add_argument(
+        "--reference-manifest-issuer",
+        help="trusted issuer expected in the ClickHouse 21.8 reference source manifest",
     )
     check_parser.add_argument("--target-batch", required=True, help="expected target batch ID")
     check_parser.add_argument(
@@ -442,6 +466,8 @@ def _run_check(
         check.reference.connection,
         check.target.connection,
         environment,
+        arguments.reference_manifest,
+        arguments.reference_manifest_issuer,
         arguments.target_manifest,
         arguments.target_manifest_issuer,
     )
@@ -739,6 +765,8 @@ def _execution_services(
     reference: ConnectionDefinition,
     target: ConnectionDefinition,
     environment: Mapping[str, str],
+    reference_manifest_path: Path | None,
+    reference_manifest_issuer: str | None,
     target_manifest_path: Path | None,
     target_manifest_issuer: str | None,
 ) -> (
@@ -748,6 +776,7 @@ def _execution_services(
     | MssqlGreengageExecutionServices
     | OriginalGreenplumPostgresExecutionServices
     | OriginalGreenplumGreengageExecutionServices
+    | ClickHousePostgresExecutionServices
     | PostgresClickHouseExecutionServices
     | MssqlClickHouseExecutionServices
     | OriginalGreenplumClickHouseExecutionServices
@@ -759,7 +788,12 @@ def _execution_services(
         )
     if target.adapter not in (Adapter.POSTGRESQL, Adapter.GREENGAGE, Adapter.CLICKHOUSE):
         raise CliInputError(f"target connection adapter {target.adapter.value!r} is unsupported")
-    if reference.adapter not in (Adapter.POSTGRESQL, Adapter.MSSQL, Adapter.GREENPLUM):
+    if reference.adapter not in (
+        Adapter.POSTGRESQL,
+        Adapter.MSSQL,
+        Adapter.GREENPLUM,
+        Adapter.CLICKHOUSE,
+    ):
         raise CliInputError(
             f"reference connection adapter {reference.adapter.value!r} is unsupported"
         )
@@ -777,24 +811,80 @@ def _execution_services(
         _MAX_PROTECTED_LOCK_TIMEOUT_MILLISECONDS,
         statement_timeout - 1,
     )
+    if reference.adapter is Adapter.CLICKHOUSE:
+        if target.adapter is not Adapter.POSTGRESQL:
+            raise CliInputError("ClickHouse reference execution requires a PostgreSQL target")
+        if reference_manifest_path is None or reference_manifest_issuer is None:
+            raise CliInputError(
+                "ClickHouse reference execution requires --reference-manifest and "
+                "--reference-manifest-issuer"
+            )
+        if target_manifest_path is not None or target_manifest_issuer is not None:
+            raise CliInputError(
+                "--target-manifest and --target-manifest-issuer are supported only for a "
+                "ClickHouse target"
+            )
+        reference_runtime_profile = match_clickhouse_runtime_profile(
+            reference.driver,
+            reference.profile,
+        )
+        if reference_runtime_profile is ClickHouseRuntimeProfile.LEGACY_21_8_LTS_SOURCE:
+            reference_manifest, manifest_issuer = _validated_clickhouse_legacy_source_manifest(
+                reference_manifest_path,
+                reference_manifest_issuer,
+            )
+        else:
+            raise CliInputError(
+                "ClickHouse reference has an unsupported driver/profile pair: "
+                f"driver={reference.driver!r}, profile={reference.profile!r}"
+            )
+        reference_execution_limits = build_clickhouse_execution_limits(config.execution)
+        return ClickHousePostgresExecutionServices(
+            reference_connection_id=reference.connection_id,
+            reference_settings=_clickhouse_connection_settings(
+                reference,
+                environment,
+                "dfe-cli-check-reference",
+            ),
+            target_connection_id=target.connection_id,
+            target_settings=_connection_settings(
+                target,
+                environment,
+                statement_timeout,
+                "dfe-cli-check-target",
+            ),
+            metadata_connection_id=config.metadata.connection.connection_id,
+            metadata_settings=metadata_settings,
+            reference_retry_policy=_clickhouse_retry_policy(),
+            target_retry_policy=_retry_policy(),
+            metadata_retry_policy=_retry_policy(),
+            reference_transport_limits=reference_execution_limits.transport,
+            reference_readiness_limits=reference_execution_limits.readiness,
+            reference_canonical_limits=reference_execution_limits.canonical,
+            reference_manifest=reference_manifest,
+            reference_expected_issuer=manifest_issuer,
+            reference_max_mutation_records=config.execution.max_fetched_records,
+            reference_max_tie_groups=config.execution.max_fetched_records,
+            reference_max_part_records=config.execution.max_fetched_records,
+            protected_lock_timeout_milliseconds=protected_lock_timeout_milliseconds,
+            metadata_record_bytes=metadata_record_bytes,
+            metadata_total_bytes=config.execution.max_coordinator_memory_bytes,
+        )
     if target.adapter is Adapter.CLICKHOUSE:
+        if reference_manifest_path is not None or reference_manifest_issuer is not None:
+            raise CliInputError(
+                "--reference-manifest and --reference-manifest-issuer are supported only for a "
+                "ClickHouse reference"
+            )
         if target_manifest_path is None or target_manifest_issuer is None:
             raise CliInputError(
                 "ClickHouse target execution requires --target-manifest and "
                 "--target-manifest-issuer"
             )
-        manifest_issuer = _nonblank_argument_text(
+        target_manifest, manifest_issuer = _validated_clickhouse_target_manifest(
+            target_manifest_path,
             target_manifest_issuer,
-            "ClickHouse target manifest issuer",
         )
-        target_manifest = parse_clickhouse_immutable_version_manifest(
-            _read_clickhouse_manifest(target_manifest_path),
-            _MAX_CLICKHOUSE_MANIFEST_BYTES,
-        )
-        if target_manifest.issuer != manifest_issuer:
-            raise CliInputError(
-                "ClickHouse target manifest issuer does not match the independently trusted issuer"
-            )
         target_settings = _clickhouse_connection_settings(
             target,
             environment,
@@ -882,6 +972,11 @@ def _execution_services(
             protected_lock_timeout_milliseconds=protected_lock_timeout_milliseconds,
             metadata_record_bytes=metadata_record_bytes,
             metadata_total_bytes=config.execution.max_coordinator_memory_bytes,
+        )
+    if reference_manifest_path is not None or reference_manifest_issuer is not None:
+        raise CliInputError(
+            "--reference-manifest and --reference-manifest-issuer are supported only for a "
+            "ClickHouse reference"
         )
     if target_manifest_path is not None or target_manifest_issuer is not None:
         raise CliInputError(
@@ -1271,10 +1366,46 @@ def _read_secret_file(path: Path, connection_id: str) -> str:
     return dsn
 
 
-def _read_clickhouse_manifest(path: Path) -> bytes:
+def _validated_clickhouse_legacy_source_manifest(
+    path: Path,
+    issuer: str,
+) -> tuple[ClickHouseLegacySourceManifest, str]:
+    trusted_issuer = _nonblank_argument_text(
+        issuer,
+        "ClickHouse legacy source manifest issuer",
+    )
+    manifest = parse_clickhouse_legacy_source_manifest(
+        _read_clickhouse_manifest(path, "ClickHouse legacy source manifest"),
+        _MAX_CLICKHOUSE_MANIFEST_BYTES,
+    )
+    if manifest.issuer != trusted_issuer:
+        raise CliInputError(
+            "ClickHouse legacy source manifest issuer does not match the independently "
+            "trusted issuer"
+        )
+    return manifest, trusted_issuer
+
+
+def _validated_clickhouse_target_manifest(
+    path: Path,
+    issuer: str,
+) -> tuple[ClickHouseImmutableVersionManifest, str]:
+    trusted_issuer = _nonblank_argument_text(issuer, "ClickHouse target manifest issuer")
+    manifest = parse_clickhouse_immutable_version_manifest(
+        _read_clickhouse_manifest(path, "ClickHouse target manifest"),
+        _MAX_CLICKHOUSE_MANIFEST_BYTES,
+    )
+    if manifest.issuer != trusted_issuer:
+        raise CliInputError(
+            "ClickHouse target manifest issuer does not match the independently trusted issuer"
+        )
+    return manifest, trusted_issuer
+
+
+def _read_clickhouse_manifest(path: Path, context: str) -> bytes:
     if not path.is_absolute():
-        raise CliInputError("ClickHouse target manifest path must be absolute")
-    unavailable_message = "ClickHouse target manifest must be a readable regular file"
+        raise CliInputError(f"{context} path must be absolute")
+    unavailable_message = f"{context} must be a readable regular file"
     try:
         path_mode = path.stat().st_mode
     except (OSError, ValueError):
@@ -1289,11 +1420,9 @@ def _read_clickhouse_manifest(path: Path) -> bytes:
     except OSError:
         raise CliInputError(unavailable_message) from None
     if len(payload) > _MAX_CLICKHOUSE_MANIFEST_BYTES:
-        raise CliInputError(
-            f"ClickHouse target manifest exceeds the {_MAX_CLICKHOUSE_MANIFEST_BYTES}-byte limit"
-        )
+        raise CliInputError(f"{context} exceeds the {_MAX_CLICKHOUSE_MANIFEST_BYTES}-byte limit")
     if not payload:
-        raise CliInputError("ClickHouse target manifest must not be empty")
+        raise CliInputError(f"{context} must not be empty")
     return payload
 
 

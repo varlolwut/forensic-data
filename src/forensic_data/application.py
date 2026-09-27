@@ -53,6 +53,12 @@ from forensic_data.clickhouse_endpoint import (
     ClickHouseProtectedReadinessInspection,
     ClickHouseProtectedRelationInspection,
     open_clickhouse_protected_read_context,
+    open_legacy_clickhouse_source_protected_read_context,
+)
+from forensic_data.clickhouse_legacy import (
+    ClickHouseLegacySourceManifest,
+    ClickHouseLegacySourceRequest,
+    validate_clickhouse_legacy_limit_closure,
 )
 from forensic_data.clickhouse_profile import (
     ClickHouseRuntimeProfile,
@@ -259,6 +265,7 @@ from forensic_data.result import (
 __all__: Final[tuple[str, ...]] = (
     "ApplicationError",
     "ApplicationStateError",
+    "ClickHousePostgresExecutionServices",
     "DiffRequest",
     "ExecuteCheckRequest",
     "HistoryRequest",
@@ -683,6 +690,8 @@ class PostgresClickHouseExecutionServices:
     metadata_total_bytes: int
 
     def __post_init__(self) -> None:
+        if type(self.target_manifest) is not ClickHouseImmutableVersionManifest:
+            raise TypeError("ClickHouse target manifest must be an immutable-version manifest")
         _validate_clickhouse_service_common(
             self.reference_connection_id,
             self.target_connection_id,
@@ -735,6 +744,8 @@ class MssqlClickHouseExecutionServices:
     metadata_total_bytes: int
 
     def __post_init__(self) -> None:
+        if type(self.target_manifest) is not ClickHouseImmutableVersionManifest:
+            raise TypeError("ClickHouse target manifest must be an immutable-version manifest")
         _validate_clickhouse_service_common(
             self.reference_connection_id,
             self.target_connection_id,
@@ -787,6 +798,8 @@ class OriginalGreenplumClickHouseExecutionServices:
     metadata_total_bytes: int
 
     def __post_init__(self) -> None:
+        if type(self.target_manifest) is not ClickHouseImmutableVersionManifest:
+            raise TypeError("ClickHouse target manifest must be an immutable-version manifest")
         _validate_clickhouse_service_common(
             self.reference_connection_id,
             self.target_connection_id,
@@ -815,21 +828,84 @@ class OriginalGreenplumClickHouseExecutionServices:
         )
 
 
+@final
+@dataclass(frozen=True, slots=True)
+class ClickHousePostgresExecutionServices:
+    reference_connection_id: str
+    reference_settings: ClickHouseConnectionSettings
+    target_connection_id: str
+    target_settings: PostgresConnectionSettings
+    metadata_connection_id: str
+    metadata_settings: PostgresConnectionSettings
+    reference_retry_policy: ClickHouseRetryPolicy
+    target_retry_policy: PostgresRetryPolicy
+    metadata_retry_policy: PostgresRetryPolicy
+    protected_lock_timeout_milliseconds: int
+    reference_transport_limits: ClickHouseTransportLimits
+    reference_readiness_limits: ClickHouseReadinessLimits
+    reference_canonical_limits: ClickHouseCanonicalLimits
+    reference_manifest: ClickHouseLegacySourceManifest
+    reference_expected_issuer: str
+    reference_max_mutation_records: int
+    reference_max_tie_groups: int
+    reference_max_part_records: int
+    metadata_record_bytes: int
+    metadata_total_bytes: int
+
+    def __post_init__(self) -> None:
+        if type(self.reference_manifest) is not ClickHouseLegacySourceManifest:
+            raise TypeError("ClickHouse reference manifest must be a legacy source manifest")
+        _validate_clickhouse_service_common(
+            self.reference_connection_id,
+            self.target_connection_id,
+            self.metadata_connection_id,
+            self.reference_settings,
+            self.metadata_settings,
+            self.reference_retry_policy,
+            self.metadata_retry_policy,
+            self.reference_transport_limits,
+            self.reference_readiness_limits,
+            self.reference_canonical_limits,
+            self.reference_manifest,
+            self.reference_expected_issuer,
+            self.reference_max_mutation_records,
+            self.reference_max_tie_groups,
+            self.metadata_record_bytes,
+            self.metadata_total_bytes,
+        )
+        if not isinstance(cast(object, self.target_settings), PostgresConnectionSettings):
+            raise TypeError("target connection settings must be PostgresConnectionSettings")
+        if not isinstance(cast(object, self.target_retry_policy), PostgresRetryPolicy):
+            raise TypeError("target retry policy must be PostgresRetryPolicy")
+        _require_positive_integer(
+            self.protected_lock_timeout_milliseconds,
+            "protected lock timeout milliseconds",
+        )
+        _require_positive_integer(
+            self.reference_max_part_records,
+            "reference ClickHouse active-part record limit",
+        )
+        validate_clickhouse_legacy_limit_closure(
+            self.reference_readiness_limits,
+            self.reference_canonical_limits,
+        )
+
+
 def _validate_clickhouse_service_common(
     reference_connection_id: str,
     target_connection_id: str,
     metadata_connection_id: str,
-    target_settings: ClickHouseConnectionSettings,
+    clickhouse_settings: ClickHouseConnectionSettings,
     metadata_settings: PostgresConnectionSettings,
-    target_retry_policy: ClickHouseRetryPolicy,
+    clickhouse_retry_policy: ClickHouseRetryPolicy,
     metadata_retry_policy: PostgresRetryPolicy,
-    target_transport_limits: ClickHouseTransportLimits,
-    target_readiness_limits: ClickHouseReadinessLimits,
-    target_canonical_limits: ClickHouseCanonicalLimits,
-    target_manifest: ClickHouseImmutableVersionManifest,
-    target_expected_issuer: str,
-    target_max_mutation_records: int,
-    target_max_tie_groups: int,
+    clickhouse_transport_limits: ClickHouseTransportLimits,
+    clickhouse_readiness_limits: ClickHouseReadinessLimits,
+    clickhouse_canonical_limits: ClickHouseCanonicalLimits,
+    clickhouse_manifest: ClickHouseImmutableVersionManifest | ClickHouseLegacySourceManifest,
+    clickhouse_expected_issuer: str,
+    clickhouse_max_mutation_records: int,
+    clickhouse_max_tie_groups: int,
     metadata_record_bytes: int,
     metadata_total_bytes: int,
 ) -> None:
@@ -837,46 +913,53 @@ def _validate_clickhouse_service_common(
         (reference_connection_id, "reference connection id"),
         (target_connection_id, "target connection id"),
         (metadata_connection_id, "metadata connection id"),
-        (target_expected_issuer, "target expected manifest issuer"),
+        (clickhouse_expected_issuer, "ClickHouse expected manifest issuer"),
     ):
         _require_nonblank(value, context)
-    if not isinstance(cast(object, target_settings), ClickHouseConnectionSettings):
-        raise TypeError("target connection settings must be ClickHouseConnectionSettings")
+    if not isinstance(cast(object, clickhouse_settings), ClickHouseConnectionSettings):
+        raise TypeError("ClickHouse connection settings must be ClickHouseConnectionSettings")
     if not isinstance(cast(object, metadata_settings), PostgresConnectionSettings):
         raise TypeError("metadata connection settings must be PostgresConnectionSettings")
-    if type(target_retry_policy) is not ClickHouseRetryPolicy:
-        raise TypeError("target retry policy must be ClickHouseRetryPolicy")
+    if type(clickhouse_retry_policy) is not ClickHouseRetryPolicy:
+        raise TypeError("ClickHouse retry policy must be ClickHouseRetryPolicy")
     if not isinstance(cast(object, metadata_retry_policy), PostgresRetryPolicy):
         raise TypeError("metadata retry policy must be PostgresRetryPolicy")
-    if type(target_transport_limits) is not ClickHouseTransportLimits:
-        raise TypeError("target transport limits must be ClickHouseTransportLimits")
-    if type(target_readiness_limits) is not ClickHouseReadinessLimits:
-        raise TypeError("target readiness limits must be ClickHouseReadinessLimits")
-    if type(target_canonical_limits) is not ClickHouseCanonicalLimits:
-        raise TypeError("target canonical limits must be ClickHouseCanonicalLimits")
+    if type(clickhouse_transport_limits) is not ClickHouseTransportLimits:
+        raise TypeError("ClickHouse transport limits must be ClickHouseTransportLimits")
+    if type(clickhouse_readiness_limits) is not ClickHouseReadinessLimits:
+        raise TypeError("ClickHouse readiness limits must be ClickHouseReadinessLimits")
+    if type(clickhouse_canonical_limits) is not ClickHouseCanonicalLimits:
+        raise TypeError("ClickHouse canonical limits must be ClickHouseCanonicalLimits")
     for name, response_bytes in (
-        ("target_readiness_limits.max_response_bytes", target_readiness_limits.max_response_bytes),
-        ("target_canonical_limits.max_response_bytes", target_canonical_limits.max_response_bytes),
+        (
+            "clickhouse_readiness_limits.max_response_bytes",
+            clickhouse_readiness_limits.max_response_bytes,
+        ),
+        (
+            "clickhouse_canonical_limits.max_response_bytes",
+            clickhouse_canonical_limits.max_response_bytes,
+        ),
     ):
         required_ipc_bytes = required_clickhouse_ipc_message_bytes(response_bytes)
-        if required_ipc_bytes > target_transport_limits.max_ipc_message_bytes:
+        if required_ipc_bytes > clickhouse_transport_limits.max_ipc_message_bytes:
             raise ValueError(
                 "ClickHouse execution response limit exceeds the transport IPC capacity: "
                 f"limit={name!r}, max_response_bytes={response_bytes}, "
                 f"required_ipc_message_bytes={required_ipc_bytes}, "
-                f"max_ipc_message_bytes={target_transport_limits.max_ipc_message_bytes}"
+                f"max_ipc_message_bytes={clickhouse_transport_limits.max_ipc_message_bytes}"
             )
-    if type(target_manifest) is not ClickHouseImmutableVersionManifest:
-        raise TypeError("target manifest must be ClickHouseImmutableVersionManifest")
-    if target_manifest.issuer != target_expected_issuer:
-        raise ValueError(
-            "target manifest issuer differs from the explicitly trusted ClickHouse issuer"
-        )
+    if type(clickhouse_manifest) not in (
+        ClickHouseImmutableVersionManifest,
+        ClickHouseLegacySourceManifest,
+    ):
+        raise TypeError("ClickHouse manifest has an unsupported typed representation")
+    if clickhouse_manifest.issuer != clickhouse_expected_issuer:
+        raise ValueError("ClickHouse manifest issuer differs from the explicitly trusted issuer")
     _require_positive_integer(
-        target_max_mutation_records,
-        "target ClickHouse mutation record limit",
+        clickhouse_max_mutation_records,
+        "ClickHouse mutation record limit",
     )
-    _require_positive_integer(target_max_tie_groups, "target ClickHouse tie group limit")
+    _require_positive_integer(clickhouse_max_tie_groups, "ClickHouse tie group limit")
     _require_positive_integer(metadata_record_bytes, "metadata record bytes")
     _require_positive_integer(metadata_total_bytes, "metadata total bytes")
     if metadata_record_bytes > metadata_total_bytes:
@@ -893,6 +976,7 @@ type ExecutionServices = (
     | PostgresClickHouseExecutionServices
     | MssqlClickHouseExecutionServices
     | OriginalGreenplumClickHouseExecutionServices
+    | ClickHousePostgresExecutionServices
 )
 type ProtectedReadContext = (
     PostgresProtectedReadContext
@@ -1143,6 +1227,7 @@ def _execute_attempt(
     persisted_cut: PersistedInputCut | None = None
     failure: _AttemptFailure | None = None
     greenplum_endpoint_direction: PlanDirection | None = PlanDirection.REFERENCE
+    clickhouse_endpoint_direction = _declared_clickhouse_direction(check)
     try:
         reference_opened = _open_side(
             check,
@@ -1270,6 +1355,7 @@ def _execute_attempt(
             error,
             resources,
             persisted_cut,
+            clickhouse_endpoint_direction,
         )
     except ComparisonKeyMappingError as error:
         contract_reason = error.contract_violation_reason
@@ -1373,6 +1459,7 @@ def _execute_attempt(
             persisted_cut is not None,
             source_budget,
             greenplum_endpoint_direction,
+            clickhouse_endpoint_direction,
         )
     finally:
         cleanup_failure = _close_attempt_resources(attempt, tuple(resources), services)
@@ -1838,11 +1925,22 @@ def _open_clickhouse_side(
     source_budget: PostgresSourceBudgetAttempt,
     services: ExecutionServices,
 ) -> _ProtectedSide | EarlyExecutionOutcome:
-    if direction is not PlanDirection.TARGET:
-        raise UnsupportedClickHouseProfileError(
-            "ClickHouse endpoint execution is implemented only for the target direction"
-        )
-    if not isinstance(
+    if direction is PlanDirection.REFERENCE:
+        if not isinstance(services, ClickHousePostgresExecutionServices):
+            raise TypeError(
+                "ClickHouse reference execution requires ClickHouse to PostgreSQL services"
+            )
+        clickhouse_settings = services.reference_settings
+        clickhouse_retry_policy = services.reference_retry_policy
+        clickhouse_transport_limits = services.reference_transport_limits
+        clickhouse_readiness_limits = services.reference_readiness_limits
+        clickhouse_canonical_limits = services.reference_canonical_limits
+        clickhouse_manifest = services.reference_manifest
+        clickhouse_expected_issuer = services.reference_expected_issuer
+        clickhouse_max_mutation_records = services.reference_max_mutation_records
+        clickhouse_max_tie_groups = services.reference_max_tie_groups
+        clickhouse_max_part_records: int | None = services.reference_max_part_records
+    elif direction is PlanDirection.TARGET and isinstance(
         services,
         (
             PostgresClickHouseExecutionServices,
@@ -1850,23 +1948,42 @@ def _open_clickhouse_side(
             OriginalGreenplumClickHouseExecutionServices,
         ),
     ):
-        raise TypeError("ClickHouse target execution requires ClickHouse execution services")
+        clickhouse_settings = services.target_settings
+        clickhouse_retry_policy = services.target_retry_policy
+        clickhouse_transport_limits = services.target_transport_limits
+        clickhouse_readiness_limits = services.target_readiness_limits
+        clickhouse_canonical_limits = services.target_canonical_limits
+        clickhouse_manifest = services.target_manifest
+        clickhouse_expected_issuer = services.target_expected_issuer
+        clickhouse_max_mutation_records = services.target_max_mutation_records
+        clickhouse_max_tie_groups = services.target_max_tie_groups
+        clickhouse_max_part_records = None
+    else:
+        raise TypeError(
+            f"ClickHouse {direction.value} execution requires matching ClickHouse services"
+        )
     locator = dataset.locator
     if not isinstance(locator, RelationLocator):
-        raise UnsupportedComparisonError("ClickHouse target execution requires a physical relation")
+        raise UnsupportedComparisonError(
+            f"ClickHouse {direction.value} execution requires a physical relation"
+        )
     if locator.relation_scope is not RelationScope.PHYSICAL_ONLY:
         raise UnsupportedComparisonError(
-            "ClickHouse target execution requires physical_only relation scope"
+            f"ClickHouse {direction.value} execution requires physical_only relation scope"
         )
-    if (
-        match_clickhouse_runtime_profile(
-            dataset.connection.driver,
-            dataset.connection.profile,
-        )
-        is not ClickHouseRuntimeProfile.LTS
-    ):
+    runtime_profile = match_clickhouse_runtime_profile(
+        dataset.connection.driver,
+        dataset.connection.profile,
+    )
+    expected_runtime_profile = (
+        ClickHouseRuntimeProfile.LEGACY_21_8_LTS_SOURCE
+        if direction is PlanDirection.REFERENCE
+        else ClickHouseRuntimeProfile.LTS
+    )
+    if runtime_profile is not expected_runtime_profile:
         raise UnsupportedClickHouseProfileError(
-            "ClickHouse target requires driver='clickhouse-connect' and profile='clickhouse_lts'"
+            f"ClickHouse {direction.value} has an unsupported driver/profile pair: "
+            f"driver={dataset.connection.driver!r}, profile={dataset.connection.profile!r}"
         )
     consistency = check.consistency
     if consistency.minimum_evidence is not MinimumEvidence.ASSERTED:
@@ -1874,41 +1991,74 @@ def _open_clickhouse_side(
             "ClickHouse immutable named-version execution requires explicit "
             "minimum_evidence='asserted'"
         )
-    _, target_consistency = _side_definitions(check, direction)
-    if target_consistency.stable_read is not StableReadKind.IMMUTABLE_NAMED_VERSION:
+    _, clickhouse_consistency = _side_definitions(check, direction)
+    if clickhouse_consistency.stable_read is not StableReadKind.IMMUTABLE_NAMED_VERSION:
         raise UnsupportedClickHouseProfileError(
-            "ClickHouse target requires stable_read='immutable_named_version'"
+            f"ClickHouse {direction.value} requires stable_read='immutable_named_version'"
         )
-    request = ClickHouseProjectionRequest(
-        version_request=ClickHouseImmutableVersionRequest(
-            direction=direction,
-            endpoint_profile="direct_single_server",
-            readiness_database=readiness.relation.schema,
-            readiness_table=readiness.relation.name,
-            expected_issuer=services.target_expected_issuer,
-            dataset_id=dataset.dataset_id,
-            scope_digest=scope.scope_digest,
-            expected_batch_id=expected_batch_id,
-            alignment_fields=consistency.alignment_fields,
-            minimum_evidence=consistency.minimum_evidence,
-            late_arrivals=consistency.late_arrivals,
-            limits=services.target_readiness_limits,
-        ),
-        schema=dataset.logical_schema.schema,
-        column_names=tuple(field.column_name for field in dataset.projection),
-        canonical_limits=services.target_canonical_limits,
-        max_mutation_records=services.target_max_mutation_records,
-        max_tie_groups=services.target_max_tie_groups,
+    version_request = ClickHouseImmutableVersionRequest(
+        direction=direction,
+        endpoint_profile="direct_single_server",
+        readiness_database=readiness.relation.schema,
+        readiness_table=readiness.relation.name,
+        expected_issuer=clickhouse_expected_issuer,
+        dataset_id=dataset.dataset_id,
+        scope_digest=scope.scope_digest,
+        expected_batch_id=expected_batch_id,
+        alignment_fields=consistency.alignment_fields,
+        minimum_evidence=consistency.minimum_evidence,
+        late_arrivals=consistency.late_arrivals,
+        limits=clickhouse_readiness_limits,
     )
-    opened = open_clickhouse_protected_read_context(
-        services.target_settings,
-        services.target_retry_policy,
-        services.target_transport_limits,
-        source_budget,
-        PostgresSourceDirection.TARGET,
-        request,
-        services.target_manifest,
-    )
+    column_names = tuple(field.column_name for field in dataset.projection)
+    if runtime_profile is ClickHouseRuntimeProfile.LTS:
+        if type(clickhouse_manifest) is not ClickHouseImmutableVersionManifest:
+            raise TypeError("ClickHouse LTS execution requires an immutable-version manifest")
+        request = ClickHouseProjectionRequest(
+            version_request=version_request,
+            schema=dataset.logical_schema.schema,
+            column_names=column_names,
+            canonical_limits=clickhouse_canonical_limits,
+            max_mutation_records=clickhouse_max_mutation_records,
+            max_tie_groups=clickhouse_max_tie_groups,
+        )
+        opened = open_clickhouse_protected_read_context(
+            clickhouse_settings,
+            clickhouse_retry_policy,
+            clickhouse_transport_limits,
+            source_budget,
+            PostgresSourceDirection(direction.value),
+            request,
+            clickhouse_manifest,
+        )
+    elif runtime_profile is ClickHouseRuntimeProfile.LEGACY_21_8_LTS_SOURCE:
+        if direction is not PlanDirection.REFERENCE:
+            raise UnsupportedClickHouseProfileError(
+                "ClickHouse 21.8 LTS is admitted only as a reference source"
+            )
+        if type(clickhouse_manifest) is not ClickHouseLegacySourceManifest:
+            raise TypeError("ClickHouse 21.8 LTS execution requires a legacy source manifest")
+        if clickhouse_max_part_records is None:
+            raise AssertionError("ClickHouse legacy source part record limit is missing")
+        source_request = ClickHouseLegacySourceRequest(
+            version_request=version_request,
+            schema=dataset.logical_schema.schema,
+            column_names=column_names,
+            canonical_limits=clickhouse_canonical_limits,
+            max_mutation_records=clickhouse_max_mutation_records,
+            max_part_records=clickhouse_max_part_records,
+        )
+        opened = open_legacy_clickhouse_source_protected_read_context(
+            clickhouse_settings,
+            clickhouse_retry_policy,
+            clickhouse_transport_limits,
+            source_budget,
+            PostgresSourceDirection.REFERENCE,
+            source_request,
+            clickhouse_manifest,
+        )
+    else:
+        raise AssertionError("admitted ClickHouse runtime profile was not dispatched")
     if isinstance(opened, EarlyExecutionOutcome):
         return opened
     dataset_relation = _protected_clickhouse_relation(
@@ -2116,7 +2266,10 @@ def _close_attempt_resources(
             protected_context.close()
         except ClickHouseProtectedContextConfirmationError as error:
             close_failed = True
-            resource_reason = _clickhouse_confirmation_loss_reason(error)
+            resource_reason = _clickhouse_confirmation_loss_reason(
+                error,
+                resource.protected.direction,
+            )
             resource_additional_reasons = (error.outcome.reason,)
         except (
             ClickHouseProtectedContextCleanupError,
@@ -2126,7 +2279,10 @@ def _close_attempt_resources(
             resource_reason = _clickhouse_cleanup_uncertainty_reason(error)
         except ClickHouseCancellationUnconfirmedError as error:
             close_failed = True
-            resource_reason = _clickhouse_unconfirmed_cancellation_reason(error)
+            resource_reason = _clickhouse_unconfirmed_cancellation_reason(
+                error,
+                resource.protected.direction,
+            )
         except (
             ClickHouseAttemptDeadlineExceededError,
             ClickHouseResultLimitError,
@@ -2136,7 +2292,7 @@ def _close_attempt_resources(
             close_failed = True
             resource_reason = _reason_from_source_error(
                 ReasonCode.BUDGET_EXHAUSTED,
-                "confirm_target",
+                _clickhouse_confirmation_operation(resource.protected.direction),
                 "ClickHouse final confirmation exhausted an immutable execution budget",
                 error,
             )
@@ -2144,7 +2300,7 @@ def _close_attempt_resources(
             close_failed = True
             resource_reason = _reason_from_source_error(
                 ReasonCode.UNSUPPORTED_CAPABILITY,
-                "confirm_target",
+                _clickhouse_confirmation_operation(resource.protected.direction),
                 "ClickHouse final confirmation no longer satisfies the required profile",
                 error,
             )
@@ -2157,7 +2313,7 @@ def _close_attempt_resources(
             close_failed = True
             resource_reason = _reason_from_source_error(
                 ReasonCode.PROTOCOL_VIOLATION,
-                "confirm_target",
+                _clickhouse_confirmation_operation(resource.protected.direction),
                 "ClickHouse final confirmation violated its typed evidence protocol",
                 error,
             )
@@ -2165,7 +2321,7 @@ def _close_attempt_resources(
             close_failed = True
             resource_reason = _reason_from_source_error(
                 ReasonCode.QUERY_ERROR,
-                "confirm_target",
+                _clickhouse_confirmation_operation(resource.protected.direction),
                 "ClickHouse final confirmation query failed",
                 error,
             )
@@ -2269,7 +2425,7 @@ def _cleanup_failure_dominates(
         return True
     if (
         candidate.reason.code is ReasonCode.SNAPSHOT_LOST
-        and candidate.reason.operation == "confirm_target"
+        and candidate.reason.operation in ("confirm_reference", "confirm_target")
         and current.reason.code is ReasonCode.SNAPSHOT_LOST
         and current.reason.operation == "close_read_context"
     ):
@@ -2291,17 +2447,24 @@ def _context_loss_reason() -> ResultReason:
 
 def _clickhouse_confirmation_loss_reason(
     error: ClickHouseProtectedContextConfirmationError,
+    direction: PlanDirection,
 ) -> ResultReason:
     return _reason(
         ReasonCode.SNAPSHOT_LOST,
-        "confirm_target",
-        "ClickHouse immutable target provenance could not be confirmed after comparison",
+        _clickhouse_confirmation_operation(direction),
+        f"ClickHouse {direction.value} provenance could not be confirmed after comparison",
         (
             SafeParameter(name="error_type", value=type(error).__name__),
             SafeParameter(name="confirmation_code", value=error.outcome.reason.code.value),
             SafeParameter(name="confirmation_operation", value=error.outcome.reason.operation),
         ),
     )
+
+
+def _clickhouse_confirmation_operation(direction: PlanDirection) -> str:
+    if type(direction) is not PlanDirection:
+        raise TypeError("ClickHouse confirmation direction must be PlanDirection")
+    return f"confirm_{direction.value}"
 
 
 def _clickhouse_cleanup_uncertainty_reason(error: Exception) -> ResultReason:
@@ -2916,6 +3079,7 @@ def _failure_from_attempt_error(
     cut_aligned: bool,
     source_budget: PostgresSourceBudgetAttempt,
     greenplum_endpoint_direction: PlanDirection | None,
+    clickhouse_endpoint_direction: PlanDirection | None,
 ) -> _AttemptFailure:
     if isinstance(error, UnsupportedComparisonError):
         return _failure_from_unsupported_comparison(
@@ -2990,7 +3154,10 @@ def _failure_from_attempt_error(
             source_budget,
         )
     if isinstance(error, ClickHouseCancellationUnconfirmedError):
-        reason = _clickhouse_unconfirmed_cancellation_reason(error)
+        reason = _clickhouse_unconfirmed_cancellation_reason(
+            error,
+            _require_clickhouse_endpoint_direction(clickhouse_endpoint_direction),
+        )
         return _failure_from_terminal_source_reason(
             reason,
             resources,
@@ -3086,9 +3253,10 @@ def _failure_from_attempt_error(
             source_budget,
         )
     if isinstance(error, UnsupportedClickHouseProfileError):
+        direction = _require_clickhouse_endpoint_direction(clickhouse_endpoint_direction)
         return _failure_from_unsupported_source_error(
-            "open_target",
-            "the ClickHouse target does not satisfy the immutable named-version profile",
+            f"open_{direction.value}",
+            f"the ClickHouse {direction.value} does not satisfy its protected-read profile",
             error,
             resources,
             cut_aligned,
@@ -3150,11 +3318,12 @@ def _failure_from_attempt_error(
         error,
         (ClickHouseProtectedContextCleanupError, ClickHouseTransportCleanupError),
     ):
+        direction = _require_clickhouse_endpoint_direction(clickhouse_endpoint_direction)
         return _failure_from_error(
             ExecutionStatus.INCOMPLETE,
             ReasonCode.CANCELLATION_UNCONFIRMED,
-            "cleanup_target",
-            "ClickHouse target transport cleanup could not be established",
+            f"cleanup_{direction.value}",
+            f"ClickHouse {direction.value} transport cleanup could not be established",
             error,
             False,
             resources,
@@ -3162,11 +3331,12 @@ def _failure_from_attempt_error(
             source_budget,
         )
     if isinstance(error, ClickHouseTransportError):
+        direction = _require_clickhouse_endpoint_direction(clickhouse_endpoint_direction)
         return _failure_from_error(
             ExecutionStatus.ERROR,
             ReasonCode.QUERY_ERROR,
-            "read_target",
-            "a ClickHouse target operation failed",
+            f"read_{direction.value}",
+            f"a ClickHouse {direction.value} operation failed",
             error,
             True,
             resources,
@@ -3197,6 +3367,32 @@ def _failure_from_unsupported_source_error(
     )
 
 
+def _declared_clickhouse_direction(check: RowCheckDefinition) -> PlanDirection | None:
+    directions = tuple(
+        direction
+        for direction, adapter in (
+            (PlanDirection.REFERENCE, check.reference.connection.adapter),
+            (PlanDirection.TARGET, check.target.connection.adapter),
+        )
+        if adapter is Adapter.CLICKHOUSE
+    )
+    if not directions:
+        return None
+    if len(directions) != 1:
+        raise UnsupportedComparisonError(
+            "a comparison must contain exactly one ClickHouse endpoint"
+        )
+    return directions[0]
+
+
+def _require_clickhouse_endpoint_direction(
+    direction: PlanDirection | None,
+) -> PlanDirection:
+    if direction is None:
+        raise AssertionError("ClickHouse error classification requires its endpoint direction")
+    return direction
+
+
 def _greenplum_unsupported_error_context(
     endpoint_direction: PlanDirection | None,
 ) -> tuple[str, str]:
@@ -3220,6 +3416,7 @@ def _failure_from_comparison_interruption(
     error: ComparisonInterruptedError,
     resources: list[_AttemptResource],
     persisted_cut: PersistedInputCut | None,
+    clickhouse_endpoint_direction: PlanDirection | None,
 ) -> _AttemptFailure:
     if persisted_cut is None:
         raise ApplicationStateError(
@@ -3284,7 +3481,10 @@ def _failure_from_comparison_interruption(
         retryable = False
     elif isinstance(cause, ClickHouseCancellationUnconfirmedError):
         execution_status = ExecutionStatus.INCOMPLETE
-        reason = _clickhouse_unconfirmed_cancellation_reason(cause)
+        reason = _clickhouse_unconfirmed_cancellation_reason(
+            cause,
+            _require_clickhouse_endpoint_direction(clickhouse_endpoint_direction),
+        )
         retryable = False
     elif isinstance(
         cause,
@@ -3348,10 +3548,11 @@ def _failure_from_comparison_interruption(
         retryable = False
     elif isinstance(cause, UnsupportedClickHouseProfileError):
         execution_status = ExecutionStatus.ERROR
+        direction = _require_clickhouse_endpoint_direction(clickhouse_endpoint_direction)
         reason = _reason(
             ReasonCode.UNSUPPORTED_CAPABILITY,
-            "open_target",
-            "the ClickHouse target does not satisfy the immutable named-version profile",
+            f"open_{direction.value}",
+            f"the ClickHouse {direction.value} does not satisfy its protected-read profile",
             (SafeParameter(name="error_type", value=type(cause).__name__),),
         )
         retryable = False
@@ -3409,10 +3610,11 @@ def _failure_from_comparison_interruption(
         retryable = False
     elif isinstance(cause, ClickHouseTransportError):
         execution_status = ExecutionStatus.ERROR
+        direction = _require_clickhouse_endpoint_direction(clickhouse_endpoint_direction)
         reason = _reason_from_source_error(
             ReasonCode.QUERY_ERROR,
-            "read_target",
-            "a ClickHouse target operation failed",
+            f"read_{direction.value}",
+            f"a ClickHouse {direction.value} operation failed",
             cause,
         )
         retryable = True
@@ -3690,15 +3892,21 @@ def _mssql_unconfirmed_cancellation_reason(
 
 def _clickhouse_unconfirmed_cancellation_reason(
     error: ClickHouseCancellationUnconfirmedError,
+    direction: PlanDirection,
 ) -> ResultReason:
+    if type(direction) is not PlanDirection:
+        raise TypeError("ClickHouse cancellation direction must be PlanDirection")
     return ResultReason(
         code=ReasonCode.CANCELLATION_UNCONFIRMED,
-        operation="cancel_target_query",
-        message="ClickHouse target-query completion could not be confirmed after cancellation",
+        operation=f"cancel_{direction.value}_query",
+        message=(
+            f"ClickHouse {direction.value}-query completion could not be confirmed after "
+            "cancellation"
+        ),
         safe_parameters=(
             SafeParameter(name="error_type", value=type(error).__name__),
             SafeParameter(name="attempt_id", value=str(error.attempt_id)),
-            SafeParameter(name="target_operation", value=error.operation),
+            SafeParameter(name="query_operation", value=error.operation),
             SafeParameter(name="trigger_cause", value=error.trigger_cause),
             SafeParameter(name="cancellation_cause", value=error.cancellation_cause),
             SafeParameter(
@@ -4312,6 +4520,7 @@ def _postgres_settings(
             PostgresExecutionServices,
             MssqlPostgresExecutionServices,
             OriginalGreenplumPostgresExecutionServices,
+            ClickHousePostgresExecutionServices,
         ),
     ):
         return services.target_settings
@@ -4335,7 +4544,11 @@ def _postgres_retry_policy(
         return services.source_retry_policy
     if direction is PlanDirection.TARGET and isinstance(
         services,
-        (MssqlPostgresExecutionServices, OriginalGreenplumPostgresExecutionServices),
+        (
+            MssqlPostgresExecutionServices,
+            OriginalGreenplumPostgresExecutionServices,
+            ClickHousePostgresExecutionServices,
+        ),
     ):
         return services.target_retry_policy
     if direction is PlanDirection.REFERENCE and isinstance(
@@ -4493,6 +4706,15 @@ def _validate_service_closure(
         if not isinstance(services, MssqlPostgresExecutionServices):
             raise TypeError("MSSQL to PostgreSQL execution requires matching services")
         return
+    if pair == (Adapter.CLICKHOUSE, Adapter.POSTGRESQL):
+        if not isinstance(services, ClickHousePostgresExecutionServices):
+            raise TypeError("ClickHouse to PostgreSQL execution requires matching services")
+        _validate_clickhouse_comparison_capacity(
+            config,
+            check,
+            services.reference_canonical_limits,
+        )
+        return
     if pair == (Adapter.MSSQL, Adapter.GREENGAGE):
         if not isinstance(services, MssqlGreengageExecutionServices):
             raise TypeError("MSSQL to Greengage execution requires matching services")
@@ -4539,23 +4761,30 @@ def _validate_clickhouse_comparison_capacity(
     check: RowCheckDefinition,
     limits: ClickHouseCanonicalLimits,
 ) -> None:
-    locator = check.reference.locator
-    if not isinstance(locator, RelationLocator):
-        return
-    if locator.relation_scope is not RelationScope.PHYSICAL_ONLY:
+    datasets = (check.reference, check.target)
+    if any(
+        not isinstance(dataset.locator, RelationLocator)
+        or dataset.locator.relation_scope is not RelationScope.PHYSICAL_ONLY
+        for dataset in datasets
+    ):
         # Union provenance depends on discovered members; the endpoint validates it after discovery.
         return
-    member_count = 1
-    if check.reference.connection.adapter is Adapter.MSSQL:
-        # SQL Server inspection requires one binding per canonical field, plus three relation IDs.
-        member_count = 3 + len(check.reference.logical_schema.schema.fields)
+    member_count = max(
+        (
+            3 + len(dataset.logical_schema.schema.fields)
+            if dataset.connection.adapter is Adapter.MSSQL
+            else 1
+        )
+        for dataset in datasets
+    )
     required_row_bytes = comparison_max_encoded_row_bytes(config.execution, member_count)
     if required_row_bytes > limits.max_encoded_envelope_bytes:
         raise ValueError(
             "ClickHouse canonical row limit cannot contain the configured comparison request: "
             f"check_id={check.check_id!r}, required_encoded_row_bytes={required_row_bytes}, "
             f"max_encoded_envelope_bytes={limits.max_encoded_envelope_bytes}; "
-            "derive compatible target limits with build_clickhouse_execution_limits(config.execution)"
+            "derive compatible ClickHouse limits with "
+            "build_clickhouse_execution_limits(config.execution)"
         )
 
 
@@ -4564,7 +4793,16 @@ def _validate_runtime_profiles(
     check: RowCheckDefinition,
 ) -> None:
     reference = check.reference.connection
-    if reference.adapter is Adapter.MSSQL:
+    if reference.adapter is Adapter.CLICKHOUSE:
+        if (
+            match_clickhouse_runtime_profile(reference.driver, reference.profile)
+            is not ClickHouseRuntimeProfile.LEGACY_21_8_LTS_SOURCE
+        ):
+            raise UnsupportedClickHouseProfileError(
+                "ClickHouse reference requires driver='clickhouse-connect' and profile "
+                "'clickhouse_21_8_lts'"
+            )
+    elif reference.adapter is Adapter.MSSQL:
         if match_mssql_runtime_profile(reference.driver, reference.profile) not in (
             MssqlRuntimeProfile.MSSQL_2022,
             MssqlRuntimeProfile.MSSQL_2016,

@@ -7,6 +7,7 @@ from forensic_data.clickhouse_canonical import (
     ClickHouseCanonicalLimits,
     ClickHouseCanonicalRelation,
     clickhouse_comparison_aggregate_settings,
+    clickhouse_comparison_grouped_settings,
     clickhouse_comparison_ordered_settings,
     lower_clickhouse_integer_comparison,
 )
@@ -173,22 +174,16 @@ def build_clickhouse_integer_range_fingerprint_query(
         ") AS dfe_aggregate ON dfe_aggregate.dfe_ordinal = tupleElement(dfe_range, 1) "
         "ORDER BY tupleElement(dfe_range, 1)"
     )
-    settings = clickhouse_comparison_ordered_settings(
-        relation,
-        limits,
-        len(ranges),
-        raw_response_limit,
-    )
-    settings.update(
-        {
-            "max_rows_to_group_by": len(ranges) + 1,
-            "group_by_overflow_mode": "throw",
-        }
-    )
     return ClickHouseEndpointQuery(
         statement=statement,
         parameters=parameters,
-        settings=settings,
+        settings=clickhouse_comparison_grouped_settings(
+            relation,
+            limits,
+            len(ranges),
+            raw_response_limit,
+            len(ranges) + 1,
+        ),
         max_response_bytes=raw_response_limit,
         operation="clickhouse_integer_range_fingerprints",
         full_scans=full_scans,

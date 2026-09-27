@@ -27,11 +27,13 @@ from forensic_data.clickhouse_http import (
     ClickHouseHttpOutcomeKind,
     ClickHouseHttpPoolConfig,
     ClickHouseHttpRequest,
+    ClickHouseHttpResponseProtocol,
     ClickHouseHttpWorker,
     ClickHouseHttpWorkerError,
     ClickHouseHttpWorkerStartupError,
     start_clickhouse_http_worker,
 )
+from forensic_data.clickhouse_profile import ClickHouseRuntimeProfile
 from forensic_data.postgres import (
     PostgresReadDeadline,
     PostgresReadDeadlineExceededError,
@@ -74,6 +76,14 @@ _CLICKHOUSE_ZERO_SCAN_OPERATIONS = frozenset(
         "inspect_immutable_version_row_policies",
         "inspect_immutable_version_columns",
         "read_immutable_version_readiness",
+        "inspect_legacy_table_catalog",
+        "inspect_legacy_table_columns",
+        "inspect_legacy_row_policies",
+        "inspect_legacy_projection_settings",
+        "inspect_legacy_projection_parts",
+        "inspect_legacy_mutations",
+        "inspect_legacy_active_parts",
+        "read_legacy_immutable_version_readiness",
         "inspect_logical_projection_mutations",
         "inspect_logical_projection_runtime",
         "inspect_logical_projection_parts",
@@ -302,6 +312,20 @@ class ClickHouseResourceSetting(StrEnum):
     MAX_RESULT_ROWS = "max_result_rows"
     MAX_RESULT_BYTES = "max_result_bytes"
     MAX_ROWS_TO_GROUP_BY = "max_rows_to_group_by"
+
+
+class ClickHouseTimezoneStrategy(StrEnum):
+    SESSION_SETTING = "session_setting"
+    SERVER_UTC_CONFIGURATION = "server_utc_configuration"
+
+
+class ClickHouseOverflowSetting(StrEnum):
+    GROUP_BY = "group_by_overflow_mode"
+    READ = "read_overflow_mode"
+    READ_LEAF = "read_overflow_mode_leaf"
+    RESULT = "result_overflow_mode"
+    SORT = "sort_overflow_mode"
+    TIMEOUT = "timeout_overflow_mode"
 
 
 class ClickHouseConnectionSettings(BaseModel):
@@ -593,7 +617,42 @@ class ClickHouseResourceConstraint:
 
 
 @dataclass(frozen=True, slots=True)
+class ClickHouseLockedOverflowMode:
+    setting: ClickHouseOverflowSetting
+    value: str
+
+
+@dataclass(frozen=True, slots=True)
+class ClickHouseModernProfileProvenance:
+    runtime_profile: ClickHouseRuntimeProfile
+    response_protocol: ClickHouseHttpResponseProtocol
+    timezone_strategy: ClickHouseTimezoneStrategy
+
+
+@dataclass(frozen=True, slots=True)
+class ClickHouseLegacyProfileProvenance:
+    runtime_profile: ClickHouseRuntimeProfile
+    response_protocol: ClickHouseHttpResponseProtocol
+    timezone_strategy: ClickHouseTimezoneStrategy
+    cancel_http_readonly_queries_on_client_close: int
+    cancel_http_readonly_queries_on_client_close_locked: bool
+    send_progress_in_http_headers: int
+    send_progress_in_http_headers_locked: bool
+    allow_experimental_projection_optimization: int
+    allow_experimental_projection_optimization_locked: bool
+    force_optimize_projection: int
+    force_optimize_projection_locked: bool
+    locked_overflow_modes: tuple[ClickHouseLockedOverflowMode, ...]
+
+
+type ClickHouseProfileProvenance = (
+    ClickHouseModernProfileProvenance | ClickHouseLegacyProfileProvenance
+)
+
+
+@dataclass(frozen=True, slots=True)
 class ClickHouseServerProfile:
+    provenance: ClickHouseProfileProvenance
     binding_library_name: str
     binding_library_version: str
     transport_library_name: str
@@ -689,6 +748,26 @@ class _ClickHouseProfilePayload(BaseModel):
     result_overflow_mode: str
 
 
+class _ClickHouseLegacyProfilePayload(BaseModel):
+    model_config = ConfigDict(extra="ignore", frozen=True, strict=True)
+
+    server_version: str
+    server_version_number: str
+    build_id: str
+    server_timezone: str
+    session_timezone: str
+    current_user: str
+    current_database: str
+    readonly: str
+    max_memory_usage: str
+    max_threads: str
+    max_result_rows: str
+    max_result_bytes: str
+    result_overflow_mode: str
+    cancel_http_readonly_queries_on_client_close: str
+    send_progress_in_http_headers: str
+
+
 class _ClickHouseColumnPayload(BaseModel):
     model_config = ConfigDict(extra="ignore", frozen=True, strict=True)
 
@@ -712,12 +791,126 @@ class _ClickHouseSettingPayload(BaseModel):
     readonly: int
 
 
+@dataclass(frozen=True, slots=True)
+class _ClickHouseInitializationProbe:
+    query: str
+    query_settings: tuple[tuple[str, ClickHouseParameter], ...]
+    expected_payload: bytes
+
+
+@dataclass(frozen=True, slots=True)
+class _ClickHouseTransportProtocol:
+    runtime_profile: ClickHouseRuntimeProfile
+    response_protocol: ClickHouseHttpResponseProtocol
+    url_parameters: tuple[tuple[str, str], ...]
+    transport_owned_query_settings: frozenset[str]
+    locked_query_settings: frozenset[str]
+    unsupported_query_settings: frozenset[str]
+    cancellation_query_settings: tuple[tuple[str, ClickHouseParameter], ...]
+    data_initialization: _ClickHouseInitializationProbe
+    control_initialization: _ClickHouseInitializationProbe
+
+
+_MODERN_CLICKHOUSE_PROTOCOL = _ClickHouseTransportProtocol(
+    runtime_profile=ClickHouseRuntimeProfile.LTS,
+    response_protocol=ClickHouseHttpResponseProtocol.MODERN_EXCEPTION_FRAME,
+    url_parameters=(
+        ("http_write_exception_in_output_format", "0"),
+        ("wait_end_of_query", "1"),
+    ),
+    transport_owned_query_settings=frozenset(
+        {
+            "http_write_exception_in_output_format",
+            "query_id",
+            "wait_end_of_query",
+        }
+    ),
+    locked_query_settings=frozenset(),
+    unsupported_query_settings=frozenset(),
+    cancellation_query_settings=(("session_timezone", "UTC"),),
+    data_initialization=_ClickHouseInitializationProbe(
+        query=(
+            "SELECT 'ready', "
+            "toUInt8(getSetting('cancel_http_readonly_queries_on_client_close')), "
+            "toUInt8(getSetting('http_write_exception_in_output_format'))"
+        ),
+        query_settings=(("session_timezone", "UTC"), ("max_result_rows", 1)),
+        expected_payload=b"ready\t1\t0\n",
+    ),
+    control_initialization=_ClickHouseInitializationProbe(
+        query=(
+            "SELECT 'control-ready', "
+            "toUInt8(getSetting('cancel_http_readonly_queries_on_client_close')), "
+            "toUInt8(getSetting('http_write_exception_in_output_format'))"
+        ),
+        query_settings=(("session_timezone", "UTC"), ("max_result_rows", 1)),
+        expected_payload=b"control-ready\t1\t0\n",
+    ),
+)
+
+_LEGACY_CLICKHOUSE_21_8_PROTOCOL = _ClickHouseTransportProtocol(
+    runtime_profile=ClickHouseRuntimeProfile.LEGACY_21_8_LTS_SOURCE,
+    response_protocol=ClickHouseHttpResponseProtocol.LEGACY_CLEAN_EOF,
+    url_parameters=(("wait_end_of_query", "1"),),
+    transport_owned_query_settings=frozenset({"query_id", "wait_end_of_query"}),
+    locked_query_settings=frozenset(
+        {
+            "cancel_http_readonly_queries_on_client_close",
+            "allow_experimental_projection_optimization",
+            "force_optimize_projection",
+            "group_by_overflow_mode",
+            "read_overflow_mode",
+            "read_overflow_mode_leaf",
+            "readonly",
+            "result_overflow_mode",
+            "send_progress_in_http_headers",
+            "sort_overflow_mode",
+            "timeout_overflow_mode",
+        }
+    ),
+    unsupported_query_settings=frozenset(
+        {
+            "apply_mutations_on_fly",
+            "apply_patch_parts",
+            "final",
+            "http_write_exception_in_output_format",
+            "session_timezone",
+            "timeout_overflow_mode_leaf",
+        }
+    ),
+    cancellation_query_settings=(),
+    data_initialization=_ClickHouseInitializationProbe(
+        query=(
+            "SELECT 'ready', "
+            "toUInt8(getSetting('cancel_http_readonly_queries_on_client_close')), "
+            "toUInt8(getSetting('send_progress_in_http_headers')), "
+            "toUInt8(getSetting('readonly')), "
+            "toString(getSetting('result_overflow_mode')), timezone()"
+        ),
+        query_settings=(),
+        expected_payload=b"ready\t1\t0\t2\tthrow\tUTC\n",
+    ),
+    control_initialization=_ClickHouseInitializationProbe(
+        query=(
+            "SELECT 'control-ready', "
+            "toUInt8(getSetting('cancel_http_readonly_queries_on_client_close')), "
+            "toUInt8(getSetting('send_progress_in_http_headers')), "
+            "toUInt8(getSetting('readonly')), "
+            "toString(getSetting('result_overflow_mode')), timezone()"
+        ),
+        query_settings=(),
+        expected_payload=b"control-ready\t1\t0\t2\tthrow\tUTC\n",
+    ),
+)
+
+
 class ClickHouseTransport:
     """Dedicated single-owner ClickHouse HTTP transport."""
 
     def __init__(
         self,
         settings: ClickHouseConnectionSettings,
+        protocol: _ClickHouseTransportProtocol,
         limits: ClickHouseTransportLimits,
         deadline: PostgresReadDeadline,
         attempt_id: UUID,
@@ -728,6 +921,7 @@ class ClickHouseTransport:
         accounting: _ClickHouseRequestAccounting,
     ) -> None:
         self._settings = settings
+        self._protocol = protocol
         self._limits = limits
         self._deadline = deadline
         self._attempt_id = attempt_id
@@ -762,6 +956,14 @@ class ClickHouseTransport:
     @property
     def last_query_id(self) -> UUID | None:
         return self._last_query_id
+
+    @property
+    def runtime_profile(self) -> ClickHouseRuntimeProfile:
+        return self._protocol.runtime_profile
+
+    @property
+    def response_protocol(self) -> ClickHouseHttpResponseProtocol:
+        return self._protocol.response_protocol
 
     @property
     def source_slot_released(self) -> bool:
@@ -853,23 +1055,14 @@ class ClickHouseTransport:
         validate_clickhouse_text_scalar(operation, "ClickHouse operation")
         if type(max_response_bytes) is not int or max_response_bytes < 1:
             raise ValueError("max_response_bytes must be a positive integer")
-        if any(
-            name in settings
-            for name in (
-                "query_id",
-                "wait_end_of_query",
-                "http_write_exception_in_output_format",
-            )
-        ):
-            raise ValueError(
-                "ClickHouse query settings must not override transport-owned query metadata"
-            )
+        _require_protocol_query_settings(self._protocol, settings)
         query_id = uuid4()
         self._last_query_id = query_id
         work_deadline = self._work_deadline_nanoseconds()
         http_deadline = self._http_deadline_nanoseconds(work_deadline)
         request = _clickhouse_http_request(
             settings=self._settings,
+            protocol=self._protocol,
             transport_limits=self._limits,
             read_deadline=self._deadline,
             dispatch_deadline_nanoseconds=work_deadline,
@@ -890,6 +1083,7 @@ class ClickHouseTransport:
 
     def initialize_control_connection(self) -> ClickHouseRawResult:
         operation = "initialize_clickhouse_control_transport"
+        probe = self._protocol.control_initialization
         self._require_active(operation)
         query_id = uuid4()
         self._last_query_id = query_id
@@ -897,18 +1091,15 @@ class ClickHouseTransport:
         http_deadline = self._http_deadline_nanoseconds(work_deadline)
         request = _clickhouse_http_request(
             settings=self._settings,
+            protocol=self._protocol,
             transport_limits=self._limits,
             read_deadline=self._deadline,
             dispatch_deadline_nanoseconds=work_deadline,
             io_deadline_nanoseconds=http_deadline,
             query_id=query_id,
-            query=(
-                "SELECT 'control-ready', "
-                "toUInt8(getSetting('cancel_http_readonly_queries_on_client_close')), "
-                "toUInt8(getSetting('http_write_exception_in_output_format'))"
-            ),
+            query=probe.query,
             parameters={},
-            query_settings={"session_timezone": "UTC", "max_result_rows": 1},
+            query_settings=dict(probe.query_settings),
             result_format="TabSeparatedRaw",
             max_response_bytes=self._limits.max_initialization_response_bytes,
         )
@@ -1227,6 +1418,7 @@ class ClickHouseTransport:
         try:
             request = _clickhouse_http_request(
                 settings=self._settings,
+                protocol=self._protocol,
                 transport_limits=self._limits,
                 read_deadline=self._deadline,
                 dispatch_deadline_nanoseconds=cancellation_deadline,
@@ -1234,7 +1426,7 @@ class ClickHouseTransport:
                 query_id=control_query_id,
                 query="KILL QUERY WHERE query_id = {target_query_id:String} SYNC",
                 parameters={"target_query_id": str(query_id)},
-                query_settings={"session_timezone": "UTC"},
+                query_settings=dict(self._protocol.cancellation_query_settings),
                 result_format="TabSeparatedRaw",
                 max_response_bytes=self._limits.max_cancellation_response_bytes,
             )
@@ -1268,7 +1460,9 @@ class ClickHouseTransport:
             cleanup_cause = self._retire(ClickHouseTransportState.CANCELLATION_UNCONFIRMED)
             return False, cleanup_cause or "CancellationAcknowledgementDeadlineExceeded"
         kill_confirmed = outcome.kind is ClickHouseHttpOutcomeKind.SUCCESS and _kill_query_finished(
-            outcome.payload, query_id
+            outcome.payload,
+            query_id,
+            self._settings.user,
         )
         state = (
             ClickHouseTransportState.LOST
@@ -1367,6 +1561,25 @@ def open_clickhouse_transport(
 ) -> ClickHouseTransport:
     return _open_clickhouse_transport(
         settings,
+        _MODERN_CLICKHOUSE_PROTOCOL,
+        retry_policy,
+        limits,
+        deadline,
+        attempt_id,
+        _UnbudgetedClickHouseRequestAccounting(),
+    )
+
+
+def open_legacy_clickhouse_source_transport(
+    settings: ClickHouseConnectionSettings,
+    retry_policy: ClickHouseRetryPolicy,
+    limits: ClickHouseTransportLimits,
+    deadline: PostgresReadDeadline,
+    attempt_id: UUID,
+) -> ClickHouseTransport:
+    return _open_clickhouse_transport(
+        settings,
+        _LEGACY_CLICKHOUSE_21_8_PROTOCOL,
         retry_policy,
         limits,
         deadline,
@@ -1395,6 +1608,36 @@ def open_budgeted_clickhouse_transport(
         )
     return _open_clickhouse_transport(
         settings,
+        _MODERN_CLICKHOUSE_PROTOCOL,
+        retry_policy,
+        limits,
+        deadline,
+        attempt_id,
+        _SourceBudgetClickHouseRequestAccounting(source_budget, direction),
+    )
+
+
+def open_budgeted_legacy_clickhouse_source_transport(
+    settings: ClickHouseConnectionSettings,
+    retry_policy: ClickHouseRetryPolicy,
+    limits: ClickHouseTransportLimits,
+    deadline: PostgresReadDeadline,
+    attempt_id: UUID,
+    source_budget: PostgresSourceBudgetAttempt,
+    direction: PostgresSourceDirection,
+) -> ClickHouseTransport:
+    if not isinstance(cast(object, source_budget), PostgresSourceBudgetAttempt):
+        raise TypeError("budgeted legacy ClickHouse transport requires PostgresSourceBudgetAttempt")
+    if not isinstance(cast(object, direction), PostgresSourceDirection):
+        raise TypeError("budgeted legacy ClickHouse transport requires PostgresSourceDirection")
+    if source_budget.attempt_id != attempt_id:
+        raise ValueError(
+            "budgeted legacy ClickHouse transport attempt ID differs from its source budget: "
+            f"transport_attempt_id={attempt_id}, budget_attempt_id={source_budget.attempt_id}"
+        )
+    return _open_clickhouse_transport(
+        settings,
+        _LEGACY_CLICKHOUSE_21_8_PROTOCOL,
         retry_policy,
         limits,
         deadline,
@@ -1405,6 +1648,7 @@ def open_budgeted_clickhouse_transport(
 
 def _open_clickhouse_transport(
     settings: ClickHouseConnectionSettings,
+    protocol: _ClickHouseTransportProtocol,
     retry_policy: ClickHouseRetryPolicy,
     limits: ClickHouseTransportLimits,
     deadline: PostgresReadDeadline,
@@ -1412,6 +1656,8 @@ def _open_clickhouse_transport(
     accounting: _ClickHouseRequestAccounting,
 ) -> ClickHouseTransport:
     _require_open_arguments(settings, retry_policy, limits, deadline, attempt_id)
+    if type(protocol) is not _ClickHouseTransportProtocol:
+        raise TypeError("ClickHouse transport protocol has an unexpected type")
     if not isinstance(cast(object, accounting), _ClickHouseRequestAccounting):
         raise TypeError("ClickHouse transport accounting has an unexpected type")
     last_error: ClickHouseQueryError | None = None
@@ -1442,6 +1688,7 @@ def _open_clickhouse_transport(
             )
             transport = ClickHouseTransport(
                 settings=settings,
+                protocol=protocol,
                 limits=limits,
                 deadline=deadline,
                 attempt_id=attempt_id,
@@ -1451,20 +1698,17 @@ def _open_clickhouse_transport(
                 physical_request_count=total_dispatches,
                 accounting=accounting,
             )
+            data_probe = protocol.data_initialization
             initialized = transport.execute_raw(
-                query=(
-                    "SELECT 'ready', "
-                    "toUInt8(getSetting('cancel_http_readonly_queries_on_client_close')), "
-                    "toUInt8(getSetting('http_write_exception_in_output_format'))"
-                ),
+                query=data_probe.query,
                 parameters={},
-                settings={"session_timezone": "UTC", "max_result_rows": 1},
+                settings=dict(data_probe.query_settings),
                 result_format="TabSeparatedRaw",
                 max_response_bytes=limits.max_initialization_response_bytes,
                 operation="initialize_clickhouse_transport",
             )
             total_dispatches = transport.physical_request_count
-            if initialized.payload != b"ready\t1\t0\n":
+            if initialized.payload != data_probe.expected_payload:
                 transport.close()
                 raise ClickHouseConnectionError(
                     attempt_id=attempt_id,
@@ -1479,7 +1723,7 @@ def _open_clickhouse_transport(
                 )
             control_initialized = transport.initialize_control_connection()
             total_dispatches = transport.physical_request_count
-            if control_initialized.payload != b"control-ready\t1\t0\n":
+            if control_initialized.payload != protocol.control_initialization.expected_payload:
                 transport.close()
                 raise ClickHouseConnectionError(
                     attempt_id=attempt_id,
@@ -1613,6 +1857,7 @@ def _open_clickhouse_transport(
 
 def _clickhouse_http_request(
     settings: ClickHouseConnectionSettings,
+    protocol: _ClickHouseTransportProtocol,
     transport_limits: ClickHouseTransportLimits,
     read_deadline: PostgresReadDeadline,
     dispatch_deadline_nanoseconds: int,
@@ -1624,9 +1869,12 @@ def _clickhouse_http_request(
     result_format: str,
     max_response_bytes: int,
 ) -> ClickHouseHttpRequest:
+    if type(protocol) is not _ClickHouseTransportProtocol:
+        raise TypeError("ClickHouse HTTP protocol has an unexpected type")
     if _CLICKHOUSE_FORMAT.fullmatch(result_format) is None:
         raise ValueError("ClickHouse result format must be an ASCII identifier")
     _require_clickhouse_request_inputs(parameters, query_settings, query, transport_limits)
+    _require_protocol_query_settings(protocol, query_settings)
     try:
         bound_query, bound_parameters = bind_query(query, parameters, UTC)
     except ProgrammingError:
@@ -1658,10 +1906,14 @@ def _clickhouse_http_request(
     )
     url_parameters: dict[str, str] = {
         "database": settings.database,
-        "http_write_exception_in_output_format": "0",
         "query_id": str(query_id),
-        "wait_end_of_query": "1",
     }
+    for name, value in protocol.url_parameters:
+        if name in url_parameters:
+            raise AssertionError(
+                f"ClickHouse protocol URL parameter collides with request metadata: name={name!r}"
+            )
+        url_parameters[name] = value
     for name, value in effective_settings.items():
         _require_clickhouse_parameter_name(name, "setting")
         if name in url_parameters or name.startswith("param_"):
@@ -1697,11 +1949,43 @@ def _clickhouse_http_request(
         headers=headers,
         body=query_bytes,
         query_id=str(query_id),
+        response_protocol=protocol.response_protocol,
         max_response_bytes=max_response_bytes,
         max_error_response_bytes=transport_limits.max_error_response_bytes,
         dispatch_deadline_nanoseconds=dispatch_deadline_nanoseconds,
         io_deadline_nanoseconds=io_deadline_nanoseconds,
     )
+
+
+def _require_protocol_query_settings(
+    protocol: _ClickHouseTransportProtocol,
+    query_settings: dict[str, ClickHouseParameter],
+) -> None:
+    if type(protocol) is not _ClickHouseTransportProtocol:
+        raise TypeError("ClickHouse query protocol has an unexpected type")
+    if type(query_settings) is not dict:
+        raise TypeError("ClickHouse query settings must be a dictionary")
+    names = frozenset(query_settings)
+    owned = names & protocol.transport_owned_query_settings
+    if owned:
+        raise ValueError(
+            "ClickHouse query settings must not override transport-owned metadata: "
+            f"settings={tuple(sorted(owned))!r}"
+        )
+    locked = names & protocol.locked_query_settings
+    if locked:
+        raise ValueError(
+            "ClickHouse query settings must omit values locked by the selected runtime profile: "
+            f"runtime_profile={protocol.runtime_profile.value!r}, "
+            f"settings={tuple(sorted(locked))!r}"
+        )
+    unsupported = names & protocol.unsupported_query_settings
+    if unsupported:
+        raise ValueError(
+            "ClickHouse query settings are unsupported by the selected runtime profile: "
+            f"runtime_profile={protocol.runtime_profile.value!r}, "
+            f"settings={tuple(sorted(unsupported))!r}"
+        )
 
 
 def _require_clickhouse_request_inputs(
@@ -1845,18 +2129,27 @@ def _cancellation_unconfirmed_error(
     )
 
 
-def _kill_query_finished(payload: bytes, target_query_id: UUID) -> bool:
-    lines = payload.splitlines()
-    if len(lines) != 1:
+def _kill_query_finished(
+    payload: bytes,
+    target_query_id: UUID,
+    expected_user: str,
+) -> bool:
+    validate_clickhouse_text_scalar(expected_user, "ClickHouse cancellation user")
+    if not payload.endswith(b"\n") or payload.endswith(b"\n\n"):
         return False
-    fields = lines[0].split(b"\t", 2)
-    if len(fields) < 2 or fields[0] != b"finished":
+    row = payload[:-1]
+    if b"\n" in row or b"\r" in row:
+        return False
+    fields = row.split(b"\t")
+    if len(fields) != 4 or fields[0] != b"finished" or not fields[3]:
         return False
     try:
-        observed_query_id = UUID(fields[1].decode("ascii"))
-    except (UnicodeDecodeError, ValueError):
+        observed_query_id = fields[1].decode("ascii", errors="strict")
+        observed_user = fields[2].decode("utf-8", errors="strict")
+        fields[3].decode("utf-8", errors="strict")
+    except UnicodeDecodeError:
         return False
-    return observed_query_id == target_query_id
+    return observed_query_id == str(target_query_id) and observed_user == expected_user
 
 
 def _cancellation_cause(outcome: ClickHouseHttpOutcome) -> str:
@@ -1941,6 +2234,24 @@ def _require_open_arguments(
         raise ValueError("attempt_id must be a non-zero UUID")
 
 
+def _require_transport_runtime_profile(
+    transport: ClickHouseTransport,
+    expected_profile: ClickHouseRuntimeProfile,
+    operation: str,
+) -> None:
+    if type(transport) is not ClickHouseTransport:
+        raise TypeError("ClickHouse profile inspection requires ClickHouseTransport")
+    if not isinstance(cast(object, expected_profile), ClickHouseRuntimeProfile):
+        raise TypeError("expected ClickHouse runtime profile has an unexpected type")
+    validate_clickhouse_text_scalar(operation, "ClickHouse runtime-profile operation")
+    if transport.runtime_profile is not expected_profile:
+        raise UnsupportedClickHouseProfileError(
+            "ClickHouse transport runtime profile does not match the requested operation: "
+            f"operation={operation!r}, expected={expected_profile.value!r}, "
+            f"actual={transport.runtime_profile.value!r}"
+        )
+
+
 def _connection_error_is_retryable(error: ClickHouseQueryError) -> bool:
     return (
         error.completion
@@ -1992,6 +2303,11 @@ def inspect_clickhouse_server_profile(
     transport: ClickHouseTransport,
     settings: ClickHouseConnectionSettings,
 ) -> ClickHouseServerProfile:
+    _require_transport_runtime_profile(
+        transport,
+        ClickHouseRuntimeProfile.LTS,
+        "inspect_server_profile",
+    )
     result = transport.execute_raw(
         query=(
             "SELECT version() AS server_version, "
@@ -2037,6 +2353,11 @@ def inspect_clickhouse_server_profile(
     )
     settings_by_name = _settings_by_name(setting_rows)
     profile = ClickHouseServerProfile(
+        provenance=ClickHouseModernProfileProvenance(
+            runtime_profile=ClickHouseRuntimeProfile.LTS,
+            response_protocol=ClickHouseHttpResponseProtocol.MODERN_EXCEPTION_FRAME,
+            timezone_strategy=ClickHouseTimezoneStrategy.SESSION_SETTING,
+        ),
         binding_library_name="clickhouse-connect",
         binding_library_version=_validated_driver_version(package_version("clickhouse-connect")),
         transport_library_name="urllib3",
@@ -2072,6 +2393,173 @@ def inspect_clickhouse_server_profile(
         resource_constraints=_resource_constraints(settings_by_name),
     )
     _require_clickhouse_profile(profile, settings)
+    return profile
+
+
+def inspect_legacy_clickhouse_server_profile(
+    transport: ClickHouseTransport,
+    settings: ClickHouseConnectionSettings,
+) -> ClickHouseServerProfile:
+    _require_transport_runtime_profile(
+        transport,
+        ClickHouseRuntimeProfile.LEGACY_21_8_LTS_SOURCE,
+        "inspect_legacy_server_profile",
+    )
+    result = transport.execute_raw(
+        query=(
+            "SELECT version() AS server_version, "
+            "(SELECT value FROM system.build_options "
+            "WHERE name = 'VERSION_INTEGER') AS server_version_number, "
+            "buildId() AS build_id, "
+            "timezone() AS server_timezone, timezone() AS session_timezone, "
+            "currentUser() AS current_user, "
+            "currentDatabase() AS current_database, "
+            "toString(getSetting('readonly')) AS readonly, "
+            "toString(getSetting('max_memory_usage')) AS max_memory_usage, "
+            "toString(getSetting('max_threads')) AS max_threads, "
+            "toString(getSetting('max_result_rows')) AS max_result_rows, "
+            "toString(getSetting('max_result_bytes')) AS max_result_bytes, "
+            "toString(getSetting('result_overflow_mode')) AS result_overflow_mode, "
+            "toString(toUInt8(getSetting("
+            "'cancel_http_readonly_queries_on_client_close'))) "
+            "AS cancel_http_readonly_queries_on_client_close, "
+            "toString(toUInt8(getSetting('send_progress_in_http_headers'))) "
+            "AS send_progress_in_http_headers"
+        ),
+        parameters={},
+        settings={},
+        result_format="JSONEachRow",
+        max_response_bytes=_MAX_PROFILE_RESPONSE_BYTES,
+        operation="inspect_server_profile",
+    )
+    payload = _single_json_row(
+        result.payload,
+        _ClickHouseLegacyProfilePayload,
+        "legacy server profile",
+    )
+    setting_result = transport.execute_raw(
+        query=(
+            "SELECT name, value, min, max, readonly FROM system.settings "
+            "WHERE name IN "
+            "('readonly', 'max_memory_usage', 'max_threads', 'max_execution_time', "
+            "'max_result_rows', 'max_result_bytes', 'max_rows_to_group_by', "
+            "'result_overflow_mode', "
+            "'cancel_http_readonly_queries_on_client_close', "
+            "'send_progress_in_http_headers', "
+            "'allow_experimental_projection_optimization', "
+            "'force_optimize_projection', 'timeout_overflow_mode', "
+            "'read_overflow_mode', 'read_overflow_mode_leaf', "
+            "'sort_overflow_mode', 'group_by_overflow_mode') "
+            "ORDER BY name"
+        ),
+        parameters={},
+        settings={},
+        result_format="JSONEachRow",
+        max_response_bytes=_MAX_SETTINGS_RESPONSE_BYTES,
+        operation="inspect_resource_constraints",
+    )
+    setting_rows = parse_clickhouse_json_rows(
+        setting_result.payload,
+        _ClickHouseSettingPayload,
+        "legacy resource constraints",
+    )
+    settings_by_name = _legacy_settings_by_name(setting_rows)
+    readonly = _parse_nonnegative_integer(payload.readonly, "readonly")
+    catalog_readonly = _parse_nonnegative_integer(
+        settings_by_name["readonly"].value,
+        "readonly catalog value",
+    )
+    if readonly != catalog_readonly:
+        raise ClickHouseDataValidationError(
+            "ClickHouse legacy readonly setting changed between profile observations"
+        )
+    cancel_on_close = _parse_binary_integer(
+        payload.cancel_http_readonly_queries_on_client_close,
+        "cancel_http_readonly_queries_on_client_close",
+    )
+    send_progress = _parse_binary_integer(
+        payload.send_progress_in_http_headers,
+        "send_progress_in_http_headers",
+    )
+    if cancel_on_close != _parse_binary_integer(
+        settings_by_name["cancel_http_readonly_queries_on_client_close"].value,
+        "cancel_http_readonly_queries_on_client_close catalog value",
+    ):
+        raise ClickHouseDataValidationError(
+            "ClickHouse legacy cancellation setting changed between profile observations"
+        )
+    if send_progress != _parse_binary_integer(
+        settings_by_name["send_progress_in_http_headers"].value,
+        "send_progress_in_http_headers catalog value",
+    ):
+        raise ClickHouseDataValidationError(
+            "ClickHouse legacy progress-header setting changed between profile observations"
+        )
+    profile = ClickHouseServerProfile(
+        provenance=ClickHouseLegacyProfileProvenance(
+            runtime_profile=ClickHouseRuntimeProfile.LEGACY_21_8_LTS_SOURCE,
+            response_protocol=ClickHouseHttpResponseProtocol.LEGACY_CLEAN_EOF,
+            timezone_strategy=ClickHouseTimezoneStrategy.SERVER_UTC_CONFIGURATION,
+            cancel_http_readonly_queries_on_client_close=cancel_on_close,
+            cancel_http_readonly_queries_on_client_close_locked=_setting_is_locked(
+                settings_by_name["cancel_http_readonly_queries_on_client_close"]
+            ),
+            send_progress_in_http_headers=send_progress,
+            send_progress_in_http_headers_locked=_setting_is_locked(
+                settings_by_name["send_progress_in_http_headers"]
+            ),
+            allow_experimental_projection_optimization=_parse_binary_integer(
+                settings_by_name["allow_experimental_projection_optimization"].value,
+                "allow_experimental_projection_optimization",
+            ),
+            allow_experimental_projection_optimization_locked=_setting_is_locked(
+                settings_by_name["allow_experimental_projection_optimization"]
+            ),
+            force_optimize_projection=_parse_binary_integer(
+                settings_by_name["force_optimize_projection"].value,
+                "force_optimize_projection",
+            ),
+            force_optimize_projection_locked=_setting_is_locked(
+                settings_by_name["force_optimize_projection"]
+            ),
+            locked_overflow_modes=_legacy_locked_overflow_modes(settings_by_name),
+        ),
+        binding_library_name="clickhouse-connect",
+        binding_library_version=_validated_driver_version(package_version("clickhouse-connect")),
+        transport_library_name="urllib3",
+        transport_library_version=_validated_driver_version(package_version("urllib3")),
+        server_version=_validated_profile_text(payload.server_version, "server version"),
+        server_version_number=_parse_positive_integer(
+            payload.server_version_number,
+            "server version number",
+        ),
+        build_id=_validated_profile_text(payload.build_id, "build ID"),
+        server_timezone=_validated_profile_text(payload.server_timezone, "server timezone"),
+        session_timezone=_validated_profile_text(payload.session_timezone, "session timezone"),
+        current_user=_validated_profile_text(payload.current_user, "current user"),
+        current_database=_validated_profile_text(payload.current_database, "current database"),
+        readonly=readonly,
+        max_memory_usage=_parse_nonnegative_integer(payload.max_memory_usage, "max_memory_usage"),
+        max_threads=_parse_nonnegative_integer(payload.max_threads, "max_threads"),
+        max_execution_time_seconds=_required_setting_maximum(
+            settings_by_name[ClickHouseResourceSetting.MAX_EXECUTION_TIME.value],
+            ClickHouseResourceSetting.MAX_EXECUTION_TIME,
+        ),
+        effective_max_execution_time_seconds=_parse_nonnegative_decimal(
+            settings_by_name[ClickHouseResourceSetting.MAX_EXECUTION_TIME.value].value,
+            "effective max_execution_time",
+        ),
+        max_result_rows=_parse_nonnegative_integer(payload.max_result_rows, "max_result_rows"),
+        max_result_bytes=_parse_nonnegative_integer(payload.max_result_bytes, "max_result_bytes"),
+        result_overflow_mode=_validated_profile_text(
+            payload.result_overflow_mode,
+            "result_overflow_mode",
+        ),
+        readonly_locked=_setting_is_locked(settings_by_name["readonly"]),
+        result_overflow_mode_locked=_setting_is_locked(settings_by_name["result_overflow_mode"]),
+        resource_constraints=_resource_constraints(settings_by_name),
+    )
+    _require_legacy_clickhouse_profile(profile, settings)
     return profile
 
 
@@ -2379,7 +2867,24 @@ def parse_clickhouse_json_rows[Payload: BaseModel](
     model_type: type[Payload],
     label: str,
 ) -> tuple[Payload, ...]:
-    lines = payload.splitlines()
+    if type(payload) is not bytes:
+        raise TypeError("ClickHouse JSONEachRow payload must be bytes")
+    if not payload:
+        return ()
+    if b"\r" in payload:
+        raise ClickHouseDataValidationError(
+            f"ClickHouse {label} returned a JSONEachRow response containing a carriage return"
+        )
+    if not payload.endswith(b"\n"):
+        raise ClickHouseDataValidationError(
+            f"ClickHouse {label} returned an incomplete JSONEachRow response: missing final LF"
+        )
+    lines = payload[:-1].split(b"\n")
+    for ordinal, line in enumerate(lines, start=1):
+        if not line:
+            raise ClickHouseDataValidationError(
+                f"ClickHouse {label} returned an empty JSONEachRow record: record={ordinal}"
+            )
     try:
         return tuple(model_type.model_validate_json(line) for line in lines)
     except ValueError as error:
@@ -2406,6 +2911,30 @@ def _settings_by_name(
         raise ClickHouseDataValidationError(
             "ClickHouse resource profile did not return each required setting exactly once: "
             f"expected_count={len(expected)}, observed_count={len(rows)}, "
+            f"distinct_count={len(by_name)}"
+        )
+    return by_name
+
+
+def _legacy_settings_by_name(
+    rows: tuple[_ClickHouseSettingPayload, ...],
+) -> dict[str, _ClickHouseSettingPayload]:
+    expected = (
+        {setting.value for setting in ClickHouseResourceSetting}
+        | {setting.value for setting in ClickHouseOverflowSetting}
+        | {
+            "allow_experimental_projection_optimization",
+            "cancel_http_readonly_queries_on_client_close",
+            "force_optimize_projection",
+            "readonly",
+            "send_progress_in_http_headers",
+        }
+    )
+    by_name = {row.name: row for row in rows}
+    if len(rows) != len(expected) or set(by_name) != expected:
+        raise ClickHouseDataValidationError(
+            "ClickHouse legacy resource profile did not return each required setting exactly "
+            f"once: expected_count={len(expected)}, observed_count={len(rows)}, "
             f"distinct_count={len(by_name)}"
         )
     return by_name
@@ -2463,7 +2992,44 @@ def _required_setting_maximum(
     return maximum
 
 
+def _legacy_locked_overflow_modes(
+    settings_by_name: dict[str, _ClickHouseSettingPayload],
+) -> tuple[ClickHouseLockedOverflowMode, ...]:
+    modes: list[ClickHouseLockedOverflowMode] = []
+    for setting in ClickHouseOverflowSetting:
+        row = settings_by_name[setting.value]
+        value = _validated_profile_text(row.value, setting.value)
+        locked = _setting_is_locked(row)
+        if value != "throw" or not locked:
+            raise UnsupportedClickHouseProfileError(
+                "ClickHouse legacy source profile requires a locked throw overflow mode: "
+                f"setting={setting.value!r}, observed={value!r}, "
+                f"locked={locked}"
+            )
+        modes.append(ClickHouseLockedOverflowMode(setting=setting, value=value))
+    return tuple(modes)
+
+
 def _require_clickhouse_profile(
+    profile: ClickHouseServerProfile,
+    settings: ClickHouseConnectionSettings,
+) -> None:
+    if profile.provenance != ClickHouseModernProfileProvenance(
+        runtime_profile=ClickHouseRuntimeProfile.LTS,
+        response_protocol=ClickHouseHttpResponseProtocol.MODERN_EXCEPTION_FRAME,
+        timezone_strategy=ClickHouseTimezoneStrategy.SESSION_SETTING,
+    ):
+        raise ClickHouseDataValidationError(
+            "ClickHouse modern profile has inconsistent runtime provenance"
+        )
+    if profile.readonly != 1:
+        raise UnsupportedClickHouseProfileError(
+            f"ClickHouse source profile requires readonly=1: observed={profile.readonly}"
+        )
+    _require_clickhouse_profile_baseline(profile, settings)
+
+
+def _require_clickhouse_profile_baseline(
     profile: ClickHouseServerProfile,
     settings: ClickHouseConnectionSettings,
 ) -> None:
@@ -2482,10 +3048,6 @@ def _require_clickhouse_profile(
         raise UnsupportedClickHouseProfileError(
             "ClickHouse profile requires an effective UTC session timezone: "
             f"observed={profile.session_timezone!r}"
-        )
-    if profile.readonly != 1:
-        raise UnsupportedClickHouseProfileError(
-            f"ClickHouse source profile requires readonly=1: observed={profile.readonly}"
         )
     if not profile.readonly_locked:
         raise UnsupportedClickHouseProfileError(
@@ -2573,6 +3135,80 @@ def _require_clickhouse_profile(
             raise UnsupportedClickHouseProfileError(
                 "ClickHouse source setting must permit the adapter's bounded downward override: "
                 f"setting={setting.value!r}"
+            )
+
+
+def _require_legacy_clickhouse_profile(
+    profile: ClickHouseServerProfile,
+    settings: ClickHouseConnectionSettings,
+) -> None:
+    provenance = profile.provenance
+    if type(provenance) is not ClickHouseLegacyProfileProvenance:
+        raise ClickHouseDataValidationError(
+            "ClickHouse legacy profile has inconsistent runtime provenance"
+        )
+    if (
+        provenance.runtime_profile is not ClickHouseRuntimeProfile.LEGACY_21_8_LTS_SOURCE
+        or provenance.response_protocol is not ClickHouseHttpResponseProtocol.LEGACY_CLEAN_EOF
+        or provenance.timezone_strategy is not ClickHouseTimezoneStrategy.SERVER_UTC_CONFIGURATION
+    ):
+        raise ClickHouseDataValidationError(
+            "ClickHouse legacy profile has inconsistent protocol or timezone provenance"
+        )
+    if profile.readonly != 2:
+        raise UnsupportedClickHouseProfileError(
+            f"ClickHouse legacy source profile requires readonly=2: observed={profile.readonly}"
+        )
+    if profile.server_timezone != "UTC" or profile.session_timezone != "UTC":
+        raise UnsupportedClickHouseProfileError(
+            "ClickHouse legacy source profile requires UTC server configuration: "
+            f"server_timezone={profile.server_timezone!r}, "
+            f"effective_timezone={profile.session_timezone!r}"
+        )
+    if (
+        provenance.cancel_http_readonly_queries_on_client_close != 1
+        or not provenance.cancel_http_readonly_queries_on_client_close_locked
+    ):
+        raise UnsupportedClickHouseProfileError(
+            "ClickHouse legacy source profile requires locked "
+            "cancel_http_readonly_queries_on_client_close=1"
+        )
+    if (
+        provenance.send_progress_in_http_headers != 0
+        or not provenance.send_progress_in_http_headers_locked
+    ):
+        raise UnsupportedClickHouseProfileError(
+            "ClickHouse legacy source profile requires locked send_progress_in_http_headers=0"
+        )
+    if (
+        provenance.allow_experimental_projection_optimization != 0
+        or not provenance.allow_experimental_projection_optimization_locked
+        or provenance.force_optimize_projection != 0
+        or not provenance.force_optimize_projection_locked
+    ):
+        raise UnsupportedClickHouseProfileError(
+            "ClickHouse legacy source profile requires locked projection selection guards: "
+            "allow_experimental_projection_optimization=0, force_optimize_projection=0"
+        )
+    expected_overflow_modes = tuple(
+        ClickHouseLockedOverflowMode(setting=setting, value="throw")
+        for setting in ClickHouseOverflowSetting
+    )
+    if provenance.locked_overflow_modes != expected_overflow_modes:
+        raise ClickHouseDataValidationError(
+            "ClickHouse legacy profile has inconsistent locked overflow-mode provenance"
+        )
+    _require_clickhouse_profile_baseline(profile, settings)
+    for constraint in profile.resource_constraints:
+        if constraint.changeable_in_readonly and (
+            constraint.minimum is None
+            or constraint.minimum < 1
+            or constraint.minimum > constraint.value
+        ):
+            raise UnsupportedClickHouseProfileError(
+                "ClickHouse legacy source resource constraint must prevent zero from disabling "
+                f"the guard: setting={constraint.setting.value!r}, "
+                f"minimum={(None if constraint.minimum is None else str(constraint.minimum))!r}"
             )
 
 
@@ -2667,6 +3303,15 @@ def _parse_nonnegative_integer(value: str, label: str) -> int:
     parsed = _parse_integer(value, label)
     if parsed < 0:
         raise ClickHouseDataValidationError(f"ClickHouse {label} must be non-negative")
+    return parsed
+
+
+def _parse_binary_integer(value: str, label: str) -> int:
+    parsed = _parse_nonnegative_integer(value, label)
+    if parsed not in (0, 1):
+        raise ClickHouseDataValidationError(
+            f"ClickHouse {label} must be encoded as zero or one: observed={parsed}"
+        )
     return parsed
 
 

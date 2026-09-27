@@ -14,7 +14,11 @@ from forensic_data.canonical import (
     schema_digest_hex,
     schema_from_metadata_json,
 )
-from forensic_data.clickhouse_profile import CLICKHOUSE_CONNECT_DRIVER, CLICKHOUSE_LTS_PROFILE
+from forensic_data.clickhouse_profile import (
+    CLICKHOUSE_21_8_LTS_SOURCE_PROFILE,
+    CLICKHOUSE_CONNECT_DRIVER,
+    CLICKHOUSE_LTS_PROFILE,
+)
 from forensic_data.contracts.identity import sql_parameters_semantic_value
 from forensic_data.contracts.model import (
     Adapter,
@@ -243,12 +247,17 @@ class DatasetVersionDefinition:
                 f"actual=({self.driver!r}, {self.profile!r})"
             )
         if self.adapter is Adapter.CLICKHOUSE and (
-            self.driver,
-            self.profile,
-        ) != (CLICKHOUSE_CONNECT_DRIVER, CLICKHOUSE_LTS_PROFILE):
+            self.driver != CLICKHOUSE_CONNECT_DRIVER
+            or self.profile
+            not in (
+                CLICKHOUSE_LTS_PROFILE,
+                CLICKHOUSE_21_8_LTS_SOURCE_PROFILE,
+            )
+        ):
             raise ValueError(
-                "ClickHouse dataset requires exact driver/profile pair: "
-                f"required=({CLICKHOUSE_CONNECT_DRIVER!r}, {CLICKHOUSE_LTS_PROFILE!r}), "
+                "ClickHouse dataset requires an admitted exact driver/profile pair: "
+                f"driver={CLICKHOUSE_CONNECT_DRIVER!r}, "
+                f"profiles={(CLICKHOUSE_LTS_PROFILE, CLICKHOUSE_21_8_LTS_SOURCE_PROFILE)!r}, "
                 f"actual=({self.driver!r}, {self.profile!r})"
             )
         _require_enum(self.locator_kind, DatasetLocatorKind, "dataset locator kind")
@@ -884,9 +893,9 @@ def _require_dataset_body_shape(
         raise ValueError(
             f"{context} original Greenplum connection requires exact driver/profile pair"
         )
-    if adapter is Adapter.CLICKHOUSE and (driver, profile) != (
-        CLICKHOUSE_CONNECT_DRIVER,
-        CLICKHOUSE_LTS_PROFILE,
+    if adapter is Adapter.CLICKHOUSE and (
+        driver != CLICKHOUSE_CONNECT_DRIVER
+        or profile not in (CLICKHOUSE_LTS_PROFILE, CLICKHOUSE_21_8_LTS_SOURCE_PROFILE)
     ):
         raise ValueError(f"{context} ClickHouse connection requires exact driver/profile pair")
     _semantic_text(body["dataset_id"], f"{context} dataset id")
@@ -1257,6 +1266,10 @@ def _contract_readiness_identities(
                 _semantic_object(body["connection"], f"contract {direction} connection")["adapter"],
                 f"contract {direction} connection adapter",
             ),
+            _semantic_text(
+                _semantic_object(body["connection"], f"contract {direction} connection")["profile"],
+                f"contract {direction} connection profile",
+            ),
         )
         for direction, body in zip(
             ("reference", "target"),
@@ -1264,8 +1277,6 @@ def _contract_readiness_identities(
             strict=True,
         )
     )
-    if expected_connections[0][1] is Adapter.CLICKHOUSE:
-        raise ValueError("contract reference dataset cannot use the target-only ClickHouse adapter")
     identities: list[_SqlArtifactIdentity | None] = []
     for index, (value, expected_dataset_id, connection) in enumerate(
         zip(
@@ -1275,8 +1286,17 @@ def _contract_readiness_identities(
             strict=True,
         )
     ):
-        expected_connection_id, expected_adapter = connection
+        expected_connection_id, expected_adapter, expected_profile = connection
         context = f"contract consistency dataset {index}"
+        if expected_adapter is Adapter.CLICKHOUSE:
+            expected_clickhouse_profile = (
+                CLICKHOUSE_21_8_LTS_SOURCE_PROFILE if index == 0 else CLICKHOUSE_LTS_PROFILE
+            )
+            if expected_profile != expected_clickhouse_profile:
+                raise ValueError(
+                    f"{context} ClickHouse profile is invalid for its direction: "
+                    f"expected={expected_clickhouse_profile!r}, actual={expected_profile!r}"
+                )
         dataset = _semantic_object(value, context)
         _require_exact_semantic_keys(
             dataset,

@@ -98,4 +98,4 @@ jobs:
         run: bash tests/fixtures/mssql-2016/ci/stop.sh "$RUNNER_TEMP/dfe-sql2016"
       - name: Stop PostgreSQL fixture
         if: always()
-        run: docker compose --file tests/fixtures/postgres/compose.yaml down --volumes
+        run: docker compose --file tests/fixtures/postgres/compose.yaml down

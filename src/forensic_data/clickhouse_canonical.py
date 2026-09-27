@@ -22,6 +22,7 @@ from forensic_data.canonical import (
 from forensic_data.canonical.model import DECIMAL_38_MAX, INT64_MAX
 from forensic_data.clickhouse import (
     ClickHouseDataValidationError,
+    ClickHouseDateTime64Type,
     ClickHouseParameter,
     ClickHouseResultLimitError,
     ClickHouseTransport,
@@ -35,6 +36,7 @@ from forensic_data.clickhouse import (
     validate_clickhouse_identifier,
     validate_clickhouse_text_scalar,
 )
+from forensic_data.clickhouse_profile import ClickHouseRuntimeProfile
 from forensic_data.postgres_sql import PostgresScopePredicate
 
 _LOWER_HEX_BYTES = re.compile(r"(?:[0-9a-f]{2})+\Z", re.ASCII)
@@ -113,6 +115,7 @@ type ClickHouseCanonicalSource = (
 class ClickHouseCanonicalRelation:
     database: str
     table: str
+    runtime_profile: ClickHouseRuntimeProfile
     source: ClickHouseCanonicalSource
     schema: CanonicalSchema
     bindings: tuple[ClickHouseCanonicalFieldBinding, ...]
@@ -120,6 +123,8 @@ class ClickHouseCanonicalRelation:
     def __post_init__(self) -> None:
         validate_clickhouse_identifier(self.database, "ClickHouse canonical database")
         validate_clickhouse_identifier(self.table, "ClickHouse canonical table")
+        if type(self.runtime_profile) is not ClickHouseRuntimeProfile:
+            raise TypeError("ClickHouse canonical runtime profile has an unexpected type")
         _require_source(self.source)
         if self.source.database != self.database or self.source.table != self.table:
             raise ValueError(
@@ -166,7 +171,7 @@ class ClickHouseCanonicalRelation:
             if binding.column_name in column_names:
                 raise ValueError("ClickHouse canonical binding column names must be unique")
             column_names.add(binding.column_name)
-            _validate_physical_mapping(field, binding, index)
+            _validate_physical_mapping(field, binding, index, self.runtime_profile)
 
 
 @final
@@ -291,6 +296,12 @@ class _ClickHouseColumnPayload(BaseModel):
     type: str
 
 
+class _ClickHouseTimeZonePayload(BaseModel):
+    model_config = ConfigDict(extra="ignore", frozen=True, strict=True)
+
+    effective_timezone: str
+
+
 class _ClickHouseCanonicalRowPayload(BaseModel):
     model_config = ConfigDict(extra="ignore", frozen=True, strict=True)
 
@@ -359,6 +370,49 @@ def inspect_clickhouse_canonical_relation(
     max_response_bytes: int,
     max_execution_time_seconds: int,
 ) -> ClickHouseCanonicalRelation:
+    return _inspect_clickhouse_canonical_relation(
+        transport,
+        database,
+        table,
+        schema,
+        column_names,
+        max_response_bytes,
+        max_execution_time_seconds,
+        ClickHouseRuntimeProfile.LTS,
+    )
+
+
+def inspect_legacy_clickhouse_canonical_relation(
+    transport: ClickHouseTransport,
+    database: str,
+    table: str,
+    schema: CanonicalSchema,
+    column_names: tuple[str, ...],
+    max_response_bytes: int,
+    max_execution_time_seconds: int,
+) -> ClickHouseCanonicalRelation:
+    return _inspect_clickhouse_canonical_relation(
+        transport,
+        database,
+        table,
+        schema,
+        column_names,
+        max_response_bytes,
+        max_execution_time_seconds,
+        ClickHouseRuntimeProfile.LEGACY_21_8_LTS_SOURCE,
+    )
+
+
+def _inspect_clickhouse_canonical_relation(
+    transport: ClickHouseTransport,
+    database: str,
+    table: str,
+    schema: CanonicalSchema,
+    column_names: tuple[str, ...],
+    max_response_bytes: int,
+    max_execution_time_seconds: int,
+    runtime_profile: ClickHouseRuntimeProfile,
+) -> ClickHouseCanonicalRelation:
     validate_clickhouse_identifier(database, "ClickHouse canonical database")
     validate_clickhouse_identifier(table, "ClickHouse canonical table")
     if type(schema) is not CanonicalSchema:
@@ -396,13 +450,12 @@ def inspect_clickhouse_canonical_relation(
             f"AND name IN ({placeholders}) ORDER BY position"
         ),
         parameters=parameters,
-        settings={
-            "session_timezone": "UTC",
-            "max_execution_time": max_execution_time_seconds,
-            "max_result_rows": len(column_names) + 1,
-            "max_result_bytes": max_response_bytes,
-            "result_overflow_mode": "throw",
-        },
+        settings=_canonical_catalog_settings(
+            runtime_profile,
+            max_execution_time_seconds,
+            len(column_names) + 1,
+            max_response_bytes,
+        ),
         result_format="JSONEachRow",
         max_response_bytes=max_response_bytes,
         operation="inspect_canonical_relation",
@@ -430,12 +483,16 @@ def inspect_clickhouse_canonical_relation(
             column_name,
             by_name[column_name].type,
             index,
+            runtime_profile,
+            max_response_bytes,
+            max_execution_time_seconds,
         )
         for index, (field, column_name) in enumerate(zip(schema.fields, column_names, strict=True))
     )
     return ClickHouseCanonicalRelation(
         database=database,
         table=table,
+        runtime_profile=runtime_profile,
         source=ClickHouseDirectTableSource(database=database, table=table),
         schema=schema,
         bindings=bindings,
@@ -475,6 +532,7 @@ def read_clickhouse_canonical_rows(
             request.limits,
             result_limit,
             request.relation.source,
+            request.relation.runtime_profile,
         ),
         result_format="JSONEachRow",
         max_response_bytes=request.limits.max_response_bytes,
@@ -527,7 +585,12 @@ def read_clickhouse_canonical_fingerprint(
             f"FROM {_aliased_source_sql(relation.source)}"
         ),
         parameters=_parameter_dict(lowering.parameters),
-        settings=_common_query_settings(limits, 1, relation.source),
+        settings=_common_query_settings(
+            limits,
+            1,
+            relation.source,
+            relation.runtime_profile,
+        ),
         result_format="JSONEachRow",
         max_response_bytes=limits.max_response_bytes,
         operation="read_canonical_fingerprint",
@@ -576,6 +639,7 @@ def read_clickhouse_canonical_key_groups(
             request.limits,
             result_limit,
             request.relation.source,
+            request.relation.runtime_profile,
         ),
         result_format="JSONEachRow",
         max_response_bytes=request.limits.max_response_bytes,
@@ -657,7 +721,12 @@ def clickhouse_comparison_aggregate_settings(
             f"requested={max_result_bytes}, accepted={limits.max_response_bytes}"
         )
     return {
-        **_common_query_settings(limits, max_result_rows, relation.source),
+        **_common_query_settings(
+            limits,
+            max_result_rows,
+            relation.source,
+            relation.runtime_profile,
+        ),
         "max_result_bytes": max_result_bytes,
     }
 
@@ -668,14 +737,46 @@ def clickhouse_comparison_ordered_settings(
     max_result_rows: int,
     max_result_bytes: int,
 ) -> dict[str, ClickHouseParameter]:
+    settings = clickhouse_comparison_aggregate_settings(
+        relation,
+        limits,
+        max_result_rows,
+        max_result_bytes,
+    )
+    if relation.runtime_profile is ClickHouseRuntimeProfile.LEGACY_21_8_LTS_SOURCE:
+        return settings
     return {
-        **clickhouse_comparison_aggregate_settings(
+        **settings,
+        "sort_overflow_mode": "throw",
+    }
+
+
+def clickhouse_comparison_grouped_settings(
+    relation: ClickHouseCanonicalRelation,
+    limits: ClickHouseCanonicalLimits,
+    max_result_rows: int,
+    max_result_bytes: int,
+    max_rows_to_group_by: int,
+) -> dict[str, ClickHouseParameter]:
+    _validate_positive_integer(
+        max_rows_to_group_by,
+        "ClickHouse comparison group row limit",
+        INT64_MAX,
+    )
+    settings = {
+        **clickhouse_comparison_ordered_settings(
             relation,
             limits,
             max_result_rows,
             max_result_bytes,
         ),
-        "sort_overflow_mode": "throw",
+        "max_rows_to_group_by": max_rows_to_group_by,
+    }
+    if relation.runtime_profile is ClickHouseRuntimeProfile.LEGACY_21_8_LTS_SOURCE:
+        return settings
+    return {
+        **settings,
+        "group_by_overflow_mode": "throw",
     }
 
 
@@ -685,6 +786,9 @@ def _inspect_field_binding(
     column_name: str,
     declared_type: str,
     field_index: int,
+    runtime_profile: ClickHouseRuntimeProfile,
+    max_response_bytes: int,
+    max_execution_time_seconds: int,
 ) -> ClickHouseCanonicalFieldBinding:
     base_type, nullable = _unwrap_nullable_type(declared_type, field_index)
     datetime_timezone: str | None = None
@@ -692,7 +796,13 @@ def _inspect_field_binding(
         LogicalType.TIMESTAMP_LOCAL,
         LogicalType.TIMESTAMP_INSTANT,
     ):
-        datetime_type = inspect_clickhouse_datetime64_type(transport, base_type)
+        datetime_type = _inspect_datetime64_type(
+            transport,
+            base_type,
+            runtime_profile,
+            max_response_bytes,
+            max_execution_time_seconds,
+        )
         datetime_timezone = datetime_type.timezone
     binding = ClickHouseCanonicalFieldBinding(
         field_name=field.name,
@@ -703,6 +813,51 @@ def _inspect_field_binding(
         datetime_timezone=datetime_timezone,
     )
     return binding
+
+
+def _inspect_datetime64_type(
+    transport: ClickHouseTransport,
+    type_name: str,
+    runtime_profile: ClickHouseRuntimeProfile,
+    max_response_bytes: int,
+    max_execution_time_seconds: int,
+) -> ClickHouseDateTime64Type:
+    if runtime_profile is ClickHouseRuntimeProfile.LTS:
+        return inspect_clickhouse_datetime64_type(transport, type_name)
+    if runtime_profile is not ClickHouseRuntimeProfile.LEGACY_21_8_LTS_SOURCE:
+        raise TypeError("ClickHouse DateTime64 runtime profile is unsupported")
+    precision, declared_timezone = parse_clickhouse_datetime64_declaration(type_name)
+    result = transport.execute_raw(
+        query="SELECT timezoneOf(defaultValueOfTypeName({type_name:String})) AS effective_timezone",
+        parameters={"type_name": type_name},
+        settings={
+            "max_execution_time": max_execution_time_seconds,
+            "max_result_rows": 1,
+            "max_result_bytes": max_response_bytes,
+        },
+        result_format="JSONEachRow",
+        max_response_bytes=max_response_bytes,
+        operation="inspect_datetime64_timezone",
+    )
+    rows = parse_clickhouse_json_rows(
+        result.payload,
+        _ClickHouseTimeZonePayload,
+        "legacy DateTime64 effective timezone",
+    )
+    if len(rows) != 1:
+        raise ClickHouseDataValidationError(
+            "ClickHouse legacy DateTime64 inspection must return exactly one row: "
+            f"actual={len(rows)}"
+        )
+    validate_clickhouse_text_scalar(
+        rows[0].effective_timezone,
+        "ClickHouse legacy DateTime64 effective timezone",
+    )
+    return ClickHouseDateTime64Type(
+        precision=precision,
+        declared_timezone=declared_timezone,
+        timezone=rows[0].effective_timezone,
+    )
 
 
 def _unwrap_nullable_type(type_name: str, field_index: int) -> tuple[str, bool]:
@@ -723,6 +878,7 @@ def _validate_physical_mapping(
     field: FieldSchema,
     binding: ClickHouseCanonicalFieldBinding,
     field_index: int,
+    runtime_profile: ClickHouseRuntimeProfile,
 ) -> None:
     logical_type = field.logical_type
     base_type = binding.base_type
@@ -736,13 +892,23 @@ def _validate_physical_mapping(
         parse_clickhouse_decimal_type(base_type)
         return
     if logical_type is LogicalType.BOOLEAN:
+        if runtime_profile is ClickHouseRuntimeProfile.LEGACY_21_8_LTS_SOURCE:
+            raise UnsupportedClickHouseProfileError(
+                "ClickHouse 21.8 source profile has no distinct Bool physical type: "
+                f"field_index={field_index}, physical_type={base_type!r}"
+            )
         _require_base_type(base_type, ("Bool",), logical_type, field_index)
         return
     if logical_type is LogicalType.STRING:
         _require_base_type(base_type, ("String",), logical_type, field_index)
         return
     if logical_type is LogicalType.DATE:
-        _require_base_type(base_type, ("Date", "Date32"), logical_type, field_index)
+        allowed_date_types = (
+            ("Date",)
+            if runtime_profile is ClickHouseRuntimeProfile.LEGACY_21_8_LTS_SOURCE
+            else ("Date", "Date32")
+        )
+        _require_base_type(base_type, allowed_date_types, logical_type, field_index)
         return
     if logical_type in (
         LogicalType.TIMESTAMP_LOCAL,
@@ -885,7 +1051,8 @@ def _assemble_envelope(
     )
     invalid = "NOT (" + " AND ".join(validities) + ")"
     oversized = (
-        "if(invalid_value, false, length(encoded_envelope) > {max_encoded_envelope_bytes:UInt64})"
+        "if(invalid_value, toUInt8(0), "
+        "length(encoded_envelope) > {max_encoded_envelope_bytes:UInt64})"
     )
     accepted = (
         "if(invalid_value OR oversized_value, CAST(NULL AS Nullable(String)), encoded_envelope)"
@@ -907,11 +1074,11 @@ def _payload_lowering(
 ) -> _PayloadLowering:
     logical_type = field.logical_type
     if logical_type is LogicalType.INT64:
-        return _PayloadLowering("true", f"toString({value})", ())
+        return _PayloadLowering("toUInt8(1)", f"toString({value})", ())
     if logical_type is LogicalType.DECIMAL:
         return _decimal_payload_lowering(field, binding, value, field_index)
     if logical_type is LogicalType.BOOLEAN:
-        return _PayloadLowering("true", f"if({value}, '1', '0')", ())
+        return _PayloadLowering("toUInt8(1)", f"if({value}, '1', '0')", ())
     if logical_type is LogicalType.STRING:
         return _PayloadLowering(
             f"isValidUTF8({value}) AND position({value}, char(0)) = 0",
@@ -1351,7 +1518,7 @@ def _clickhouse_scope_filter(
     scope: PostgresScopePredicate | None,
 ) -> tuple[str, tuple[tuple[str, ClickHouseParameter], ...]]:
     if scope is None:
-        return "true", ()
+        return "toUInt8(1)", ()
     if not isinstance(cast(object, scope), PostgresScopePredicate):
         raise TypeError("ClickHouse comparison scope must be PostgresScopePredicate or None")
     matches = tuple(
@@ -1385,7 +1552,17 @@ def _common_query_settings(
     limits: ClickHouseCanonicalLimits,
     max_result_rows: int,
     source: ClickHouseCanonicalSource,
+    runtime_profile: ClickHouseRuntimeProfile,
 ) -> dict[str, ClickHouseParameter]:
+    if runtime_profile is ClickHouseRuntimeProfile.LEGACY_21_8_LTS_SOURCE:
+        return {
+            "max_execution_time": limits.max_execution_time_seconds,
+            "max_result_rows": max_result_rows,
+            "max_result_bytes": limits.max_response_bytes,
+            **_source_query_settings(source, runtime_profile),
+        }
+    if runtime_profile is not ClickHouseRuntimeProfile.LTS:
+        raise TypeError("ClickHouse canonical runtime profile is unsupported")
     return {
         "session_timezone": "UTC",
         "max_execution_time": limits.max_execution_time_seconds,
@@ -1396,7 +1573,7 @@ def _common_query_settings(
         "max_result_rows": max_result_rows,
         "max_result_bytes": limits.max_response_bytes,
         "result_overflow_mode": "throw",
-        **_source_query_settings(source),
+        **_source_query_settings(source, runtime_profile),
     }
 
 
@@ -1404,9 +1581,12 @@ def _ordered_query_settings(
     limits: ClickHouseCanonicalLimits,
     max_result_rows: int,
     source: ClickHouseCanonicalSource,
+    runtime_profile: ClickHouseRuntimeProfile,
 ) -> dict[str, ClickHouseParameter]:
+    if runtime_profile is ClickHouseRuntimeProfile.LEGACY_21_8_LTS_SOURCE:
+        return _common_query_settings(limits, max_result_rows, source, runtime_profile)
     return {
-        **_common_query_settings(limits, max_result_rows, source),
+        **_common_query_settings(limits, max_result_rows, source, runtime_profile),
         "sort_overflow_mode": "throw",
     }
 
@@ -1415,9 +1595,15 @@ def _key_group_query_settings(
     limits: ClickHouseCanonicalLimits,
     max_group_rows: int,
     source: ClickHouseCanonicalSource,
+    runtime_profile: ClickHouseRuntimeProfile,
 ) -> dict[str, ClickHouseParameter]:
+    if runtime_profile is ClickHouseRuntimeProfile.LEGACY_21_8_LTS_SOURCE:
+        return {
+            **_ordered_query_settings(limits, max_group_rows, source, runtime_profile),
+            "max_rows_to_group_by": max_group_rows,
+        }
     return {
-        **_ordered_query_settings(limits, max_group_rows, source),
+        **_ordered_query_settings(limits, max_group_rows, source, runtime_profile),
         "max_rows_to_group_by": max_group_rows,
         "group_by_overflow_mode": "throw",
     }
@@ -1425,16 +1611,44 @@ def _key_group_query_settings(
 
 def _source_query_settings(
     source: ClickHouseCanonicalSource,
+    runtime_profile: ClickHouseRuntimeProfile,
 ) -> dict[str, ClickHouseParameter]:
     _require_source(source)
     if type(source) is ClickHouseDirectTableSource:
         return {}
+    if runtime_profile is ClickHouseRuntimeProfile.LEGACY_21_8_LTS_SOURCE:
+        raise UnsupportedClickHouseProfileError(
+            "ClickHouse 21.8 source profile supports only a direct plain MergeTree relation"
+        )
     return {
         "final": 0,
         "apply_mutations_on_fly": 0,
         "apply_patch_parts": 0,
         "do_not_merge_across_partitions_select_final": 0,
         "sort_overflow_mode": "throw",
+    }
+
+
+def _canonical_catalog_settings(
+    runtime_profile: ClickHouseRuntimeProfile,
+    max_execution_time_seconds: int,
+    max_result_rows: int,
+    max_response_bytes: int,
+) -> dict[str, ClickHouseParameter]:
+    if runtime_profile is ClickHouseRuntimeProfile.LEGACY_21_8_LTS_SOURCE:
+        return {
+            "max_execution_time": max_execution_time_seconds,
+            "max_result_rows": max_result_rows,
+            "max_result_bytes": max_response_bytes,
+        }
+    if runtime_profile is not ClickHouseRuntimeProfile.LTS:
+        raise TypeError("ClickHouse canonical catalog runtime profile is unsupported")
+    return {
+        "session_timezone": "UTC",
+        "max_execution_time": max_execution_time_seconds,
+        "max_result_rows": max_result_rows,
+        "max_result_bytes": max_response_bytes,
+        "result_overflow_mode": "throw",
     }
 
 

@@ -1,0 +1,33 @@
+{
+  "version": 1,
+  "issuer": "archive-release",
+  "dataset_id": "clickhouse_reference_orders",
+  "scope_digest": "df903aeb9157fcc8da48575be4a841781a2df049299fdf8b3623f719ee5465ab",
+  "expected_batch_id": "orders-v042",
+  "business_date": "2026-09-23",
+  "source_cut": "source-cut-42",
+  "dataset_version": "orders_v042",
+  "completed_at": "2026-09-24T00:00:00.000000Z",
+  "completion_revision": 42,
+  "publication_revision": 42,
+  "version_locator": {
+    "database": "archive",
+    "table": "orders_v042",
+    "uuid": "42424242-4242-4242-8242-424242424242"
+  },
+  "expected_definition_sha256": "0000000000000000000000000000000000000000000000000000000000000000",
+  "server_identity_kind": "operator_configured_macro",
+  "server_identity_macro": "dfe_server_uuid",
+  "expected_server_uuid": "43434343-4343-4343-8343-434343434343",
+  "assertions": {
+    "direct_single_server": true,
+    "server_identity_unique": true,
+    "immutable_named_version": true,
+    "no_writes_during_attempt": true,
+    "no_ddl_during_attempt": true,
+    "no_mutations_during_attempt": true,
+    "no_ttl_during_attempt": true
+  },
+  "immutability": "asserted",
+  "late_arrivals": "next_batch"
+}

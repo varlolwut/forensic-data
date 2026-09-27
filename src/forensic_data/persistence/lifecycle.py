@@ -38,10 +38,15 @@ from forensic_data.canonical import (
     schema_digest_hex,
     schema_from_metadata_json,
 )
-from forensic_data.clickhouse import ClickHouseServerProfile
+from forensic_data.clickhouse import (
+    ClickHouseLegacyProfileProvenance,
+    ClickHouseModernProfileProvenance,
+    ClickHouseServerProfile,
+)
 from forensic_data.clickhouse_canonical import (
     ClickHouseCanonicalFieldBinding,
     ClickHouseCanonicalFingerprint,
+    ClickHouseCanonicalRelation,
 )
 from forensic_data.clickhouse_endpoint import (
     ClickHouseFinalConfirmationEvidence,
@@ -50,8 +55,23 @@ from forensic_data.clickhouse_endpoint import (
     ClickHouseProtectedReadinessInspection,
     ClickHouseProtectedRelationInspection,
 )
+from forensic_data.clickhouse_legacy import (
+    ClickHouseLegacyBasePartWitness,
+    ClickHouseLegacyMutationWitness,
+    ClickHouseLegacyProjectionSafetyWitness,
+    ClickHouseLegacyReadinessObservation,
+    ClickHouseLegacySealAssertions,
+    ClickHouseLegacyServerIdentity,
+    ClickHouseLegacySourceBinding,
+    ClickHouseLegacySourceConfirmation,
+    ClickHouseLegacySourceManifest,
+    ClickHouseLegacyTableIdentity,
+    ClickHouseLegacyTableWitness,
+)
+from forensic_data.clickhouse_profile import ClickHouseRuntimeProfile
 from forensic_data.clickhouse_projection import (
     ClickHouseMergeTreeProjectionBinding,
+    ClickHouseMergeTreeProjectionConfirmation,
     ClickHouseMutationWitness,
     ClickHouseProjectionRuntimeWitness,
 )
@@ -76,6 +96,7 @@ from forensic_data.contracts.model import (
     Adapter,
     EvidenceAction,
     ExecutionBudgets,
+    LateArrivalPolicy,
     MinimumEvidence,
     RelationScope,
     SqlDialect,
@@ -266,6 +287,8 @@ _READER_ROLE: Final[str] = "dfe_metadata_reader"
 _CANONICAL_PROTOCOL: Final[str] = "dfe_canon_v1"
 _FINGERPRINT_PROTOCOL: Final[str] = "sha256_sum32_v1"
 _CLICKHOUSE_CLOSURE_KIND: Final[str] = "clickhouse_merge_tree_final_confirmation"
+_CLICKHOUSE_LEGACY_ACQUISITION_KIND: Final[str] = "clickhouse_legacy_asserted_source"
+_CLICKHOUSE_LEGACY_CLOSURE_KIND: Final[str] = "clickhouse_legacy_asserted_source_final_confirmation"
 _CLICKHOUSE_CLOSURE_PAYLOAD_KEYS: Final[frozenset[str]] = frozenset(
     {
         "acquisition_evidence_sha256",
@@ -288,6 +311,36 @@ _CLICKHOUSE_CLOSURE_PAYLOAD_KEYS: Final[frozenset[str]] = frozenset(
         "raw_manifest_sha256",
         "read_context_id",
         "run_id",
+    }
+)
+_CLICKHOUSE_LEGACY_CLOSURE_PAYLOAD_KEYS: Final[frozenset[str]] = frozenset(
+    {
+        "acquisition_evidence_sha256",
+        "attempt_id",
+        "binding_sha256",
+        "confirmed_at",
+        "end_operation_id",
+        "ended_at",
+        "final_logical_fingerprint",
+        "final_readiness",
+        "final_source",
+        "manifest_completion_revision",
+        "manifest_publication_revision",
+        "physical_query_provenance",
+        "raw_manifest_sha256",
+        "read_context_id",
+        "run_id",
+    }
+)
+_CLICKHOUSE_LEGACY_SEAL_ASSERTION_KEYS: Final[frozenset[str]] = frozenset(
+    {
+        "direct_single_server",
+        "immutable_named_version",
+        "no_ddl_during_attempt",
+        "no_mutations_during_attempt",
+        "no_ttl_during_attempt",
+        "no_writes_during_attempt",
+        "server_identity_unique",
     }
 )
 _POST_COMPARISON_CONTEXT_LOSS_CODES: Final[frozenset[ReasonCode]] = frozenset(
@@ -3206,9 +3259,10 @@ def _require_clickhouse_context_acquisition_row(
     row: DatabaseRow,
     expected: _ClickHouseContextClosureExpectation,
 ) -> None:
+    expected_direction = _clickhouse_context_request(expected.protected_context).direction.value
     if (
         _row_text(row[7], "ClickHouse read context engine") != Adapter.CLICKHOUSE.value
-        or _row_text(row[4], "ClickHouse read context direction") != PlanDirection.TARGET.value
+        or _row_text(row[4], "ClickHouse read context direction") != expected_direction
         or _canonical_database_json(row[16], "ClickHouse acquisition evidence")
         != expected.acquisition_evidence_json
     ):
@@ -3272,13 +3326,21 @@ def _validate_stored_clickhouse_closure(
         frozenset({"evidence_version", "kind", "payload"}),
         "ClickHouse closure evidence",
     )
-    if (
-        _semantic_integer(closure.get("evidence_version"), "ClickHouse closure version") != 1
-        or _semantic_text(closure.get("kind"), "ClickHouse closure kind")
-        != _CLICKHOUSE_CLOSURE_KIND
-    ):
+    if _semantic_integer(closure.get("evidence_version"), "ClickHouse closure version") != 1:
         raise StoredLifecycleIntegrityError(
             "ClickHouse closure evidence has an unsupported version or kind"
+        )
+    closure_kind = _semantic_text(closure.get("kind"), "ClickHouse closure kind")
+    if closure_kind == _CLICKHOUSE_LEGACY_CLOSURE_KIND:
+        _validate_stored_legacy_clickhouse_closure(row, closure)
+        return
+    if closure_kind != _CLICKHOUSE_CLOSURE_KIND:
+        raise StoredLifecycleIntegrityError(
+            "ClickHouse closure evidence has an unsupported version or kind"
+        )
+    if _row_text(row[4], "ClickHouse closure direction") != PlanDirection.TARGET.value:
+        raise StoredLifecycleIntegrityError(
+            "ClickHouse modern closure evidence requires target direction"
         )
     payload = _semantic_object(closure.get("payload"), "ClickHouse closure payload")
     _require_semantic_keys(
@@ -3365,6 +3427,11 @@ def _validate_stored_clickhouse_closure(
         projection.get("immutable_binding"),
         "ClickHouse acquisition immutable binding",
     )
+    immutable_request = _semantic_object(
+        immutable.get("request"),
+        "ClickHouse acquisition immutable request",
+    )
+    stored_direction = _row_text(row[4], "ClickHouse closure direction")
     if (
         _semantic_text(acquisition_context.get("context_id"), "acquisition context id")
         != _semantic_text(payload.get("read_context_id"), "closure context id")
@@ -3376,9 +3443,20 @@ def _validate_stored_clickhouse_closure(
         != _semantic_text(payload.get("attempt_id"), "closure attempt id")
         or _semantic_sha256(payload.get("binding_sha256"), "ClickHouse binding digest")
         != semantic_digest_hex(projection)
+        or _semantic_text(
+            acquisition_context.get("source_direction"),
+            "ClickHouse acquisition source direction",
+        )
+        != stored_direction
+        or _semantic_text(
+            immutable_request.get("direction"),
+            "ClickHouse immutable request direction",
+        )
+        != stored_direction
     ):
         raise StoredLifecycleIntegrityError(
-            "ClickHouse closure is not tied to its immutable context and projection binding"
+            "ClickHouse closure is not tied to its immutable context, direction, and projection "
+            "binding"
         )
     manifest = _semantic_object(immutable.get("manifest"), "ClickHouse acquisition manifest")
     completion_revision = _semantic_nonnegative_integer(
@@ -3505,6 +3583,341 @@ def _validate_stored_clickhouse_closure(
         raise StoredLifecycleIntegrityError(
             "ClickHouse acquisition, binding, confirmation, and closure timestamps are out of "
             "canonical order"
+        )
+
+
+def _validate_stored_legacy_clickhouse_closure(
+    row: DatabaseRow,
+    closure: dict[str, SemanticValue],
+) -> None:
+    payload = _semantic_object(closure.get("payload"), "ClickHouse legacy closure payload")
+    _require_semantic_keys(
+        payload,
+        _CLICKHOUSE_LEGACY_CLOSURE_PAYLOAD_KEYS,
+        "ClickHouse legacy closure payload",
+    )
+    ended_at = _row_optional_datetime(row[20], "ClickHouse legacy context ended_at")
+    end_operation_id = _row_optional_uuid(row[19], "ClickHouse legacy context end operation id")
+    if ended_at is None or end_operation_id is None:
+        raise StoredLifecycleIntegrityError(
+            "closed ClickHouse legacy context lacks its durable end receipt"
+        )
+    if (
+        _semantic_text(payload.get("run_id"), "ClickHouse legacy closure run id")
+        != str(_row_uuid(row[1], "ClickHouse legacy closure run row id"))
+        or _semantic_text(payload.get("attempt_id"), "ClickHouse legacy closure attempt id")
+        != str(_row_uuid(row[2], "ClickHouse legacy closure attempt row id"))
+        or _semantic_text(payload.get("read_context_id"), "ClickHouse legacy closure context id")
+        != str(_row_uuid(row[0], "ClickHouse legacy closure context row id"))
+        or _semantic_text(
+            payload.get("end_operation_id"),
+            "ClickHouse legacy closure end operation id",
+        )
+        != str(end_operation_id)
+        or _semantic_utc_datetime(
+            payload.get("ended_at"),
+            "ClickHouse legacy closure ended_at",
+        )
+        != ended_at
+    ):
+        raise StoredLifecycleIntegrityError(
+            "ClickHouse legacy closure evidence differs from its durable context receipt"
+        )
+    acquisition_json = _canonical_database_json(
+        row[16],
+        "ClickHouse legacy closure acquisition evidence",
+    )
+    acquisition_sha256 = hashlib.sha256(
+        acquisition_json.encode("utf-8", errors="strict")
+    ).hexdigest()
+    if (
+        _semantic_sha256(
+            payload.get("acquisition_evidence_sha256"),
+            "ClickHouse legacy closure acquisition digest",
+        )
+        != acquisition_sha256
+    ):
+        raise StoredLifecycleIntegrityError(
+            "ClickHouse legacy closure differs from its acquisition evidence"
+        )
+    try:
+        acquisition_semantic = semantic_value_from_json(acquisition_json)
+    except ValueError as error:
+        raise StoredLifecycleIntegrityError(
+            "ClickHouse legacy closure acquisition evidence is invalid semantic JSON: "
+            f"reason={error}"
+        ) from None
+    acquisition = _semantic_object(
+        acquisition_semantic,
+        "ClickHouse legacy closure acquisition evidence",
+    )
+    if (
+        _semantic_integer(
+            acquisition.get("evidence_version"),
+            "ClickHouse legacy acquisition version",
+        )
+        != 1
+        or _semantic_text(
+            acquisition.get("kind"),
+            "ClickHouse legacy acquisition kind",
+        )
+        != _CLICKHOUSE_LEGACY_ACQUISITION_KIND
+    ):
+        raise StoredLifecycleIntegrityError(
+            "ClickHouse legacy closure references unsupported acquisition evidence"
+        )
+    acquisition_payload = _semantic_object(
+        acquisition.get("payload"),
+        "ClickHouse legacy acquisition payload",
+    )
+    acquisition_context = _semantic_object(
+        acquisition_payload.get("context"),
+        "ClickHouse legacy acquisition context",
+    )
+    binding = _semantic_object(
+        acquisition_payload.get("source_binding"),
+        "ClickHouse legacy acquisition binding",
+    )
+    request = _semantic_object(
+        binding.get("request"),
+        "ClickHouse legacy acquisition request",
+    )
+    version_request = _semantic_object(
+        request.get("version_request"),
+        "ClickHouse legacy immutable request",
+    )
+    manifest = _semantic_object(
+        binding.get("manifest"),
+        "ClickHouse legacy acquisition manifest",
+    )
+    stored_direction = _row_text(row[4], "ClickHouse legacy closure direction")
+    _require_persisted_legacy_clickhouse_seal(
+        binding,
+        version_request,
+        manifest,
+        stored_direction,
+    )
+    if (
+        _semantic_text(acquisition_context.get("context_id"), "legacy acquisition context id")
+        != _semantic_text(payload.get("read_context_id"), "legacy closure context id")
+        or _semantic_text(
+            acquisition_context.get("attempt_id"),
+            "legacy acquisition attempt id",
+        )
+        != _semantic_text(payload.get("attempt_id"), "legacy closure attempt id")
+        or _semantic_text(binding.get("context_id"), "legacy binding context id")
+        != _semantic_text(payload.get("read_context_id"), "legacy closure context id")
+        or _semantic_text(binding.get("attempt_id"), "legacy binding attempt id")
+        != _semantic_text(payload.get("attempt_id"), "legacy closure attempt id")
+        or _semantic_sha256(
+            payload.get("binding_sha256"),
+            "ClickHouse legacy binding digest",
+        )
+        != semantic_digest_hex(binding)
+        or _semantic_text(
+            acquisition_context.get("source_direction"),
+            "ClickHouse legacy acquisition source direction",
+        )
+        != stored_direction
+        or _semantic_text(
+            version_request.get("direction"),
+            "ClickHouse legacy request direction",
+        )
+        != stored_direction
+    ):
+        raise StoredLifecycleIntegrityError(
+            "ClickHouse legacy closure is not tied to its context, direction, and binding"
+        )
+    completion_revision = _semantic_positive_integer(
+        payload.get("manifest_completion_revision"),
+        "ClickHouse legacy closure completion revision",
+    )
+    publication_revision = _semantic_positive_integer(
+        payload.get("manifest_publication_revision"),
+        "ClickHouse legacy closure publication revision",
+    )
+    if (
+        _semantic_sha256(
+            payload.get("raw_manifest_sha256"),
+            "ClickHouse legacy raw manifest digest",
+        )
+        != _semantic_sha256(manifest.get("artifact_sha256"), "legacy manifest digest")
+        or completion_revision
+        != _semantic_positive_integer(
+            manifest.get("completion_revision"),
+            "legacy manifest completion revision",
+        )
+        or publication_revision
+        != _semantic_positive_integer(
+            manifest.get("publication_revision"),
+            "legacy manifest publication revision",
+        )
+    ):
+        raise StoredLifecycleIntegrityError(
+            "ClickHouse legacy closure manifest provenance differs from acquisition"
+        )
+    if any(
+        canonical_semantic_json(actual) != canonical_semantic_json(expected)
+        for actual, expected in (
+            (payload.get("final_readiness"), binding.get("readiness")),
+            (payload.get("final_source"), binding.get("source")),
+            (payload.get("final_logical_fingerprint"), binding.get("logical_fingerprint")),
+        )
+    ):
+        raise StoredLifecycleIntegrityError(
+            "ClickHouse legacy final witnesses differ from acquisition evidence"
+        )
+    final_readiness = _semantic_object(
+        payload.get("final_readiness"),
+        "ClickHouse legacy final readiness",
+    )
+    final_record = _semantic_object(
+        final_readiness.get("record"),
+        "ClickHouse legacy final readiness record",
+    )
+    if (
+        _semantic_positive_integer(
+            final_record.get("completion_revision"),
+            "ClickHouse legacy final completion revision",
+        )
+        != completion_revision
+        or _semantic_positive_integer(
+            final_record.get("publication_revision"),
+            "ClickHouse legacy final publication revision",
+        )
+        != publication_revision
+        or _semantic_text(final_record.get("state"), "ClickHouse legacy final state") != "complete"
+        or _semantic_text(
+            final_record.get("dataset_id"),
+            "ClickHouse legacy final dataset id",
+        )
+        != _semantic_text(manifest.get("dataset_id"), "legacy manifest dataset id")
+        or _semantic_text(
+            final_record.get("scope_digest"),
+            "ClickHouse legacy final scope digest",
+        )
+        != _semantic_text(manifest.get("scope_digest"), "legacy manifest scope digest")
+        or _semantic_text(final_record.get("batch_id"), "ClickHouse legacy final batch id")
+        != _semantic_text(
+            manifest.get("expected_batch_id"),
+            "legacy manifest expected batch id",
+        )
+        or _semantic_text(
+            final_record.get("business_date"),
+            "ClickHouse legacy final business date",
+        )
+        != _semantic_text(manifest.get("business_date"), "legacy manifest business date")
+        or _semantic_text(
+            final_record.get("source_cut"),
+            "ClickHouse legacy final source cut",
+        )
+        != _semantic_text(manifest.get("source_cut"), "legacy manifest source cut")
+        or _semantic_text(
+            final_record.get("dataset_version"),
+            "ClickHouse legacy final dataset version",
+        )
+        != _semantic_text(manifest.get("dataset_version"), "legacy manifest dataset version")
+        or _semantic_text(
+            final_record.get("completed_at"),
+            "ClickHouse legacy final completed_at",
+        )
+        != _semantic_text(manifest.get("completed_at"), "legacy manifest completed_at")
+    ):
+        raise StoredLifecycleIntegrityError(
+            "ClickHouse legacy final readiness differs from its trusted manifest"
+        )
+    final_source = _semantic_object(
+        payload.get("final_source"),
+        "ClickHouse legacy final source",
+    )
+    source_identity = _semantic_object(
+        final_source.get("identity"),
+        "ClickHouse legacy final source identity",
+    )
+    source_server = _semantic_object(
+        source_identity.get("server"),
+        "ClickHouse legacy final server identity",
+    )
+    version_locator = _semantic_object(
+        manifest.get("version_locator"),
+        "ClickHouse legacy manifest version locator",
+    )
+    if (
+        _semantic_text(source_identity.get("database"), "legacy source database")
+        != _semantic_text(version_locator.get("database"), "legacy manifest database")
+        or _semantic_text(source_identity.get("table"), "legacy source table")
+        != _semantic_text(version_locator.get("table"), "legacy manifest table")
+        or _semantic_uuid_text(source_identity.get("uuid"), "legacy source table UUID")
+        != _semantic_uuid_text(version_locator.get("uuid"), "legacy manifest table UUID")
+        or _semantic_sha256(
+            source_identity.get("definition_sha256"),
+            "legacy source definition digest",
+        )
+        != _semantic_sha256(
+            manifest.get("expected_definition_sha256"),
+            "legacy manifest definition digest",
+        )
+        or _semantic_uuid_text(
+            source_server.get("asserted_server_uuid"),
+            "legacy source asserted server UUID",
+        )
+        != _semantic_uuid_text(
+            manifest.get("expected_server_uuid"),
+            "legacy manifest expected server UUID",
+        )
+    ):
+        raise StoredLifecycleIntegrityError(
+            "ClickHouse legacy final source identity differs from its trusted manifest"
+        )
+    provenance = _semantic_object(
+        payload.get("physical_query_provenance"),
+        "ClickHouse legacy physical query provenance",
+    )
+    _require_semantic_keys(
+        provenance,
+        frozenset(
+            {"attempt_id", "connection_attempts", "final_query_id", "physical_request_count"}
+        ),
+        "ClickHouse legacy physical query provenance",
+    )
+    _semantic_positive_integer(
+        provenance.get("connection_attempts"),
+        "ClickHouse legacy connection attempts",
+    )
+    _semantic_positive_integer(
+        provenance.get("physical_request_count"),
+        "ClickHouse legacy physical request count",
+    )
+    if _semantic_text(
+        provenance.get("attempt_id"),
+        "ClickHouse legacy query provenance attempt id",
+    ) != _semantic_text(payload.get("attempt_id"), "ClickHouse legacy closure attempt id"):
+        raise StoredLifecycleIntegrityError(
+            "ClickHouse legacy physical query provenance differs from its closure attempt"
+        )
+    _semantic_uuid_text(
+        provenance.get("final_query_id"),
+        "ClickHouse legacy final query id",
+    )
+    opened_at = _semantic_utc_datetime(
+        binding.get("opened_at"),
+        "ClickHouse legacy binding opened_at",
+    )
+    context_started_at = _semantic_utc_datetime(
+        acquisition_context.get("started_at"),
+        "ClickHouse legacy acquisition context started_at",
+    )
+    confirmed_at = _semantic_utc_datetime(
+        payload.get("confirmed_at"),
+        "ClickHouse legacy confirmed_at",
+    )
+    if (
+        opened_at != context_started_at
+        or context_started_at > confirmed_at
+        or confirmed_at > ended_at
+    ):
+        raise StoredLifecycleIntegrityError(
+            "ClickHouse legacy acquisition, confirmation, and closure timestamps are out of order"
         )
 
 
@@ -4956,6 +5369,7 @@ def _is_degraded_structural_context_loss(
     primary = reasons[0]
     return primary.code in _POST_COMPARISON_CONTEXT_LOSS_CODES and primary.operation in (
         "close_read_context",
+        "confirm_reference",
         "confirm_target",
     )
 
@@ -5469,6 +5883,10 @@ def _validate_context_definition(
         _validate_clickhouse_context_definition(context)
         if context.evidence.attempt_id != attempt.attempt_id:
             raise ValueError("ClickHouse read context attempt differs from its lifecycle attempt")
+        if context.source_direction.value != definition.direction.value:
+            raise ValueError(
+                "ClickHouse read context direction differs from its lifecycle direction"
+            )
     else:
         evidence = context.evidence
         profile = context.profile
@@ -5508,15 +5926,21 @@ def _validate_clickhouse_context_binding(
     evidence = context.evidence
     profile = context.profile
     binding = context.projection_binding
+    if type(binding) is ClickHouseLegacySourceBinding:
+        _validate_legacy_clickhouse_context_binding(context, binding)
+        return
+    if type(binding) is not ClickHouseMergeTreeProjectionBinding:
+        raise TypeError("ClickHouse lifecycle context has an unsupported binding type")
     immutable = binding.immutable_binding
     relations = _clickhouse_context_relations(context)
     readiness = context.protected_readiness
     if evidence.engine != "ClickHouse":
         raise ValueError("ClickHouse lifecycle read context requires engine='ClickHouse'")
-    if context.source_direction is not PostgresSourceDirection.TARGET:
-        raise ValueError("ClickHouse lifecycle read context is supported only as a target")
-    if immutable.request.direction is not PlanDirection.TARGET:
-        raise ValueError("ClickHouse immutable-version request must use the target direction")
+    if (
+        context.source_direction is not PostgresSourceDirection.TARGET
+        or immutable.request.direction is not PlanDirection.TARGET
+    ):
+        raise ValueError("ClickHouse modern immutable projection requires target direction")
     if (
         immutable.request.minimum_evidence is not MinimumEvidence.ASSERTED
         or immutable.stable_read_evidence is not ConsistencyLevel.ASSERTED
@@ -5545,6 +5969,12 @@ def _validate_clickhouse_context_binding(
         or evidence.server_version_number != profile.server_version_number
     ):
         raise ValueError("ClickHouse lifecycle context evidence differs from its server profile")
+    provenance = profile.provenance
+    if (
+        type(provenance) is not ClickHouseModernProfileProvenance
+        or provenance.runtime_profile is not ClickHouseRuntimeProfile.LTS
+    ):
+        raise ValueError("ClickHouse modern context lacks exact runtime-profile provenance")
     if (
         not profile.binding_library_name.strip()
         or not profile.binding_library_version.strip()
@@ -5565,6 +5995,75 @@ def _validate_clickhouse_context_binding(
         raise ValueError(
             "ClickHouse lifecycle readiness inspection differs from its immutable binding"
         )
+
+
+def _validate_legacy_clickhouse_context_binding(
+    context: ClickHouseProtectedReadContext,
+    binding: ClickHouseLegacySourceBinding,
+) -> None:
+    evidence = context.evidence
+    profile = context.profile
+    request = binding.request.version_request
+    relations = _clickhouse_context_relations(context)
+    readiness = context.protected_readiness
+    if evidence.engine != "ClickHouse":
+        raise ValueError("ClickHouse legacy lifecycle context requires engine='ClickHouse'")
+    if (
+        context.source_direction is not PostgresSourceDirection.REFERENCE
+        or request.direction.value != context.source_direction.value
+    ):
+        raise ValueError("ClickHouse legacy source context requires reference direction")
+    if (
+        request.minimum_evidence is not MinimumEvidence.ASSERTED
+        or binding.overall_evidence is not ConsistencyLevel.ASSERTED
+        or binding.manifest.immutability_evidence is not ConsistencyLevel.ASSERTED
+        or evidence.consistency_level is not ConsistencyLevel.ASSERTED
+    ):
+        raise ValueError("ClickHouse legacy lifecycle stable-read evidence must remain asserted")
+    if binding.readiness.evidence.evidence_level is not ConsistencyLevel.VERIFIED:
+        raise ValueError("ClickHouse legacy readiness query evidence must remain verified")
+    if (
+        evidence.context_id != binding.context_id
+        or evidence.attempt_id != binding.attempt_id
+        or evidence.attempt_id != context.source_budget.attempt_id
+        or evidence.strategy != binding.strategy
+        or evidence.snapshot_locator != str(binding.source.identity.uuid)
+        or evidence.started_at != binding.opened_at
+        or evidence.limitations != binding.limitations
+        or evidence.allowed_concurrency != 1
+    ):
+        raise ValueError(
+            "ClickHouse legacy lifecycle context evidence differs from its source binding"
+        )
+    if (
+        evidence.server_version != profile.server_version
+        or evidence.server_version_number != profile.server_version_number
+    ):
+        raise ValueError("ClickHouse legacy context evidence differs from its server profile")
+    provenance = profile.provenance
+    if (
+        type(provenance) is not ClickHouseLegacyProfileProvenance
+        or provenance.runtime_profile is not ClickHouseRuntimeProfile.LEGACY_21_8_LTS_SOURCE
+    ):
+        raise ValueError("ClickHouse legacy context lacks exact runtime-profile provenance")
+    if (
+        not profile.binding_library_name.strip()
+        or not profile.binding_library_version.strip()
+        or not profile.transport_library_name.strip()
+        or not profile.transport_library_version.strip()
+        or not profile.build_id.strip()
+    ):
+        raise ValueError("ClickHouse legacy profile lacks transport or build identity")
+    if len(relations) != 1 or relations[0].projection_binding is not binding:
+        raise ValueError("ClickHouse legacy context must protect its exact source binding")
+    if (
+        readiness.context_id != evidence.context_id
+        or readiness.identity != binding.readiness.table.identity
+        or readiness.record != binding.readiness.record
+        or readiness.evidence != binding.readiness.evidence
+        or readiness.request != request
+    ):
+        raise ValueError("ClickHouse legacy readiness inspection differs from its source binding")
 
 
 def _validate_clickhouse_context_definition(
@@ -5603,6 +6102,18 @@ def _validate_clickhouse_context_closure(
         raise ValueError(
             "ClickHouse final confirmation differs from its persisted context or attempt"
         )
+    if type(confirmation) is ClickHouseLegacySourceConfirmation:
+        _validate_legacy_clickhouse_context_closure(
+            attempt,
+            context,
+            confirmation,
+            ended_at,
+        )
+        return
+    if type(confirmation) is not ClickHouseMergeTreeProjectionConfirmation:
+        raise TypeError("ClickHouse context has an unsupported final confirmation type")
+    if type(context.projection_binding) is not ClickHouseMergeTreeProjectionBinding:
+        raise ValueError("ClickHouse modern confirmation has a non-modern context binding")
     if confirmation.immutable_confirmation.binding is not (
         context.projection_binding.immutable_binding
     ):
@@ -5621,14 +6132,42 @@ def _validate_clickhouse_context_closure(
             "ClickHouse acquisition, binding, confirmation, and durable closure timestamps must "
             "remain in canonical order"
         )
-    expected_batch = _expected_batch(attempt.run.request, PlanDirection.TARGET)
     request = context.projection_binding.immutable_binding.request
+    expected_batch = _expected_batch(attempt.run.request, request.direction)
     if (
         request.dataset_id != expected_batch.dataset_id
         or request.expected_batch_id != expected_batch.batch_id
         or request.scope_digest != attempt.run.request.scope.scope_digest
     ):
-        raise ValueError("ClickHouse final confirmation is outside the run request target closure")
+        raise ValueError("ClickHouse final confirmation is outside its run direction closure")
+
+
+def _validate_legacy_clickhouse_context_closure(
+    attempt: RunAttemptRecord,
+    context: ClickHouseProtectedReadContext,
+    confirmation: ClickHouseLegacySourceConfirmation,
+    ended_at: datetime,
+) -> None:
+    binding = context.projection_binding
+    if type(binding) is not ClickHouseLegacySourceBinding:
+        raise ValueError("ClickHouse legacy confirmation has a non-legacy context binding")
+    if confirmation.binding is not binding:
+        raise ValueError("ClickHouse legacy final confirmation has a different source binding")
+    if binding.opened_at != context.evidence.started_at or not (
+        context.evidence.started_at <= confirmation.confirmed_at <= ended_at
+    ):
+        raise ValueError(
+            "ClickHouse legacy acquisition, confirmation, and durable closure timestamps must "
+            "remain in canonical order"
+        )
+    request = binding.request.version_request
+    expected_batch = _expected_batch(attempt.run.request, request.direction)
+    if (
+        request.dataset_id != expected_batch.dataset_id
+        or request.expected_batch_id != expected_batch.batch_id
+        or request.scope_digest != attempt.run.request.scope.scope_digest
+    ):
+        raise ValueError("ClickHouse legacy final confirmation is outside its run closure")
 
 
 def _validate_greengage_context_definition(
@@ -6121,6 +6660,17 @@ def _clickhouse_context_relations(
     if readiness.context_id != context.evidence.context_id:
         raise ValueError("ClickHouse protected readiness belongs to a different context")
     return relations
+
+
+def _clickhouse_context_request(
+    context: ClickHouseProtectedReadContext,
+) -> ClickHouseImmutableVersionRequest:
+    binding = context.projection_binding
+    if type(binding) is ClickHouseLegacySourceBinding:
+        return binding.request.version_request
+    if type(binding) is not ClickHouseMergeTreeProjectionBinding:
+        raise TypeError("ClickHouse protected context has an unsupported binding type")
+    return binding.immutable_binding.request
 
 
 def _mssql_context_relations(
@@ -6708,8 +7258,11 @@ def _require_readiness_relation_closure(
         )
     stable_read = _semantic_text(item.get("stable_read"), "contract stable-read strategy")
     if isinstance(definition.protected_context, ClickHouseProtectedReadContext):
-        if definition.direction is not PlanDirection.TARGET:
-            raise ValueError("ClickHouse lifecycle observations are supported only as a target")
+        request_direction = _clickhouse_context_request(definition.protected_context).direction
+        if definition.direction is not request_direction:
+            raise ValueError(
+                "ClickHouse lifecycle observation direction differs from its immutable request"
+            )
         if stable_read != StableReadKind.IMMUTABLE_NAMED_VERSION.value:
             raise ValueError(
                 "ClickHouse lifecycle runtime requires contract immutable_named_version reads"
@@ -6771,15 +7324,17 @@ def _require_stable_read_context(
     if isinstance(context, ClickHouseProtectedReadContext):
         if strategy != context.evidence.strategy or strategy != context.projection_binding.strategy:
             raise ValueError(
-                "readiness context does not provide the persisted ClickHouse projection strategy"
+                "readiness context does not provide the persisted ClickHouse binding strategy"
             )
-        if snapshot_locator != str(
-            context.projection_binding.immutable_binding.version_identity.uuid
-        ):
+        if snapshot_locator != str(context.protected_relations[0].version_identity.uuid):
             raise ValueError(
                 "ClickHouse readiness context lacks its immutable named-version locator"
             )
-        expected_kind = "clickhouse_immutable_named_version_projection"
+        expected_kind = (
+            _CLICKHOUSE_LEGACY_ACQUISITION_KIND
+            if type(context.projection_binding) is ClickHouseLegacySourceBinding
+            else "clickhouse_immutable_named_version_projection"
+        )
     elif isinstance(context, PostgresProtectedReadContext):
         if strategy != "protected_read_only_repeatable_read":
             raise ValueError("readiness context does not provide the contract transaction snapshot")
@@ -6821,14 +7376,35 @@ def _require_stable_read_context(
             payload.get("context"),
             "ClickHouse persisted context evidence",
         )
-        projection = _semantic_object(
-            payload.get("projection"),
-            "ClickHouse persisted projection evidence",
-        )
-        immutable = _semantic_object(
-            projection.get("immutable_binding"),
-            "ClickHouse persisted immutable binding",
-        )
+        if type(context.projection_binding) is ClickHouseLegacySourceBinding:
+            _require_persisted_legacy_clickhouse_binding(payload, context)
+        else:
+            projection = _semantic_object(
+                payload.get("projection"),
+                "ClickHouse persisted projection evidence",
+            )
+            immutable = _semantic_object(
+                projection.get("immutable_binding"),
+                "ClickHouse persisted immutable binding",
+            )
+            if (
+                _semantic_text(
+                    projection.get("overall_evidence"),
+                    "ClickHouse persisted projection evidence level",
+                )
+                != ConsistencyLevel.ASSERTED.value
+                or _semantic_text(
+                    immutable.get("stable_read_evidence"),
+                    "ClickHouse persisted stable-read evidence level",
+                )
+                != ConsistencyLevel.ASSERTED.value
+                or _semantic_text(
+                    immutable.get("overall_evidence"),
+                    "ClickHouse persisted overall evidence level",
+                )
+                != ConsistencyLevel.ASSERTED.value
+            ):
+                raise ValueError("persisted ClickHouse stable-read evidence must remain asserted")
         if (
             _semantic_text(
                 persisted_context.get("consistency_level"),
@@ -6836,24 +7412,6 @@ def _require_stable_read_context(
             )
             != ConsistencyLevel.ASSERTED.value
             or _semantic_text(
-                projection.get("overall_evidence"),
-                "ClickHouse persisted projection evidence level",
-            )
-            != ConsistencyLevel.ASSERTED.value
-            or _semantic_text(
-                immutable.get("stable_read_evidence"),
-                "ClickHouse persisted stable-read evidence level",
-            )
-            != ConsistencyLevel.ASSERTED.value
-            or _semantic_text(
-                immutable.get("overall_evidence"),
-                "ClickHouse persisted overall evidence level",
-            )
-            != ConsistencyLevel.ASSERTED.value
-        ):
-            raise ValueError("persisted ClickHouse stable-read evidence must remain asserted")
-        if (
-            _semantic_text(
                 persisted_context.get("context_id"),
                 "ClickHouse persisted context id",
             )
@@ -6872,6 +7430,138 @@ def _require_stable_read_context(
             raise ValueError(
                 "persisted ClickHouse stable-read evidence has a different attempt or version"
             )
+
+
+def _require_persisted_legacy_clickhouse_binding(
+    payload: dict[str, SemanticValue],
+    context: ClickHouseProtectedReadContext,
+) -> None:
+    binding = _semantic_object(
+        payload.get("source_binding"),
+        "ClickHouse persisted legacy source binding",
+    )
+    request = _semantic_object(
+        binding.get("request"),
+        "ClickHouse persisted legacy source request",
+    )
+    version_request = _semantic_object(
+        request.get("version_request"),
+        "ClickHouse persisted legacy immutable request",
+    )
+    manifest = _semantic_object(
+        binding.get("manifest"),
+        "ClickHouse persisted legacy manifest",
+    )
+    _require_persisted_legacy_clickhouse_seal(
+        binding,
+        version_request,
+        manifest,
+        context.source_direction.value,
+    )
+    if (
+        _semantic_text(
+            binding.get("context_id"),
+            "ClickHouse persisted legacy binding context id",
+        )
+        != str(context.evidence.context_id)
+        or _semantic_text(
+            binding.get("attempt_id"),
+            "ClickHouse persisted legacy binding attempt id",
+        )
+        != str(context.evidence.attempt_id)
+        or _semantic_text(
+            binding.get("strategy"),
+            "ClickHouse persisted legacy binding strategy",
+        )
+        != context.evidence.strategy
+    ):
+        raise ValueError("persisted ClickHouse legacy binding differs from its live context")
+
+
+def _require_persisted_legacy_clickhouse_seal(
+    binding: dict[str, SemanticValue],
+    version_request: dict[str, SemanticValue],
+    manifest: dict[str, SemanticValue],
+    expected_direction: str,
+) -> None:
+    assertions = _semantic_object(
+        manifest.get("assertions"),
+        "ClickHouse persisted legacy seal assertions",
+    )
+    _require_semantic_keys(
+        assertions,
+        _CLICKHOUSE_LEGACY_SEAL_ASSERTION_KEYS,
+        "ClickHouse persisted legacy seal assertions",
+    )
+    source = _semantic_object(
+        binding.get("source"),
+        "ClickHouse persisted legacy source",
+    )
+    identity = _semantic_object(
+        source.get("identity"),
+        "ClickHouse persisted legacy source identity",
+    )
+    server = _semantic_object(
+        identity.get("server"),
+        "ClickHouse persisted legacy server identity",
+    )
+    if (
+        expected_direction != PostgresSourceDirection.REFERENCE.value
+        or _semantic_text(
+            binding.get("overall_evidence"),
+            "ClickHouse persisted legacy binding evidence level",
+        )
+        != ConsistencyLevel.ASSERTED.value
+        or _semantic_text(
+            manifest.get("immutability_evidence"),
+            "ClickHouse persisted legacy manifest evidence level",
+        )
+        != ConsistencyLevel.ASSERTED.value
+        or _semantic_text(
+            manifest.get("late_arrivals"),
+            "ClickHouse persisted legacy manifest late-arrival policy",
+        )
+        != LateArrivalPolicy.NEXT_BATCH.value
+        or _semantic_text(
+            version_request.get("minimum_evidence"),
+            "ClickHouse persisted legacy minimum evidence",
+        )
+        != MinimumEvidence.ASSERTED.value
+        or _semantic_text(
+            version_request.get("late_arrivals"),
+            "ClickHouse persisted legacy request late-arrival policy",
+        )
+        != LateArrivalPolicy.NEXT_BATCH.value
+        or _semantic_text(
+            version_request.get("direction"),
+            "ClickHouse persisted legacy request direction",
+        )
+        != expected_direction
+        or _semantic_text(
+            manifest.get("server_identity_kind"),
+            "ClickHouse persisted legacy manifest identity kind",
+        )
+        != "operator_configured_macro"
+        or _semantic_text(
+            manifest.get("server_identity_macro"),
+            "ClickHouse persisted legacy manifest identity macro",
+        )
+        != "dfe_server_uuid"
+        or _semantic_text(server.get("kind"), "ClickHouse persisted legacy identity kind")
+        != "operator_configured_macro"
+        or _semantic_text(server.get("macro"), "ClickHouse persisted legacy identity macro")
+        != "dfe_server_uuid"
+        or not all(
+            _semantic_boolean(
+                assertions.get(name),
+                f"ClickHouse persisted legacy assertion {name}",
+            )
+            for name in sorted(_CLICKHOUSE_LEGACY_SEAL_ASSERTION_KEYS)
+        )
+    ):
+        raise StoredLifecycleIntegrityError(
+            "persisted ClickHouse legacy stable-read seal is not fully asserted"
+        )
 
 
 def _require_context_contains_observation_relations(
@@ -6967,9 +7657,14 @@ def _clickhouse_acquisition_evidence_semantic_value(
         _clickhouse_relation_semantic_value(item) for item in _clickhouse_context_relations(context)
     ]
     relations.append(_clickhouse_readiness_semantic_value(context.protected_readiness))
+    binding = context.projection_binding
     return {
         "evidence_version": 1,
-        "kind": "clickhouse_immutable_named_version_projection",
+        "kind": (
+            _CLICKHOUSE_LEGACY_ACQUISITION_KIND
+            if type(binding) is ClickHouseLegacySourceBinding
+            else "clickhouse_immutable_named_version_projection"
+        ),
         "payload": {
             **_clickhouse_context_provenance_semantic_value(context),
             "relations": relations,
@@ -7119,6 +7814,18 @@ def _clickhouse_closure_evidence_semantic_value(
     if type(evidence) is not ClickHouseFinalConfirmationEvidence:
         raise ValueError("ClickHouse closure evidence requires typed final confirmation")
     confirmation = evidence.confirmation
+    if type(confirmation) is ClickHouseLegacySourceConfirmation:
+        return _clickhouse_legacy_closure_evidence_semantic_value(
+            attempt,
+            evidence,
+            confirmation,
+            read_context_id,
+            end_operation_id,
+            ended_at,
+            acquisition_evidence_json,
+        )
+    if type(confirmation) is not ClickHouseMergeTreeProjectionConfirmation:
+        raise TypeError("ClickHouse closure evidence has an unsupported confirmation type")
     immutable_confirmation = confirmation.immutable_confirmation
     manifest = confirmation.binding.immutable_binding.manifest
     return {
@@ -7179,11 +7886,60 @@ def _clickhouse_closure_evidence_semantic_value(
     }
 
 
+def _clickhouse_legacy_closure_evidence_semantic_value(
+    attempt: RunAttemptRecord,
+    evidence: ClickHouseFinalConfirmationEvidence,
+    confirmation: ClickHouseLegacySourceConfirmation,
+    read_context_id: UUID,
+    end_operation_id: UUID,
+    ended_at: datetime,
+    acquisition_evidence_json: str,
+) -> dict[str, SemanticValue]:
+    binding = confirmation.binding
+    manifest = binding.manifest
+    return {
+        "evidence_version": 1,
+        "kind": _CLICKHOUSE_LEGACY_CLOSURE_KIND,
+        "payload": {
+            "acquisition_evidence_sha256": hashlib.sha256(
+                acquisition_evidence_json.encode("utf-8", errors="strict")
+            ).hexdigest(),
+            "attempt_id": str(attempt.attempt_id),
+            "binding_sha256": semantic_digest_hex(
+                _clickhouse_legacy_binding_semantic_value(binding)
+            ),
+            "confirmed_at": confirmation.confirmed_at.astimezone(UTC).isoformat(),
+            "end_operation_id": str(end_operation_id),
+            "ended_at": ended_at.astimezone(UTC).isoformat(),
+            "final_logical_fingerprint": _clickhouse_fingerprint_semantic_value(
+                confirmation.final_logical_fingerprint
+            ),
+            "final_readiness": _clickhouse_legacy_readiness_semantic_value(
+                confirmation.final_readiness
+            ),
+            "final_source": _clickhouse_legacy_table_witness_semantic_value(
+                confirmation.final_source
+            ),
+            "manifest_completion_revision": manifest.completion_revision,
+            "manifest_publication_revision": manifest.publication_revision,
+            "physical_query_provenance": {
+                "attempt_id": str(evidence.attempt_id),
+                "connection_attempts": evidence.connection_attempts,
+                "final_query_id": str(evidence.final_query_id),
+                "physical_request_count": evidence.physical_request_count,
+            },
+            "raw_manifest_sha256": manifest.artifact_sha256,
+            "read_context_id": str(read_context_id),
+            "run_id": str(attempt.run.run_id),
+        },
+    }
+
+
 def _clickhouse_context_provenance_semantic_value(
     context: ClickHouseProtectedReadContext,
 ) -> dict[str, SemanticValue]:
     evidence = context.evidence
-    return {
+    value: dict[str, SemanticValue] = {
         "context": {
             "allowed_concurrency": evidence.allowed_concurrency,
             "attempt_id": str(evidence.attempt_id),
@@ -7197,8 +7953,13 @@ def _clickhouse_context_provenance_semantic_value(
             "strategy": evidence.strategy,
         },
         "profile": _clickhouse_profile_semantic_value(context.profile),
-        "projection": _clickhouse_projection_semantic_value(context.projection_binding),
     }
+    binding = context.projection_binding
+    if type(binding) is ClickHouseLegacySourceBinding:
+        value["source_binding"] = _clickhouse_legacy_binding_semantic_value(binding)
+    else:
+        value["projection"] = _clickhouse_projection_semantic_value(binding)
+    return value
 
 
 def _clickhouse_profile_semantic_value(
@@ -7218,6 +7979,7 @@ def _clickhouse_profile_semantic_value(
         "max_result_bytes": profile.max_result_bytes,
         "max_result_rows": profile.max_result_rows,
         "max_threads": profile.max_threads,
+        "provenance": _clickhouse_profile_provenance_semantic_value(profile),
         "readonly": profile.readonly,
         "readonly_locked": profile.readonly_locked,
         "resource_constraints": [
@@ -7240,6 +8002,44 @@ def _clickhouse_profile_semantic_value(
             "name": profile.transport_library_name,
             "version": profile.transport_library_version,
         },
+    }
+
+
+def _clickhouse_profile_provenance_semantic_value(
+    profile: ClickHouseServerProfile,
+) -> dict[str, SemanticValue]:
+    provenance = profile.provenance
+    common: dict[str, SemanticValue] = {
+        "response_protocol": provenance.response_protocol.value,
+        "runtime_profile": provenance.runtime_profile.value,
+        "timezone_strategy": provenance.timezone_strategy.value,
+    }
+    if type(provenance) is ClickHouseModernProfileProvenance:
+        return common
+    if type(provenance) is not ClickHouseLegacyProfileProvenance:
+        raise TypeError("ClickHouse profile has unsupported provenance")
+    return {
+        **common,
+        "allow_experimental_projection_optimization": (
+            provenance.allow_experimental_projection_optimization
+        ),
+        "allow_experimental_projection_optimization_locked": (
+            provenance.allow_experimental_projection_optimization_locked
+        ),
+        "cancel_http_readonly_queries_on_client_close": (
+            provenance.cancel_http_readonly_queries_on_client_close
+        ),
+        "cancel_http_readonly_queries_on_client_close_locked": (
+            provenance.cancel_http_readonly_queries_on_client_close_locked
+        ),
+        "force_optimize_projection": provenance.force_optimize_projection,
+        "force_optimize_projection_locked": provenance.force_optimize_projection_locked,
+        "locked_overflow_modes": [
+            {"setting": item.setting.value, "value": item.value}
+            for item in provenance.locked_overflow_modes
+        ],
+        "send_progress_in_http_headers": provenance.send_progress_in_http_headers,
+        "send_progress_in_http_headers_locked": (provenance.send_progress_in_http_headers_locked),
     }
 
 
@@ -7270,9 +8070,195 @@ def _clickhouse_projection_semantic_value(
             "max_mutation_records": binding.request.max_mutation_records,
             "max_tie_groups": binding.request.max_tie_groups,
         },
-        "relation": _clickhouse_canonical_relation_semantic_value(binding),
+        "relation": _clickhouse_canonical_relation_semantic_value(binding.relation),
         "runtime_witness": _clickhouse_runtime_witness_semantic_value(binding.runtime_witness),
         "strategy": binding.strategy,
+    }
+
+
+def _clickhouse_legacy_binding_semantic_value(
+    binding: ClickHouseLegacySourceBinding,
+) -> dict[str, SemanticValue]:
+    request = binding.request
+    return {
+        "attempt_id": str(binding.attempt_id),
+        "context_id": str(binding.context_id),
+        "limitations": list(binding.limitations),
+        "logical_fingerprint": _clickhouse_fingerprint_semantic_value(binding.logical_fingerprint),
+        "manifest": _clickhouse_legacy_manifest_semantic_value(binding.manifest),
+        "opened_at": binding.opened_at.astimezone(UTC).isoformat(),
+        "overall_evidence": binding.overall_evidence.value,
+        "readiness": _clickhouse_legacy_readiness_semantic_value(binding.readiness),
+        "relation": _clickhouse_canonical_relation_semantic_value(binding.relation),
+        "request": {
+            "canonical_limits": {
+                "max_encoded_envelope_bytes": request.canonical_limits.max_encoded_envelope_bytes,
+                "max_execution_time_seconds": (request.canonical_limits.max_execution_time_seconds),
+                "max_response_bytes": request.canonical_limits.max_response_bytes,
+            },
+            "column_names": list(request.column_names),
+            "logical_schema": semantic_value_from_json(canonical_schema_json(request.schema)),
+            "max_mutation_records": request.max_mutation_records,
+            "max_part_records": request.max_part_records,
+            "version_request": _clickhouse_request_semantic_value(request.version_request),
+        },
+        "source": _clickhouse_legacy_table_witness_semantic_value(binding.source),
+        "strategy": binding.strategy,
+    }
+
+
+def _clickhouse_legacy_manifest_semantic_value(
+    manifest: ClickHouseLegacySourceManifest,
+) -> dict[str, SemanticValue]:
+    return {
+        "artifact_sha256": manifest.artifact_sha256,
+        "assertions": _clickhouse_legacy_assertions_semantic_value(manifest.assertions),
+        "business_date": manifest.business_date.isoformat(),
+        "completed_at": manifest.completed_at.astimezone(UTC).isoformat(),
+        "completion_revision": manifest.completion_revision,
+        "dataset_id": manifest.dataset_id,
+        "dataset_version": manifest.dataset_version,
+        "expected_batch_id": manifest.expected_batch_id,
+        "expected_definition_sha256": manifest.expected_definition_sha256,
+        "expected_server_uuid": str(manifest.expected_server_uuid),
+        "immutability_evidence": manifest.immutability_evidence.value,
+        "issuer": manifest.issuer,
+        "late_arrivals": manifest.late_arrivals.value,
+        "manifest_version": manifest.manifest_version,
+        "publication_revision": manifest.publication_revision,
+        "scope_digest": manifest.scope_digest,
+        "server_identity_kind": manifest.server_identity_kind,
+        "server_identity_macro": manifest.server_identity_macro,
+        "source_cut": manifest.source_cut,
+        "version_locator": {
+            "database": manifest.version_locator.database,
+            "table": manifest.version_locator.table,
+            "uuid": str(manifest.version_locator.uuid),
+        },
+    }
+
+
+def _clickhouse_legacy_assertions_semantic_value(
+    assertions: ClickHouseLegacySealAssertions,
+) -> dict[str, SemanticValue]:
+    return {
+        "direct_single_server": assertions.direct_single_server,
+        "immutable_named_version": assertions.immutable_named_version,
+        "no_ddl_during_attempt": assertions.no_ddl_during_attempt,
+        "no_mutations_during_attempt": assertions.no_mutations_during_attempt,
+        "no_ttl_during_attempt": assertions.no_ttl_during_attempt,
+        "no_writes_during_attempt": assertions.no_writes_during_attempt,
+        "server_identity_unique": assertions.server_identity_unique,
+    }
+
+
+def _clickhouse_legacy_readiness_semantic_value(
+    readiness: ClickHouseLegacyReadinessObservation,
+) -> dict[str, SemanticValue]:
+    return {
+        "evidence": {
+            "consistency_level": readiness.evidence.evidence_level.value,
+            "payload": readiness_evidence_semantic_value(readiness.evidence),
+        },
+        "record": _clickhouse_readiness_record_semantic_value(readiness.record),
+        "table": _clickhouse_legacy_table_witness_semantic_value(readiness.table),
+    }
+
+
+def _clickhouse_legacy_table_witness_semantic_value(
+    witness: ClickHouseLegacyTableWitness,
+) -> dict[str, SemanticValue]:
+    return {
+        "base_parts": _clickhouse_legacy_base_parts_semantic_value(witness.base_parts),
+        "identity": _clickhouse_legacy_table_identity_semantic_value(witness.identity),
+        "mutations": _clickhouse_legacy_mutations_semantic_value(witness.mutations),
+        "projection_safety": _clickhouse_legacy_projection_safety_semantic_value(
+            witness.projection_safety
+        ),
+        "row_policy_count": witness.row_policy_count,
+    }
+
+
+def _clickhouse_legacy_server_identity_semantic_value(
+    identity: ClickHouseLegacyServerIdentity,
+) -> dict[str, SemanticValue]:
+    return {
+        "asserted_server_uuid": str(identity.asserted_server_uuid),
+        "build_id": identity.build_id,
+        "hostname": identity.hostname,
+        "kind": identity.kind,
+        "macro": identity.macro,
+        "server_version": identity.server_version,
+        "server_version_number": identity.server_version_number,
+    }
+
+
+def _clickhouse_legacy_table_identity_semantic_value(
+    identity: ClickHouseLegacyTableIdentity,
+) -> dict[str, SemanticValue]:
+    return {
+        "columns": [
+            _clickhouse_column_identity_semantic_value(column) for column in identity.columns
+        ],
+        "database": identity.database,
+        "database_engine": identity.database_engine,
+        "database_uuid": str(identity.database_uuid),
+        "definition_sha256": identity.definition_sha256,
+        "engine_full": identity.engine_full,
+        "partition_key": identity.partition_key,
+        "server": _clickhouse_legacy_server_identity_semantic_value(identity.server),
+        "sorting_key": identity.sorting_key,
+        "table": identity.table,
+        "table_engine": identity.table_engine,
+        "uuid": str(identity.uuid),
+    }
+
+
+def _clickhouse_legacy_projection_safety_semantic_value(
+    witness: ClickHouseLegacyProjectionSafetyWitness,
+) -> dict[str, SemanticValue]:
+    return {
+        "active_projection_part_count": witness.active_projection_part_count,
+        "definition_sha256": witness.definition_sha256,
+        "projection_definition_absent": witness.projection_definition_absent,
+        "server": _clickhouse_legacy_server_identity_semantic_value(witness.server),
+        "settings": [
+            {
+                "locked": setting.locked,
+                "maximum": setting.maximum,
+                "minimum": setting.minimum,
+                "name": setting.name,
+                "value": setting.value,
+            }
+            for setting in witness.settings
+        ],
+        "ttl_definition_absent": witness.ttl_definition_absent,
+    }
+
+
+def _clickhouse_legacy_mutations_semantic_value(
+    witness: ClickHouseLegacyMutationWitness,
+) -> dict[str, SemanticValue]:
+    return {
+        "available_fields": list(witness.available_fields),
+        "failed_mutation_count": witness.failed_mutation_count,
+        "mutation_count": witness.mutation_count,
+        "pending_mutation_count": witness.pending_mutation_count,
+        "records_sha256": witness.records_sha256,
+        "server": _clickhouse_legacy_server_identity_semantic_value(witness.server),
+        "unavailable_fields": list(witness.unavailable_fields),
+    }
+
+
+def _clickhouse_legacy_base_parts_semantic_value(
+    witness: ClickHouseLegacyBasePartWitness,
+) -> dict[str, SemanticValue]:
+    return {
+        "active_bytes_on_disk": witness.active_bytes_on_disk,
+        "active_part_count": witness.active_part_count,
+        "active_row_count": witness.active_row_count,
+        "ordered_records_sha256": witness.ordered_records_sha256,
+        "server": _clickhouse_legacy_server_identity_semantic_value(witness.server),
     }
 
 
@@ -7563,16 +8549,20 @@ def _clickhouse_fingerprint_semantic_value(
 
 
 def _clickhouse_canonical_relation_semantic_value(
-    binding: ClickHouseMergeTreeProjectionBinding,
+    relation: ClickHouseCanonicalRelation,
 ) -> dict[str, SemanticValue]:
-    relation = binding.relation
+    source_kind = (
+        "legacy_merge_tree_direct_source"
+        if relation.runtime_profile is ClickHouseRuntimeProfile.LEGACY_21_8_LTS_SOURCE
+        else "merge_tree_logical_projection"
+    )
     return {
         "bindings": [
             _clickhouse_canonical_binding_semantic_value(item) for item in relation.bindings
         ],
         "database": relation.database,
         "logical_schema": semantic_value_from_json(canonical_schema_json(relation.schema)),
-        "source_kind": "merge_tree_logical_projection",
+        "source_kind": source_kind,
         "table": relation.table,
     }
 
@@ -7603,10 +8593,12 @@ def _clickhouse_relation_semantic_value(
             "requested_relation": list(protected.acquisition.relation.components),
         },
         "canonical_relation": _clickhouse_canonical_relation_semantic_value(
-            protected.projection_binding
+            protected.canonical_relation
         ),
         "context_id": str(protected.context_id),
-        "version_identity": _clickhouse_table_identity_semantic_value(protected.version_identity),
+        "version_identity": _clickhouse_protected_table_identity_semantic_value(
+            protected.version_identity
+        ),
     }
 
 
@@ -7619,10 +8611,20 @@ def _clickhouse_readiness_semantic_value(
             "consistency_level": protected.evidence.evidence_level.value,
             "payload": readiness_evidence_semantic_value(protected.evidence),
         },
-        "identity": _clickhouse_table_identity_semantic_value(protected.identity),
+        "identity": _clickhouse_protected_table_identity_semantic_value(protected.identity),
         "record": _clickhouse_readiness_record_semantic_value(protected.record),
         "request": _clickhouse_request_semantic_value(protected.request),
     }
+
+
+def _clickhouse_protected_table_identity_semantic_value(
+    identity: ClickHouseTableIdentity | ClickHouseLegacyTableIdentity,
+) -> dict[str, SemanticValue]:
+    if type(identity) is ClickHouseLegacyTableIdentity:
+        return _clickhouse_legacy_table_identity_semantic_value(identity)
+    if type(identity) is not ClickHouseTableIdentity:
+        raise TypeError("ClickHouse protected relation has an unsupported identity type")
+    return _clickhouse_table_identity_semantic_value(identity)
 
 
 def _protected_relation_semantic_value(
@@ -11365,7 +12367,7 @@ def _require_partial_stable_read_closure(
         _require_verified_non_clickhouse_contexts(reference_context, target_context)
         return
     if stable_reads is ConsistencyLevel.ASSERTED:
-        _require_asserted_clickhouse_target_closure(reference_context, target_context)
+        _require_asserted_clickhouse_closure(reference_context, target_context)
         return
     raise StoredLifecycleIntegrityError(
         "partial comparison has an unsupported stable-read evidence level"
@@ -11618,7 +12620,7 @@ def _require_completed_stable_read_closure(
         _require_verified_non_clickhouse_contexts(reference_context, target_context)
         return
     if stable_reads is ConsistencyLevel.ASSERTED:
-        _require_asserted_clickhouse_target_closure(reference_context, target_context)
+        _require_asserted_clickhouse_closure(reference_context, target_context)
         return
     raise StoredLifecycleIntegrityError(
         "completed comparison has an unsupported stable-read evidence level"
@@ -11638,33 +12640,36 @@ def _require_verified_non_clickhouse_contexts(
         )
 
 
-def _require_asserted_clickhouse_target_closure(
+def _require_asserted_clickhouse_closure(
     reference_context: DatabaseRow,
     target_context: DatabaseRow,
 ) -> None:
     _require_closed_stable_read_contexts(reference_context, target_context)
-    if (
+    reference_is_clickhouse = (
         _row_text(reference_context[7], "asserted reference context engine")
         == Adapter.CLICKHOUSE.value
-        or _row_text(target_context[7], "asserted target context engine")
-        != Adapter.CLICKHOUSE.value
-    ):
+    )
+    target_is_clickhouse = (
+        _row_text(target_context[7], "asserted target context engine") == Adapter.CLICKHOUSE.value
+    )
+    if reference_is_clickhouse == target_is_clickhouse:
         raise StoredLifecycleIntegrityError(
-            "asserted stable reads require exactly one target-side ClickHouse context"
+            "asserted stable reads require exactly one ClickHouse context"
         )
+    clickhouse_context = reference_context if reference_is_clickhouse else target_context
     closure_json = _row_optional_canonical_json(
-        target_context[21],
-        "asserted ClickHouse target closure evidence",
+        clickhouse_context[21],
+        "asserted ClickHouse closure evidence",
     )
     if (
-        _row_text(target_context[18], "asserted ClickHouse target context state")
+        _row_text(clickhouse_context[18], "asserted ClickHouse context state")
         != ReadContextStatus.CLOSED.value
         or closure_json is None
     ):
         raise RunLifecycleStateError(
-            "asserted stable reads require a durably confirmed closed ClickHouse target context"
+            "asserted stable reads require a durably confirmed closed ClickHouse context"
         )
-    _validate_stored_clickhouse_closure(target_context, closure_json)
+    _validate_stored_clickhouse_closure(clickhouse_context, closure_json)
 
 
 def _require_closed_stable_read_contexts(

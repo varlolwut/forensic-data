@@ -79,7 +79,7 @@ class _ImmutableVersionLocatorPayload(BaseModel):
 class _ImmutableManifestPayload(BaseModel):
     model_config = ConfigDict(extra="forbid", frozen=True, strict=True)
 
-    version: Literal[1]
+    version: int = Field(ge=1, le=1)
     issuer: str
     dataset_id: str
     scope_digest: str

@@ -29,6 +29,9 @@ _CLICKHOUSE_ERROR_NAME = re.compile(
 )
 _CLICKHOUSE_ERROR_CODE = re.compile(r"[1-9][0-9]{0,9}\Z", re.ASCII)
 _CLICKHOUSE_ERROR_CODE_IN_MESSAGE = re.compile(rb"(?:\A|\n)Code: ([1-9][0-9]{0,9})\.")
+_CLICKHOUSE_LEGACY_ERROR_CODE_IN_MESSAGE = re.compile(
+    rb"\ACode: ([1-9][0-9]{0,9}), e\.displayText\(\) = DB::Exception: "
+)
 _CLICKHOUSE_MAX_ERROR_CODE = 2_147_483_647
 _IDENTITY_ENCODINGS = frozenset((None, "", "identity"))
 _IPC_HEADER = struct.Struct("!Q")
@@ -48,6 +51,11 @@ class ClickHouseHttpOutcomeKind(StrEnum):
     RESULT_LIMIT = "result_limit"
     PROTOCOL_ERROR = "protocol_error"
     TRANSPORT_ERROR = "transport_error"
+
+
+class ClickHouseHttpResponseProtocol(StrEnum):
+    MODERN_EXCEPTION_FRAME = "modern_exception_frame"
+    LEGACY_CLEAN_EOF = "legacy_clean_eof"
 
 
 class ClickHouseHttpWorkerState(StrEnum):
@@ -115,6 +123,7 @@ class ClickHouseHttpRequest:
     headers: tuple[tuple[str, str], ...]
     body: bytes
     query_id: str
+    response_protocol: ClickHouseHttpResponseProtocol
     max_response_bytes: int
     max_error_response_bytes: int
     dispatch_deadline_nanoseconds: int
@@ -137,6 +146,8 @@ class ClickHouseHttpRequest:
                 raise TypeError("each HTTP header must be a non-empty text pair")
         if type(self.body) is not bytes:
             raise TypeError("body must be bytes")
+        if type(self.response_protocol) is not ClickHouseHttpResponseProtocol:
+            raise TypeError("response_protocol must be ClickHouseHttpResponseProtocol")
         for name, value in (
             ("max_response_bytes", self.max_response_bytes),
             ("max_error_response_bytes", self.max_error_response_bytes),
@@ -679,6 +690,17 @@ def _read_http_response(
     response: HTTPResponse,
     request: ClickHouseHttpRequest,
 ) -> ClickHouseHttpOutcome:
+    if request.response_protocol is ClickHouseHttpResponseProtocol.MODERN_EXCEPTION_FRAME:
+        return _read_modern_http_response(response, request)
+    if request.response_protocol is ClickHouseHttpResponseProtocol.LEGACY_CLEAN_EOF:
+        return _read_legacy_http_response(response, request)
+    raise AssertionError("ClickHouse HTTP request has an unsupported response protocol")
+
+
+def _read_modern_http_response(
+    response: HTTPResponse,
+    request: ClickHouseHttpRequest,
+) -> ClickHouseHttpOutcome:
     status_code = response.status
     response_query_id = response.headers.get("X-ClickHouse-Query-Id")
     exception_code_text = response.headers.get("X-ClickHouse-Exception-Code")
@@ -878,6 +900,186 @@ def _read_http_response(
     )
 
 
+def _read_legacy_http_response(
+    response: HTTPResponse,
+    request: ClickHouseHttpRequest,
+) -> ClickHouseHttpOutcome:
+    status_code = response.status
+    response_query_id = response.headers.get("X-ClickHouse-Query-Id")
+    exception_code_text = response.headers.get("X-ClickHouse-Exception-Code")
+    exception_tag = response.headers.get("X-ClickHouse-Exception-Tag")
+    exception_code = _parse_error_code(exception_code_text)
+    has_error_status = not 200 <= status_code < 300
+    has_error_header = exception_code is not None
+    query_id_is_missing = response_query_id is None
+    if response_query_id is not None and response_query_id != request.query_id:
+        _discard_response(response)
+        return ClickHouseHttpOutcome(
+            kind=ClickHouseHttpOutcomeKind.PROTOCOL_ERROR,
+            dispatch_state=ClickHouseHttpDispatchState.UNKNOWN,
+            payload=b"",
+            status_code=status_code,
+            response_query_id=response_query_id,
+            error_code=exception_code,
+            error_name=None,
+            received_bytes=0,
+            truncated=False,
+            cause_type="QueryIdMismatch",
+        )
+    if exception_code_text is not None and exception_code is None:
+        _discard_response(response)
+        return ClickHouseHttpOutcome(
+            kind=ClickHouseHttpOutcomeKind.PROTOCOL_ERROR,
+            dispatch_state=ClickHouseHttpDispatchState.UNKNOWN,
+            payload=b"",
+            status_code=status_code,
+            response_query_id=response_query_id,
+            error_code=None,
+            error_name=None,
+            received_bytes=0,
+            truncated=False,
+            cause_type="InvalidClickHouseExceptionCode",
+        )
+    missing_query_id_can_be_verified = (
+        query_id_is_missing and 400 <= status_code <= 599 and exception_code is not None
+    )
+    if query_id_is_missing and not missing_query_id_can_be_verified:
+        _discard_response(response)
+        return ClickHouseHttpOutcome(
+            kind=ClickHouseHttpOutcomeKind.PROTOCOL_ERROR,
+            dispatch_state=ClickHouseHttpDispatchState.UNKNOWN,
+            payload=b"",
+            status_code=status_code,
+            response_query_id=None,
+            error_code=exception_code,
+            error_name=None,
+            received_bytes=0,
+            truncated=False,
+            cause_type="QueryIdMismatch",
+        )
+    if exception_tag is not None:
+        _discard_response(response)
+        return ClickHouseHttpOutcome(
+            kind=ClickHouseHttpOutcomeKind.PROTOCOL_ERROR,
+            dispatch_state=ClickHouseHttpDispatchState.UNKNOWN,
+            payload=b"",
+            status_code=status_code,
+            response_query_id=response_query_id,
+            error_code=exception_code,
+            error_name=None,
+            received_bytes=0,
+            truncated=False,
+            cause_type="UnexpectedClickHouseExceptionTag",
+        )
+    content_encoding = response.headers.get("Content-Encoding")
+    if content_encoding not in _IDENTITY_ENCODINGS:
+        _discard_response(response)
+        return ClickHouseHttpOutcome(
+            kind=ClickHouseHttpOutcomeKind.PROTOCOL_ERROR,
+            dispatch_state=ClickHouseHttpDispatchState.RESPONSE_RECEIVED,
+            payload=b"",
+            status_code=status_code,
+            response_query_id=response_query_id,
+            error_code=exception_code,
+            error_name=None,
+            received_bytes=0,
+            truncated=False,
+            cause_type="UnexpectedContentEncoding",
+        )
+    response_limit = (
+        request.max_error_response_bytes
+        if has_error_status or has_error_header
+        else request.max_response_bytes
+    )
+    body_read = _read_bounded_body(response, response_limit)
+    if body_read.terminal_status is not _BoundedBodyTerminalStatus.CLEAN:
+        _discard_response(response)
+        return ClickHouseHttpOutcome(
+            kind=ClickHouseHttpOutcomeKind.PROTOCOL_ERROR,
+            dispatch_state=ClickHouseHttpDispatchState.UNKNOWN,
+            payload=b"",
+            status_code=status_code,
+            response_query_id=response_query_id,
+            error_code=exception_code,
+            error_name=None,
+            received_bytes=len(body_read.payload),
+            truncated=body_read.truncated,
+            cause_type=body_read.cause_type,
+        )
+    if query_id_is_missing and (
+        body_read.truncated
+        or _parse_legacy_error_code_from_body(body_read.payload) != exception_code
+    ):
+        _discard_response(response)
+        return ClickHouseHttpOutcome(
+            kind=ClickHouseHttpOutcomeKind.PROTOCOL_ERROR,
+            dispatch_state=ClickHouseHttpDispatchState.UNKNOWN,
+            payload=b"",
+            status_code=status_code,
+            response_query_id=None,
+            error_code=exception_code,
+            error_name=None,
+            received_bytes=len(body_read.payload),
+            truncated=body_read.truncated,
+            cause_type="UnverifiedLegacyMissingQueryId",
+        )
+    if has_error_header:
+        _discard_response(response)
+        return ClickHouseHttpOutcome(
+            kind=ClickHouseHttpOutcomeKind.SERVER_ERROR,
+            dispatch_state=ClickHouseHttpDispatchState.RESPONSE_RECEIVED,
+            payload=b"",
+            status_code=status_code,
+            response_query_id=response_query_id,
+            error_code=exception_code,
+            error_name=_parse_error_name(body_read.payload),
+            received_bytes=len(body_read.payload),
+            truncated=body_read.truncated,
+            cause_type=None,
+        )
+    if has_error_status:
+        _discard_response(response)
+        return ClickHouseHttpOutcome(
+            kind=ClickHouseHttpOutcomeKind.PROTOCOL_ERROR,
+            dispatch_state=ClickHouseHttpDispatchState.UNKNOWN,
+            payload=b"",
+            status_code=status_code,
+            response_query_id=response_query_id,
+            error_code=None,
+            error_name=None,
+            received_bytes=len(body_read.payload),
+            truncated=body_read.truncated,
+            cause_type="UnverifiedHttpError",
+        )
+    if len(body_read.payload) > request.max_response_bytes:
+        _discard_response(response)
+        return ClickHouseHttpOutcome(
+            kind=ClickHouseHttpOutcomeKind.RESULT_LIMIT,
+            dispatch_state=ClickHouseHttpDispatchState.RESPONSE_RECEIVED,
+            payload=b"",
+            status_code=status_code,
+            response_query_id=response_query_id,
+            error_code=None,
+            error_name=None,
+            received_bytes=len(body_read.payload),
+            truncated=body_read.truncated,
+            cause_type=None,
+        )
+    response.release_conn()
+    return ClickHouseHttpOutcome(
+        kind=ClickHouseHttpOutcomeKind.SUCCESS,
+        dispatch_state=ClickHouseHttpDispatchState.RESPONSE_RECEIVED,
+        payload=body_read.payload,
+        status_code=status_code,
+        response_query_id=response_query_id,
+        error_code=None,
+        error_name=None,
+        received_bytes=len(body_read.payload),
+        truncated=False,
+        cause_type=None,
+    )
+
+
 def _read_bounded_body(response: HTTPResponse, limit: int) -> _BoundedBodyRead:
     chunks: list[bytes] = []
     received = 0
@@ -997,6 +1199,14 @@ def _parse_error_name(body: bytes) -> str | None:
 
 def _parse_error_code_from_body(body: bytes) -> int | None:
     match = _CLICKHOUSE_ERROR_CODE_IN_MESSAGE.search(body)
+    if match is None:
+        return None
+    code = int(match.group(1))
+    return code if code <= _CLICKHOUSE_MAX_ERROR_CODE else None
+
+
+def _parse_legacy_error_code_from_body(body: bytes) -> int | None:
+    match = _CLICKHOUSE_LEGACY_ERROR_CODE_IN_MESSAGE.match(body)
     if match is None:
         return None
     code = int(match.group(1))

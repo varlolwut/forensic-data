@@ -15,6 +15,7 @@ _MIGRATION_RESOURCES: Final[tuple[tuple[int, str], ...]] = (
     (7, "0007_greengage_dataset_adapter.sql"),
     (8, "0008_greenplum_dataset_adapter.sql"),
     (9, "0009_clickhouse_dataset_adapter.sql"),
+    (10, "0010_clickhouse_legacy_source.sql"),
 )
 
 

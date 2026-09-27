@@ -1930,13 +1930,14 @@ def _validate_inputs(
         check.target.connection.adapter,
     )
     if Adapter.CLICKHOUSE in adapter_pair and adapter_pair not in (
+        (Adapter.CLICKHOUSE, Adapter.POSTGRESQL),
         (Adapter.POSTGRESQL, Adapter.CLICKHOUSE),
         (Adapter.MSSQL, Adapter.CLICKHOUSE),
         (Adapter.GREENPLUM, Adapter.CLICKHOUSE),
     ):
         raise UnsupportedComparisonError(
-            "ClickHouse is supported only as a target for PostgreSQL, SQL Server, or "
-            "original Greenplum references"
+            "ClickHouse is supported as a reference only with PostgreSQL targets, or as a "
+            "target for PostgreSQL, SQL Server, or original Greenplum references"
         )
     if Adapter.GREENPLUM in adapter_pair and adapter_pair not in (
         (Adapter.GREENPLUM, Adapter.POSTGRESQL),
@@ -2074,10 +2075,6 @@ def _validate_dataset_relation(
             f"{direction} integer-range comparison has an unsupported relation scope"
         )
     if isinstance(relation, ClickHouseProtectedRelationInspection):
-        if direction != "target":
-            raise ComparisonProtocolError(
-                "ClickHouse protected inspection is supported only on the target side"
-            )
         if dataset.connection.adapter is not Adapter.CLICKHOUSE:
             raise ComparisonProtocolError(
                 f"{direction} ClickHouse inspection is bound to a non-ClickHouse dataset"
@@ -4106,6 +4103,8 @@ def _exact_frontier_reservation(
         target_member_count,
         target_physical_scan_count,
     )
+    if isinstance(reference_context, ClickHouseProtectedReadContext):
+        reference = replace(reference, full_scans=reference_physical_scan_count)
     if isinstance(target_context, ClickHouseProtectedReadContext):
         target = replace(target, full_scans=target_physical_scan_count)
     if (

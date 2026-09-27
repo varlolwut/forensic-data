@@ -118,7 +118,9 @@ jobs:
         run: uv run pytest -m "not integration" --ignore-glob="tests/*_integration.py"
       - name: Run database integration suite
         if: github.event_name == 'workflow_dispatch'
-        run: uv run pytest -m "not mssql_legacy and not greenplum"
+        run: >-
+          uv run pytest -m "not mssql_legacy and not greenplum"
+          --ignore=tests/test_clickhouse_legacy_endpoint_integration.py
       - name: Capture ClickHouse fixture logs
         if: failure() && github.event_name == 'workflow_dispatch'
         run: |
@@ -127,10 +129,10 @@ jobs:
       - name: Stop database fixtures
         if: always() && github.event_name == 'workflow_dispatch'
         run: |
-          docker compose --file tests/fixtures/clickhouse/compose.yaml down --volumes --remove-orphans
+          docker compose --file tests/fixtures/clickhouse/compose.yaml down --remove-orphans
           docker compose --file tests/fixtures/mssql-2022/compose.yaml down --volumes --remove-orphans
-          docker compose --file tests/fixtures/postgres-legacy/compose.yaml down --volumes
-          docker compose --file tests/fixtures/postgres/compose.yaml down --volumes
+          docker compose --file tests/fixtures/postgres-legacy/compose.yaml down
+          docker compose --file tests/fixtures/postgres/compose.yaml down
 
   build:
     name: Build package
@@ -187,7 +189,7 @@ jobs:
           .artifact-venv/bin/python -c "import forensic_data; print(forensic_data.__version__)"
           .artifact-venv/bin/python -c "import clickhouse_connect; from forensic_data.clickhouse import ClickHouseConnectionSettings; from forensic_data.clickhouse_profile import ClickHouseRuntimeProfile; assert clickhouse_connect.__version__ == '1.9.0'; assert ClickHouseConnectionSettings and ClickHouseRuntimeProfile"
           .artifact-venv/bin/python -c "from forensic_data.mssql_resources import load_mssql_2016_canonical_utf8_helper_sql; load_mssql_2016_canonical_utf8_helper_sql()"
-          .artifact-venv/bin/python -c "from importlib.resources import files; root = files('forensic_data.persistence'); assert root.joinpath('sql/migrations/0001_initial.sql').read_bytes(); assert root.joinpath('sql/migrations/0002_run_lifecycle.sql').read_bytes(); assert root.joinpath('sql/migrations/0003_completed_comparisons.sql').read_bytes(); assert root.joinpath('sql/migrations/0004_retained_anomalies.sql').read_bytes(); assert root.joinpath('sql/migrations/0005_frozen_physical_union.sql').read_bytes(); assert root.joinpath('sql/bootstrap.sql').read_bytes()"
+          .artifact-venv/bin/python -c "from forensic_data.persistence import load_postgres_metadata_bootstrap_sql, load_postgres_metadata_migrations; migrations = load_postgres_metadata_migrations(); assert tuple((item.version, item.name) for item in migrations) == ((1, '0001_initial.sql'), (2, '0002_run_lifecycle.sql'), (3, '0003_completed_comparisons.sql'), (4, '0004_retained_anomalies.sql'), (5, '0005_frozen_physical_union.sql'), (6, '0006_mssql_dataset_adapter.sql'), (7, '0007_greengage_dataset_adapter.sql'), (8, '0008_greenplum_dataset_adapter.sql'), (9, '0009_clickhouse_dataset_adapter.sql'), (10, '0010_clickhouse_legacy_source.sql')); assert load_postgres_metadata_bootstrap_sql()"
           .artifact-venv/bin/forensics --help
           .artifact-venv/bin/forensics plan --config examples/postgres-relation-manifest/contract.yaml --check daily_orders --scope-json '{"business_date":"2026-09-23"}' --output json
       - name: Upload package artifacts
@@ -248,8 +250,8 @@ jobs:
       - name: Stop legacy box fixtures
         if: always() && github.event_name == 'workflow_dispatch'
         run: |
-          docker compose --file tests/fixtures/postgres-legacy/compose.yaml down --volumes
-          docker compose --file tests/fixtures/postgres/compose.yaml down --volumes
+          docker compose --file tests/fixtures/postgres-legacy/compose.yaml down
+          docker compose --file tests/fixtures/postgres/compose.yaml down
       - name: Run Docker quickstart and persistence smoke
         if: github.event_name == 'workflow_dispatch'
         env:
@@ -287,5 +289,5 @@ jobs:
         env:
           DFE_IMAGE: forensic-data:ci
         run: |
-          docker compose --profile setup --profile demo down --volumes --remove-orphans
+          docker compose --profile setup --profile demo down --remove-orphans
           docker compose --file examples/docker-quickstart/secrets.compose.yaml down --remove-orphans

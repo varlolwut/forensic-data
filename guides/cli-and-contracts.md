@@ -91,6 +91,48 @@ The ClickHouse reader needs `SELECT` on the target relations and on `system.buil
 POLICIES ON *.*`. These read-only catalog grants let the adapter record exact server provenance and
 verify that no mutation or row-policy state invalidates the immutable-version claim.
 
+### ClickHouse 21.8 legacy source inputs
+
+The legacy source path is verified against ClickHouse 21.8.15.7 with `clickhouse-connect`. That
+version is an evidence point, not a numeric runtime allowlist. Select the path explicitly with
+adapter `clickhouse`, driver `clickhouse-connect`, profile `clickhouse_21_8_lts`, and exactly
+`roles: [source]`; the profile never silently falls back to the modern target strategy. The
+verified pairing uses PostgreSQL 17.11 as the target.
+
+The source must be a `physical_only` plain `MergeTree` in an `Atomic` database, with
+relation-manifest readiness, `stable_read: immutable_named_version`, and explicit
+`minimum_evidence: asserted`. It uses the same strict one-line ClickHouse JSON connection format
+shown above through `secret_ref`. The
+[legacy source example](../examples/clickhouse-legacy-source/contract.yaml) includes matching
+[connection-secret](../examples/clickhouse-legacy-source/clickhouse-secret.json.example) and
+[manifest](../examples/clickhouse-legacy-source/manifest.json.example) templates.
+
+Before publication, replace the template values with the exact scope digest emitted by
+`forensics plan`, an independently captured SHA-256 of `system.tables.create_table_query`, the
+source table UUID, and a unique operator-configured `dfe_server_uuid` macro. The manifest issuer is
+an independently trusted identifier. DFE checks that identifier, validates the bounded manifest,
+and records its digest; it does not verify a signature and must not derive replacement trust values
+from the live source during a check.
+
+Pass the absolute runtime manifest path and trusted issuer with the reference flags:
+
+```console
+forensics check --config /run/config/clickhouse-legacy-source.yaml --check daily_orders --scope-json '{"business_date":"2026-09-23"}' --reference-batch orders-v042 --target-batch target-batch-42 --reference-manifest /run/manifests/orders-v042.json --reference-manifest-issuer archive-release --request-id 7fa700c4-7c5d-42eb-8f55-50e372ed0e25 --output json
+```
+
+Overall stable-read evidence remains `ASSERTED`. ClickHouse 21.8 HTTP reads do not share a
+transaction snapshot; unique direct-server identity and the exclusions for writes, DDL, mutations,
+and TTL are operator assertions. Equal pre/post identity, readiness, part, mutation, and logical
+fingerprint witnesses detect observed changes but cannot exclude a transient write that reverted.
+ClickHouse 21.8 exposes neither native server-UUID evidence nor table-readonly evidence. The path
+rejects row policies, physical projections, TTL expressions, pending or failed mutations, and a
+final witness that differs from acquisition.
+
+The legacy reader needs `SELECT` on both bound relations and on `system.build_options`,
+`system.columns`, `system.databases`, `system.mutations`, `system.parts`, `system.processes`,
+`system.projection_parts`, `system.row_policies`, `system.settings`, and `system.tables`, plus `SHOW
+ROW POLICIES ON *.*`. No write or `KILL QUERY` grant is part of the verified profile.
+
 The example uses a 29,000 ms statement timeout beneath a 30-second ClickHouse
 `max_execution_time` ceiling. Keep the server ceiling at least one second above the rounded-up
 statement timeout so the adapter retains time to confirm or cancel the server query itself.
@@ -104,14 +146,17 @@ from forensic_data.clickhouse_limits import build_clickhouse_execution_limits
 limits = build_clickhouse_execution_limits(config.execution)
 ```
 
-Pass `limits.transport`, `limits.readiness`, and `limits.canonical` as `target_transport_limits`,
-`target_readiness_limits`, and `target_canonical_limits` when constructing the matching
-`PostgresClickHouseExecutionServices`, `OriginalGreenplumClickHouseExecutionServices`, or
-`MssqlClickHouseExecutionServices`. Manually supplied limits must fit the transport capacity and
-the comparison's encoded-row requirement. Transport capacity is checked at service construction;
-for physical-only sources, row capacity is checked before metadata registration or source reads.
-For a PostgreSQL physical union, row capacity also depends on the discovered members and is checked
-after discovery. A rejected configuration does not silently widen or clamp the supplied limits.
+For a ClickHouse target, pass `limits.transport`, `limits.readiness`, and `limits.canonical` as
+`target_transport_limits`, `target_readiness_limits`, and `target_canonical_limits` when
+constructing `PostgresClickHouseExecutionServices`, `OriginalGreenplumClickHouseExecutionServices`,
+or `MssqlClickHouseExecutionServices`. For the legacy source path, construct the typed
+`ClickHousePostgresExecutionServices` and pass the same single assembly as
+`reference_transport_limits`, `reference_readiness_limits`, and `reference_canonical_limits`.
+Manually supplied limits must fit the transport capacity and the comparison's encoded-row
+requirement. Transport capacity is checked at service construction; for physical-only sources, row
+capacity is checked before metadata registration or source reads. For a PostgreSQL physical union,
+row capacity also depends on the discovered members and is checked after discovery. A rejected
+configuration does not silently widen or clamp the supplied limits.
 
 The metadata login used by `check` or `execute_check` must be a member of both
 `dfe_metadata_writer` and `dfe_metadata_reader`. The login used by `history`, `diff`,

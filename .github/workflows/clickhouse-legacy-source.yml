@@ -1,0 +1,95 @@
+name: ClickHouse 21.8 legacy source
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: clickhouse-legacy-source-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  legacy-source:
+    name: ClickHouse 21.8 source to PostgreSQL 17
+    runs-on: ubuntu-24.04
+    timeout-minutes: 45
+    env:
+      DFE_PG_ADMIN_PASSWORD: phase01-admin
+      DFE_PG_READER_PASSWORD: phase01-reader
+      DFE_PG_WRITER_PASSWORD: phase01-writer
+      DFE_PG_METADATA_MIGRATOR_PASSWORD: phase02-metadata-migrator
+      DFE_PG_METADATA_WRITER_PASSWORD: phase02-metadata-writer
+      DFE_PG_METADATA_READER_PASSWORD: phase02-metadata-reader
+      DFE_PG_PORT: "55432"
+      DFE_CLICKHOUSE_LEGACY_HTTP_PORT: "18128"
+      DFE_TEST_POSTGRES_ADMIN_DSN: "postgresql://postgres:phase01-admin@127.0.0.1:55432/postgres?sslmode=disable&connect_timeout=5"
+      DFE_TEST_POSTGRES_READER_DSN: "postgresql://dfe_fixture_reader:phase01-reader@127.0.0.1:55432/dfe_fixture?sslmode=disable&connect_timeout=5"
+      DFE_TEST_POSTGRES_WRITER_DSN: "postgresql://dfe_fixture_writer:phase01-writer@127.0.0.1:55432/dfe_fixture?sslmode=disable&connect_timeout=5"
+      DFE_TEST_POSTGRES_METADATA_MIGRATOR_DSN: "postgresql://dfe_metadata_migrator_login:phase02-metadata-migrator@127.0.0.1:55432/dfe_fixture?sslmode=disable&connect_timeout=5"
+      DFE_TEST_POSTGRES_METADATA_WRITER_DSN: "postgresql://dfe_metadata_writer_login:phase02-metadata-writer@127.0.0.1:55432/dfe_fixture?sslmode=disable&connect_timeout=5"
+      DFE_TEST_POSTGRES_METADATA_READER_DSN: "postgresql://dfe_metadata_reader_login:phase02-metadata-reader@127.0.0.1:55432/dfe_fixture?sslmode=disable&connect_timeout=5"
+      DFE_P0507_POSTGRES_TARGET_DSN: "postgresql://dfe_fixture_reader:phase01-reader@127.0.0.1:55432/dfe_fixture?sslmode=disable&connect_timeout=5"
+      DFE_P0507_METADATA_DSN: "postgresql://dfe_metadata_writer_login:phase02-metadata-writer@127.0.0.1:55432/dfe_fixture?sslmode=disable&connect_timeout=5"
+    steps:
+      - name: Check out source
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - name: Set up Python
+        uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
+        with:
+          python-version: "3.12.14"
+      - name: Set up uv
+        uses: astral-sh/setup-uv@c18668ad3cf93ea998bef934396af7bb5c839dc7 # v10.2.0
+        with:
+          cache-dependency-glob: uv.lock
+          enable-cache: true
+          version: "0.12.18"
+      - name: Install locked dependencies
+        run: uv sync --frozen --all-groups
+      - name: Create ephemeral ClickHouse fixture credentials
+        shell: bash
+        run: |
+          admin_password="$(openssl rand -hex 32)"
+          reader_password="$(openssl rand -hex 32)"
+          echo "::add-mask::${admin_password}"
+          echo "::add-mask::${reader_password}"
+          {
+            echo "DFE_CLICKHOUSE_LEGACY_ADMIN_PASSWORD=${admin_password}"
+            echo "DFE_CLICKHOUSE_LEGACY_READER_PASSWORD=${reader_password}"
+            printf 'DFE_P0507_CLICKHOUSE_REFERENCE_SECRET={"host":"127.0.0.1","port":%s,"database":"dfe_fixture","user":"dfe_legacy_reader","password":"%s","transport_security":"plaintext-local-fixture","ca_cert":null,"connect_timeout_seconds":5,"send_receive_timeout_seconds":30}\n' \
+              "${DFE_CLICKHOUSE_LEGACY_HTTP_PORT}" "${reader_password}"
+          } >> "${GITHUB_ENV}"
+      - name: Start PostgreSQL 17.11 fixture
+        run: docker compose --file tests/fixtures/postgres/compose.yaml up --detach --wait
+      - name: Start ClickHouse 21.8.15.7 fixture
+        run: |
+          docker compose --file tests/fixtures/clickhouse-21-8/compose.yaml config --quiet
+          docker compose --file tests/fixtures/clickhouse-21-8/compose.yaml up --detach --wait
+      - name: Run the legacy-source durability and seal-loss gate
+        id: legacy-source-gate
+        run: >-
+          uv run pytest -q --tb=short --show-capture=no
+          tests/test_clickhouse_legacy_endpoint_integration.py::test_clickhouse_21_8_source_is_bounded_durable_and_loses_changed_seal
+      - name: Record tested revision and fixture images
+        if: always()
+        shell: bash
+        env:
+          LEGACY_SOURCE_GATE_OUTCOME: ${{ steps.legacy-source-gate.outcome }}
+        run: |
+          {
+            printf 'Tested revision: %s\n' "$(git rev-parse HEAD)"
+            printf 'Scenario: test_clickhouse_21_8_source_is_bounded_durable_and_loses_changed_seal\n'
+            printf 'Gate outcome: %s\n' "${LEGACY_SOURCE_GATE_OUTCOME}"
+            docker ps --all --filter name=forensic-data- --format '{{.Names}} {{.Image}} {{.Status}}'
+          } >> "${GITHUB_STEP_SUMMARY}"
+      - name: Remove ClickHouse containers and network
+        if: always()
+        run: >-
+          docker compose --file tests/fixtures/clickhouse-21-8/compose.yaml
+          down --remove-orphans
+      - name: Remove PostgreSQL containers and network
+        if: always()
+        run: >-
+          docker compose --file tests/fixtures/postgres/compose.yaml
+          down --remove-orphans

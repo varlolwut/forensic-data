@@ -6,11 +6,13 @@ changes. It refuses to silently round, normalize, or drop values.
 
 The current `0.1.0.dev0` package is a development release with a typed Python API and a `forensics`
 CLI. Source connections are read-only. It supports verified PostgreSQL comparisons, verified SQL
-Server 2016- and 2022-source-to-PostgreSQL workflows, and verified PostgreSQL 17.11- and SQL Server
-2022-source-to-Greengage 7.5 target workflows. The exact original Greenplum artifact identified as
-`4.3.99.00 build dev` is also verified as a physical-heap source to PostgreSQL 17.11 and Greengage
-7.5 targets. Reads are bounded and protected by readiness acquisition, with durable history,
-retained typed differences, and explicit completed, incomplete, or error outcomes.
+Server 2016- and 2022-source-to-PostgreSQL workflows, verified PostgreSQL 17.11- and SQL Server
+2022-source-to-Greengage 7.5 target workflows, and a verified ClickHouse 21.8.15.7 source to
+PostgreSQL 17.11. The exact original Greenplum artifact identified as `4.3.99.00 build dev` is also
+verified as a physical-heap source to PostgreSQL 17.11 and Greengage 7.5 targets. PostgreSQL 17.11,
+SQL Server 2022, and original Greenplum are separately verified as sources to a ClickHouse 26.8.6.5
+target. Reads are bounded and protected by readiness acquisition, with durable history, retained
+typed differences, and explicit completed, incomplete, or error outcomes.
 
 There is no scheduler integration or background service yet. Static planning does not connect to a
 database or prove readiness, capability, schema presence, or data equality.
@@ -49,6 +51,8 @@ writes machine JSON to `.local/docker-quickstart/output/{check,history,diff}.jso
 | SQL Server 2022 Developer CU27 `16.0.4295.3` | Verified | Not yet implemented or verified |
 | Original Greenplum `4.3.99.00 build dev` | Verified for physical heap | Not yet implemented or verified |
 | Greengage 7.5.0 | Not yet verified | Verified |
+| ClickHouse 21.8.15.7 | Verified with source-only `clickhouse_21_8_lts` | Not supported by this profile |
+| ClickHouse 26.8.6.5 | Not yet verified | Verified with target-only `clickhouse_lts` |
 
 This matrix records tested configurations, not a version allowlist. Database connections are not
 rejected solely because their server version, edition, or driver patch is untested. The selected
@@ -61,6 +65,11 @@ The [Greenplum-family guide](guides/greenplum.md) covers the verified original G
 Greengage 7.5 target endpoints, including their verified relation and type coverage, and records
 the exact distributed artifacts. Original Greenplum append-optimized row and column relations have
 snapshot-probe evidence only; their endpoint behavior has not been verified.
+
+The [ClickHouse 21.8 legacy source guide](guides/cli-and-contracts.md#clickhouse-218-legacy-source-inputs)
+explains the explicit source-only profile, independently trusted manifest, asserted immutability
+boundary, and the verified PostgreSQL 17.11 pairing. The matrix is evidence, not a version-number
+allowlist; runtime admission validates the capabilities required by the selected profile.
 
 Runtime capability admission is wider than an exact verified conformance point and does not certify
 untested builds, editions, operating systems, or driver patches. See the
@@ -86,8 +95,8 @@ match exits `0`, a completed mismatch exits `1`, an error exits `2`, and an inco
 
 - [Docker quickstart](guides/docker-quickstart.md) — secrets, first run, persistence proof, shutdown,
   backup, and connecting your own data.
-- [CLI and contracts](guides/cli-and-contracts.md) — commands, typed API, static planning, retention,
-  pagination, output, and exit behavior.
+- [CLI and contracts](guides/cli-and-contracts.md) — commands, typed API, ClickHouse source and
+  target inputs, static planning, retention, pagination, output, and exit behavior.
 - [PostgreSQL profiles and operation](guides/postgresql.md) — modern and 9.6 source profiles,
   physical scopes, readiness, budgets, and metadata bootstrap.
 - [SQL Server source profiles](guides/sql-server.md) — the exact SQL Server 2016 and 2022
@@ -103,4 +112,5 @@ match exits `0`, a completed mismatch exits `1`, an error exits `2`, and an inco
 - [Docker quickstart contract](examples/docker-quickstart/contract.yaml)
 - [PostgreSQL relation-manifest contract](examples/postgres-relation-manifest/contract.yaml)
 - [PostgreSQL SQL-backed contract](examples/postgres-row/contract.yaml)
+- [ClickHouse 21.8 source-to-PostgreSQL contract](examples/clickhouse-legacy-source/contract.yaml)
 - [SQL Server-to-PostgreSQL fixture contract](tests/fixtures/mssql-2022/comparison-contract.yaml)

@@ -1,0 +1,131 @@
+name: forensic-data-phase05-clickhouse-21-8
+
+services:
+  clickhouse-legacy:
+    image: clickhouse/clickhouse-server:21.8.15.7@sha256:a9141f199e4b1f60cd6fe5ee58e25a86938117d26a73c4a1fa5c31b6e2f64abf
+    platform: linux/amd64
+    hostname: forensic-data-phase05-clickhouse-21-8
+    environment:
+      CLICKHOUSE_USER: dfe_legacy_admin
+      CLICKHOUSE_PASSWORD: ${DFE_CLICKHOUSE_LEGACY_ADMIN_PASSWORD:?set DFE_CLICKHOUSE_LEGACY_ADMIN_PASSWORD}
+      CLICKHOUSE_DEFAULT_ACCESS_MANAGEMENT: "1"
+      DFE_CLICKHOUSE_LEGACY_READER_PASSWORD: ${DFE_CLICKHOUSE_LEGACY_READER_PASSWORD:?set DFE_CLICKHOUSE_LEGACY_READER_PASSWORD}
+    ports:
+      - 127.0.0.1:${DFE_CLICKHOUSE_LEGACY_HTTP_PORT:?set DFE_CLICKHOUSE_LEGACY_HTTP_PORT}:8123
+    volumes:
+      - clickhouse-legacy-data:/var/lib/clickhouse
+      - ./config/docker-related.xml:/etc/clickhouse-server/config.d/docker_related_config.xml:ro
+      - ./config/server.xml:/etc/clickhouse-server/config.d/dfe-server.xml:ro
+      - ./init:/docker-entrypoint-initdb.d:ro
+    healthcheck:
+      test:
+        - CMD-SHELL
+        - >-
+          test "$$(clickhouse-client
+          --host 127.0.0.1
+          --user dfe_legacy_reader
+          --password "$${DFE_CLICKHOUSE_LEGACY_READER_PASSWORD}"
+          --database dfe_fixture
+          --query="SELECT
+          version() = '21.8.15.7'
+          AND (SELECT value FROM system.build_options WHERE name = 'VERSION_INTEGER') = '21008015'
+          AND buildId() = '5E2BCEFC0773AB45CAD70DB02B740C39044F588F'
+          AND hostName() = 'forensic-data-phase05-clickhouse-21-8'
+          AND timezone() = 'UTC'
+          AND getMacro('dfe_server_uuid') = '77777777-7777-4777-8777-777777777777'
+          AND getSetting('readonly') = 2
+          AND getSetting('cancel_http_readonly_queries_on_client_close') = 1
+          AND getSetting('send_progress_in_http_headers') = 0
+          AND getSetting('allow_experimental_projection_optimization') = 0
+          AND getSetting('force_optimize_projection') = 0
+          AND getSetting('max_memory_usage') = 268435456
+          AND getSetting('max_threads') = 2
+          AND getSetting('max_block_size') = 65536
+          AND getSetting('max_execution_time') = 30
+          AND getSetting('max_result_rows') = 120000
+          AND getSetting('max_result_bytes') = 67108864
+          AND getSetting('max_rows_to_group_by') = 120000
+          AND getSetting('result_overflow_mode') = 'throw'
+          AND getSetting('timeout_overflow_mode') = 'throw'
+          AND getSetting('read_overflow_mode') = 'throw'
+          AND getSetting('read_overflow_mode_leaf') = 'throw'
+          AND getSetting('sort_overflow_mode') = 'throw'
+          AND getSetting('group_by_overflow_mode') = 'throw'
+          AND (SELECT count() FROM comparison_orders_v001) = 4
+          AND (SELECT count() FROM immutable_version_readiness) = 1
+          AND (SELECT engine = 'Atomic'
+          AND uuid = toUUID('44444444-4444-4444-8444-444444444444')
+          FROM system.databases WHERE name = 'dfe_fixture')
+          AND (SELECT uuid = toUUID('55555555-5555-4555-8555-555555555555')
+          AND engine = 'MergeTree'
+          AND partition_key = 'toYYYYMM(business_date)'
+          AND primary_key = 'order_id'
+          AND sorting_key = 'order_id'
+          AND sampling_key = ''
+          AND lower(hex(SHA256(create_table_query))) =
+          '7f593054bebded05cba79194eaee4647731c4d3251a79fde0f2a3c6af44abb71'
+          FROM system.tables
+          WHERE database = 'dfe_fixture' AND name = 'comparison_orders_v001')
+          AND (SELECT uuid = toUUID('66666666-6666-4666-8666-666666666666')
+          AND engine = 'MergeTree'
+          AND partition_key = ''
+          AND primary_key = ''
+          AND sorting_key = ''
+          AND sampling_key = ''
+          FROM system.tables
+          WHERE database = 'dfe_fixture' AND name = 'immutable_version_readiness')
+          AND (SELECT count() FROM system.mutations
+          WHERE database = 'dfe_fixture'
+          AND table IN ('comparison_orders_v001', 'immutable_version_readiness')) = 0
+          AND (SELECT count() FROM system.projection_parts
+          WHERE active AND database = 'dfe_fixture'
+          AND table IN ('comparison_orders_v001', 'immutable_version_readiness')) = 0
+          AND (SELECT count() FROM system.row_policies
+          WHERE database = 'system'
+          OR (database = 'dfe_fixture'
+          AND table IN ('comparison_orders_v001', 'immutable_version_readiness'))) = 0
+          AND (SELECT readonly = 1 AND isNull(min) AND isNull(max)
+          FROM system.settings WHERE name = 'readonly')
+          AND (SELECT readonly = 1 AND isNull(min) AND isNull(max)
+          FROM system.settings
+          WHERE name = 'cancel_http_readonly_queries_on_client_close')
+          AND (SELECT readonly = 1 AND isNull(min) AND isNull(max)
+          FROM system.settings WHERE name = 'send_progress_in_http_headers')
+          AND (SELECT readonly = 1 AND isNull(min) AND isNull(max)
+          FROM system.settings
+          WHERE name = 'allow_experimental_projection_optimization')
+          AND (SELECT readonly = 1 AND isNull(min) AND isNull(max)
+          FROM system.settings WHERE name = 'force_optimize_projection')
+          AND (SELECT readonly = 1 AND isNull(min) AND isNull(max)
+          FROM system.settings WHERE name = 'max_memory_usage')
+          AND (SELECT readonly = 1 AND isNull(min) AND isNull(max)
+          FROM system.settings WHERE name = 'max_threads')
+          AND (SELECT readonly = 0 AND min = '1' AND max = '65536'
+          FROM system.settings WHERE name = 'max_block_size')
+          AND (SELECT readonly = 0 AND min = '1' AND max = '30'
+          FROM system.settings WHERE name = 'max_execution_time')
+          AND (SELECT readonly = 0 AND min = '1' AND max = '120000'
+          FROM system.settings WHERE name = 'max_result_rows')
+          AND (SELECT readonly = 0 AND min = '1' AND max = '67108864'
+          FROM system.settings WHERE name = 'max_result_bytes')
+          AND (SELECT readonly = 0 AND min = '1' AND max = '120000'
+          FROM system.settings WHERE name = 'max_rows_to_group_by')
+          AND (SELECT count() = 6 AND countIf(readonly = 1) = 6
+          AND countIf(isNull(min) AND isNull(max)) = 6
+          FROM system.settings
+          WHERE name IN ('result_overflow_mode', 'timeout_overflow_mode',
+          'read_overflow_mode', 'read_overflow_mode_leaf',
+          'sort_overflow_mode', 'group_by_overflow_mode'))")" = "1"
+      interval: 2s
+      timeout: 5s
+      retries: 60
+      start_period: 10s
+    mem_limit: 2g
+    ulimits:
+      nofile:
+        soft: 262144
+        hard: 262144
+    restart: "no"
+
+volumes:
+  clickhouse-legacy-data:

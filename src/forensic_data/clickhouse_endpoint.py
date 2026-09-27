@@ -29,8 +29,11 @@ from forensic_data.clickhouse import (
     ClickHouseTransportCleanupError,
     ClickHouseTransportError,
     ClickHouseTransportLimits,
+    UnsupportedClickHouseProfileError,
     inspect_clickhouse_server_profile,
+    inspect_legacy_clickhouse_server_profile,
     open_budgeted_clickhouse_transport,
+    open_budgeted_legacy_clickhouse_source_transport,
     require_clickhouse_resource_setting_value,
 )
 from forensic_data.clickhouse_canonical import (
@@ -42,6 +45,15 @@ from forensic_data.clickhouse_endpoint_sql import (
     build_clickhouse_integer_key_summary_query,
     build_clickhouse_integer_range_fingerprint_query,
     build_clickhouse_integer_range_rows_query,
+)
+from forensic_data.clickhouse_legacy import (
+    ClickHouseLegacySourceBinding,
+    ClickHouseLegacySourceConfirmation,
+    ClickHouseLegacySourceManifest,
+    ClickHouseLegacySourceRequest,
+    ClickHouseLegacyTableIdentity,
+    acquire_clickhouse_legacy_source,
+    confirm_clickhouse_legacy_source,
 )
 from forensic_data.clickhouse_projection import (
     ClickHouseMergeTreeProjectionBinding,
@@ -75,6 +87,14 @@ from forensic_data.postgres import (
 )
 from forensic_data.postgres_sql import PostgresIntegerRangeRequest, PostgresScopePredicate
 from forensic_data.result import ConsistencyLevel
+
+type ClickHouseProtectedBinding = (
+    ClickHouseMergeTreeProjectionBinding | ClickHouseLegacySourceBinding
+)
+type ClickHouseProtectedConfirmation = (
+    ClickHouseMergeTreeProjectionConfirmation | ClickHouseLegacySourceConfirmation
+)
+type ClickHouseProtectedTableIdentity = ClickHouseTableIdentity | ClickHouseLegacyTableIdentity
 
 
 class ClickHouseProtectedContextClosedError(ClickHouseTransportError):
@@ -170,8 +190,8 @@ class ClickHouseProtectedRelationInspection:
     context_id: UUID
     acquisition: ClickHouseRelationAcquisition
     canonical_relation: ClickHouseCanonicalRelation
-    version_identity: ClickHouseTableIdentity
-    projection_binding: ClickHouseMergeTreeProjectionBinding
+    version_identity: ClickHouseProtectedTableIdentity
+    projection_binding: ClickHouseProtectedBinding
 
     def __post_init__(self) -> None:
         if type(self.context_id) is not UUID or self.context_id.int == 0:
@@ -180,14 +200,24 @@ class ClickHouseProtectedRelationInspection:
             raise TypeError("ClickHouse protected relation acquisition has an invalid type")
         if type(self.canonical_relation) is not ClickHouseCanonicalRelation:
             raise TypeError("ClickHouse protected relation requires a canonical relation")
-        if type(self.version_identity) is not ClickHouseTableIdentity:
+        if type(self.version_identity) not in (
+            ClickHouseTableIdentity,
+            ClickHouseLegacyTableIdentity,
+        ):
             raise TypeError("ClickHouse protected relation requires a table identity")
-        if type(self.projection_binding) is not ClickHouseMergeTreeProjectionBinding:
-            raise TypeError("ClickHouse protected relation requires a projection binding")
-        immutable = self.projection_binding.immutable_binding
-        if self.context_id != immutable.context_id:
+        if type(self.projection_binding) not in (
+            ClickHouseMergeTreeProjectionBinding,
+            ClickHouseLegacySourceBinding,
+        ):
+            raise TypeError("ClickHouse protected relation requires a supported binding")
+        if self.context_id != _binding_context_id(self.projection_binding):
             raise ValueError("ClickHouse protected relation belongs to another context")
-        if self.version_identity != immutable.version_identity:
+        binding_identity = (
+            self.projection_binding.immutable_binding.version_identity
+            if type(self.projection_binding) is ClickHouseMergeTreeProjectionBinding
+            else self.projection_binding.source.identity
+        )
+        if self.version_identity != binding_identity:
             raise ValueError("ClickHouse protected relation has a different version identity")
         if self.canonical_relation != self.projection_binding.relation:
             raise ValueError("ClickHouse protected relation differs from its projection binding")
@@ -211,7 +241,7 @@ class ClickHouseProtectedRelationInspection:
 @dataclass(frozen=True, slots=True)
 class ClickHouseProtectedReadinessInspection:
     context_id: UUID
-    identity: ClickHouseTableIdentity
+    identity: ClickHouseProtectedTableIdentity
     record: ClickHouseRelationManifestRecord
     evidence: RelationManifestEvidence
     request: ClickHouseImmutableVersionRequest
@@ -219,7 +249,7 @@ class ClickHouseProtectedReadinessInspection:
     def __post_init__(self) -> None:
         if type(self.context_id) is not UUID or self.context_id.int == 0:
             raise ValueError("ClickHouse protected readiness requires a non-zero context ID")
-        if type(self.identity) is not ClickHouseTableIdentity:
+        if type(self.identity) not in (ClickHouseTableIdentity, ClickHouseLegacyTableIdentity):
             raise TypeError("ClickHouse protected readiness requires a table identity")
         if type(self.record) is not ClickHouseRelationManifestRecord:
             raise TypeError("ClickHouse protected readiness requires a manifest record")
@@ -282,7 +312,7 @@ class ClickHouseFinalConfirmationEvidence:
     connection_attempts: int
     physical_request_count: int
     final_query_id: UUID
-    confirmation: ClickHouseMergeTreeProjectionConfirmation
+    confirmation: ClickHouseProtectedConfirmation
 
     def __post_init__(self) -> None:
         if type(self.context_id) is not UUID or self.context_id.int == 0:
@@ -297,12 +327,23 @@ class ClickHouseFinalConfirmationEvidence:
             )
         if type(self.final_query_id) is not UUID or self.final_query_id.int == 0:
             raise ValueError("ClickHouse final confirmation requires a non-zero final query ID")
-        if type(self.confirmation) is not ClickHouseMergeTreeProjectionConfirmation:
+        if type(self.confirmation) not in (
+            ClickHouseMergeTreeProjectionConfirmation,
+            ClickHouseLegacySourceConfirmation,
+        ):
             raise TypeError(
                 "ClickHouse final confirmation evidence requires the exact confirmation type"
             )
-        immutable = self.confirmation.binding.immutable_binding
-        if self.context_id != immutable.context_id or self.attempt_id != immutable.attempt_id:
+        binding = self.confirmation.binding
+        binding_identity = (
+            binding.immutable_binding
+            if type(binding) is ClickHouseMergeTreeProjectionBinding
+            else binding
+        )
+        if (
+            self.context_id != binding_identity.context_id
+            or self.attempt_id != binding_identity.attempt_id
+        ):
             raise ValueError(
                 "ClickHouse final confirmation evidence differs from its immutable binding"
             )
@@ -317,13 +358,13 @@ _CLICKHOUSE_ENDPOINT_RUNTIME_ERRORS = (
 
 
 class ClickHouseProtectedReadContext:
-    """One single-owner, immutable named-version ClickHouse target context."""
+    """One single-owner, immutable named-version ClickHouse context."""
 
     def __init__(
         self,
         transport: ClickHouseTransport,
         profile: ClickHouseServerProfile,
-        projection_binding: ClickHouseMergeTreeProjectionBinding,
+        projection_binding: ClickHouseProtectedBinding,
         protected_relation: ClickHouseProtectedRelationInspection,
         protected_readiness: ClickHouseProtectedReadinessInspection,
         evidence: ClickHouseProtectedReadContextEvidence,
@@ -338,7 +379,7 @@ class ClickHouseProtectedReadContext:
         self._evidence = evidence
         self._source_budget = source_budget
         self._source_direction = source_direction
-        self._confirmation: ClickHouseMergeTreeProjectionConfirmation | None = None
+        self._confirmation: ClickHouseProtectedConfirmation | None = None
         self._confirmation_evidence: ClickHouseFinalConfirmationEvidence | None = None
         self._state = ClickHouseProtectedContextState.ACTIVE
         self._query_lock = Lock()
@@ -349,7 +390,11 @@ class ClickHouseProtectedReadContext:
         return self._profile
 
     @property
-    def projection_binding(self) -> ClickHouseMergeTreeProjectionBinding:
+    def projection_binding(self) -> ClickHouseProtectedBinding:
+        return self._projection_binding
+
+    @property
+    def binding(self) -> ClickHouseProtectedBinding:
         return self._projection_binding
 
     @property
@@ -377,7 +422,7 @@ class ClickHouseProtectedReadContext:
         return self._source_direction
 
     @property
-    def confirmation(self) -> ClickHouseMergeTreeProjectionConfirmation | None:
+    def confirmation(self) -> ClickHouseProtectedConfirmation | None:
         return self._confirmation
 
     @property
@@ -545,10 +590,17 @@ class ClickHouseProtectedReadContext:
                 self._transport.close()
                 return
             try:
-                confirmation = confirm_clickhouse_merge_tree_projection(
-                    self._transport,
-                    self._projection_binding,
-                )
+                if type(self._projection_binding) is ClickHouseMergeTreeProjectionBinding:
+                    confirmation = confirm_clickhouse_merge_tree_projection(
+                        self._transport,
+                        self._projection_binding,
+                    )
+                else:
+                    confirmation = confirm_clickhouse_legacy_source(
+                        self._transport,
+                        self._profile,
+                        self._projection_binding,
+                    )
                 if isinstance(confirmation, EarlyExecutionOutcome):
                     raise ClickHouseProtectedContextConfirmationError(confirmation)
             except (
@@ -710,6 +762,73 @@ def open_clickhouse_protected_read_context(
                 ) from primary_error
 
 
+def open_legacy_clickhouse_source_protected_read_context(
+    settings: ClickHouseConnectionSettings,
+    retry_policy: ClickHouseRetryPolicy,
+    transport_limits: ClickHouseTransportLimits,
+    source_budget: PostgresSourceBudgetAttempt,
+    direction: PostgresSourceDirection,
+    source_request: ClickHouseLegacySourceRequest,
+    manifest: ClickHouseLegacySourceManifest,
+) -> ClickHouseProtectedReadContext | EarlyExecutionOutcome:
+    if not isinstance(cast(object, source_budget), PostgresSourceBudgetAttempt):
+        raise TypeError("ClickHouse protected context requires PostgresSourceBudgetAttempt")
+    if not isinstance(cast(object, direction), PostgresSourceDirection):
+        raise TypeError("ClickHouse protected context requires PostgresSourceDirection")
+    if direction is not PostgresSourceDirection.REFERENCE:
+        raise UnsupportedClickHouseProfileError(
+            "ClickHouse 21.8 LTS source profile requires reference direction"
+        )
+    if type(source_request) is not ClickHouseLegacySourceRequest:
+        raise TypeError("ClickHouse legacy protected context requires a source request")
+    if type(manifest) is not ClickHouseLegacySourceManifest:
+        raise TypeError("ClickHouse legacy protected context requires a source manifest")
+    deadline = source_budget.read_deadline(source_budget.effective_statement_timeout_milliseconds())
+    transport = open_budgeted_legacy_clickhouse_source_transport(
+        settings,
+        retry_policy,
+        transport_limits,
+        deadline,
+        source_budget.attempt_id,
+        source_budget,
+        direction,
+    )
+    succeeded = False
+    try:
+        profile = inspect_legacy_clickhouse_server_profile(transport, settings)
+        acquired = acquire_clickhouse_legacy_source(
+            transport,
+            profile,
+            source_request,
+            manifest,
+        )
+        if isinstance(acquired, EarlyExecutionOutcome):
+            transport.close()
+            succeeded = True
+            return acquired
+        context = _legacy_protected_context(
+            transport,
+            profile,
+            acquired,
+            source_budget,
+            direction,
+        )
+        succeeded = True
+        return context
+    finally:
+        if not succeeded:
+            primary_error = sys.exception()
+            try:
+                transport.close()
+            except ClickHouseTransportError as cleanup_error:
+                if primary_error is None:
+                    raise
+                raise ClickHouseProtectedContextCleanupError(
+                    primary_error,
+                    cleanup_error,
+                ) from primary_error
+
+
 def _protected_context(
     transport: ClickHouseTransport,
     profile: ClickHouseServerProfile,
@@ -765,6 +884,60 @@ def _protected_context(
     )
 
 
+def _legacy_protected_context(
+    transport: ClickHouseTransport,
+    profile: ClickHouseServerProfile,
+    binding: ClickHouseLegacySourceBinding,
+    source_budget: PostgresSourceBudgetAttempt,
+    direction: PostgresSourceDirection,
+) -> ClickHouseProtectedReadContext:
+    acquisition = ClickHouseRelationAcquisition(
+        schema=binding.request.schema,
+        relation=ClickHouseRelation(
+            components=(binding.relation.database, binding.relation.table),
+        ),
+        relation_scope=RelationScope.PHYSICAL_ONLY,
+        column_names=binding.request.column_names,
+    )
+    relation = ClickHouseProtectedRelationInspection(
+        context_id=binding.context_id,
+        acquisition=acquisition,
+        canonical_relation=binding.relation,
+        version_identity=binding.source.identity,
+        projection_binding=binding,
+    )
+    readiness = ClickHouseProtectedReadinessInspection(
+        context_id=binding.context_id,
+        identity=binding.readiness.table.identity,
+        record=binding.readiness.record,
+        evidence=binding.readiness.evidence,
+        request=binding.request.version_request,
+    )
+    evidence = ClickHouseProtectedReadContextEvidence(
+        context_id=binding.context_id,
+        attempt_id=binding.attempt_id,
+        engine="ClickHouse",
+        server_version=profile.server_version,
+        server_version_number=profile.server_version_number,
+        strategy=binding.strategy,
+        snapshot_locator=str(binding.source.identity.uuid),
+        started_at=binding.opened_at,
+        allowed_concurrency=1,
+        consistency_level=ConsistencyLevel.ASSERTED,
+        limitations=binding.limitations,
+    )
+    return ClickHouseProtectedReadContext(
+        transport,
+        profile,
+        binding,
+        relation,
+        readiness,
+        evidence,
+        source_budget,
+        direction,
+    )
+
+
 def _require_profile_admitted_endpoint_query(
     profile: ClickHouseServerProfile,
     query: ClickHouseEndpointQuery,
@@ -794,30 +967,40 @@ def _require_profile_admitted_endpoint_query(
 
 
 def _validate_context_closure(context: ClickHouseProtectedReadContext) -> None:
-    immutable = context.projection_binding.immutable_binding
+    binding = context.projection_binding
     relation = context.protected_relations[0]
     readiness = context.protected_readiness
-    if context.evidence.context_id != immutable.context_id:
+    if context.evidence.context_id != _binding_context_id(binding):
         raise ValueError("ClickHouse context evidence differs from its immutable binding")
-    if context.evidence.attempt_id != immutable.attempt_id:
+    if context.evidence.attempt_id != _binding_attempt_id(binding):
         raise ValueError("ClickHouse context attempt differs from its immutable binding")
-    if context.source_budget.attempt_id != immutable.attempt_id:
+    if context.source_budget.attempt_id != _binding_attempt_id(binding):
         raise ValueError("ClickHouse source budget differs from its immutable binding")
-    if relation.context_id != immutable.context_id:
+    if relation.context_id != _binding_context_id(binding):
         raise ValueError("ClickHouse protected relation context closure is inconsistent")
-    if readiness.context_id != immutable.context_id:
+    if readiness.context_id != _binding_context_id(binding):
         raise ValueError("ClickHouse protected readiness context closure is inconsistent")
+    if type(binding) is ClickHouseMergeTreeProjectionBinding:
+        expected_identity = binding.immutable_binding.readiness_identity
+        expected_record = binding.immutable_binding.readiness_record
+        expected_evidence = binding.immutable_binding.readiness_evidence
+        expected_request = binding.immutable_binding.request
+    else:
+        expected_identity = binding.readiness.table.identity
+        expected_record = binding.readiness.record
+        expected_evidence = binding.readiness.evidence
+        expected_request = binding.request.version_request
     if (
-        readiness.identity != immutable.readiness_identity
-        or readiness.record != immutable.readiness_record
-        or readiness.evidence != immutable.readiness_evidence
-        or readiness.request != immutable.request
+        readiness.identity != expected_identity
+        or readiness.record != expected_record
+        or readiness.evidence != expected_evidence
+        or readiness.request != expected_request
     ):
         raise ValueError("ClickHouse protected readiness differs from its immutable binding")
 
 
 def _comparison_limits(
-    binding: ClickHouseMergeTreeProjectionBinding,
+    binding: ClickHouseProtectedBinding,
     max_encoded_envelope_bytes: int,
 ) -> ClickHouseCanonicalLimits:
     limits = binding.request.canonical_limits
@@ -832,6 +1015,18 @@ def _comparison_limits(
         max_response_bytes=limits.max_response_bytes,
         max_execution_time_seconds=limits.max_execution_time_seconds,
     )
+
+
+def _binding_context_id(binding: ClickHouseProtectedBinding) -> UUID:
+    if type(binding) is ClickHouseMergeTreeProjectionBinding:
+        return binding.immutable_binding.context_id
+    return binding.context_id
+
+
+def _binding_attempt_id(binding: ClickHouseProtectedBinding) -> UUID:
+    if type(binding) is ClickHouseMergeTreeProjectionBinding:
+        return binding.immutable_binding.attempt_id
+    return binding.attempt_id
 
 
 def _parse_range_fingerprints(
@@ -1018,8 +1213,22 @@ def _tsv_records(
 ) -> tuple[tuple[bytes, ...], ...]:
     if type(payload) is not bytes:
         raise TypeError("ClickHouse TSV payload must be bytes")
+    if not payload:
+        return ()
+    if b"\r" in payload:
+        raise ClickHouseDataValidationError(
+            f"ClickHouse {operation} returned a TSV response containing a carriage return"
+        )
+    if not payload.endswith(b"\n"):
+        raise ClickHouseDataValidationError(
+            f"ClickHouse {operation} returned an incomplete TSV response: missing final LF"
+        )
     records: list[tuple[bytes, ...]] = []
-    for ordinal, line in enumerate(payload.splitlines(), start=1):
+    for ordinal, line in enumerate(payload[:-1].split(b"\n"), start=1):
+        if not line:
+            raise ClickHouseDataValidationError(
+                f"ClickHouse {operation} returned an empty TSV record: record={ordinal}"
+            )
         fields = tuple(line.split(b"\t"))
         if len(fields) != field_count:
             raise ClickHouseDataValidationError(
