@@ -39,6 +39,10 @@ services:
           AND getSetting('max_rows_to_group_by') = 1
           AND getSetting('group_by_overflow_mode') = 'any'
           AND getSetting('result_overflow_mode') = 'throw'
+          AND getSetting('final') = 0
+          AND getSetting('apply_mutations_on_fly') = 0
+          AND getSetting('apply_patch_parts') = 0
+          AND getSetting('do_not_merge_across_partitions_select_final') = 0
           AND (SELECT count() FROM fidelity_probe) = 3
           AND (SELECT count() FROM canonical_common_types) = 2
           AND (SELECT count() FROM canonical_empty_common_types) = 0
@@ -47,13 +51,28 @@ services:
           AND (SELECT count() FROM canonical_key_groups) = 5
           AND (SELECT count() FROM canonical_null_key) = 1
           AND (SELECT count() FROM canonical_group_overflow) = 5
-          AND (SELECT count() FROM immutable_version_readiness) = 1
+          AND (SELECT count() FROM immutable_version_readiness) = 2
           AND (SELECT count() FROM immutable_orders_staging) = 3
           AND (SELECT count() FROM immutable_orders_v001) = 2
           AND (SELECT count() FROM immutable_orders_v002) = 3
+          AND (SELECT count() FROM logical_orders_v001) = 5
+          AND (SELECT count() FROM logical_orders_v001 FINAL) = 3
           AND (SELECT count() FROM system.row_policies WHERE database = 'system') = 0
           AND (SELECT position(engine_full, 'table_readonly = 1') > 0 FROM system.tables WHERE database = 'dfe_fixture' AND name = 'immutable_orders_v001')
           AND (SELECT position(engine_full, 'table_readonly = 1') > 0 FROM system.tables WHERE database = 'dfe_fixture' AND name = 'immutable_orders_v002')")" = "1"
+          && test "$$(clickhouse-client
+          --user dfe_fixture_reader
+          --password "$${DFE_CLICKHOUSE_READER_PASSWORD}"
+          --database dfe_fixture
+          --query="SELECT
+          uuid = toUUID('33333333-3333-4333-8333-333333333333')
+          AND engine = 'ReplacingMergeTree'
+          AND sorting_key = 'order_id'
+          AND partition_key = ''
+          AND position(engine_full, 'ReplacingMergeTree(row_version)') > 0
+          AND position(engine_full, 'table_readonly = 1') > 0
+          FROM system.tables
+          WHERE database = 'dfe_fixture' AND name = 'logical_orders_v001'")" = "1"
           && test "$$(clickhouse-client
           --user dfe_fixture_writer
           --password "$${DFE_CLICKHOUSE_WRITER_PASSWORD}"

@@ -224,6 +224,20 @@ INSERT INTO dfe_fixture.immutable_version_readiness VALUES
     toUInt64(1)
 );
 
+INSERT INTO dfe_fixture.immutable_version_readiness VALUES
+(
+    'logical_orders',
+    '8e9db77eac98d983fe0053501478a2f52fa3fd35bca9ea56cbb3e6b44f3430e7',
+    'logical-orders-2024-02-29-v001',
+    'complete',
+    toDate('2024-02-29'),
+    'logical-orders-cut-000001',
+    'logical_orders_v001',
+    toDateTime64('2024-03-01 00:10:00.000000', 6, 'UTC'),
+    toUInt64(1),
+    toUInt64(1)
+);
+
 DROP TABLE IF EXISTS dfe_fixture.immutable_orders_staging;
 
 CREATE TABLE dfe_fixture.immutable_orders_staging
@@ -278,6 +292,37 @@ INSERT INTO dfe_fixture.immutable_orders_v002 VALUES
 
 ALTER TABLE dfe_fixture.immutable_orders_v002 MODIFY SETTING table_readonly = 1;
 
+DROP TABLE IF EXISTS dfe_fixture.logical_orders_v001 SYNC;
+
+CREATE TABLE dfe_fixture.logical_orders_v001 UUID '33333333-3333-4333-8333-333333333333'
+(
+    order_id Int64,
+    amount Decimal(38, 3),
+    business_date Date,
+    poison String,
+    row_version UInt64,
+    amount_default Decimal(38, 3) DEFAULT amount,
+    amount_materialized Decimal(38, 3) MATERIALIZED amount,
+    amount_alias Decimal(38, 3) ALIAS amount
+)
+ENGINE = ReplacingMergeTree(row_version)
+ORDER BY order_id;
+
+SYSTEM STOP MERGES dfe_fixture.logical_orders_v001;
+
+INSERT INTO dfe_fixture.logical_orders_v001
+    (order_id, amount, business_date, poison, row_version) VALUES
+    (1, '10.000', toDate('2024-02-29'), '10', toUInt64(1)),
+    (2, '20.000', toDate('2024-02-29'), 'mutation-failure', toUInt64(2)),
+    (3, '30.000', toDate('2024-02-29'), '30', toUInt64(1));
+
+INSERT INTO dfe_fixture.logical_orders_v001
+    (order_id, amount, business_date, poison, row_version) VALUES
+    (1, '11.000', toDate('2024-02-29'), '11', toUInt64(2)),
+    (2, '19.000', toDate('2024-02-29'), '19', toUInt64(1));
+
+ALTER TABLE dfe_fixture.logical_orders_v001 MODIFY SETTING table_readonly = 1;
+
 DROP USER IF EXISTS dfe_fixture_reader;
 DROP USER IF EXISTS dfe_fixture_writer;
 
@@ -293,9 +338,16 @@ SETTINGS
     max_result_bytes = 67108864 MIN 1 MAX 67108864 CHANGEABLE_IN_READONLY,
     max_rows_to_group_by = 1 MIN 1 MAX 100000 CHANGEABLE_IN_READONLY,
     group_by_overflow_mode = 'any' CHANGEABLE_IN_READONLY,
-    result_overflow_mode = 'throw' CONST;
+    result_overflow_mode = 'throw' CONST,
+    final = 0 CONST,
+    apply_mutations_on_fly = 0 CONST,
+    apply_patch_parts = 0 CONST,
+    do_not_merge_across_partitions_select_final = 0 CONST;
 
 GRANT SELECT ON dfe_fixture.* TO dfe_fixture_reader;
+GRANT SELECT ON system.mutations TO dfe_fixture_reader;
+GRANT SELECT ON system.parts TO dfe_fixture_reader;
+GRANT SELECT ON system.projections TO dfe_fixture_reader;
 GRANT SHOW ROW POLICIES ON *.* TO dfe_fixture_reader;
 
 CREATE USER dfe_fixture_writer

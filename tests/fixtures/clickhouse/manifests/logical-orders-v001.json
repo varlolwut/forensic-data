@@ -1,0 +1,20 @@
+{
+  "version": 1,
+  "issuer": "dfe_fixture_loader",
+  "dataset_id": "logical_orders",
+  "scope_digest": "8e9db77eac98d983fe0053501478a2f52fa3fd35bca9ea56cbb3e6b44f3430e7",
+  "expected_batch_id": "logical-orders-2024-02-29-v001",
+  "business_date": "2024-02-29",
+  "source_cut": "logical-orders-cut-000001",
+  "dataset_version": "logical_orders_v001",
+  "completed_at": "2024-03-01T00:10:00.000000Z",
+  "completion_revision": 1,
+  "publication_revision": 1,
+  "version_locator": {
+    "database": "dfe_fixture",
+    "table": "logical_orders_v001",
+    "uuid": "33333333-3333-4333-8333-333333333333"
+  },
+  "immutability": "asserted",
+  "late_arrivals": "next_batch"
+}

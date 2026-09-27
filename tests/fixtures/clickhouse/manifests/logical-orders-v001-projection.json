@@ -1,0 +1,29 @@
+{
+  "version": 1,
+  "issuer": "dfe_fixture_loader",
+  "dataset_id": "logical_orders",
+  "expected_batch_id": "logical-orders-2024-02-29-v001",
+  "publication_revision": 1,
+  "immutable_manifest_sha256": "7f2f1cab4bf9539ef6a9be3560b84d6d7d8813786457d1f6ddcf816681bd852a",
+  "version_locator": {
+    "database": "dfe_fixture",
+    "table": "logical_orders_v001",
+    "uuid": "33333333-3333-4333-8333-333333333333"
+  },
+  "table_definition_sha256": "d0e09ef9031ed0d328aa2e36a52dfbf9efba8680c1daef81ea36c6c7ae582014",
+  "projected_columns": [
+    "order_id",
+    "amount",
+    "business_date"
+  ],
+  "sorting_key_columns": [
+    "order_id"
+  ],
+  "version_column": "row_version",
+  "projection_strategy": "replacing_merge_tree_final",
+  "equal_version_policy": "forbidden",
+  "preseal_equal_max_version_key_count": 0,
+  "physical_row_count": 5,
+  "logical_row_count": 3,
+  "logical_deletes": "unsupported"
+}

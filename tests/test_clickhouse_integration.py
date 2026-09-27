@@ -1,5 +1,7 @@
+from datetime import date
 from decimal import Decimal
 from pathlib import Path
+from time import monotonic, sleep
 
 import clickhouse_connect
 import pytest
@@ -10,6 +12,7 @@ from forensic_data.acquisition import EarlyExecutionOutcome
 from forensic_data.canonical import (
     PROTOCOL,
     CanonicalSchema,
+    DecimalParameters,
     FieldSchema,
     Fingerprint,
     LogicalType,
@@ -18,6 +21,7 @@ from forensic_data.canonical import (
     encode_key,
     encode_row,
     envelope_sha256,
+    fingerprint_rows,
     schema_from_metadata_json,
 )
 from forensic_data.clickhouse import (
@@ -39,10 +43,26 @@ from forensic_data.clickhouse_canonical import (
     ClickHouseCanonicalGroupRequest,
     ClickHouseCanonicalLimits,
     ClickHouseCanonicalReadRequest,
+    ClickHouseMergeTreeLogicalProjectionSource,
+    ClickHouseReplacingMergeTreeLogicalProjectionSource,
     inspect_clickhouse_canonical_relation,
     read_clickhouse_canonical_fingerprint,
     read_clickhouse_canonical_key_groups,
     read_clickhouse_canonical_rows,
+)
+from forensic_data.clickhouse_projection import (
+    ClickHouseMergeTreeProjectionBinding,
+    ClickHouseMergeTreeProjectionConfirmation,
+    ClickHouseMutationFailureError,
+    ClickHouseProjectionRequest,
+    ClickHouseReplacingMergeTreeProjectionBinding,
+    ClickHouseReplacingMergeTreeProjectionConfirmation,
+    ClickHouseReplacingVersionAmbiguityError,
+    acquire_clickhouse_merge_tree_projection,
+    acquire_clickhouse_replacing_merge_tree_projection,
+    confirm_clickhouse_merge_tree_projection,
+    confirm_clickhouse_replacing_merge_tree_projection,
+    parse_clickhouse_replacing_projection_manifest,
 )
 from forensic_data.clickhouse_readiness import (
     ClickHouseImmutableVersionBinding,
@@ -615,6 +635,284 @@ def test_clickhouse_immutable_versions_bind_only_complete_append_only_publicatio
         _reset_immutable_version_readiness(admin_settings)
 
 
+def test_clickhouse_logical_projection_is_explicit_tie_free_and_mutation_ready() -> None:
+    immutable_manifest = parse_clickhouse_immutable_version_manifest(
+        (_CLICKHOUSE_MANIFESTS / "immutable-orders-v001.json").read_bytes(),
+        1_024,
+    )
+    logical_manifest = parse_clickhouse_immutable_version_manifest(
+        (_CLICKHOUSE_MANIFESTS / "logical-orders-v001.json").read_bytes(),
+        1_024,
+    )
+    projection_payload = (
+        _CLICKHOUSE_MANIFESTS / "logical-orders-v001-projection.json"
+    ).read_bytes()
+    projection_manifest = parse_clickhouse_replacing_projection_manifest(
+        projection_payload,
+        4_096,
+    )
+    logical_schema = _logical_orders_schema()
+    canonical_limits = ClickHouseCanonicalLimits(
+        max_encoded_envelope_bytes=1_024,
+        max_response_bytes=65_536,
+        max_execution_time_seconds=5,
+    )
+    projected_columns = ("order_id", "amount", "business_date")
+    plain_request = _projection_request(
+        immutable_manifest,
+        logical_schema,
+        projected_columns,
+        canonical_limits,
+    )
+    replacing_request = _projection_request(
+        logical_manifest,
+        logical_schema,
+        projected_columns,
+        canonical_limits,
+    )
+    alias_projection_payload = projection_payload.replace(
+        b'    "amount",',
+        b'    "amount_alias",',
+        1,
+    )
+    assert alias_projection_payload != projection_payload
+    alias_projection_manifest = parse_clickhouse_replacing_projection_manifest(
+        alias_projection_payload,
+        4_096,
+    )
+    alias_request = _projection_request(
+        logical_manifest,
+        logical_schema,
+        ("order_id", "amount_alias", "business_date"),
+        canonical_limits,
+    )
+    admin_settings = required_clickhouse_admin_settings("dfe-phase05-projection-reset")
+    reader_settings = required_clickhouse_reader_settings("dfe-phase05-projection-reader")
+    admin = _open_clickhouse_fixture_client(admin_settings)
+    reader = None
+    mutation_id: str | None = None
+    try:
+        _reset_logical_orders_projection(admin)
+        _reset_immutable_version_readiness(admin_settings)
+        reader = open_clickhouse_transport(
+            reader_settings,
+            single_attempt_clickhouse_retry_policy(),
+        )
+
+        plain_binding = acquire_clickhouse_merge_tree_projection(
+            reader,
+            plain_request,
+            immutable_manifest,
+        )
+        assert isinstance(plain_binding, ClickHouseMergeTreeProjectionBinding)
+        assert type(plain_binding.relation.source) is ClickHouseMergeTreeLogicalProjectionSource
+        plain_envelopes = (
+            encode_row(
+                logical_schema,
+                (1, Decimal("10.000"), date(2024, 2, 29)),
+            ),
+            encode_row(
+                logical_schema,
+                (2, Decimal("20.000"), date(2024, 2, 29)),
+            ),
+        )
+        plain_rows = read_clickhouse_canonical_rows(
+            reader,
+            ClickHouseCanonicalReadRequest(
+                relation=plain_binding.relation,
+                order_columns=("order_id",),
+                max_records=2,
+                limits=canonical_limits,
+            ),
+        )
+        assert tuple(row.envelope for row in plain_rows) == plain_envelopes
+        assert tuple(row.sha256 for row in plain_rows) == tuple(
+            envelope_sha256(envelope) for envelope in plain_envelopes
+        )
+        assert plain_binding.logical_fingerprint.fingerprint == fingerprint_rows(plain_envelopes)
+        assert plain_binding.logical_fingerprint.invalid_row_count == 0
+        assert plain_binding.logical_fingerprint.oversized_row_count == 0
+        assert plain_binding.overall_evidence is ConsistencyLevel.ASSERTED
+        plain_confirmation = confirm_clickhouse_merge_tree_projection(
+            reader,
+            plain_binding,
+        )
+        assert isinstance(
+            plain_confirmation,
+            ClickHouseMergeTreeProjectionConfirmation,
+        )
+
+        replacing_binding = acquire_clickhouse_replacing_merge_tree_projection(
+            reader,
+            replacing_request,
+            logical_manifest,
+            projection_manifest,
+        )
+        assert isinstance(
+            replacing_binding,
+            ClickHouseReplacingMergeTreeProjectionBinding,
+        )
+        assert (
+            type(replacing_binding.relation.source)
+            is ClickHouseReplacingMergeTreeLogicalProjectionSource
+        )
+        assert replacing_binding.row_counts.physical_row_count == 5
+        assert replacing_binding.row_counts.logical_row_count == 3
+        replacing_envelopes = (
+            encode_row(
+                logical_schema,
+                (1, Decimal("11.000"), date(2024, 2, 29)),
+            ),
+            encode_row(
+                logical_schema,
+                (2, Decimal("20.000"), date(2024, 2, 29)),
+            ),
+            encode_row(
+                logical_schema,
+                (3, Decimal("30.000"), date(2024, 2, 29)),
+            ),
+        )
+        replacing_rows = read_clickhouse_canonical_rows(
+            reader,
+            ClickHouseCanonicalReadRequest(
+                relation=replacing_binding.relation,
+                order_columns=("order_id",),
+                max_records=3,
+                limits=canonical_limits,
+            ),
+        )
+        assert tuple(row.envelope for row in replacing_rows) == replacing_envelopes
+        assert tuple(row.sha256 for row in replacing_rows) == tuple(
+            envelope_sha256(envelope) for envelope in replacing_envelopes
+        )
+        assert replacing_binding.logical_fingerprint.fingerprint == fingerprint_rows(
+            replacing_envelopes
+        )
+        assert replacing_binding.logical_fingerprint.invalid_row_count == 0
+        assert replacing_binding.logical_fingerprint.oversized_row_count == 0
+        assert replacing_binding.stable_read_evidence is ConsistencyLevel.ASSERTED
+        assert replacing_binding.tie_freedom_evidence is ConsistencyLevel.ASSERTED
+        assert replacing_binding.overall_evidence is ConsistencyLevel.ASSERTED
+        replacing_confirmation = confirm_clickhouse_replacing_merge_tree_projection(
+            reader,
+            replacing_binding,
+        )
+        assert isinstance(
+            replacing_confirmation,
+            ClickHouseReplacingMergeTreeProjectionConfirmation,
+        )
+
+        with pytest.raises(
+            UnsupportedClickHouseProfileError,
+            match="supports only ordinary stored columns",
+        ):
+            acquire_clickhouse_replacing_merge_tree_projection(
+                reader,
+                alias_request,
+                logical_manifest,
+                alias_projection_manifest,
+            )
+
+        admin.command(  # pyright: ignore[reportUnknownMemberType]
+            "ALTER TABLE dfe_fixture.logical_orders_v001 MODIFY SETTING table_readonly = 0"
+        )
+        admin.command(  # pyright: ignore[reportUnknownMemberType]
+            "INSERT INTO dfe_fixture.logical_orders_v001 "
+            "(order_id, amount, business_date, poison, row_version) VALUES "
+            "(1, '12.000', toDate('2024-02-29'), '12', toUInt64(2))"
+        )
+        admin.command(  # pyright: ignore[reportUnknownMemberType]
+            "ALTER TABLE dfe_fixture.logical_orders_v001 MODIFY SETTING table_readonly = 1"
+        )
+        with pytest.raises(ClickHouseReplacingVersionAmbiguityError):
+            acquire_clickhouse_replacing_merge_tree_projection(
+                reader,
+                replacing_request,
+                logical_manifest,
+                projection_manifest,
+            )
+
+        _reset_logical_orders_projection(admin)
+        admin.command(  # pyright: ignore[reportUnknownMemberType]
+            "ALTER TABLE dfe_fixture.logical_orders_v001 MODIFY SETTING table_readonly = 0"
+        )
+        admin.command(  # pyright: ignore[reportUnknownMemberType]
+            "ALTER TABLE dfe_fixture.logical_orders_v001 "
+            "UPDATE amount = CAST(poison AS Decimal(38, 3)) WHERE order_id = 2 "
+            "SETTINGS mutations_sync = 0"
+        )
+        mutation_id = _single_logical_orders_mutation_id(admin)
+        admin.command(  # pyright: ignore[reportUnknownMemberType]
+            "ALTER TABLE dfe_fixture.logical_orders_v001 MODIFY SETTING table_readonly = 1"
+        )
+        pending_mutation = acquire_clickhouse_replacing_merge_tree_projection(
+            reader,
+            replacing_request,
+            logical_manifest,
+            projection_manifest,
+        )
+        assert isinstance(pending_mutation, EarlyExecutionOutcome)
+        assert pending_mutation.execution_status is ExecutionStatus.INCOMPLETE
+        assert pending_mutation.reason.code is ReasonCode.NOT_READY
+        assert (
+            pending_mutation.reason.message
+            == "ClickHouse logical projection has an unfinished mutation"
+        )
+
+        admin.command(  # pyright: ignore[reportUnknownMemberType]
+            "ALTER TABLE dfe_fixture.logical_orders_v001 MODIFY SETTING table_readonly = 0"
+        )
+        admin.command(  # pyright: ignore[reportUnknownMemberType]
+            "SYSTEM START MERGES dfe_fixture.logical_orders_v001"
+        )
+        mutation_error_code = _wait_for_logical_orders_mutation_failure(
+            admin,
+            mutation_id,
+            10.0,
+        )
+        admin.command(  # pyright: ignore[reportUnknownMemberType]
+            "SYSTEM STOP MERGES dfe_fixture.logical_orders_v001"
+        )
+        admin.command(  # pyright: ignore[reportUnknownMemberType]
+            "ALTER TABLE dfe_fixture.logical_orders_v001 MODIFY SETTING table_readonly = 1"
+        )
+        with pytest.raises(ClickHouseMutationFailureError) as mutation_failure:
+            acquire_clickhouse_replacing_merge_tree_projection(
+                reader,
+                replacing_request,
+                logical_manifest,
+                projection_manifest,
+            )
+        assert str(mutation_failure.value) == (
+            "ClickHouse logical projection has a failed mutation: "
+            "database='dfe_fixture', table='logical_orders_v001', "
+            f"mutation_id={mutation_id!r}, error_code={mutation_error_code!r}"
+        )
+        assert "mutation-failure" not in str(mutation_failure.value)
+    finally:
+        if reader is not None and not reader.closed:
+            reader.close()
+        admin.command(  # pyright: ignore[reportUnknownMemberType]
+            "ALTER TABLE dfe_fixture.logical_orders_v001 MODIFY SETTING table_readonly = 0"
+        )
+        if mutation_id is not None:
+            admin.command(  # pyright: ignore[reportUnknownMemberType]
+                "KILL MUTATION WHERE database = {database:String} "
+                "AND table = {table:String} AND mutation_id = {mutation_id:String} SYNC",
+                parameters={
+                    "database": "dfe_fixture",
+                    "table": "logical_orders_v001",
+                    "mutation_id": mutation_id,
+                },
+            )
+        admin.command(  # pyright: ignore[reportUnknownMemberType]
+            "SYSTEM START MERGES dfe_fixture.logical_orders_v001"
+        )
+        _reset_logical_orders_projection(admin)
+        admin.close_connections()
+        _reset_immutable_version_readiness(admin_settings)
+
+
 def _expected_row(
     order_value: int,
     decimal_scaled: int,
@@ -739,6 +1037,51 @@ def _immutable_version_request(
     )
 
 
+def _logical_orders_schema() -> CanonicalSchema:
+    return CanonicalSchema(
+        protocol=PROTOCOL,
+        fields=(
+            FieldSchema(
+                name="order_id",
+                logical_type=LogicalType.INT64,
+                nullable=False,
+                parameters=NoParameters(),
+                normalization=Normalization.NONE,
+            ),
+            FieldSchema(
+                name="amount",
+                logical_type=LogicalType.DECIMAL,
+                nullable=False,
+                parameters=DecimalParameters(precision=38, scale=3),
+                normalization=Normalization.NONE,
+            ),
+            FieldSchema(
+                name="business_date",
+                logical_type=LogicalType.DATE,
+                nullable=False,
+                parameters=NoParameters(),
+                normalization=Normalization.NONE,
+            ),
+        ),
+    )
+
+
+def _projection_request(
+    manifest: ClickHouseImmutableVersionManifest,
+    schema: CanonicalSchema,
+    column_names: tuple[str, ...],
+    canonical_limits: ClickHouseCanonicalLimits,
+) -> ClickHouseProjectionRequest:
+    return ClickHouseProjectionRequest(
+        version_request=_immutable_version_request(manifest),
+        schema=schema,
+        column_names=column_names,
+        canonical_limits=canonical_limits,
+        max_mutation_records=8,
+        max_tie_groups=8,
+    )
+
+
 def _reset_immutable_version_readiness(settings: ClickHouseConnectionSettings) -> None:
     admin = _open_clickhouse_fixture_client(settings)
     try:
@@ -775,8 +1118,106 @@ def _reset_immutable_version_readiness(settings: ClickHouseConnectionSettings) -
             "toDateTime64('2024-03-01 00:00:00.000000', 6, 'UTC'), "
             "toUInt64(1), toUInt64(1))"
         )
+        admin.command(  # pyright: ignore[reportUnknownMemberType]
+            "INSERT INTO dfe_fixture.immutable_version_readiness VALUES "
+            "('logical_orders', "
+            "'8e9db77eac98d983fe0053501478a2f52fa3fd35bca9ea56cbb3e6b44f3430e7', "
+            "'logical-orders-2024-02-29-v001', 'complete', "
+            "toDate('2024-02-29'), 'logical-orders-cut-000001', "
+            "'logical_orders_v001', "
+            "toDateTime64('2024-03-01 00:10:00.000000', 6, 'UTC'), "
+            "toUInt64(1), toUInt64(1))"
+        )
+        restored_datasets = admin.raw_query(  # pyright: ignore[reportUnknownMemberType]
+            "SELECT dataset_id FROM dfe_fixture.immutable_version_readiness ORDER BY dataset_id",
+            fmt="TabSeparatedRaw",
+        )
+        assert restored_datasets == b"immutable_orders\nlogical_orders\n"
     finally:
         admin.close_connections()
+
+
+def _reset_logical_orders_projection(client: Client) -> None:
+    client.command(  # pyright: ignore[reportUnknownMemberType]
+        "SYSTEM START MERGES dfe_fixture.logical_orders_v001"
+    )
+    client.command(  # pyright: ignore[reportUnknownMemberType]
+        "DROP TABLE IF EXISTS dfe_fixture.logical_orders_v001 SYNC"
+    )
+    client.command(  # pyright: ignore[reportUnknownMemberType]
+        "CREATE TABLE dfe_fixture.logical_orders_v001 "
+        "UUID '33333333-3333-4333-8333-333333333333' "
+        "(order_id Int64, amount Decimal(38, 3), business_date Date, "
+        "poison String, row_version UInt64, "
+        "amount_default Decimal(38, 3) DEFAULT amount, "
+        "amount_materialized Decimal(38, 3) MATERIALIZED amount, "
+        "amount_alias Decimal(38, 3) ALIAS amount) "
+        "ENGINE = ReplacingMergeTree(row_version) ORDER BY order_id"
+    )
+    client.command(  # pyright: ignore[reportUnknownMemberType]
+        "SYSTEM STOP MERGES dfe_fixture.logical_orders_v001"
+    )
+    client.command(  # pyright: ignore[reportUnknownMemberType]
+        "INSERT INTO dfe_fixture.logical_orders_v001 "
+        "(order_id, amount, business_date, poison, row_version) VALUES "
+        "(1, '10.000', toDate('2024-02-29'), '10', toUInt64(1)), "
+        "(2, '20.000', toDate('2024-02-29'), 'mutation-failure', toUInt64(2)), "
+        "(3, '30.000', toDate('2024-02-29'), '30', toUInt64(1))"
+    )
+    client.command(  # pyright: ignore[reportUnknownMemberType]
+        "INSERT INTO dfe_fixture.logical_orders_v001 "
+        "(order_id, amount, business_date, poison, row_version) VALUES "
+        "(1, '11.000', toDate('2024-02-29'), '11', toUInt64(2)), "
+        "(2, '19.000', toDate('2024-02-29'), '19', toUInt64(1))"
+    )
+    client.command(  # pyright: ignore[reportUnknownMemberType]
+        "ALTER TABLE dfe_fixture.logical_orders_v001 MODIFY SETTING table_readonly = 1"
+    )
+
+
+def _single_logical_orders_mutation_id(client: Client) -> str:
+    payload = client.raw_query(  # pyright: ignore[reportUnknownMemberType]
+        "SELECT mutation_id FROM system.mutations "
+        "WHERE database = 'dfe_fixture' AND table = 'logical_orders_v001' "
+        "ORDER BY mutation_id",
+        fmt="TabSeparatedRaw",
+    )
+    mutation_ids = tuple(line for line in payload.decode("utf-8").splitlines() if line)
+    if len(mutation_ids) != 1:
+        raise AssertionError(
+            "logical_orders_v001 must expose exactly one mutation after the mutation command: "
+            f"actual={len(mutation_ids)}"
+        )
+    return mutation_ids[0]
+
+
+def _wait_for_logical_orders_mutation_failure(
+    client: Client,
+    mutation_id: str,
+    timeout_seconds: float,
+) -> str:
+    deadline = monotonic() + timeout_seconds
+    while True:
+        payload = client.raw_query(  # pyright: ignore[reportUnknownMemberType]
+            "SELECT latest_fail_error_code_name FROM system.mutations "
+            "WHERE database = {database:String} AND table = {table:String} "
+            "AND mutation_id = {mutation_id:String}",
+            parameters={
+                "database": "dfe_fixture",
+                "table": "logical_orders_v001",
+                "mutation_id": mutation_id,
+            },
+            fmt="TabSeparatedRaw",
+        )
+        error_codes = payload.decode("utf-8").splitlines()
+        if len(error_codes) == 1 and error_codes[0]:
+            return error_codes[0]
+        if monotonic() >= deadline:
+            raise AssertionError(
+                "logical_orders_v001 mutation did not retain a native failure code "
+                f"within {timeout_seconds} seconds: mutation_id={mutation_id!r}"
+            )
+        sleep(0.05)
 
 
 def _append_building_readiness(

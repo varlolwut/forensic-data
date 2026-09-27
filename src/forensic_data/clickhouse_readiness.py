@@ -122,6 +122,8 @@ class _VersionTablePayload(BaseModel):
     database_engine: str
     table_engine: str
     engine_full: str
+    partition_key: str
+    sorting_key: str
     definition_sha256: str
 
 
@@ -366,6 +368,9 @@ class ClickHouseTableIdentity:
     uuid: UUID
     database_engine: str
     table_engine: str
+    engine_full: str
+    partition_key: str
+    sorting_key: str
     table_readonly: bool
     definition_sha256: str
     columns: tuple[ClickHouseColumnIdentity, ...]
@@ -387,6 +392,13 @@ class ClickHouseTableIdentity:
             )
         _require_bounded_text(self.database_engine, "bound version database engine")
         _require_bounded_text(self.table_engine, "bound version table engine")
+        _require_text(self.engine_full, "bound version full engine definition")
+        if not self.engine_full:
+            raise ClickHouseDataValidationError(
+                "ClickHouse bound version full engine definition must not be empty"
+            )
+        _require_text(self.partition_key, "bound version partition key")
+        _require_text(self.sorting_key, "bound version sorting key")
         if type(self.table_readonly) is not bool:
             raise TypeError("ClickHouse bound version table_readonly must be a boolean")
         _require_sha256(self.definition_sha256, "bound version definition digest")
@@ -399,6 +411,68 @@ class ClickHouseTableIdentity:
                 raise ClickHouseDataValidationError(
                     "ClickHouse bound table column positions must be contiguous from one"
                 )
+
+
+@final
+@dataclass(frozen=True, slots=True)
+class ClickHouseNamedVersionObservation:
+    context_id: UUID
+    request: ClickHouseImmutableVersionRequest
+    manifest: ClickHouseImmutableVersionManifest
+    readiness_record: ClickHouseRelationManifestRecord
+    readiness_evidence: RelationManifestEvidence
+    readiness_identity: ClickHouseTableIdentity
+    version_identity: ClickHouseTableIdentity
+    observed_at: datetime
+
+    def __post_init__(self) -> None:
+        if type(self.context_id) is not UUID:
+            raise TypeError("ClickHouse named-version context ID must be a UUID")
+        if type(self.request) is not ClickHouseImmutableVersionRequest:
+            raise TypeError("request must be ClickHouseImmutableVersionRequest")
+        if type(self.manifest) is not ClickHouseImmutableVersionManifest:
+            raise TypeError("manifest must be ClickHouseImmutableVersionManifest")
+        if type(self.readiness_record) is not ClickHouseRelationManifestRecord:
+            raise TypeError("readiness_record must be ClickHouseRelationManifestRecord")
+        if type(self.readiness_evidence) is not RelationManifestEvidence:
+            raise TypeError("readiness_evidence must be RelationManifestEvidence")
+        if type(self.readiness_identity) is not ClickHouseTableIdentity:
+            raise TypeError("readiness_identity must be ClickHouseTableIdentity")
+        if type(self.version_identity) is not ClickHouseTableIdentity:
+            raise TypeError("version_identity must be ClickHouseTableIdentity")
+        if self.readiness_evidence.evidence_level is not ConsistencyLevel.VERIFIED:
+            raise ValueError("ClickHouse query readiness must remain database-verified")
+        _require_utc_datetime(self.observed_at, "named-version observation observed_at")
+        _require_request_manifest_closure(self.request, self.manifest)
+        _require_manifest_record_closure(self.manifest, self.readiness_record)
+        _require_readiness_identity(self.request, self.readiness_identity)
+        _require_locator_identity(self.manifest.version_locator, self.version_identity)
+        _require_same_server(self.readiness_identity, self.version_identity)
+        _require_sealed_named_version_identity(self.version_identity)
+
+
+@final
+@dataclass(frozen=True, slots=True)
+class ClickHouseNamedVersionConfirmation:
+    observation: ClickHouseNamedVersionObservation
+    final_readiness_record: ClickHouseRelationManifestRecord
+    final_readiness_evidence: RelationManifestEvidence
+    final_readiness_identity: ClickHouseTableIdentity
+    final_version_identity: ClickHouseTableIdentity
+    confirmed_at: datetime
+
+    def __post_init__(self) -> None:
+        if type(self.observation) is not ClickHouseNamedVersionObservation:
+            raise TypeError("observation must be ClickHouseNamedVersionObservation")
+        if self.final_readiness_record != self.observation.readiness_record:
+            raise ValueError("confirmed ClickHouse readiness differs from its observation")
+        if self.final_readiness_evidence != self.observation.readiness_evidence:
+            raise ValueError("confirmed ClickHouse readiness evidence differs from its observation")
+        if self.final_readiness_identity != self.observation.readiness_identity:
+            raise ValueError("confirmed ClickHouse readiness identity differs from its observation")
+        if self.final_version_identity != self.observation.version_identity:
+            raise ValueError("confirmed ClickHouse version identity differs from its observation")
+        _require_utc_datetime(self.confirmed_at, "named-version confirmation confirmed_at")
 
 
 @final
@@ -549,19 +623,18 @@ def parse_clickhouse_immutable_version_manifest(
         ) from None
 
 
-def acquire_clickhouse_immutable_version(
+def observe_clickhouse_named_version(
     transport: ClickHouseTransport,
     request: ClickHouseImmutableVersionRequest,
     manifest: ClickHouseImmutableVersionManifest,
-) -> ClickHouseImmutableVersionBinding | EarlyExecutionOutcome:
+) -> ClickHouseNamedVersionObservation | EarlyExecutionOutcome:
     _require_transport(transport)
     if type(request) is not ClickHouseImmutableVersionRequest:
         raise TypeError("request must be ClickHouseImmutableVersionRequest")
     if type(manifest) is not ClickHouseImmutableVersionManifest:
         raise TypeError("manifest must be ClickHouseImmutableVersionManifest")
     _require_request_manifest_closure(request, manifest)
-    if request.minimum_evidence is MinimumEvidence.VERIFIED:
-        return _unsupported_evidence_outcome(request)
+    _require_direct_single_server_endpoint(request.endpoint_profile)
     initial_readiness_identity = _inspect_clickhouse_readiness_table(transport, request)
     initial = _read_current_readiness(
         transport,
@@ -575,12 +648,12 @@ def acquire_clickhouse_immutable_version(
             request,
             "ClickHouse readiness and immutable-version manifest are not one publication",
         )
-    identity = inspect_clickhouse_version_table(
+    identity = _inspect_clickhouse_named_version_table(
         transport,
         manifest.version_locator,
         request.limits,
-        request.endpoint_profile,
     )
+    _require_sealed_named_version_identity(identity)
     confirmed = _read_current_readiness(
         transport,
         request,
@@ -599,29 +672,122 @@ def acquire_clickhouse_immutable_version(
             request,
             "ClickHouse readiness table identity changed while the version was being bound",
         )
-    confirmed_version_identity = inspect_clickhouse_version_table(
+    confirmed_version_identity = _inspect_clickhouse_named_version_table(
         transport,
         manifest.version_locator,
         request.limits,
-        request.endpoint_profile,
     )
+    _require_sealed_named_version_identity(confirmed_version_identity)
     if confirmed_version_identity != identity:
         return _cut_mismatch_outcome(
             request,
             "ClickHouse named version table identity changed while it was being bound",
         )
-    return ClickHouseImmutableVersionBinding(
+    return ClickHouseNamedVersionObservation(
         context_id=uuid4(),
-        strategy=_IMMUTABLE_VERSION_STRATEGY,
         request=request,
         manifest=manifest,
         readiness_record=confirmed.record,
         readiness_evidence=confirmed.evidence,
         readiness_identity=confirmed_readiness_identity,
         version_identity=confirmed_version_identity,
+        observed_at=datetime.now(UTC),
+    )
+
+
+def confirm_clickhouse_named_version(
+    transport: ClickHouseTransport,
+    observation: ClickHouseNamedVersionObservation,
+) -> ClickHouseNamedVersionConfirmation | EarlyExecutionOutcome:
+    _require_transport(transport)
+    if type(observation) is not ClickHouseNamedVersionObservation:
+        raise TypeError("observation must be ClickHouseNamedVersionObservation")
+    first = _read_current_readiness(
+        transport,
+        observation.request,
+        observation.readiness_identity.server_uuid,
+    )
+    if isinstance(first, EarlyExecutionOutcome):
+        return first
+    if (
+        first.record != observation.readiness_record
+        or first.evidence != observation.readiness_evidence
+    ):
+        return _cut_mismatch_outcome(
+            observation.request,
+            "ClickHouse readiness cut differs from the bound immutable version",
+        )
+    readiness_identity = _inspect_clickhouse_readiness_table(
+        transport,
+        observation.request,
+    )
+    if readiness_identity != observation.readiness_identity:
+        return _cut_mismatch_outcome(
+            observation.request,
+            "ClickHouse readiness table identity differs from the bound context",
+        )
+    identity = _inspect_clickhouse_named_version_table(
+        transport,
+        observation.manifest.version_locator,
+        observation.request.limits,
+    )
+    _require_sealed_named_version_identity(identity)
+    if identity != observation.version_identity:
+        return _cut_mismatch_outcome(
+            observation.request,
+            "ClickHouse named version table identity differs from the bound version",
+        )
+    second = _read_current_readiness(
+        transport,
+        observation.request,
+        observation.readiness_identity.server_uuid,
+    )
+    if isinstance(second, EarlyExecutionOutcome):
+        return second
+    if second != first:
+        return _cut_mismatch_outcome(
+            observation.request,
+            "ClickHouse readiness changed during final immutable-version confirmation",
+        )
+    return ClickHouseNamedVersionConfirmation(
+        observation=observation,
+        final_readiness_record=second.record,
+        final_readiness_evidence=second.evidence,
+        final_readiness_identity=readiness_identity,
+        final_version_identity=identity,
+        confirmed_at=datetime.now(UTC),
+    )
+
+
+def acquire_clickhouse_immutable_version(
+    transport: ClickHouseTransport,
+    request: ClickHouseImmutableVersionRequest,
+    manifest: ClickHouseImmutableVersionManifest,
+) -> ClickHouseImmutableVersionBinding | EarlyExecutionOutcome:
+    _require_transport(transport)
+    if type(request) is not ClickHouseImmutableVersionRequest:
+        raise TypeError("request must be ClickHouseImmutableVersionRequest")
+    if type(manifest) is not ClickHouseImmutableVersionManifest:
+        raise TypeError("manifest must be ClickHouseImmutableVersionManifest")
+    _require_request_manifest_closure(request, manifest)
+    if request.minimum_evidence is MinimumEvidence.VERIFIED:
+        return _unsupported_evidence_outcome(request)
+    observation = observe_clickhouse_named_version(transport, request, manifest)
+    if isinstance(observation, EarlyExecutionOutcome):
+        return observation
+    _require_plain_immutable_version_identity(observation.version_identity)
+    return ClickHouseImmutableVersionBinding(
+        context_id=observation.context_id,
+        strategy=_IMMUTABLE_VERSION_STRATEGY,
+        request=request,
+        manifest=manifest,
+        readiness_record=observation.readiness_record,
+        readiness_evidence=observation.readiness_evidence,
+        readiness_identity=observation.readiness_identity,
+        version_identity=observation.version_identity,
         stable_read_evidence=manifest.immutability_evidence,
         overall_evidence=ConsistencyLevel.ASSERTED,
-        opened_at=datetime.now(UTC),
+        opened_at=observation.observed_at,
         limitations=_IMMUTABLE_VERSION_LIMITATIONS,
     )
 
@@ -633,54 +799,28 @@ def confirm_clickhouse_immutable_version(
     _require_transport(transport)
     if type(binding) is not ClickHouseImmutableVersionBinding:
         raise TypeError("binding must be ClickHouseImmutableVersionBinding")
-    first = _read_current_readiness(
-        transport,
-        binding.request,
-        binding.readiness_identity.server_uuid,
+    _require_plain_immutable_version_identity(binding.version_identity)
+    observation = ClickHouseNamedVersionObservation(
+        context_id=binding.context_id,
+        request=binding.request,
+        manifest=binding.manifest,
+        readiness_record=binding.readiness_record,
+        readiness_evidence=binding.readiness_evidence,
+        readiness_identity=binding.readiness_identity,
+        version_identity=binding.version_identity,
+        observed_at=binding.opened_at,
     )
-    if isinstance(first, EarlyExecutionOutcome):
-        return first
-    if first.record != binding.readiness_record or first.evidence != binding.readiness_evidence:
-        return _cut_mismatch_outcome(
-            binding.request,
-            "ClickHouse readiness cut differs from the bound immutable version",
-        )
-    readiness_identity = _inspect_clickhouse_readiness_table(transport, binding.request)
-    if readiness_identity != binding.readiness_identity:
-        return _cut_mismatch_outcome(
-            binding.request,
-            "ClickHouse readiness table identity differs from the bound context",
-        )
-    identity = inspect_clickhouse_version_table(
-        transport,
-        binding.manifest.version_locator,
-        binding.request.limits,
-        binding.request.endpoint_profile,
-    )
-    if identity != binding.version_identity:
-        return _cut_mismatch_outcome(
-            binding.request,
-            "ClickHouse named version table identity differs from the bound version",
-        )
-    second = _read_current_readiness(
-        transport,
-        binding.request,
-        binding.readiness_identity.server_uuid,
-    )
-    if isinstance(second, EarlyExecutionOutcome):
-        return second
-    if second != first:
-        return _cut_mismatch_outcome(
-            binding.request,
-            "ClickHouse readiness changed during final immutable-version confirmation",
-        )
+    confirmation = confirm_clickhouse_named_version(transport, observation)
+    if isinstance(confirmation, EarlyExecutionOutcome):
+        return confirmation
+    _require_plain_immutable_version_identity(confirmation.final_version_identity)
     return ClickHouseImmutableVersionConfirmation(
         binding=binding,
-        final_readiness_record=second.record,
-        final_readiness_evidence=second.evidence,
-        final_readiness_identity=readiness_identity,
-        final_version_identity=identity,
-        confirmed_at=datetime.now(UTC),
+        final_readiness_record=confirmation.final_readiness_record,
+        final_readiness_evidence=confirmation.final_readiness_evidence,
+        final_readiness_identity=confirmation.final_readiness_identity,
+        final_version_identity=confirmation.final_version_identity,
+        confirmed_at=confirmation.confirmed_at,
     )
 
 
@@ -696,6 +836,20 @@ def inspect_clickhouse_version_table(
         raise TypeError("locator must be ClickHouseVersionLocator")
     if type(limits) is not ClickHouseReadinessLimits:
         raise TypeError("limits must be ClickHouseReadinessLimits")
+    identity = _inspect_clickhouse_named_version_table(
+        transport,
+        locator,
+        limits,
+    )
+    _require_plain_immutable_version_identity(identity)
+    return identity
+
+
+def _inspect_clickhouse_named_version_table(
+    transport: ClickHouseTransport,
+    locator: ClickHouseVersionLocator,
+    limits: ClickHouseReadinessLimits,
+) -> ClickHouseTableIdentity:
     identity = _inspect_clickhouse_table(
         transport,
         locator.database,
@@ -703,7 +857,36 @@ def inspect_clickhouse_version_table(
         limits,
         "inspect_immutable_version_table",
     )
-    _require_locator_identity(locator, identity)
+    result = replace(
+        identity,
+        columns=_inspect_clickhouse_columns(
+            transport,
+            locator.database,
+            locator.table,
+            limits,
+            identity.server_uuid,
+        ),
+    )
+    _require_locator_identity(locator, result)
+    if result.database_engine != "Atomic":
+        raise UnsupportedClickHouseProfileError(
+            "ClickHouse immutable named-version strategy requires an Atomic database: "
+            f"database={result.database!r}, observed_engine={result.database_engine!r}"
+        )
+    return result
+
+
+def _require_sealed_named_version_identity(identity: ClickHouseTableIdentity) -> None:
+    if identity.database_engine != "Atomic" or not identity.table_readonly:
+        raise UnsupportedClickHouseProfileError(
+            "ClickHouse named-version observation requires a sealed table: "
+            f"database={identity.database!r}, table={identity.table!r}, "
+            f"observed_engine={identity.table_engine!r}, "
+            f"table_readonly={identity.table_readonly!r}"
+        )
+
+
+def _require_plain_immutable_version_identity(identity: ClickHouseTableIdentity) -> None:
     if identity.database_engine != "Atomic":
         raise UnsupportedClickHouseProfileError(
             "ClickHouse immutable named-version strategy requires an Atomic database: "
@@ -716,7 +899,6 @@ def inspect_clickhouse_version_table(
             f"observed_engine={identity.table_engine!r}, "
             f"table_readonly={identity.table_readonly!r}"
         )
-    return identity
 
 
 def _inspect_clickhouse_readiness_table(
@@ -765,6 +947,20 @@ def _inspect_clickhouse_readiness_table(
     return result
 
 
+def _require_readiness_identity(
+    request: ClickHouseImmutableVersionRequest,
+    identity: ClickHouseTableIdentity,
+) -> None:
+    if (
+        identity.database != request.readiness_database
+        or identity.table != request.readiness_table
+        or identity.database_engine != "Atomic"
+        or identity.table_engine != "MergeTree"
+        or identity.table_readonly
+    ):
+        raise ValueError("ClickHouse readiness identity is not the bound writable Atomic MergeTree")
+
+
 def _inspect_clickhouse_table(
     transport: ClickHouseTransport,
     database: str,
@@ -780,7 +976,7 @@ def _inspect_clickhouse_table(
             "WHERE name = {database:String})) AS database_uuid, "
             "(SELECT any(engine) FROM system.databases "
             "WHERE name = {database:String}) AS database_engine, "
-            "engine AS table_engine, engine_full, "
+            "engine AS table_engine, engine_full, partition_key, sorting_key, "
             "lower(hex(SHA256(create_table_query))) AS definition_sha256 "
             "FROM system.tables WHERE database = {database:String} "
             "AND name = {table:String} ORDER BY uuid LIMIT 2"
@@ -819,6 +1015,9 @@ def _inspect_clickhouse_table(
             uuid=_parse_uuid(row.uuid, "catalog table UUID"),
             database_engine=row.database_engine,
             table_engine=row.table_engine,
+            engine_full=row.engine_full,
+            partition_key=row.partition_key,
+            sorting_key=row.sorting_key,
             table_readonly=_engine_is_readonly(row.engine_full),
             definition_sha256=row.definition_sha256,
             columns=(),

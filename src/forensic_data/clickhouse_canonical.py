@@ -72,15 +72,61 @@ class ClickHouseCanonicalFieldBinding:
 
 @final
 @dataclass(frozen=True, slots=True)
+class ClickHouseDirectTableSource:
+    database: str
+    table: str
+
+    def __post_init__(self) -> None:
+        _validate_source_locator(self.database, self.table)
+
+
+@final
+@dataclass(frozen=True, slots=True)
+class ClickHouseMergeTreeLogicalProjectionSource:
+    database: str
+    table: str
+
+    def __post_init__(self) -> None:
+        _validate_source_locator(self.database, self.table)
+
+
+@final
+@dataclass(frozen=True, slots=True)
+class ClickHouseReplacingMergeTreeLogicalProjectionSource:
+    database: str
+    table: str
+
+    def __post_init__(self) -> None:
+        _validate_source_locator(self.database, self.table)
+
+
+type ClickHouseCanonicalSource = (
+    ClickHouseDirectTableSource
+    | ClickHouseMergeTreeLogicalProjectionSource
+    | ClickHouseReplacingMergeTreeLogicalProjectionSource
+)
+
+
+@final
+@dataclass(frozen=True, slots=True)
 class ClickHouseCanonicalRelation:
     database: str
     table: str
+    source: ClickHouseCanonicalSource
     schema: CanonicalSchema
     bindings: tuple[ClickHouseCanonicalFieldBinding, ...]
 
     def __post_init__(self) -> None:
         validate_clickhouse_identifier(self.database, "ClickHouse canonical database")
         validate_clickhouse_identifier(self.table, "ClickHouse canonical table")
+        _require_source(self.source)
+        if self.source.database != self.database or self.source.table != self.table:
+            raise ValueError(
+                "ClickHouse canonical source locator must equal the relation locator: "
+                f"relation_database={self.database!r}, relation_table={self.table!r}, "
+                f"source_database={self.source.database!r}, "
+                f"source_table={self.source.table!r}"
+            )
         if type(self.schema) is not CanonicalSchema:
             raise TypeError("ClickHouse canonical relation schema must be a CanonicalSchema")
         if type(self.bindings) is not tuple:
@@ -371,6 +417,7 @@ def inspect_clickhouse_canonical_relation(
     return ClickHouseCanonicalRelation(
         database=database,
         table=table,
+        source=ClickHouseDirectTableSource(database=database, table=table),
         schema=schema,
         bindings=bindings,
     )
@@ -400,12 +447,16 @@ def read_clickhouse_canonical_rows(
             "lower(hex(SHA256(assumeNotNull(row_envelope))))) AS sha256_hex, "
             "toString(toUInt8(invalid_value)) AS invalid_row, "
             "toString(toUInt8(oversized_value)) AS oversized_row "
-            f"FROM {_relation_sql(request.relation)} AS dfe_source "
+            f"FROM {_aliased_source_sql(request.relation.source)} "
             f"ORDER BY {_order_sql(request.order_columns)} "
             "LIMIT {result_limit:UInt64}"
         ),
         parameters=parameters,
-        settings=_ordered_query_settings(request.limits, result_limit),
+        settings=_ordered_query_settings(
+            request.limits,
+            result_limit,
+            request.relation.source,
+        ),
         result_format="JSONEachRow",
         max_response_bytes=request.limits.max_response_bytes,
         operation="read_canonical_rows",
@@ -454,10 +505,10 @@ def read_clickhouse_canonical_fingerprint(
             f"{limb_selects}, "
             "toString(countIf(invalid_value)) AS invalid_row_count, "
             "toString(countIf(oversized_value)) AS oversized_row_count "
-            f"FROM {_relation_sql(relation)} AS dfe_source"
+            f"FROM {_aliased_source_sql(relation.source)}"
         ),
         parameters=_parameter_dict(lowering.parameters),
-        settings=_common_query_settings(limits, 1),
+        settings=_common_query_settings(limits, 1, relation.source),
         result_format="JSONEachRow",
         max_response_bytes=limits.max_response_bytes,
         operation="read_canonical_fingerprint",
@@ -496,13 +547,17 @@ def read_clickhouse_canonical_key_groups(
             "AS envelope_hex, "
             "if(invalid_value OR oversized_value, '0', toString(length(key_envelope))) "
             "AS envelope_bytes, toString(count()) AS row_count "
-            f"FROM {_relation_sql(request.relation)} AS dfe_source "
+            f"FROM {_aliased_source_sql(request.relation.source)} "
             "GROUP BY invalid_value, oversized_value, key_envelope "
             "ORDER BY invalid_value DESC, oversized_value DESC, key_envelope ASC "
             "LIMIT {result_limit:UInt64}"
         ),
         parameters=_parameter_dict((*lowering.parameters, ("result_limit", result_limit))),
-        settings=_key_group_query_settings(request.limits, result_limit),
+        settings=_key_group_query_settings(
+            request.limits,
+            result_limit,
+            request.relation.source,
+        ),
         result_format="JSONEachRow",
         max_response_bytes=request.limits.max_response_bytes,
         operation="read_canonical_key_groups",
@@ -1163,6 +1218,7 @@ def _parameter_dict(
 def _common_query_settings(
     limits: ClickHouseCanonicalLimits,
     max_result_rows: int,
+    source: ClickHouseCanonicalSource,
 ) -> dict[str, ClickHouseParameter]:
     return {
         "session_timezone": "UTC",
@@ -1174,15 +1230,17 @@ def _common_query_settings(
         "max_result_rows": max_result_rows,
         "max_result_bytes": limits.max_response_bytes,
         "result_overflow_mode": "throw",
+        **_source_query_settings(source),
     }
 
 
 def _ordered_query_settings(
     limits: ClickHouseCanonicalLimits,
     max_result_rows: int,
+    source: ClickHouseCanonicalSource,
 ) -> dict[str, ClickHouseParameter]:
     return {
-        **_common_query_settings(limits, max_result_rows),
+        **_common_query_settings(limits, max_result_rows, source),
         "sort_overflow_mode": "throw",
     }
 
@@ -1190,19 +1248,40 @@ def _ordered_query_settings(
 def _key_group_query_settings(
     limits: ClickHouseCanonicalLimits,
     max_group_rows: int,
+    source: ClickHouseCanonicalSource,
 ) -> dict[str, ClickHouseParameter]:
     return {
-        **_ordered_query_settings(limits, max_group_rows),
+        **_ordered_query_settings(limits, max_group_rows, source),
         "max_rows_to_group_by": max_group_rows,
         "group_by_overflow_mode": "throw",
     }
 
 
-def _relation_sql(relation: ClickHouseCanonicalRelation) -> str:
-    return (
-        f"{quote_clickhouse_identifier(relation.database)}."
-        f"{quote_clickhouse_identifier(relation.table)}"
+def _source_query_settings(
+    source: ClickHouseCanonicalSource,
+) -> dict[str, ClickHouseParameter]:
+    _require_source(source)
+    if type(source) is ClickHouseDirectTableSource:
+        return {}
+    return {
+        "final": 0,
+        "apply_mutations_on_fly": 0,
+        "apply_patch_parts": 0,
+        "do_not_merge_across_partitions_select_final": 0,
+        "sort_overflow_mode": "throw",
+    }
+
+
+def _aliased_source_sql(source: ClickHouseCanonicalSource) -> str:
+    _require_source(source)
+    locator = (
+        f"{quote_clickhouse_identifier(source.database)}."
+        f"{quote_clickhouse_identifier(source.table)}"
     )
+    aliased = f"{locator} AS dfe_source"
+    if type(source) is ClickHouseReplacingMergeTreeLogicalProjectionSource:
+        return f"{aliased} FINAL"
+    return aliased
 
 
 def _column_sql(binding: ClickHouseCanonicalFieldBinding) -> str:
@@ -1240,6 +1319,15 @@ def _require_relation(value: object) -> None:
         raise TypeError("relation must be ClickHouseCanonicalRelation")
 
 
+def _require_source(value: object) -> None:
+    if type(value) not in (
+        ClickHouseDirectTableSource,
+        ClickHouseMergeTreeLogicalProjectionSource,
+        ClickHouseReplacingMergeTreeLogicalProjectionSource,
+    ):
+        raise TypeError("source must be a supported ClickHouseCanonicalSource")
+
+
 def _require_limits(value: object) -> None:
     if type(value) is not ClickHouseCanonicalLimits:
         raise TypeError("limits must be ClickHouseCanonicalLimits")
@@ -1260,3 +1348,8 @@ def _validate_logical_field_name(value: object) -> None:
             "ClickHouse logical field name must contain valid Unicode scalar values: "
             f"start={error.start}, end={error.end}"
         ) from None
+
+
+def _validate_source_locator(database: str, table: str) -> None:
+    validate_clickhouse_identifier(database, "ClickHouse canonical source database")
+    validate_clickhouse_identifier(table, "ClickHouse canonical source table")
