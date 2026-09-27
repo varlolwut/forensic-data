@@ -1,0 +1,9 @@
+<clickhouse>
+    <https_port>8443</https_port>
+    <openSSL>
+        <server>
+            <certificateFile>/etc/clickhouse-server/tls/server.pem</certificateFile>
+            <privateKeyFile>/etc/clickhouse-server/tls/server-key.pem</privateKeyFile>
+        </server>
+    </openSSL>
+</clickhouse>

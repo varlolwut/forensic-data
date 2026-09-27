@@ -417,6 +417,7 @@ class ClickHouseTableIdentity:
 @dataclass(frozen=True, slots=True)
 class ClickHouseNamedVersionObservation:
     context_id: UUID
+    attempt_id: UUID
     request: ClickHouseImmutableVersionRequest
     manifest: ClickHouseImmutableVersionManifest
     readiness_record: ClickHouseRelationManifestRecord
@@ -428,6 +429,8 @@ class ClickHouseNamedVersionObservation:
     def __post_init__(self) -> None:
         if type(self.context_id) is not UUID:
             raise TypeError("ClickHouse named-version context ID must be a UUID")
+        if type(self.attempt_id) is not UUID or self.attempt_id.int == 0:
+            raise ValueError("ClickHouse named-version attempt ID must be a non-zero UUID")
         if type(self.request) is not ClickHouseImmutableVersionRequest:
             raise TypeError("request must be ClickHouseImmutableVersionRequest")
         if type(self.manifest) is not ClickHouseImmutableVersionManifest:
@@ -479,6 +482,7 @@ class ClickHouseNamedVersionConfirmation:
 @dataclass(frozen=True, slots=True)
 class ClickHouseImmutableVersionBinding:
     context_id: UUID
+    attempt_id: UUID
     strategy: str
     request: ClickHouseImmutableVersionRequest
     manifest: ClickHouseImmutableVersionManifest
@@ -494,6 +498,8 @@ class ClickHouseImmutableVersionBinding:
     def __post_init__(self) -> None:
         if type(self.context_id) is not UUID:
             raise TypeError("ClickHouse immutable context ID must be a UUID")
+        if type(self.attempt_id) is not UUID or self.attempt_id.int == 0:
+            raise ValueError("ClickHouse immutable attempt ID must be a non-zero UUID")
         if self.strategy != _IMMUTABLE_VERSION_STRATEGY:
             raise ValueError("ClickHouse immutable context has an unsupported strategy")
         if type(self.request) is not ClickHouseImmutableVersionRequest:
@@ -685,6 +691,7 @@ def observe_clickhouse_named_version(
         )
     return ClickHouseNamedVersionObservation(
         context_id=uuid4(),
+        attempt_id=transport.attempt_id,
         request=request,
         manifest=manifest,
         readiness_record=confirmed.record,
@@ -702,6 +709,10 @@ def confirm_clickhouse_named_version(
     _require_transport(transport)
     if type(observation) is not ClickHouseNamedVersionObservation:
         raise TypeError("observation must be ClickHouseNamedVersionObservation")
+    transport.require_attempt(
+        observation.attempt_id,
+        "confirm_clickhouse_named_version",
+    )
     first = _read_current_readiness(
         transport,
         observation.request,
@@ -778,6 +789,7 @@ def acquire_clickhouse_immutable_version(
     _require_plain_immutable_version_identity(observation.version_identity)
     return ClickHouseImmutableVersionBinding(
         context_id=observation.context_id,
+        attempt_id=observation.attempt_id,
         strategy=_IMMUTABLE_VERSION_STRATEGY,
         request=request,
         manifest=manifest,
@@ -799,9 +811,14 @@ def confirm_clickhouse_immutable_version(
     _require_transport(transport)
     if type(binding) is not ClickHouseImmutableVersionBinding:
         raise TypeError("binding must be ClickHouseImmutableVersionBinding")
+    transport.require_attempt(
+        binding.attempt_id,
+        "confirm_clickhouse_immutable_version",
+    )
     _require_plain_immutable_version_identity(binding.version_identity)
     observation = ClickHouseNamedVersionObservation(
         context_id=binding.context_id,
+        attempt_id=binding.attempt_id,
         request=binding.request,
         manifest=binding.manifest,
         readiness_record=binding.readiness_record,

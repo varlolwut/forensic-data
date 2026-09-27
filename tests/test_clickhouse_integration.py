@@ -1,7 +1,9 @@
+from dataclasses import replace
 from datetime import date
 from decimal import Decimal
 from pathlib import Path
 from time import monotonic, sleep
+from uuid import UUID
 
 import clickhouse_connect
 import pytest
@@ -25,13 +27,21 @@ from forensic_data.canonical import (
     schema_from_metadata_json,
 )
 from forensic_data.clickhouse import (
+    ClickHouseAttemptDeadlineExceededError,
+    ClickHouseCancellationUnconfirmedError,
+    ClickHouseConnectionError,
     ClickHouseConnectionSettings,
     ClickHouseDataValidationError,
     ClickHouseExactReadRequest,
     ClickHouseExactRow,
+    ClickHouseQueryCompletion,
+    ClickHouseQueryError,
     ClickHouseResourceConstraint,
     ClickHouseResourceSetting,
+    ClickHouseResponseLimitError,
     ClickHouseResultLimitError,
+    ClickHouseTransport,
+    ClickHouseTransportAttemptMismatchError,
     ClickHouseTransportState,
     UnsupportedClickHouseProfileError,
     inspect_clickhouse_fidelity_relation,
@@ -49,6 +59,9 @@ from forensic_data.clickhouse_canonical import (
     read_clickhouse_canonical_fingerprint,
     read_clickhouse_canonical_key_groups,
     read_clickhouse_canonical_rows,
+)
+from forensic_data.clickhouse_http import (
+    CLICKHOUSE_HTTP_EXCEPTION_FRAME_MAX_BYTES,
 )
 from forensic_data.clickhouse_projection import (
     ClickHouseMergeTreeProjectionBinding,
@@ -79,10 +92,15 @@ from forensic_data.planning import PlanDirection
 from forensic_data.result import ConsistencyLevel, ExecutionStatus, ReasonCode
 from tests.canonical_vectors import vector_named
 from tests.clickhouse_support import (
+    clickhouse_read_deadline,
+    fresh_clickhouse_attempt_id,
     required_clickhouse_admin_settings,
     required_clickhouse_reader_settings,
+    required_clickhouse_tls_reader_settings,
+    required_clickhouse_untrusted_tls_reader_settings,
     required_clickhouse_writer_settings,
     single_attempt_clickhouse_retry_policy,
+    standard_clickhouse_transport_limits,
 )
 
 pytestmark = [pytest.mark.integration, pytest.mark.clickhouse]
@@ -114,6 +132,9 @@ def test_clickhouse_canonical_bytes_fingerprint_and_binary_groups_match_shared_o
     transport = open_clickhouse_transport(
         settings,
         single_attempt_clickhouse_retry_policy(),
+        standard_clickhouse_transport_limits(),
+        clickhouse_read_deadline(20_000, 300_000),
+        fresh_clickhouse_attempt_id(),
     )
     try:
         relation = inspect_clickhouse_canonical_relation(
@@ -328,11 +349,16 @@ def test_clickhouse_lts_profile_is_lossless_bounded_and_read_only() -> None:
     transport = open_clickhouse_transport(
         settings,
         single_attempt_clickhouse_retry_policy(),
+        standard_clickhouse_transport_limits(),
+        clickhouse_read_deadline(20_000, 300_000),
+        fresh_clickhouse_attempt_id(),
     )
     try:
         profile = inspect_clickhouse_server_profile(transport, settings)
-        assert profile.driver_name == "clickhouse-connect"
-        assert profile.driver_version == "1.9.0"
+        assert profile.binding_library_name == "clickhouse-connect"
+        assert profile.binding_library_version == "1.9.0"
+        assert profile.transport_library_name == "urllib3"
+        assert profile.transport_library_version == "2.8.0"
         assert profile.server_version == "26.8.6.5"
         assert profile.build_id == "2B715913B3A50F932D0F7A695FD4CECFBAC50A6A"
         assert profile.server_timezone == "UTC"
@@ -343,6 +369,8 @@ def test_clickhouse_lts_profile_is_lossless_bounded_and_read_only() -> None:
         assert profile.max_memory_usage == 268_435_456
         assert profile.max_threads == 2
         assert profile.max_execution_time_seconds == Decimal("30")
+        # The server watchdog includes one second for parent-side cancellation.
+        assert profile.effective_max_execution_time_seconds == Decimal("21")
         assert profile.max_result_rows == 100_000
         assert profile.max_result_bytes == 67_108_864
         assert profile.result_overflow_mode == "throw"
@@ -359,10 +387,12 @@ def test_clickhouse_lts_profile_is_lossless_bounded_and_read_only() -> None:
                 Decimal("2"),
                 False,
             ),
-            _resource_constraint(
-                ClickHouseResourceSetting.MAX_EXECUTION_TIME,
-                Decimal("30"),
-                True,
+            ClickHouseResourceConstraint(
+                setting=ClickHouseResourceSetting.MAX_EXECUTION_TIME,
+                value=Decimal("21"),
+                minimum=Decimal("1"),
+                maximum=Decimal("30"),
+                changeable_in_readonly=True,
             ),
             _resource_constraint(
                 ClickHouseResourceSetting.MAX_RESULT_ROWS,
@@ -422,7 +452,7 @@ def test_clickhouse_lts_profile_is_lossless_bounded_and_read_only() -> None:
                 datetime_text="2262-04-11 23:47:16.854775807",
             ),
         )
-        with pytest.raises(ClickHouseResultLimitError):
+        with pytest.raises(ClickHouseResponseLimitError) as complete_response_limit:
             transport.execute_raw(
                 query="SELECT repeat('x', {result_size:UInt64})",
                 parameters={"result_size": 2_048},
@@ -437,7 +467,10 @@ def test_clickhouse_lts_profile_is_lossless_bounded_and_read_only() -> None:
                 max_response_bytes=64,
                 operation="prove_success_response_byte_bound",
             )
+        assert complete_response_limit.value.received_response_bytes == 2_049
+        assert complete_response_limit.value.response_truncated is False
         assert transport.state is ClickHouseTransportState.LOST
+        assert transport.source_slot_released is True
     finally:
         if not transport.closed:
             transport.close()
@@ -461,6 +494,298 @@ def test_clickhouse_lts_profile_is_lossless_bounded_and_read_only() -> None:
     )
 
 
+def test_clickhouse_http_transport_rejects_ambiguous_results_and_reaps_queries() -> None:
+    manifest = parse_clickhouse_immutable_version_manifest(
+        (_CLICKHOUSE_MANIFESTS / "immutable-orders-v001.json").read_bytes(),
+        1_024,
+    )
+    request = _immutable_version_request(manifest)
+    admin_settings = required_clickhouse_admin_settings("dfe-phase05-transport-admin")
+    reader_settings = required_clickhouse_tls_reader_settings("dfe-phase05-transport-reader")
+    untrusted_reader_settings = required_clickhouse_untrusted_tls_reader_settings(
+        "dfe-phase05-untrusted-tls-reader"
+    )
+    bounded_error_limits = replace(
+        standard_clickhouse_transport_limits(),
+        max_error_response_bytes=1_024,
+    )
+    bounded_initialization_limits = replace(
+        standard_clickhouse_transport_limits(),
+        max_initialization_response_bytes=5,
+    )
+    minimal_cancellation_limits = replace(
+        standard_clickhouse_transport_limits(),
+        cancellation_reserve_milliseconds=1,
+    )
+
+    _reset_immutable_version_readiness(admin_settings)
+    admin = _open_clickhouse_fixture_client(admin_settings)
+    try:
+        unexpected_untrusted_transport: ClickHouseTransport | None = None
+        try:
+            with pytest.raises(ClickHouseConnectionError) as untrusted_tls:
+                unexpected_untrusted_transport = open_clickhouse_transport(
+                    untrusted_reader_settings,
+                    single_attempt_clickhouse_retry_policy(),
+                    standard_clickhouse_transport_limits(),
+                    clickhouse_read_deadline(20_000, 300_000),
+                    fresh_clickhouse_attempt_id(),
+                )
+        finally:
+            if unexpected_untrusted_transport is not None:
+                _close_and_cleanup_clickhouse_transport(
+                    unexpected_untrusted_transport,
+                    admin,
+                )
+        untrusted_tls_error = untrusted_tls.value
+        assert untrusted_tls_error.connection_attempts == 1
+        assert untrusted_tls_error.query_id is None
+        assert untrusted_tls_error.http_status is None
+        assert untrusted_tls_error.error_code is None
+        assert untrusted_tls_error.error_name is None
+        assert untrusted_tls_error.received_error_bytes == 0
+        assert untrusted_tls_error.error_response_truncated is False
+        assert untrusted_tls_error.cause_type == "SSLError"
+        assert reader_settings.password.get_secret_value() not in str(untrusted_tls_error)
+
+        unexpected_initialization_transport: ClickHouseTransport | None = None
+        try:
+            with pytest.raises(ClickHouseConnectionError) as bounded_initialization:
+                unexpected_initialization_transport = open_clickhouse_transport(
+                    reader_settings,
+                    single_attempt_clickhouse_retry_policy(),
+                    bounded_initialization_limits,
+                    clickhouse_read_deadline(20_000, 300_000),
+                    fresh_clickhouse_attempt_id(),
+                )
+        finally:
+            if unexpected_initialization_transport is not None:
+                _close_and_cleanup_clickhouse_transport(
+                    unexpected_initialization_transport,
+                    admin,
+                )
+        initialization_error = bounded_initialization.value
+        assert initialization_error.connection_attempts == 1
+        assert initialization_error.http_status == 200
+        assert initialization_error.received_error_bytes == 10
+        assert initialization_error.error_response_truncated is False
+        assert initialization_error.cause_type == "InitializationResponseLimit"
+        assert initialization_error.query_id is not None
+        _require_clickhouse_query_absent(admin, initialization_error.query_id)
+
+        source_transport = open_clickhouse_transport(
+            reader_settings,
+            single_attempt_clickhouse_retry_policy(),
+            standard_clickhouse_transport_limits(),
+            clickhouse_read_deadline(20_000, 300_000),
+            fresh_clickhouse_attempt_id(),
+        )
+        try:
+            binding = acquire_clickhouse_immutable_version(
+                source_transport,
+                request,
+                manifest,
+            )
+            assert isinstance(binding, ClickHouseImmutableVersionBinding)
+        finally:
+            source_transport.close()
+
+        bounded_error_transport = open_clickhouse_transport(
+            reader_settings,
+            single_attempt_clickhouse_retry_policy(),
+            bounded_error_limits,
+            clickhouse_read_deadline(20_000, 300_000),
+            fresh_clickhouse_attempt_id(),
+        )
+        try:
+            request_count_before_mismatch = bounded_error_transport.physical_request_count
+            with pytest.raises(ClickHouseTransportAttemptMismatchError):
+                confirm_clickhouse_immutable_version(bounded_error_transport, binding)
+            assert bounded_error_transport.physical_request_count == request_count_before_mismatch
+
+            with pytest.raises(ValueError):
+                bounded_error_transport.execute_raw(
+                    query="SELECT 1",
+                    parameters={},
+                    settings={"http_write_exception_in_output_format": 1},
+                    result_format="TabSeparatedRaw",
+                    max_response_bytes=8,
+                    operation="reject_exception_frame_override",
+                )
+            assert bounded_error_transport.physical_request_count == request_count_before_mismatch
+
+            with pytest.raises(ClickHouseCancellationUnconfirmedError) as oversized_error:
+                bounded_error_transport.execute_raw(
+                    query="SELECT throwIf(1, repeat('~', {message_size:UInt64}))",
+                    parameters={"message_size": 200_000},
+                    settings={"session_timezone": "UTC"},
+                    result_format="TabSeparatedRaw",
+                    max_response_bytes=64,
+                    operation="prove_bounded_clickhouse_error_response",
+                )
+            bounded_error = oversized_error.value
+            assert bounded_error.trigger_cause == "ErrorResponseLimit"
+            assert bounded_error.cancellation_cause == "KillQueryNotFinished"
+            assert bounded_error.http_status == 500
+            assert bounded_error.error_code == 395
+            assert bounded_error.received_response_bytes == 1_025
+            assert bounded_error.response_truncated is True
+            assert "~" not in str(bounded_error)
+            assert reader_settings.password.get_secret_value() not in str(bounded_error)
+            assert (
+                bounded_error_transport.state is ClickHouseTransportState.CANCELLATION_UNCONFIRMED
+            )
+            assert bounded_error_transport.source_slot_released is False
+            _cleanup_clickhouse_query(admin, bounded_error.query_id)
+        finally:
+            _close_and_cleanup_clickhouse_transport(bounded_error_transport, admin)
+
+        capped_transport = open_clickhouse_transport(
+            reader_settings,
+            single_attempt_clickhouse_retry_policy(),
+            standard_clickhouse_transport_limits(),
+            clickhouse_read_deadline(20_000, 300_000),
+            fresh_clickhouse_attempt_id(),
+        )
+        try:
+            with pytest.raises(ClickHouseCancellationUnconfirmedError) as capped_result:
+                capped_transport.execute_raw(
+                    query="SELECT repeat('x', {result_size:UInt64})",
+                    parameters={"result_size": 20_000},
+                    settings={"session_timezone": "UTC"},
+                    result_format="TabSeparatedRaw",
+                    max_response_bytes=64,
+                    operation="prove_incomplete_response_is_never_accepted",
+                )
+            capped_error = capped_result.value
+            assert capped_error.trigger_cause == "ResponseLimit"
+            assert capped_error.cancellation_cause == "KillQueryNotFinished"
+            assert capped_error.received_response_bytes == (
+                64 + CLICKHOUSE_HTTP_EXCEPTION_FRAME_MAX_BYTES + 1
+            )
+            assert capped_error.response_truncated is True
+            assert capped_transport.state is ClickHouseTransportState.CANCELLATION_UNCONFIRMED
+            assert capped_transport.source_slot_released is False
+            _cleanup_clickhouse_query(admin, capped_error.query_id)
+        finally:
+            _close_and_cleanup_clickhouse_transport(capped_transport, admin)
+
+        late_error_transport = open_clickhouse_transport(
+            reader_settings,
+            single_attempt_clickhouse_retry_policy(),
+            standard_clickhouse_transport_limits(),
+            clickhouse_read_deadline(20_000, 300_000),
+            fresh_clickhouse_attempt_id(),
+        )
+        try:
+            with pytest.raises(ClickHouseQueryError) as late_server_error:
+                late_error_transport.execute_raw(
+                    query=(
+                        "SELECT sleepEachRow(0.1), "
+                        "throwIf(number = 2, 'late-probe') FROM numbers(5)"
+                    ),
+                    parameters={},
+                    settings={
+                        "session_timezone": "UTC",
+                        "http_wait_end_of_query": 0,
+                        "max_block_size": 1,
+                    },
+                    result_format="TabSeparatedRaw",
+                    max_response_bytes=8,
+                    operation="prove_late_clickhouse_exception_frame",
+                )
+            late_error = late_server_error.value
+            assert late_error.http_status == 200
+            assert late_error.error_code == 395
+            assert late_error.error_name == "FUNCTION_THROW_IF_VALUE_IS_NON_ZERO"
+            assert late_error.completion is ClickHouseQueryCompletion.SERVER_TERMINAL
+            assert (
+                8
+                < late_error.received_error_bytes
+                <= (8 + CLICKHOUSE_HTTP_EXCEPTION_FRAME_MAX_BYTES)
+            )
+            assert late_error.error_response_truncated is False
+            assert "late-probe" not in str(late_error)
+            assert reader_settings.password.get_secret_value() not in str(late_error)
+            assert late_error_transport.state is ClickHouseTransportState.LOST
+            assert late_error_transport.source_slot_released is True
+            _require_clickhouse_query_absent(admin, late_error.query_id)
+        finally:
+            _close_and_cleanup_clickhouse_transport(late_error_transport, admin)
+
+        deadline_transport = open_clickhouse_transport(
+            reader_settings,
+            single_attempt_clickhouse_retry_policy(),
+            standard_clickhouse_transport_limits(),
+            clickhouse_read_deadline(1_500, 15_000),
+            fresh_clickhouse_attempt_id(),
+        )
+        try:
+            with pytest.raises(ClickHouseAttemptDeadlineExceededError) as deadline_exceeded:
+                deadline_transport.execute_raw(
+                    query=("SELECT sum(sipHash64(number)) FROM numbers(1000000000000)"),
+                    parameters={},
+                    settings={
+                        "session_timezone": "UTC",
+                        "max_result_rows": 1,
+                        "max_result_bytes": 64,
+                        "result_overflow_mode": "throw",
+                    },
+                    result_format="TabSeparatedRaw",
+                    max_response_bytes=64,
+                    operation="prove_clickhouse_deadline_cancellation",
+                )
+            deadline_error = deadline_exceeded.value
+            assert deadline_error.completion is ClickHouseQueryCompletion.CANCELLED
+            assert deadline_transport.state is ClickHouseTransportState.LOST
+            assert deadline_transport.source_slot_released is True
+            _require_clickhouse_query_absent(admin, deadline_error.query_id)
+        finally:
+            _close_and_cleanup_clickhouse_transport(deadline_transport, admin)
+
+        unconfirmed_deadline_transport = open_clickhouse_transport(
+            reader_settings,
+            single_attempt_clickhouse_retry_policy(),
+            minimal_cancellation_limits,
+            clickhouse_read_deadline(1_500, 15_000),
+            fresh_clickhouse_attempt_id(),
+        )
+        try:
+            with pytest.raises(ClickHouseCancellationUnconfirmedError) as unconfirmed_deadline:
+                unconfirmed_deadline_transport.execute_raw(
+                    query=("SELECT sum(sipHash64(number)) FROM numbers(1000000000000)"),
+                    parameters={},
+                    settings={
+                        "session_timezone": "UTC",
+                        "max_result_rows": 1,
+                        "max_result_bytes": 64,
+                        "result_overflow_mode": "throw",
+                    },
+                    result_format="TabSeparatedRaw",
+                    max_response_bytes=64,
+                    operation="prove_bounded_unconfirmed_clickhouse_cancellation",
+                )
+            unconfirmed_error = unconfirmed_deadline.value
+            assert unconfirmed_error.trigger_cause == "AttemptDeadlineExceeded"
+            assert (
+                unconfirmed_error.cancellation_cause
+                == "CancellationAcknowledgementDeadlineExceeded"
+            )
+            assert (
+                unconfirmed_deadline_transport.state
+                is ClickHouseTransportState.CANCELLATION_UNCONFIRMED
+            )
+            assert unconfirmed_deadline_transport.source_slot_released is False
+            _cleanup_clickhouse_query(admin, unconfirmed_error.query_id)
+        finally:
+            _close_and_cleanup_clickhouse_transport(unconfirmed_deadline_transport, admin)
+    finally:
+        try:
+            admin.close_connections()
+        finally:
+            _reset_immutable_version_readiness(admin_settings)
+
+
 def test_clickhouse_immutable_versions_bind_only_complete_append_only_publications() -> None:
     v001_manifest = parse_clickhouse_immutable_version_manifest(
         (_CLICKHOUSE_MANIFESTS / "immutable-orders-v001.json").read_bytes(),
@@ -481,6 +806,9 @@ def test_clickhouse_immutable_versions_bind_only_complete_append_only_publicatio
         reader = open_clickhouse_transport(
             reader_settings,
             single_attempt_clickhouse_retry_policy(),
+            standard_clickhouse_transport_limits(),
+            clickhouse_read_deadline(20_000, 300_000),
+            fresh_clickhouse_attempt_id(),
         )
         try:
             v001_binding = acquire_clickhouse_immutable_version(
@@ -697,6 +1025,9 @@ def test_clickhouse_logical_projection_is_explicit_tie_free_and_mutation_ready()
         reader = open_clickhouse_transport(
             reader_settings,
             single_attempt_clickhouse_retry_policy(),
+            standard_clickhouse_transport_limits(),
+            clickhouse_read_deadline(20_000, 300_000),
+            fresh_clickhouse_attempt_id(),
         )
 
         plain_binding = acquire_clickhouse_merge_tree_projection(
@@ -927,6 +1258,44 @@ def _expected_row(
         datetime_ticks=datetime_ticks,
         datetime_text=datetime_text,
     )
+
+
+def _cleanup_clickhouse_query(client: Client, query_id: UUID) -> None:
+    client.command(  # pyright: ignore[reportUnknownMemberType]
+        "KILL QUERY WHERE query_id = {query_id:String} SYNC",
+        parameters={"query_id": str(query_id)},
+    )
+    _require_clickhouse_query_absent(client, query_id)
+
+
+def _close_and_cleanup_clickhouse_transport(
+    transport: ClickHouseTransport,
+    admin: Client,
+) -> None:
+    try:
+        if transport.state is ClickHouseTransportState.ACTIVE:
+            transport.close()
+    finally:
+        if not transport.source_slot_released and transport.last_query_id is not None:
+            _cleanup_clickhouse_query(admin, transport.last_query_id)
+
+
+def _require_clickhouse_query_absent(client: Client, query_id: UUID) -> None:
+    observation_deadline = monotonic() + 5.0
+    while True:
+        active_count = client.command(  # pyright: ignore[reportUnknownMemberType]
+            "SELECT count() FROM system.processes WHERE query_id = {query_id:String}",
+            parameters={"query_id": str(query_id)},
+        )
+        if type(active_count) is not int:
+            raise AssertionError("ClickHouse active-query count must be an integer")
+        if active_count == 0:
+            return
+        if monotonic() >= observation_deadline:
+            raise AssertionError(
+                f"ClickHouse query remained active after its transport retired: query_id={query_id}"
+            )
+        sleep(0.05)
 
 
 def _resource_constraint(

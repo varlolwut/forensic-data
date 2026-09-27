@@ -43,6 +43,7 @@ jobs:
       DFE_MSSQL_SETUP_WRITER_PASSWORD: Phase03-Mssql-Writer-2022!
       DFE_MSSQL_PORT: "51433"
       DFE_CLICKHOUSE_HTTP_PORT: "18123"
+      DFE_CLICKHOUSE_HTTPS_PORT: "18443"
     steps:
       - name: Check out source
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1

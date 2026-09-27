@@ -5,9 +5,23 @@ x-clickhouse-image: &clickhouse-image
   platform: linux/amd64
 
 services:
+  tls-init:
+    <<: *clickhouse-image
+    entrypoint:
+      - /bin/bash
+      - /fixture-tls/generate.sh
+      - /generated
+    volumes:
+      - ./tls:/fixture-tls:ro
+      - ../../../.local/p05-05-clickhouse-tls:/generated
+    restart: "no"
+
   clickhouse:
     <<: *clickhouse-image
     hostname: forensic-data-phase05-clickhouse
+    depends_on:
+      tls-init:
+        condition: service_completed_successfully
     environment:
       CLICKHOUSE_DB: dfe_fixture
       CLICKHOUSE_USER: dfe_fixture_admin
@@ -17,22 +31,35 @@ services:
       DFE_CLICKHOUSE_WRITER_PASSWORD: ${DFE_CLICKHOUSE_WRITER_PASSWORD:?set DFE_CLICKHOUSE_WRITER_PASSWORD}
     ports:
       - 127.0.0.1:${DFE_CLICKHOUSE_HTTP_PORT:?set DFE_CLICKHOUSE_HTTP_PORT}:8123
+      - 127.0.0.1:${DFE_CLICKHOUSE_HTTPS_PORT:?set DFE_CLICKHOUSE_HTTPS_PORT}:8443
     volumes:
       - clickhouse-data:/var/lib/clickhouse
+      - ./config/https.xml:/etc/clickhouse-server/config.d/https.xml:ro
       - ./init:/docker-entrypoint-initdb.d:ro
+      - ../../../.local/p05-05-clickhouse-tls:/etc/clickhouse-server/tls:ro
     healthcheck:
       test:
         - CMD-SHELL
         - >-
-          test "$$(clickhouse-client
+          test "$$(wget
+          --quiet
+          --output-document=-
+          --tries=1
+          --timeout=2
+          --ca-certificate=/etc/clickhouse-server/tls/fixture-ca.pem
+          https://localhost:8443/ping)" = "Ok."
+          && test "$$(clickhouse-client
           --user dfe_fixture_reader
           --password "$${DFE_CLICKHOUSE_READER_PASSWORD}"
           --database dfe_fixture
           --query="SELECT
           version() = '26.8.6.5'
           AND getSetting('readonly') = 1
+          AND getSetting('cancel_http_readonly_queries_on_client_close') = 1
           AND getSetting('max_memory_usage') = 268435456
           AND getSetting('max_threads') = 2
+          AND getSetting('max_block_size') = 65536
+          AND getSetting('http_wait_end_of_query') = 1
           AND getSetting('max_execution_time') = 30
           AND getSetting('max_result_rows') = 100000
           AND getSetting('max_result_bytes') = 67108864

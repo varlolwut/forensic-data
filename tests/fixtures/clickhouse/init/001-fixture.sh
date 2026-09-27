@@ -330,9 +330,12 @@ CREATE USER dfe_fixture_reader
 IDENTIFIED WITH sha256_password BY {reader_password:String}
 SETTINGS
     readonly = 1 CONST,
+    cancel_http_readonly_queries_on_client_close = 1 CONST,
     session_timezone = 'UTC' CONST,
     max_memory_usage = 268435456 CONST,
     max_threads = 2 CONST,
+    max_block_size = 65536 MIN 1 MAX 65536 CHANGEABLE_IN_READONLY,
+    http_wait_end_of_query = 1 MIN 0 MAX 1 CHANGEABLE_IN_READONLY,
     max_execution_time = 30 MIN 1 MAX 30 CHANGEABLE_IN_READONLY,
     max_result_rows = 100000 MIN 1 MAX 100000 CHANGEABLE_IN_READONLY,
     max_result_bytes = 67108864 MIN 1 MAX 67108864 CHANGEABLE_IN_READONLY,
@@ -347,6 +350,7 @@ SETTINGS
 GRANT SELECT ON dfe_fixture.* TO dfe_fixture_reader;
 GRANT SELECT ON system.mutations TO dfe_fixture_reader;
 GRANT SELECT ON system.parts TO dfe_fixture_reader;
+GRANT SELECT ON system.processes TO dfe_fixture_reader;
 GRANT SELECT ON system.projections TO dfe_fixture_reader;
 GRANT SHOW ROW POLICIES ON *.* TO dfe_fixture_reader;
 

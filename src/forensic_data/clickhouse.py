@@ -2,19 +2,36 @@ import logging
 import math
 import re
 import time
+from base64 import b64encode
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
 from decimal import Decimal, InvalidOperation, localcontext
 from enum import StrEnum
-from io import IOBase
+from importlib.metadata import version as package_version
+from ipaddress import IPv6Address
+from urllib.parse import urlencode
 from uuid import UUID, uuid4
 
-import clickhouse_connect
-from clickhouse_connect.driver.client import Client
-from clickhouse_connect.driver.exceptions import Error, OperationalError
+from clickhouse_connect.driver.binding import (
+    bind_query,  # pyright: ignore[reportUnknownVariableType]
+)
+from clickhouse_connect.driver.exceptions import ProgrammingError
 from pydantic import BaseModel, ConfigDict, Field, SecretStr, field_validator, model_validator
-from urllib3 import PoolManager
-from urllib3.exceptions import HTTPError
+
+from forensic_data.clickhouse_http import (
+    CLICKHOUSE_HTTP_EXCEPTION_FRAME_MAX_BYTES,
+    ClickHouseHttpDispatchState,
+    ClickHouseHttpExecution,
+    ClickHouseHttpOutcome,
+    ClickHouseHttpOutcomeKind,
+    ClickHouseHttpPoolConfig,
+    ClickHouseHttpRequest,
+    ClickHouseHttpWorker,
+    ClickHouseHttpWorkerError,
+    ClickHouseHttpWorkerStartupError,
+    start_clickhouse_http_worker,
+)
+from forensic_data.postgres import PostgresReadDeadline
 
 LOGGER = logging.getLogger(__name__)
 _LOCAL_FIXTURE_HOSTS = frozenset({"127.0.0.1", "::1", "localhost"})
@@ -25,6 +42,15 @@ _MAX_PROFILE_RESPONSE_BYTES = 8_192
 _MAX_SETTINGS_RESPONSE_BYTES = 8_192
 _MAX_CATALOG_RESPONSE_BYTES = 8_192
 _MAX_TIMEZONE_RESPONSE_BYTES = 1_024
+_CLICKHOUSE_FORMAT = re.compile(r"[A-Za-z][A-Za-z0-9]*\Z", re.ASCII)
+_CLICKHOUSE_PARAMETER_NAME = re.compile(r"[A-Za-z_][A-Za-z0-9_]*\Z", re.ASCII)
+_CLICKHOUSE_HOST_LABEL = re.compile(
+    r"[A-Za-z0-9](?:[A-Za-z0-9-]{0,61}[A-Za-z0-9])?\Z",
+    re.ASCII,
+)
+_RETRYABLE_HTTP_STATUSES = frozenset((429, 502, 503, 504))
+_HTTP_IPC_OVERHEAD_BYTES = 65_536
+_KILL_QUERY_RESPONSE_OVERHEAD_BYTES = 65_536
 
 type ClickHouseParameter = str | int
 
@@ -36,28 +62,144 @@ class ClickHouseTransportError(RuntimeError):
 class ClickHouseConnectionError(ClickHouseTransportError):
     """Opening or profiling a ClickHouse connection failed."""
 
+    def __init__(
+        self,
+        attempt_id: UUID,
+        connection_attempts: int,
+        query_id: UUID | None,
+        http_status: int | None,
+        error_code: int | None,
+        error_name: str | None,
+        received_error_bytes: int,
+        error_response_truncated: bool,
+        cause_type: str,
+    ) -> None:
+        self.attempt_id = attempt_id
+        self.connection_attempts = connection_attempts
+        self.query_id = query_id
+        self.http_status = http_status
+        self.error_code = error_code
+        self.error_name = error_name
+        self.received_error_bytes = received_error_bytes
+        self.error_response_truncated = error_response_truncated
+        self.cause_type = cause_type
+        super().__init__(
+            "ClickHouse connection failed: "
+            f"attempt_id={attempt_id}, connection_attempts={connection_attempts}, "
+            f"query_id={query_id}, http_status={http_status!r}, "
+            f"error_code={error_code!r}, error_name={error_name!r}, "
+            f"received_error_bytes={received_error_bytes}, "
+            f"error_response_truncated={error_response_truncated}, "
+            f"cause_type={cause_type!r}"
+        )
+
+
+class ClickHouseQueryCompletion(StrEnum):
+    NOT_DISPATCHED = "not_dispatched"
+    SERVER_TERMINAL = "server_terminal"
+    CANCELLED = "cancelled"
+    UNCONFIRMED = "unconfirmed"
+
 
 class ClickHouseQueryError(ClickHouseTransportError):
     """A ClickHouse query failed and its dedicated transport was retired."""
 
     def __init__(
         self,
+        attempt_id: UUID,
         query_id: UUID,
         operation: str,
+        http_status: int | None,
         error_code: int | None,
         error_name: str | None,
+        received_error_bytes: int,
+        error_response_truncated: bool,
         cause_type: str,
+        completion: ClickHouseQueryCompletion,
     ) -> None:
+        self.attempt_id = attempt_id
         self.query_id = query_id
         self.operation = operation
+        self.http_status = http_status
         self.error_code = error_code
         self.error_name = error_name
+        self.received_error_bytes = received_error_bytes
+        self.error_response_truncated = error_response_truncated
         self.cause_type = cause_type
+        self.completion = completion
         super().__init__(
             "ClickHouse query failed: "
-            f"query_id={query_id}, operation={operation!r}, error_code={error_code!r}, "
-            f"error_name={error_name!r}, cause_type={cause_type!r}"
+            f"attempt_id={attempt_id}, query_id={query_id}, operation={operation!r}, "
+            f"http_status={http_status!r}, error_code={error_code!r}, "
+            f"error_name={error_name!r}, received_error_bytes={received_error_bytes}, "
+            f"error_response_truncated={error_response_truncated}, "
+            f"cause_type={cause_type!r}, completion={completion.value!r}"
         )
+
+
+class ClickHouseAttemptDeadlineExceededError(ClickHouseTransportError):
+    """The immutable attempt deadline expired and no result was accepted."""
+
+    def __init__(
+        self,
+        attempt_id: UUID,
+        query_id: UUID,
+        operation: str,
+        completion: ClickHouseQueryCompletion,
+    ) -> None:
+        self.attempt_id = attempt_id
+        self.query_id = query_id
+        self.operation = operation
+        self.completion = completion
+        super().__init__(
+            "ClickHouse query exceeded the immutable attempt deadline: "
+            f"attempt_id={attempt_id}, query_id={query_id}, operation={operation!r}, "
+            f"completion={completion.value!r}"
+        )
+
+
+class ClickHouseCancellationUnconfirmedError(ClickHouseTransportError):
+    """ClickHouse query completion could not be confirmed after cancellation."""
+
+    def __init__(
+        self,
+        attempt_id: UUID,
+        query_id: UUID,
+        operation: str,
+        trigger_cause: str,
+        cancellation_cause: str,
+        http_status: int | None,
+        error_code: int | None,
+        error_name: str | None,
+        received_response_bytes: int,
+        response_truncated: bool,
+    ) -> None:
+        self.attempt_id = attempt_id
+        self.query_id = query_id
+        self.operation = operation
+        self.trigger_cause = trigger_cause
+        self.cancellation_cause = cancellation_cause
+        self.http_status = http_status
+        self.error_code = error_code
+        self.error_name = error_name
+        self.received_response_bytes = received_response_bytes
+        self.response_truncated = response_truncated
+        super().__init__(
+            "ClickHouse query cancellation is unconfirmed: "
+            f"attempt_id={attempt_id}, query_id={query_id}, operation={operation!r}, "
+            f"trigger_cause={trigger_cause!r}, cancellation_cause={cancellation_cause!r}, "
+            f"http_status={http_status!r}, error_code={error_code!r}, "
+            f"error_name={error_name!r}, received_response_bytes={received_response_bytes}, "
+            f"response_truncated={response_truncated}, source_slot_released=False"
+        )
+
+
+class ClickHouseTransportAttemptMismatchError(ClickHouseTransportError):
+    """An observation was offered to a different ClickHouse transport attempt."""
+
+
+class ClickHouseTransportCleanupError(ClickHouseTransportError):
+    """An isolated ClickHouse HTTP worker could not be reaped."""
 
 
 class ClickHouseDataValidationError(ClickHouseTransportError):
@@ -66,6 +208,30 @@ class ClickHouseDataValidationError(ClickHouseTransportError):
 
 class ClickHouseResultLimitError(ClickHouseTransportError):
     """A ClickHouse result exceeded its explicit response bound."""
+
+
+class ClickHouseResponseLimitError(ClickHouseResultLimitError):
+    """A bounded HTTP response exceeded the caller's accepted result size."""
+
+    def __init__(
+        self,
+        attempt_id: UUID,
+        query_id: UUID,
+        operation: str,
+        received_response_bytes: int,
+        response_truncated: bool,
+    ) -> None:
+        self.attempt_id = attempt_id
+        self.query_id = query_id
+        self.operation = operation
+        self.received_response_bytes = received_response_bytes
+        self.response_truncated = response_truncated
+        super().__init__(
+            "ClickHouse response exceeded its explicit byte bound: "
+            f"attempt_id={attempt_id}, query_id={query_id}, operation={operation!r}, "
+            f"received_response_bytes={received_response_bytes}, "
+            f"response_truncated={response_truncated}"
+        )
 
 
 class UnsupportedClickHouseProfileError(ClickHouseTransportError):
@@ -84,6 +250,7 @@ class ClickHouseTransportSecurity(StrEnum):
 class ClickHouseTransportState(StrEnum):
     ACTIVE = "active"
     LOST = "lost"
+    CANCELLATION_UNCONFIRMED = "cancellation_unconfirmed"
     CLOSED = "closed"
 
 
@@ -109,10 +276,35 @@ class ClickHouseConnectionSettings(BaseModel):
     send_receive_timeout_seconds: int = Field(ge=1)
     application_name: str
 
-    @field_validator("host", "database", "user", "application_name")
+    @field_validator("database", "user", "application_name")
     @classmethod
     def validate_nonempty_text(cls, value: str) -> str:
         validate_clickhouse_text_scalar(value, "ClickHouse connection text")
+        return value
+
+    @field_validator("host")
+    @classmethod
+    def validate_host(cls, value: str) -> str:
+        validate_clickhouse_text_scalar(value, "ClickHouse host")
+        if any(character in value for character in "/?#@[]") or any(
+            character.isspace() for character in value
+        ):
+            raise ValueError("ClickHouse host must be a hostname or unbracketed IP address")
+        if ":" in value:
+            try:
+                IPv6Address(value)
+            except ValueError:
+                raise ValueError(
+                    "ClickHouse host containing ':' must be an unbracketed IPv6 address"
+                ) from None
+            return value
+        hostname = value[:-1] if value.endswith(".") else value
+        if (
+            not hostname
+            or len(value) > 253
+            or any(_CLICKHOUSE_HOST_LABEL.fullmatch(label) is None for label in hostname.split("."))
+        ):
+            raise ValueError("ClickHouse host must be a valid ASCII hostname or IP address")
         return value
 
     @field_validator("password")
@@ -153,7 +345,57 @@ class ClickHouseRetryPolicy:
 
 
 @dataclass(frozen=True, slots=True)
+class ClickHouseTransportLimits:
+    max_initialization_response_bytes: int
+    max_error_response_bytes: int
+    max_cancellation_response_bytes: int
+    max_query_bytes: int
+    max_ipc_message_bytes: int
+    cancellation_reserve_milliseconds: int
+    process_cleanup_timeout_milliseconds: int
+
+    def __post_init__(self) -> None:
+        for name, value in (
+            ("max_initialization_response_bytes", self.max_initialization_response_bytes),
+            ("max_error_response_bytes", self.max_error_response_bytes),
+            ("max_cancellation_response_bytes", self.max_cancellation_response_bytes),
+            ("max_query_bytes", self.max_query_bytes),
+            ("max_ipc_message_bytes", self.max_ipc_message_bytes),
+            ("cancellation_reserve_milliseconds", self.cancellation_reserve_milliseconds),
+            ("process_cleanup_timeout_milliseconds", self.process_cleanup_timeout_milliseconds),
+        ):
+            if type(value) is not int or value < 1:
+                raise ValueError(f"{name} must be a positive integer")
+        for name, bounded_ipc_bytes in (
+            (
+                "max_initialization_response_bytes",
+                self.max_initialization_response_bytes + CLICKHOUSE_HTTP_EXCEPTION_FRAME_MAX_BYTES,
+            ),
+            ("max_error_response_bytes", self.max_error_response_bytes),
+            (
+                "max_cancellation_response_bytes",
+                self.max_cancellation_response_bytes + CLICKHOUSE_HTTP_EXCEPTION_FRAME_MAX_BYTES,
+            ),
+            ("max_query_bytes", self.max_query_bytes),
+        ):
+            if bounded_ipc_bytes + _HTTP_IPC_OVERHEAD_BYTES > self.max_ipc_message_bytes:
+                raise ValueError(
+                    "max_ipc_message_bytes must contain each bounded HTTP payload plus IPC "
+                    f"overhead: incompatible_limit={name!r}"
+                )
+        if (
+            self.max_query_bytes + _KILL_QUERY_RESPONSE_OVERHEAD_BYTES
+            > self.max_cancellation_response_bytes
+        ):
+            raise ValueError(
+                "max_cancellation_response_bytes must contain the maximum query text and "
+                "KILL QUERY acknowledgement overhead"
+            )
+
+
+@dataclass(frozen=True, slots=True)
 class ClickHouseRawResult:
+    attempt_id: UUID
     query_id: UUID
     payload: bytes
 
@@ -169,8 +411,10 @@ class ClickHouseResourceConstraint:
 
 @dataclass(frozen=True, slots=True)
 class ClickHouseServerProfile:
-    driver_name: str
-    driver_version: str
+    binding_library_name: str
+    binding_library_version: str
+    transport_library_name: str
+    transport_library_version: str
     server_version: str
     build_id: str
     server_timezone: str
@@ -181,6 +425,7 @@ class ClickHouseServerProfile:
     max_memory_usage: int
     max_threads: int
     max_execution_time_seconds: Decimal
+    effective_max_execution_time_seconds: Decimal
     max_result_rows: int
     max_result_bytes: int
     result_overflow_mode: str
@@ -254,7 +499,6 @@ class _ClickHouseProfilePayload(BaseModel):
     readonly: str
     max_memory_usage: str
     max_threads: str
-    max_execution_time: str
     max_result_rows: str
     max_result_bytes: str
     result_overflow_mode: str
@@ -286,9 +530,26 @@ class _ClickHouseSettingPayload(BaseModel):
 class ClickHouseTransport:
     """Dedicated single-owner ClickHouse HTTP transport."""
 
-    def __init__(self, client: Client, pool_manager: PoolManager) -> None:
-        self._client = client
-        self._pool_manager = pool_manager
+    def __init__(
+        self,
+        settings: ClickHouseConnectionSettings,
+        limits: ClickHouseTransportLimits,
+        deadline: PostgresReadDeadline,
+        attempt_id: UUID,
+        connection_attempts: int,
+        data_worker: ClickHouseHttpWorker,
+        control_worker: ClickHouseHttpWorker,
+        physical_request_count: int,
+    ) -> None:
+        self._settings = settings
+        self._limits = limits
+        self._deadline = deadline
+        self._attempt_id = attempt_id
+        self._connection_attempts = connection_attempts
+        self._data_worker = data_worker
+        self._control_worker = control_worker
+        self._physical_request_count = physical_request_count
+        self._last_query_id: UUID | None = None
         self._state = ClickHouseTransportState.ACTIVE
 
     @property
@@ -298,6 +559,38 @@ class ClickHouseTransport:
     @property
     def closed(self) -> bool:
         return self._state is not ClickHouseTransportState.ACTIVE
+
+    @property
+    def attempt_id(self) -> UUID:
+        return self._attempt_id
+
+    @property
+    def connection_attempts(self) -> int:
+        return self._connection_attempts
+
+    @property
+    def physical_request_count(self) -> int:
+        return self._physical_request_count
+
+    @property
+    def last_query_id(self) -> UUID | None:
+        return self._last_query_id
+
+    @property
+    def source_slot_released(self) -> bool:
+        return self._state in (ClickHouseTransportState.LOST, ClickHouseTransportState.CLOSED)
+
+    def require_attempt(self, attempt_id: UUID, operation: str) -> None:
+        if type(attempt_id) is not UUID:
+            raise TypeError("ClickHouse expected transport attempt ID must be a UUID")
+        validate_clickhouse_text_scalar(operation, "ClickHouse attempt-bound operation")
+        self._require_active(operation)
+        if attempt_id != self._attempt_id:
+            raise ClickHouseTransportAttemptMismatchError(
+                "ClickHouse observation belongs to a different transport attempt: "
+                f"operation={operation!r}, expected_attempt_id={attempt_id}, "
+                f"actual_attempt_id={self._attempt_id}"
+            )
 
     def execute_raw(
         self,
@@ -314,74 +607,433 @@ class ClickHouseTransport:
         validate_clickhouse_text_scalar(operation, "ClickHouse operation")
         if type(max_response_bytes) is not int or max_response_bytes < 1:
             raise ValueError("max_response_bytes must be a positive integer")
-        if "query_id" in settings or "wait_end_of_query" in settings:
+        if any(
+            name in settings
+            for name in (
+                "query_id",
+                "wait_end_of_query",
+                "http_write_exception_in_output_format",
+            )
+        ):
             raise ValueError(
                 "ClickHouse query settings must not override transport-owned query metadata"
             )
         query_id = uuid4()
-        source: IOBase | None = None
-        try:
-            raw_source = self._client.raw_stream(  # pyright: ignore[reportUnknownMemberType]
-                query=query,
-                parameters=parameters,
-                settings={
-                    **settings,
-                    "query_id": str(query_id),
-                    "wait_end_of_query": 1,
-                },
-                fmt=result_format,
-                use_database=True,
-                external_data=None,
-                transport_settings=None,
+        self._last_query_id = query_id
+        work_deadline = self._work_deadline_nanoseconds()
+        http_deadline = self._http_deadline_nanoseconds(work_deadline)
+        request = _clickhouse_http_request(
+            settings=self._settings,
+            transport_limits=self._limits,
+            read_deadline=self._deadline,
+            dispatch_deadline_nanoseconds=work_deadline,
+            io_deadline_nanoseconds=http_deadline,
+            query_id=query_id,
+            query=query,
+            parameters=parameters,
+            query_settings=settings,
+            result_format=result_format,
+            max_response_bytes=max_response_bytes,
+        )
+        self._require_prepared_before_deadline(work_deadline, query_id, operation)
+        return self._execute_request(
+            target_worker=self._data_worker,
+            cancellation_worker=self._control_worker,
+            request=request,
+            work_deadline=work_deadline,
+            query_id=query_id,
+            operation=operation,
+        )
+
+    def initialize_control_connection(self) -> ClickHouseRawResult:
+        operation = "initialize_clickhouse_control_transport"
+        self._require_active(operation)
+        query_id = uuid4()
+        self._last_query_id = query_id
+        work_deadline = self._work_deadline_nanoseconds()
+        http_deadline = self._http_deadline_nanoseconds(work_deadline)
+        request = _clickhouse_http_request(
+            settings=self._settings,
+            transport_limits=self._limits,
+            read_deadline=self._deadline,
+            dispatch_deadline_nanoseconds=work_deadline,
+            io_deadline_nanoseconds=http_deadline,
+            query_id=query_id,
+            query=(
+                "SELECT 'control-ready', "
+                "toUInt8(getSetting('cancel_http_readonly_queries_on_client_close')), "
+                "toUInt8(getSetting('http_write_exception_in_output_format'))"
+            ),
+            parameters={},
+            query_settings={"session_timezone": "UTC", "max_result_rows": 1},
+            result_format="TabSeparatedRaw",
+            max_response_bytes=self._limits.max_initialization_response_bytes,
+        )
+        self._require_prepared_before_deadline(work_deadline, query_id, operation)
+        return self._execute_request(
+            target_worker=self._control_worker,
+            cancellation_worker=self._data_worker,
+            request=request,
+            work_deadline=work_deadline,
+            query_id=query_id,
+            operation=operation,
+        )
+
+    def _execute_request(
+        self,
+        target_worker: ClickHouseHttpWorker,
+        cancellation_worker: ClickHouseHttpWorker,
+        request: ClickHouseHttpRequest,
+        work_deadline: int,
+        query_id: UUID,
+        operation: str,
+    ) -> ClickHouseRawResult:
+        self._physical_request_count += 1
+        execution = target_worker.execute(request, work_deadline)
+        if execution.deadline_exceeded:
+            self._raise_deadline_outcome(
+                execution,
+                query_id,
+                operation,
+                cancellation_worker,
             )
-            if not isinstance(raw_source, IOBase):
-                raise ClickHouseDataValidationError(
-                    "ClickHouse synchronous raw stream returned an unsupported source type"
-                )
-            source = raw_source
-            payload = _read_bounded_response(
-                source=source,
-                max_response_bytes=max_response_bytes,
-                query_id=query_id,
-                operation=operation,
-            )
-        except ClickHouseTransportError:
-            self._retire(ClickHouseTransportState.LOST)
-            raise
-        except Error as error:
-            self._retire(ClickHouseTransportState.LOST)
-            raise ClickHouseQueryError(
-                query_id=query_id,
-                operation=operation,
-                error_code=error.code,
-                error_name=error.name,
-                cause_type=type(error).__name__,
-            ) from None
-        except (HTTPError, OSError) as error:
-            self._retire(ClickHouseTransportState.LOST)
-            raise ClickHouseQueryError(
-                query_id=query_id,
-                operation=operation,
-                error_code=None,
-                error_name=None,
-                cause_type=type(error).__name__,
-            ) from None
-        finally:
-            if source is not None:
-                source.close()
-        return ClickHouseRawResult(query_id=query_id, payload=payload)
+        if execution.outcome is None:
+            raise AssertionError("ClickHouse HTTP execution ended without an outcome")
+        return self._resolve_query_outcome(
+            execution.outcome,
+            query_id,
+            operation,
+            cancellation_worker,
+        )
 
     def close(self) -> None:
         if self._state is ClickHouseTransportState.CLOSED:
             return
-        self._client.close()
-        self._pool_manager.clear()
+        if self._state is ClickHouseTransportState.CANCELLATION_UNCONFIRMED:
+            return
+        if self._state is ClickHouseTransportState.LOST:
+            return
+        cleanup_cause = self._retire_workers(graceful=True)
+        if cleanup_cause is not None:
+            self._state = ClickHouseTransportState.CANCELLATION_UNCONFIRMED
+            raise ClickHouseTransportCleanupError(
+                "ClickHouse transport could not reap its isolated workers during close: "
+                f"cause_type={cleanup_cause!r}"
+            )
         self._state = ClickHouseTransportState.CLOSED
 
-    def _retire(self, state: ClickHouseTransportState) -> None:
-        self._client.close()
-        self._pool_manager.clear()
-        self._state = state
+    def _resolve_query_outcome(
+        self,
+        outcome: ClickHouseHttpOutcome,
+        query_id: UUID,
+        operation: str,
+        cancellation_worker: ClickHouseHttpWorker,
+    ) -> ClickHouseRawResult:
+        if outcome.kind is ClickHouseHttpOutcomeKind.SUCCESS:
+            return ClickHouseRawResult(
+                attempt_id=self._attempt_id,
+                query_id=query_id,
+                payload=outcome.payload,
+            )
+        if outcome.kind is ClickHouseHttpOutcomeKind.RESULT_LIMIT:
+            if not outcome.truncated:
+                cleanup_cause = self._retire(ClickHouseTransportState.LOST)
+                if cleanup_cause is not None:
+                    raise ClickHouseTransportCleanupError(
+                        "ClickHouse returned a complete oversized response but worker "
+                        "cleanup failed: "
+                        f"attempt_id={self._attempt_id}, query_id={query_id}, "
+                        f"operation={operation!r}, cause_type={cleanup_cause!r}"
+                    )
+                raise ClickHouseResponseLimitError(
+                    attempt_id=self._attempt_id,
+                    query_id=query_id,
+                    operation=operation,
+                    received_response_bytes=outcome.received_bytes,
+                    response_truncated=False,
+                )
+            cancellation_confirmed, cancellation_cause = self._cancel_and_retire(
+                cancellation_worker,
+                query_id,
+                operation,
+            )
+            if not cancellation_confirmed:
+                raise _cancellation_unconfirmed_error(
+                    self._attempt_id,
+                    query_id,
+                    operation,
+                    "ResponseLimit",
+                    outcome,
+                    cancellation_cause,
+                )
+            raise ClickHouseResponseLimitError(
+                attempt_id=self._attempt_id,
+                query_id=query_id,
+                operation=operation,
+                received_response_bytes=outcome.received_bytes,
+                response_truncated=True,
+            )
+        if outcome.kind is ClickHouseHttpOutcomeKind.SERVER_ERROR:
+            if outcome.truncated:
+                cancellation_confirmed, cancellation_cause = self._cancel_and_retire(
+                    cancellation_worker,
+                    query_id,
+                    operation,
+                )
+                if not cancellation_confirmed:
+                    raise _cancellation_unconfirmed_error(
+                        self._attempt_id,
+                        query_id,
+                        operation,
+                        "ErrorResponseLimit",
+                        outcome,
+                        cancellation_cause,
+                    )
+                raise _query_error_from_outcome(
+                    attempt_id=self._attempt_id,
+                    query_id=query_id,
+                    operation=operation,
+                    outcome=outcome,
+                    completion=ClickHouseQueryCompletion.CANCELLED,
+                )
+            cleanup_cause = self._retire(ClickHouseTransportState.LOST)
+            if cleanup_cause is not None:
+                raise ClickHouseTransportCleanupError(
+                    "ClickHouse returned a terminal server error but worker cleanup failed: "
+                    f"attempt_id={self._attempt_id}, query_id={query_id}, "
+                    f"operation={operation!r}, cause_type={cleanup_cause!r}"
+                )
+            raise _query_error_from_outcome(
+                attempt_id=self._attempt_id,
+                query_id=query_id,
+                operation=operation,
+                outcome=outcome,
+                completion=ClickHouseQueryCompletion.SERVER_TERMINAL,
+            )
+        if outcome.dispatch_state is ClickHouseHttpDispatchState.NOT_SENT:
+            cleanup_cause = self._retire(ClickHouseTransportState.LOST)
+            if cleanup_cause is not None:
+                raise ClickHouseTransportCleanupError(
+                    "ClickHouse request was not dispatched but worker cleanup failed: "
+                    f"attempt_id={self._attempt_id}, query_id={query_id}, "
+                    f"operation={operation!r}, cause_type={cleanup_cause!r}"
+                )
+            raise _query_error_from_outcome(
+                attempt_id=self._attempt_id,
+                query_id=query_id,
+                operation=operation,
+                outcome=outcome,
+                completion=ClickHouseQueryCompletion.NOT_DISPATCHED,
+            )
+        cancellation_confirmed, cancellation_cause = self._cancel_and_retire(
+            cancellation_worker,
+            query_id,
+            operation,
+        )
+        if not cancellation_confirmed:
+            raise _cancellation_unconfirmed_error(
+                self._attempt_id,
+                query_id,
+                operation,
+                outcome.cause_type or outcome.kind.value,
+                outcome,
+                cancellation_cause,
+            )
+        raise _query_error_from_outcome(
+            attempt_id=self._attempt_id,
+            query_id=query_id,
+            operation=operation,
+            outcome=outcome,
+            completion=ClickHouseQueryCompletion.CANCELLED,
+        )
+
+    def _raise_deadline_outcome(
+        self,
+        execution: ClickHouseHttpExecution,
+        query_id: UUID,
+        operation: str,
+        cancellation_worker: ClickHouseHttpWorker,
+    ) -> None:
+        outcome = execution.outcome
+        if outcome is not None and (
+            outcome.kind
+            in (
+                ClickHouseHttpOutcomeKind.SUCCESS,
+                ClickHouseHttpOutcomeKind.SERVER_ERROR,
+                ClickHouseHttpOutcomeKind.RESULT_LIMIT,
+            )
+            and not outcome.truncated
+        ):
+            cleanup_cause = self._retire(ClickHouseTransportState.LOST)
+            if cleanup_cause is not None:
+                raise ClickHouseTransportCleanupError(
+                    "ClickHouse query finished after its deadline but worker cleanup failed: "
+                    f"attempt_id={self._attempt_id}, query_id={query_id}, "
+                    f"operation={operation!r}, cause_type={cleanup_cause!r}"
+                )
+            raise ClickHouseAttemptDeadlineExceededError(
+                attempt_id=self._attempt_id,
+                query_id=query_id,
+                operation=operation,
+                completion=ClickHouseQueryCompletion.SERVER_TERMINAL,
+            )
+        if outcome is not None and (outcome.dispatch_state is ClickHouseHttpDispatchState.NOT_SENT):
+            cleanup_cause = self._retire(ClickHouseTransportState.LOST)
+            if cleanup_cause is not None:
+                raise ClickHouseTransportCleanupError(
+                    "ClickHouse query deadline expired before dispatch and cleanup failed: "
+                    f"attempt_id={self._attempt_id}, query_id={query_id}, "
+                    f"operation={operation!r}, cause_type={cleanup_cause!r}"
+                )
+            raise ClickHouseAttemptDeadlineExceededError(
+                attempt_id=self._attempt_id,
+                query_id=query_id,
+                operation=operation,
+                completion=ClickHouseQueryCompletion.NOT_DISPATCHED,
+            )
+        cancellation_confirmed, cancellation_cause = self._cancel_and_retire(
+            cancellation_worker,
+            query_id,
+            operation,
+        )
+        if cancellation_confirmed:
+            raise ClickHouseAttemptDeadlineExceededError(
+                attempt_id=self._attempt_id,
+                query_id=query_id,
+                operation=operation,
+                completion=ClickHouseQueryCompletion.CANCELLED,
+            )
+        raise _cancellation_unconfirmed_error(
+            self._attempt_id,
+            query_id,
+            operation,
+            "AttemptDeadlineExceeded",
+            outcome,
+            cancellation_cause,
+        )
+
+    def _cancel_and_retire(
+        self,
+        cancellation_worker: ClickHouseHttpWorker,
+        query_id: UUID,
+        operation: str,
+    ) -> tuple[bool, str]:
+        cancellation_deadline = min(
+            self._deadline.deadline_nanoseconds,
+            time.monotonic_ns() + self._limits.cancellation_reserve_milliseconds * 1_000_000,
+        )
+        if time.monotonic_ns() >= cancellation_deadline:
+            cleanup_cause = self._retire(ClickHouseTransportState.CANCELLATION_UNCONFIRMED)
+            return False, cleanup_cause or "CancellationDeadlineExceeded"
+        control_query_id = uuid4()
+        try:
+            request = _clickhouse_http_request(
+                settings=self._settings,
+                transport_limits=self._limits,
+                read_deadline=self._deadline,
+                dispatch_deadline_nanoseconds=cancellation_deadline,
+                io_deadline_nanoseconds=cancellation_deadline,
+                query_id=control_query_id,
+                query="KILL QUERY WHERE query_id = {target_query_id:String} SYNC",
+                parameters={"target_query_id": str(query_id)},
+                query_settings={"session_timezone": "UTC"},
+                result_format="TabSeparatedRaw",
+                max_response_bytes=self._limits.max_cancellation_response_bytes,
+            )
+        except (ProgrammingError, ValueError) as error:
+            self._retire(ClickHouseTransportState.CANCELLATION_UNCONFIRMED)
+            return False, type(error).__name__
+        self._physical_request_count += 1
+        execution = cancellation_worker.execute(
+            request,
+            cancellation_deadline,
+        )
+        if execution.deadline_exceeded or execution.outcome is None:
+            cleanup_cause = self._retire(ClickHouseTransportState.CANCELLATION_UNCONFIRMED)
+            return False, cleanup_cause or "CancellationAcknowledgementDeadlineExceeded"
+        outcome = execution.outcome
+        kill_confirmed = outcome.kind is ClickHouseHttpOutcomeKind.SUCCESS and _kill_query_finished(
+            outcome.payload, query_id
+        )
+        state = (
+            ClickHouseTransportState.LOST
+            if kill_confirmed
+            else ClickHouseTransportState.CANCELLATION_UNCONFIRMED
+        )
+        cleanup_cause = self._retire(state)
+        if kill_confirmed and cleanup_cause is None:
+            return True, "KillQuerySyncFinished"
+        return False, cleanup_cause or _cancellation_cause(outcome)
+
+    def _retire(self, state: ClickHouseTransportState) -> str | None:
+        cleanup_cause = self._retire_workers(graceful=False)
+        self._state = (
+            state if cleanup_cause is None else ClickHouseTransportState.CANCELLATION_UNCONFIRMED
+        )
+        return cleanup_cause
+
+    def _retire_workers(self, graceful: bool) -> str | None:
+        first_cause: str | None = None
+        for worker in (self._data_worker, self._control_worker):
+            try:
+                if graceful:
+                    worker.close()
+                else:
+                    worker.terminate()
+            except ClickHouseHttpWorkerError as error:
+                if first_cause is None:
+                    first_cause = type(error).__name__
+        return first_cause
+
+    def _work_deadline_nanoseconds(self) -> int:
+        now = time.monotonic_ns()
+        deadline = min(
+            now + self._deadline.statement_timeout_milliseconds * 1_000_000,
+            self._deadline.deadline_nanoseconds
+            - self._limits.cancellation_reserve_milliseconds * 1_000_000,
+        )
+        if now >= deadline:
+            cleanup_cause = self._retire(ClickHouseTransportState.LOST)
+            if cleanup_cause is not None:
+                raise ClickHouseTransportCleanupError(
+                    "ClickHouse attempt has no work budget and worker cleanup failed: "
+                    f"attempt_id={self._attempt_id}, cause_type={cleanup_cause!r}"
+                )
+            raise ClickHouseAttemptDeadlineExceededError(
+                attempt_id=self._attempt_id,
+                query_id=uuid4(),
+                operation="admit_clickhouse_query",
+                completion=ClickHouseQueryCompletion.NOT_DISPATCHED,
+            )
+        return deadline
+
+    def _http_deadline_nanoseconds(self, work_deadline: int) -> int:
+        return min(
+            self._deadline.deadline_nanoseconds,
+            work_deadline + self._limits.cancellation_reserve_milliseconds * 1_000_000,
+        )
+
+    def _require_prepared_before_deadline(
+        self,
+        deadline_nanoseconds: int,
+        query_id: UUID,
+        operation: str,
+    ) -> None:
+        if time.monotonic_ns() < deadline_nanoseconds:
+            return
+        cleanup_cause = self._retire(ClickHouseTransportState.LOST)
+        if cleanup_cause is not None:
+            raise ClickHouseTransportCleanupError(
+                "ClickHouse request preparation exceeded its deadline and worker cleanup failed: "
+                f"attempt_id={self._attempt_id}, query_id={query_id}, "
+                f"operation={operation!r}, cause_type={cleanup_cause!r}"
+            )
+        raise ClickHouseAttemptDeadlineExceededError(
+            attempt_id=self._attempt_id,
+            query_id=query_id,
+            operation=operation,
+            completion=ClickHouseQueryCompletion.NOT_DISPATCHED,
+        )
 
     def _require_active(self, operation: str) -> None:
         if self._state is not ClickHouseTransportState.ACTIVE:
@@ -391,69 +1043,102 @@ class ClickHouseTransport:
             )
 
 
-def _read_bounded_response(
-    source: IOBase,
-    max_response_bytes: int,
-    query_id: UUID,
-    operation: str,
-) -> bytes:
-    payload = source.read(max_response_bytes + 1)
-    if type(payload) is not bytes:
-        raise ClickHouseDataValidationError(
-            "ClickHouse synchronous raw stream returned a non-bytes payload: "
-            f"query_id={query_id}, operation={operation!r}"
-        )
-    if len(payload) > max_response_bytes:
-        raise ClickHouseResultLimitError(
-            "ClickHouse response exceeded its explicit byte bound before full buffering: "
-            f"query_id={query_id}, operation={operation!r}, "
-            f"max_response_bytes={max_response_bytes}, observed_bytes_at_least={len(payload)}"
-        )
-    return payload
-
-
 def open_clickhouse_transport(
     settings: ClickHouseConnectionSettings,
     retry_policy: ClickHouseRetryPolicy,
+    limits: ClickHouseTransportLimits,
+    deadline: PostgresReadDeadline,
+    attempt_id: UUID,
 ) -> ClickHouseTransport:
-    last_error: OperationalError | None = None
+    _require_open_arguments(settings, retry_policy, limits, deadline, attempt_id)
+    last_error: ClickHouseQueryError | None = None
+    total_dispatches = 0
     for attempt in range(1, retry_policy.max_attempts + 1):
-        pool_manager = _new_pool_manager(settings)
+        work_deadline = _clickhouse_work_deadline(
+            deadline,
+            limits,
+            attempt_id,
+            attempt,
+        )
+        data_worker: ClickHouseHttpWorker | None = None
+        control_worker: ClickHouseHttpWorker | None = None
+        transport: ClickHouseTransport | None = None
+        keep_workers = False
         try:
-            client = clickhouse_connect.get_client(  # pyright: ignore[reportUnknownMemberType]
-                host=settings.host,
-                username=settings.user,
-                password=settings.password.get_secret_value(),
-                database=settings.database,
-                interface=_interface(settings.transport_security),
-                port=settings.port,
-                secure=_secure(settings.transport_security),
-                settings={"session_timezone": "UTC"},
-                compress=False,
-                query_limit=0,
-                query_retries=0,
-                connect_timeout=settings.connect_timeout_seconds,
-                send_receive_timeout=settings.send_receive_timeout_seconds,
-                client_name=settings.application_name,
-                verify=True,
-                ca_cert=settings.ca_cert,
-                pool_mgr=pool_manager,
-                tz_source="server",
-                tz_mode="schema",
-                show_clickhouse_errors=False,
-                autogenerate_session_id=False,
-                autogenerate_query_id=False,
-                form_encode_query_params=True,
-                native_codec="python",
+            pool_config = _http_pool_config(settings, limits)
+            cleanup_timeout_seconds = limits.process_cleanup_timeout_milliseconds / 1_000
+            data_worker = start_clickhouse_http_worker(
+                pool_config,
+                work_deadline,
+                cleanup_timeout_seconds,
             )
-            return ClickHouseTransport(client=client, pool_manager=pool_manager)
-        except OperationalError as error:
-            pool_manager.clear()
+            control_worker = start_clickhouse_http_worker(
+                pool_config,
+                work_deadline,
+                cleanup_timeout_seconds,
+            )
+            transport = ClickHouseTransport(
+                settings=settings,
+                limits=limits,
+                deadline=deadline,
+                attempt_id=attempt_id,
+                connection_attempts=attempt,
+                data_worker=data_worker,
+                control_worker=control_worker,
+                physical_request_count=total_dispatches,
+            )
+            initialized = transport.execute_raw(
+                query=(
+                    "SELECT 'ready', "
+                    "toUInt8(getSetting('cancel_http_readonly_queries_on_client_close')), "
+                    "toUInt8(getSetting('http_write_exception_in_output_format'))"
+                ),
+                parameters={},
+                settings={"session_timezone": "UTC", "max_result_rows": 1},
+                result_format="TabSeparatedRaw",
+                max_response_bytes=limits.max_initialization_response_bytes,
+                operation="initialize_clickhouse_transport",
+            )
+            total_dispatches = transport.physical_request_count
+            if initialized.payload != b"ready\t1\t0\n":
+                transport.close()
+                raise ClickHouseConnectionError(
+                    attempt_id=attempt_id,
+                    connection_attempts=attempt,
+                    query_id=initialized.query_id,
+                    http_status=200,
+                    error_code=None,
+                    error_name=None,
+                    received_error_bytes=0,
+                    error_response_truncated=False,
+                    cause_type="RequiredHttpTransportSettingsUnavailable",
+                )
+            control_initialized = transport.initialize_control_connection()
+            total_dispatches = transport.physical_request_count
+            if control_initialized.payload != b"control-ready\t1\t0\n":
+                transport.close()
+                raise ClickHouseConnectionError(
+                    attempt_id=attempt_id,
+                    connection_attempts=attempt,
+                    query_id=control_initialized.query_id,
+                    http_status=200,
+                    error_code=None,
+                    error_name=None,
+                    received_error_bytes=0,
+                    error_response_truncated=False,
+                    cause_type="RequiredControlHttpTransportSettingsUnavailable",
+                )
+            keep_workers = True
+            return transport
+        except ClickHouseQueryError as error:
+            if transport is not None:
+                total_dispatches = transport.physical_request_count
             last_error = error
             LOGGER.warning(
-                "ClickHouse connection attempt failed",
+                "ClickHouse initialization attempt failed",
                 extra={
                     "operation": "connect_clickhouse",
+                    "attempt_id": str(attempt_id),
                     "attempt": attempt,
                     "max_attempts": retry_policy.max_attempts,
                     "host": settings.host,
@@ -461,22 +1146,482 @@ def open_clickhouse_transport(
                     "database": settings.database,
                     "user": settings.user,
                     "transport_security": settings.transport_security.value,
-                    "error_code": error.code,
-                    "error_name": error.name,
+                    "error_code": error.error_code,
+                    "error_name": error.error_name,
+                    "http_status": error.http_status,
+                    "completion": error.completion.value,
                 },
             )
-            if attempt < retry_policy.max_attempts:
-                time.sleep(retry_policy.delay_seconds)
-        except Error as error:
-            pool_manager.clear()
+            if attempt == retry_policy.max_attempts or not _connection_error_is_retryable(error):
+                raise _connection_error_from_query(error, attempt) from None
+            _sleep_before_clickhouse_retry(
+                retry_policy.delay_seconds,
+                work_deadline,
+                attempt_id,
+                attempt,
+            )
+        except ClickHouseResponseLimitError as error:
+            if transport is None:
+                raise AssertionError(
+                    "ClickHouse initialization limit failed before transport construction"
+                ) from None
             raise ClickHouseConnectionError(
-                _connection_error_message(settings, attempt, error)
+                attempt_id=attempt_id,
+                connection_attempts=attempt,
+                query_id=error.query_id,
+                http_status=200,
+                error_code=None,
+                error_name=None,
+                received_error_bytes=error.received_response_bytes,
+                error_response_truncated=error.response_truncated,
+                cause_type="InitializationResponseLimit",
             ) from None
+        except ClickHouseConnectionError:
+            raise
+        except ClickHouseHttpWorkerStartupError as error:
+            LOGGER.warning(
+                "ClickHouse HTTP worker startup attempt failed",
+                extra={
+                    "operation": "connect_clickhouse",
+                    "attempt_id": str(attempt_id),
+                    "attempt": attempt,
+                    "max_attempts": retry_policy.max_attempts,
+                    "host": settings.host,
+                    "port": settings.port,
+                    "database": settings.database,
+                    "user": settings.user,
+                    "transport_security": settings.transport_security.value,
+                    "cause_type": error.cause_type,
+                    "retryable": error.retryable,
+                },
+            )
+            if attempt == retry_policy.max_attempts or not error.retryable:
+                raise ClickHouseConnectionError(
+                    attempt_id=attempt_id,
+                    connection_attempts=attempt,
+                    query_id=None,
+                    http_status=None,
+                    error_code=None,
+                    error_name=None,
+                    received_error_bytes=0,
+                    error_response_truncated=False,
+                    cause_type=error.cause_type,
+                ) from None
+            _sleep_before_clickhouse_retry(
+                retry_policy.delay_seconds,
+                work_deadline,
+                attempt_id,
+                attempt,
+            )
+        except ClickHouseHttpWorkerError as error:
+            raise ClickHouseConnectionError(
+                attempt_id=attempt_id,
+                connection_attempts=attempt,
+                query_id=None,
+                http_status=None,
+                error_code=None,
+                error_name=None,
+                received_error_bytes=0,
+                error_response_truncated=False,
+                cause_type=type(error).__name__,
+            ) from None
+        finally:
+            if not keep_workers:
+                cleanup_causes: list[str] = []
+                if data_worker is not None:
+                    data_cleanup_cause = _terminate_http_worker(data_worker)
+                    if data_cleanup_cause is not None:
+                        cleanup_causes.append(data_cleanup_cause)
+                if control_worker is not None:
+                    control_cleanup_cause = _terminate_http_worker(control_worker)
+                    if control_cleanup_cause is not None:
+                        cleanup_causes.append(control_cleanup_cause)
+                if cleanup_causes:
+                    raise ClickHouseTransportCleanupError(
+                        "ClickHouse startup failure left isolated worker cleanup unconfirmed: "
+                        f"attempt_id={attempt_id}, connection_attempt={attempt}, "
+                        f"cleanup_causes={tuple(cleanup_causes)!r}"
+                    )
     if last_error is None:
         raise AssertionError("ClickHouse connection loop ended without an attempt")
-    raise ClickHouseConnectionError(
-        _connection_error_message(settings, retry_policy.max_attempts, last_error)
-    ) from None
+    raise _connection_error_from_query(last_error, retry_policy.max_attempts) from None
+
+
+def _clickhouse_http_request(
+    settings: ClickHouseConnectionSettings,
+    transport_limits: ClickHouseTransportLimits,
+    read_deadline: PostgresReadDeadline,
+    dispatch_deadline_nanoseconds: int,
+    io_deadline_nanoseconds: int,
+    query_id: UUID,
+    query: str,
+    parameters: dict[str, ClickHouseParameter],
+    query_settings: dict[str, ClickHouseParameter],
+    result_format: str,
+    max_response_bytes: int,
+) -> ClickHouseHttpRequest:
+    if _CLICKHOUSE_FORMAT.fullmatch(result_format) is None:
+        raise ValueError("ClickHouse result format must be an ASCII identifier")
+    _require_clickhouse_request_inputs(parameters, query_settings, query, transport_limits)
+    try:
+        bound_query, bound_parameters = bind_query(query, parameters, UTC)
+    except ProgrammingError:
+        raise
+    if type(bound_query) is not str:
+        raise ValueError("ClickHouse HTTP transport does not accept binary query bindings")
+    final_query = f"{bound_query} FORMAT {result_format}"
+    query_bytes = final_query.encode("utf-8", errors="strict")
+    if len(query_bytes) > transport_limits.max_query_bytes:
+        raise ValueError(
+            "ClickHouse query exceeds its explicit UTF-8 byte bound: "
+            f"max_query_bytes={transport_limits.max_query_bytes}, "
+            f"actual_query_bytes={len(query_bytes)}"
+        )
+    if (
+        max_response_bytes + CLICKHOUSE_HTTP_EXCEPTION_FRAME_MAX_BYTES + _HTTP_IPC_OVERHEAD_BYTES
+        > transport_limits.max_ipc_message_bytes
+    ):
+        raise ValueError(
+            "ClickHouse response bound exceeds the isolated transport IPC bound: "
+            f"max_response_bytes={max_response_bytes}, "
+            f"max_ipc_message_bytes={transport_limits.max_ipc_message_bytes}"
+        )
+    remaining_nanoseconds = io_deadline_nanoseconds - time.monotonic_ns()
+    effective_settings = _effective_clickhouse_query_settings(
+        query_settings,
+        read_deadline,
+        max(1, remaining_nanoseconds),
+    )
+    url_parameters: dict[str, str] = {
+        "database": settings.database,
+        "http_write_exception_in_output_format": "0",
+        "query_id": str(query_id),
+        "wait_end_of_query": "1",
+    }
+    for name, value in effective_settings.items():
+        _require_clickhouse_parameter_name(name, "setting")
+        if name in url_parameters or name.startswith("param_"):
+            raise ValueError(f"ClickHouse query setting name is reserved: name={name!r}")
+        url_parameters[name] = _clickhouse_parameter_text(value, name)
+    for name, value in bound_parameters.items():
+        if type(name) is not str or not name.startswith("param_"):
+            raise ValueError("ClickHouse binding library returned an invalid parameter name")
+        if type(value) is not str:
+            raise ValueError("ClickHouse binding library returned a non-text parameter value")
+        if name in url_parameters:
+            raise ValueError(f"ClickHouse bound parameter collides with a setting: name={name!r}")
+        url_parameters[name] = value
+    url = f"{_clickhouse_base_url(settings)}?{urlencode(sorted(url_parameters.items()))}"
+    headers = _clickhouse_http_headers(settings)
+    request_bytes = (
+        len(url.encode("utf-8", errors="strict"))
+        + len(query_bytes)
+        + sum(
+            len(name.encode("ascii", errors="strict"))
+            + len(value.encode("latin-1", errors="strict"))
+            for name, value in headers
+        )
+    )
+    if request_bytes + _HTTP_IPC_OVERHEAD_BYTES > transport_limits.max_ipc_message_bytes:
+        raise ValueError(
+            "ClickHouse bound HTTP request exceeds the isolated transport IPC bound: "
+            f"max_ipc_message_bytes={transport_limits.max_ipc_message_bytes}, "
+            f"request_bytes={request_bytes}"
+        )
+    return ClickHouseHttpRequest(
+        url=url,
+        headers=headers,
+        body=query_bytes,
+        query_id=str(query_id),
+        max_response_bytes=max_response_bytes,
+        max_error_response_bytes=transport_limits.max_error_response_bytes,
+        dispatch_deadline_nanoseconds=dispatch_deadline_nanoseconds,
+        io_deadline_nanoseconds=io_deadline_nanoseconds,
+    )
+
+
+def _require_clickhouse_request_inputs(
+    parameters: dict[str, ClickHouseParameter],
+    query_settings: dict[str, ClickHouseParameter],
+    query: str,
+    transport_limits: ClickHouseTransportLimits,
+) -> None:
+    if type(parameters) is not dict:
+        raise TypeError("ClickHouse query parameters must be a dictionary")
+    if type(query_settings) is not dict:
+        raise TypeError("ClickHouse query settings must be a dictionary")
+    input_bytes = len(query.encode("utf-8", errors="strict"))
+    for values, label in ((parameters, "parameter"), (query_settings, "setting")):
+        for name, value in values.items():
+            _require_clickhouse_parameter_name(name, label)
+            input_bytes += len(name.encode("ascii", errors="strict"))
+            if type(value) is int:
+                input_bytes += len(str(value))
+            elif type(value) is str:
+                validate_clickhouse_text_scalar(value, f"ClickHouse query {label} {name}")
+                input_bytes += len(value.encode("utf-8", errors="strict"))
+            else:
+                raise TypeError(
+                    f"ClickHouse query {label} must be text or an integer: name={name!r}"
+                )
+    if input_bytes + _HTTP_IPC_OVERHEAD_BYTES > transport_limits.max_ipc_message_bytes:
+        raise ValueError(
+            "ClickHouse query inputs exceed the isolated transport IPC bound before binding: "
+            f"max_ipc_message_bytes={transport_limits.max_ipc_message_bytes}, "
+            f"input_bytes={input_bytes}"
+        )
+
+
+def _effective_clickhouse_query_settings(
+    settings: dict[str, ClickHouseParameter],
+    deadline: PostgresReadDeadline,
+    remaining_nanoseconds: int,
+) -> dict[str, ClickHouseParameter]:
+    if type(settings) is not dict:
+        raise TypeError("ClickHouse query settings must be a dictionary")
+    effective = dict(settings)
+    configured_execution_time = effective.get("max_execution_time")
+    if configured_execution_time is not None and (
+        type(configured_execution_time) is not int or configured_execution_time < 1
+    ):
+        raise ValueError("ClickHouse max_execution_time must be a positive integer")
+    remaining_seconds = max(1, math.ceil(remaining_nanoseconds / 1_000_000_000))
+    statement_seconds = math.ceil(deadline.statement_timeout_milliseconds / 1_000) + 1
+    execution_seconds = min(remaining_seconds, statement_seconds)
+    if type(configured_execution_time) is int:
+        execution_seconds = min(execution_seconds, configured_execution_time)
+    effective["max_execution_time"] = execution_seconds
+    return effective
+
+
+def _clickhouse_base_url(settings: ClickHouseConnectionSettings) -> str:
+    host = settings.host
+    rendered_host = f"[{host}]" if ":" in host and not host.startswith("[") else host
+    return f"{_interface(settings.transport_security)}://{rendered_host}:{settings.port}/"
+
+
+def _clickhouse_http_headers(
+    settings: ClickHouseConnectionSettings,
+) -> tuple[tuple[str, str], ...]:
+    if ":" in settings.user:
+        raise ValueError("ClickHouse HTTP Basic-auth user must not contain ':'")
+    for value, label in (
+        (settings.user, "user"),
+        (settings.password.get_secret_value(), "password"),
+        (settings.application_name, "application name"),
+    ):
+        if "\r" in value or "\n" in value:
+            raise ValueError(f"ClickHouse HTTP {label} must not contain CR or LF")
+    authorization = b64encode(
+        f"{settings.user}:{settings.password.get_secret_value()}".encode()
+    ).decode("ascii")
+    return (
+        ("Accept-Encoding", "identity"),
+        ("Authorization", f"Basic {authorization}"),
+        ("Content-Type", "text/plain; charset=utf-8"),
+        ("User-Agent", settings.application_name),
+    )
+
+
+def _clickhouse_parameter_text(value: ClickHouseParameter, name: str) -> str:
+    if type(value) is int:
+        return str(value)
+    if type(value) is str:
+        validate_clickhouse_text_scalar(value, f"ClickHouse query setting {name}")
+        return value
+    raise TypeError(f"ClickHouse query setting must be text or an integer: name={name!r}")
+
+
+def _require_clickhouse_parameter_name(name: str, label: str) -> None:
+    if type(name) is not str or _CLICKHOUSE_PARAMETER_NAME.fullmatch(name) is None:
+        raise ValueError(f"ClickHouse {label} name must be an ASCII identifier")
+
+
+def _query_error_from_outcome(
+    attempt_id: UUID,
+    query_id: UUID,
+    operation: str,
+    outcome: ClickHouseHttpOutcome,
+    completion: ClickHouseQueryCompletion,
+) -> ClickHouseQueryError:
+    cause_type = outcome.cause_type or "ClickHouseServerError"
+    return ClickHouseQueryError(
+        attempt_id=attempt_id,
+        query_id=query_id,
+        operation=operation,
+        http_status=outcome.status_code,
+        error_code=outcome.error_code,
+        error_name=outcome.error_name,
+        received_error_bytes=outcome.received_bytes,
+        error_response_truncated=outcome.truncated,
+        cause_type=cause_type,
+        completion=completion,
+    )
+
+
+def _cancellation_unconfirmed_error(
+    attempt_id: UUID,
+    query_id: UUID,
+    operation: str,
+    trigger_cause: str,
+    outcome: ClickHouseHttpOutcome | None,
+    cancellation_cause: str,
+) -> ClickHouseCancellationUnconfirmedError:
+    return ClickHouseCancellationUnconfirmedError(
+        attempt_id=attempt_id,
+        query_id=query_id,
+        operation=operation,
+        trigger_cause=trigger_cause,
+        cancellation_cause=cancellation_cause,
+        http_status=None if outcome is None else outcome.status_code,
+        error_code=None if outcome is None else outcome.error_code,
+        error_name=None if outcome is None else outcome.error_name,
+        received_response_bytes=0 if outcome is None else outcome.received_bytes,
+        response_truncated=False if outcome is None else outcome.truncated,
+    )
+
+
+def _kill_query_finished(payload: bytes, target_query_id: UUID) -> bool:
+    lines = payload.splitlines()
+    if len(lines) != 1:
+        return False
+    fields = lines[0].split(b"\t", 2)
+    if len(fields) < 2 or fields[0] != b"finished":
+        return False
+    try:
+        observed_query_id = UUID(fields[1].decode("ascii"))
+    except (UnicodeDecodeError, ValueError):
+        return False
+    return observed_query_id == target_query_id
+
+
+def _cancellation_cause(outcome: ClickHouseHttpOutcome) -> str:
+    if outcome.cause_type is not None:
+        return outcome.cause_type
+    if outcome.kind is ClickHouseHttpOutcomeKind.SERVER_ERROR:
+        return "KillQueryServerError"
+    if outcome.kind is ClickHouseHttpOutcomeKind.RESULT_LIMIT:
+        return "KillQueryResponseLimit"
+    if outcome.kind is ClickHouseHttpOutcomeKind.SUCCESS:
+        return "KillQueryNotFinished"
+    return "KillQueryProtocolError"
+
+
+def _terminate_http_worker(worker: ClickHouseHttpWorker) -> str | None:
+    try:
+        worker.terminate()
+    except ClickHouseHttpWorkerError as error:
+        return type(error).__name__
+    return None
+
+
+def _http_pool_config(
+    settings: ClickHouseConnectionSettings,
+    limits: ClickHouseTransportLimits,
+) -> ClickHouseHttpPoolConfig:
+    return ClickHouseHttpPoolConfig(
+        ca_cert=settings.ca_cert,
+        tls_preflight_url=(
+            f"{_clickhouse_base_url(settings)}ping"
+            if settings.transport_security is ClickHouseTransportSecurity.TLS_VERIFY
+            else None
+        ),
+        connect_timeout_seconds=settings.connect_timeout_seconds,
+        read_timeout_seconds=settings.send_receive_timeout_seconds,
+        max_ipc_message_bytes=limits.max_ipc_message_bytes,
+    )
+
+
+def _clickhouse_work_deadline(
+    deadline: PostgresReadDeadline,
+    limits: ClickHouseTransportLimits,
+    attempt_id: UUID,
+    connection_attempts: int,
+) -> int:
+    now = time.monotonic_ns()
+    work_deadline = min(
+        now + deadline.statement_timeout_milliseconds * 1_000_000,
+        deadline.deadline_nanoseconds - limits.cancellation_reserve_milliseconds * 1_000_000,
+    )
+    if now >= work_deadline:
+        raise ClickHouseConnectionError(
+            attempt_id=attempt_id,
+            connection_attempts=connection_attempts,
+            query_id=None,
+            http_status=None,
+            error_code=None,
+            error_name=None,
+            received_error_bytes=0,
+            error_response_truncated=False,
+            cause_type="AttemptDeadlineExceededBeforeInitialization",
+        )
+    return work_deadline
+
+
+def _require_open_arguments(
+    settings: ClickHouseConnectionSettings,
+    retry_policy: ClickHouseRetryPolicy,
+    limits: ClickHouseTransportLimits,
+    deadline: PostgresReadDeadline,
+    attempt_id: UUID,
+) -> None:
+    if type(settings) is not ClickHouseConnectionSettings:
+        raise TypeError("settings must be ClickHouseConnectionSettings")
+    if type(retry_policy) is not ClickHouseRetryPolicy:
+        raise TypeError("retry_policy must be ClickHouseRetryPolicy")
+    if type(limits) is not ClickHouseTransportLimits:
+        raise TypeError("limits must be ClickHouseTransportLimits")
+    if type(deadline) is not PostgresReadDeadline:
+        raise TypeError("deadline must be PostgresReadDeadline")
+    if type(attempt_id) is not UUID or attempt_id.int == 0:
+        raise ValueError("attempt_id must be a non-zero UUID")
+
+
+def _connection_error_is_retryable(error: ClickHouseQueryError) -> bool:
+    return (
+        error.completion
+        in (ClickHouseQueryCompletion.NOT_DISPATCHED, ClickHouseQueryCompletion.CANCELLED)
+        or error.http_status in _RETRYABLE_HTTP_STATUSES
+    )
+
+
+def _connection_error_from_query(
+    error: ClickHouseQueryError,
+    connection_attempts: int,
+) -> ClickHouseConnectionError:
+    return ClickHouseConnectionError(
+        attempt_id=error.attempt_id,
+        connection_attempts=connection_attempts,
+        query_id=error.query_id,
+        http_status=error.http_status,
+        error_code=error.error_code,
+        error_name=error.error_name,
+        received_error_bytes=error.received_error_bytes,
+        error_response_truncated=error.error_response_truncated,
+        cause_type=error.cause_type,
+    )
+
+
+def _sleep_before_clickhouse_retry(
+    delay_seconds: float,
+    work_deadline: int,
+    attempt_id: UUID,
+    connection_attempts: int,
+) -> None:
+    remaining_seconds = (work_deadline - time.monotonic_ns()) / 1_000_000_000
+    if delay_seconds >= remaining_seconds:
+        raise ClickHouseConnectionError(
+            attempt_id=attempt_id,
+            connection_attempts=connection_attempts,
+            query_id=None,
+            http_status=None,
+            error_code=None,
+            error_name=None,
+            received_error_bytes=0,
+            error_response_truncated=False,
+            cause_type="AttemptDeadlineExceededBeforeRetry",
+        )
+    time.sleep(delay_seconds)
 
 
 def inspect_clickhouse_server_profile(
@@ -492,7 +1637,6 @@ def inspect_clickhouse_server_profile(
             "toString(getSetting('readonly')) AS readonly, "
             "toString(getSetting('max_memory_usage')) AS max_memory_usage, "
             "toString(getSetting('max_threads')) AS max_threads, "
-            "toString(getSetting('max_execution_time')) AS max_execution_time, "
             "toString(getSetting('max_result_rows')) AS max_result_rows, "
             "toString(getSetting('max_result_bytes')) AS max_result_bytes, "
             "toString(getSetting('result_overflow_mode')) AS result_overflow_mode"
@@ -525,8 +1669,10 @@ def inspect_clickhouse_server_profile(
     )
     settings_by_name = _settings_by_name(setting_rows)
     profile = ClickHouseServerProfile(
-        driver_name="clickhouse-connect",
-        driver_version=_validated_driver_version(clickhouse_connect.__version__),
+        binding_library_name="clickhouse-connect",
+        binding_library_version=_validated_driver_version(package_version("clickhouse-connect")),
+        transport_library_name="urllib3",
+        transport_library_version=_validated_driver_version(package_version("urllib3")),
         server_version=_validated_profile_text(payload.server_version, "server version"),
         build_id=_validated_profile_text(payload.build_id, "build ID"),
         server_timezone=_validated_profile_text(payload.server_timezone, "server timezone"),
@@ -536,8 +1682,13 @@ def inspect_clickhouse_server_profile(
         readonly=_parse_nonnegative_integer(payload.readonly, "readonly"),
         max_memory_usage=_parse_nonnegative_integer(payload.max_memory_usage, "max_memory_usage"),
         max_threads=_parse_nonnegative_integer(payload.max_threads, "max_threads"),
-        max_execution_time_seconds=_parse_nonnegative_decimal(
-            payload.max_execution_time, "max_execution_time"
+        max_execution_time_seconds=_required_setting_maximum(
+            settings_by_name[ClickHouseResourceSetting.MAX_EXECUTION_TIME.value],
+            ClickHouseResourceSetting.MAX_EXECUTION_TIME,
+        ),
+        effective_max_execution_time_seconds=_parse_nonnegative_decimal(
+            settings_by_name[ClickHouseResourceSetting.MAX_EXECUTION_TIME.value].value,
+            "effective max_execution_time",
         ),
         max_result_rows=_parse_nonnegative_integer(payload.max_result_rows, "max_result_rows"),
         max_result_bytes=_parse_nonnegative_integer(payload.max_result_bytes, "max_result_bytes"),
@@ -921,6 +2072,24 @@ def _resource_constraints(
     return tuple(constraints)
 
 
+def _required_setting_maximum(
+    row: _ClickHouseSettingPayload,
+    setting: ClickHouseResourceSetting,
+) -> Decimal:
+    if row.max is None:
+        raise UnsupportedClickHouseProfileError(
+            "ClickHouse source profile requires a declared resource ceiling: "
+            f"setting={setting.value!r}"
+        )
+    maximum = _parse_nonnegative_decimal(row.max, f"{setting.value} maximum")
+    if maximum <= 0:
+        raise UnsupportedClickHouseProfileError(
+            "ClickHouse source profile requires a positive resource ceiling: "
+            f"setting={setting.value!r}"
+        )
+    return maximum
+
+
 def _require_clickhouse_profile(
     profile: ClickHouseServerProfile,
     settings: ClickHouseConnectionSettings,
@@ -960,6 +2129,13 @@ def _require_clickhouse_profile(
             "ClickHouse source profile requires a positive max_execution_time: "
             f"observed={profile.max_execution_time_seconds}"
         )
+    if not 0 < profile.effective_max_execution_time_seconds <= profile.max_execution_time_seconds:
+        raise UnsupportedClickHouseProfileError(
+            "ClickHouse source profile requires a positive effective max_execution_time "
+            "within its declared ceiling: "
+            f"effective={profile.effective_max_execution_time_seconds}, "
+            f"ceiling={profile.max_execution_time_seconds}"
+        )
     if profile.result_overflow_mode != "throw":
         raise UnsupportedClickHouseProfileError(
             "ClickHouse source profile requires result_overflow_mode='throw': "
@@ -972,7 +2148,9 @@ def _require_clickhouse_profile(
     expected_values = {
         ClickHouseResourceSetting.MAX_MEMORY_USAGE: Decimal(profile.max_memory_usage),
         ClickHouseResourceSetting.MAX_THREADS: Decimal(profile.max_threads),
-        ClickHouseResourceSetting.MAX_EXECUTION_TIME: profile.max_execution_time_seconds,
+        ClickHouseResourceSetting.MAX_EXECUTION_TIME: (
+            profile.effective_max_execution_time_seconds
+        ),
         ClickHouseResourceSetting.MAX_RESULT_ROWS: Decimal(profile.max_result_rows),
         ClickHouseResourceSetting.MAX_RESULT_BYTES: Decimal(profile.max_result_bytes),
     }
@@ -1002,6 +2180,12 @@ def _require_clickhouse_profile(
                 "ClickHouse source resource constraint is unsafe: "
                 f"setting={setting.value!r}, requires_positive_bounded_value=True"
             )
+    execution_constraint = constraints_by_setting[ClickHouseResourceSetting.MAX_EXECUTION_TIME]
+    if execution_constraint.maximum != profile.max_execution_time_seconds:
+        raise UnsupportedClickHouseProfileError(
+            "ClickHouse source max_execution_time ceiling does not match its declared "
+            "constraint maximum"
+        )
     for setting in (
         ClickHouseResourceSetting.MAX_EXECUTION_TIME,
         ClickHouseResourceSetting.MAX_RESULT_ROWS,
@@ -1018,41 +2202,6 @@ def _interface(security: ClickHouseTransportSecurity) -> str:
     if security is ClickHouseTransportSecurity.TLS_VERIFY:
         return "https"
     return "http"
-
-
-def _new_pool_manager(settings: ClickHouseConnectionSettings) -> PoolManager:
-    if settings.ca_cert is not None:
-        return PoolManager(
-            num_pools=1,
-            maxsize=1,
-            block=True,
-            cert_reqs="CERT_REQUIRED",
-            ca_certs=settings.ca_cert,
-        )
-    return PoolManager(
-        num_pools=1,
-        maxsize=1,
-        block=True,
-        cert_reqs="CERT_REQUIRED",
-    )
-
-
-def _secure(security: ClickHouseTransportSecurity) -> bool:
-    return security is ClickHouseTransportSecurity.TLS_VERIFY
-
-
-def _connection_error_message(
-    settings: ClickHouseConnectionSettings,
-    attempts: int,
-    error: Error,
-) -> str:
-    return (
-        "ClickHouse connection failed: "
-        f"host={settings.host!r}, port={settings.port}, database={settings.database!r}, "
-        f"user={settings.user!r}, transport_security={settings.transport_security.value!r}, "
-        f"attempts={attempts}, error_code={error.code!r}, error_name={error.name!r}, "
-        f"cause_type={type(error).__name__!r}"
-    )
 
 
 def _validated_driver_version(value: str) -> str:

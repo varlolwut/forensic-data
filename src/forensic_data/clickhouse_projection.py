@@ -751,6 +751,10 @@ def confirm_clickhouse_merge_tree_projection(
     _require_transport(transport)
     if type(binding) is not ClickHouseMergeTreeProjectionBinding:
         raise TypeError("binding must be ClickHouseMergeTreeProjectionBinding")
+    transport.require_attempt(
+        binding.immutable_binding.attempt_id,
+        "confirm_clickhouse_merge_tree_projection",
+    )
     identity = binding.immutable_binding.version_identity
     first_mutations = _read_mutation_witness(
         transport,
@@ -933,6 +937,10 @@ def confirm_clickhouse_replacing_merge_tree_projection(
     _require_transport(transport)
     if type(binding) is not ClickHouseReplacingMergeTreeProjectionBinding:
         raise TypeError("binding must be ClickHouseReplacingMergeTreeProjectionBinding")
+    transport.require_attempt(
+        binding.named_version.attempt_id,
+        "confirm_clickhouse_replacing_merge_tree_projection",
+    )
     request = binding.request
     identity = binding.named_version.version_identity
     first_mutations = _read_mutation_witness(transport, identity, request)

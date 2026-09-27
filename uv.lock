@@ -89,6 +89,7 @@ dependencies = [
     { name = "pydantic" },
     { name = "pyodbc" },
     { name = "pyyaml" },
+    { name = "urllib3" },
 ]
 
 [package.dev-dependencies]
@@ -110,6 +111,7 @@ requires-dist = [
     { name = "pydantic", specifier = ">=2.13.5,<3" },
     { name = "pyodbc", specifier = "==5.3.0" },
     { name = "pyyaml", specifier = ">=6.0.3,<7" },
+    { name = "urllib3", specifier = "==2.8.0" },
 ]
 
 [package.metadata.requires-dev]
