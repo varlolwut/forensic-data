@@ -4,8 +4,22 @@ import clickhouse_connect
 import pytest
 from clickhouse_connect.driver.exceptions import DatabaseError
 
+from forensic_data.canonical import (
+    PROTOCOL,
+    CanonicalSchema,
+    FieldSchema,
+    Fingerprint,
+    LogicalType,
+    NoParameters,
+    Normalization,
+    encode_key,
+    encode_row,
+    envelope_sha256,
+    schema_from_metadata_json,
+)
 from forensic_data.clickhouse import (
     ClickHouseConnectionSettings,
+    ClickHouseDataValidationError,
     ClickHouseExactReadRequest,
     ClickHouseExactRow,
     ClickHouseResourceConstraint,
@@ -17,12 +31,256 @@ from forensic_data.clickhouse import (
     open_clickhouse_transport,
     read_clickhouse_exact_values,
 )
+from forensic_data.clickhouse_canonical import (
+    ClickHouseCanonicalGroupRequest,
+    ClickHouseCanonicalLimits,
+    ClickHouseCanonicalReadRequest,
+    inspect_clickhouse_canonical_relation,
+    read_clickhouse_canonical_fingerprint,
+    read_clickhouse_canonical_key_groups,
+    read_clickhouse_canonical_rows,
+)
+from tests.canonical_vectors import vector_named
 from tests.clickhouse_support import (
     required_clickhouse_reader_settings,
     single_attempt_clickhouse_retry_policy,
 )
 
 pytestmark = [pytest.mark.integration, pytest.mark.clickhouse]
+
+_COMMON_TYPE_COLUMNS = (
+    "id",
+    "amount",
+    "active",
+    "label",
+    "business_date",
+    "local_time",
+    "instant_time",
+)
+_ZERO_LIMBS = (0, 0, 0, 0, 0, 0, 0, 0)
+
+
+def test_clickhouse_canonical_bytes_fingerprint_and_binary_groups_match_shared_oracle() -> None:
+    row_vector = vector_named("all_common_types")
+    row_schema = schema_from_metadata_json(row_vector.metadata_json)
+    key_vector = vector_named("composite_key")
+    key_schema = schema_from_metadata_json(key_vector.metadata_json)
+    limits = ClickHouseCanonicalLimits(
+        max_encoded_envelope_bytes=1_024,
+        max_response_bytes=65_536,
+        max_execution_time_seconds=5,
+    )
+    settings = required_clickhouse_reader_settings("dfe-phase05-canonical")
+    transport = open_clickhouse_transport(
+        settings,
+        single_attempt_clickhouse_retry_policy(),
+    )
+    try:
+        relation = inspect_clickhouse_canonical_relation(
+            transport=transport,
+            database="dfe_fixture",
+            table="canonical_common_types",
+            schema=row_schema,
+            column_names=_COMMON_TYPE_COLUMNS,
+            max_response_bytes=16_384,
+            max_execution_time_seconds=5,
+        )
+        rows = read_clickhouse_canonical_rows(
+            transport,
+            ClickHouseCanonicalReadRequest(
+                relation=relation,
+                order_columns=("probe_id",),
+                max_records=2,
+                limits=limits,
+            ),
+        )
+        expected_envelope = row_vector.envelope_ascii.encode("ascii")
+        expected_sha256 = bytes.fromhex(row_vector.sha256_hex)
+        assert tuple(row.envelope for row in rows) == (expected_envelope, expected_envelope)
+        assert tuple(row.sha256 for row in rows) == (expected_sha256, expected_sha256)
+
+        fingerprint = read_clickhouse_canonical_fingerprint(
+            transport,
+            relation,
+            limits,
+        )
+        assert row_vector.duplicate_twice_count is not None
+        assert row_vector.duplicate_twice_limb_sums is not None
+        assert fingerprint.fingerprint == Fingerprint(
+            count=row_vector.duplicate_twice_count,
+            limb_sums=row_vector.duplicate_twice_limb_sums,
+        )
+        assert fingerprint.invalid_row_count == 0
+        assert fingerprint.oversized_row_count == 0
+
+        empty_relation = inspect_clickhouse_canonical_relation(
+            transport=transport,
+            database="dfe_fixture",
+            table="canonical_empty_common_types",
+            schema=row_schema,
+            column_names=_COMMON_TYPE_COLUMNS,
+            max_response_bytes=16_384,
+            max_execution_time_seconds=5,
+        )
+        empty_fingerprint = read_clickhouse_canonical_fingerprint(
+            transport,
+            empty_relation,
+            limits,
+        )
+        assert empty_fingerprint.fingerprint == Fingerprint(
+            count=0,
+            limb_sums=_ZERO_LIMBS,
+        )
+        assert empty_fingerprint.invalid_row_count == 0
+        assert empty_fingerprint.oversized_row_count == 0
+
+        lossy_relation = inspect_clickhouse_canonical_relation(
+            transport=transport,
+            database="dfe_fixture",
+            table="canonical_lossy_common_types",
+            schema=row_schema,
+            column_names=_COMMON_TYPE_COLUMNS,
+            max_response_bytes=16_384,
+            max_execution_time_seconds=5,
+        )
+        with pytest.raises(
+            ClickHouseDataValidationError,
+            match="invalid_row_count=2",
+        ):
+            read_clickhouse_canonical_fingerprint(
+                transport,
+                lossy_relation,
+                limits,
+            )
+
+        nullable_schema = CanonicalSchema(
+            protocol=PROTOCOL,
+            fields=(
+                FieldSchema(
+                    name="label",
+                    logical_type=LogicalType.STRING,
+                    nullable=True,
+                    parameters=NoParameters(),
+                    normalization=Normalization.NONE,
+                ),
+            ),
+        )
+        nullable_relation = inspect_clickhouse_canonical_relation(
+            transport=transport,
+            database="dfe_fixture",
+            table="canonical_nullable_strings",
+            schema=nullable_schema,
+            column_names=("label",),
+            max_response_bytes=8_192,
+            max_execution_time_seconds=5,
+        )
+        nullable_rows = read_clickhouse_canonical_rows(
+            transport,
+            ClickHouseCanonicalReadRequest(
+                relation=nullable_relation,
+                order_columns=("probe_id",),
+                max_records=2,
+                limits=limits,
+            ),
+        )
+        expected_nullable_envelopes = (
+            encode_row(nullable_schema, (None,)),
+            encode_row(nullable_schema, ("",)),
+        )
+        assert tuple(row.envelope for row in nullable_rows) == expected_nullable_envelopes
+        assert tuple(row.sha256 for row in nullable_rows) == tuple(
+            envelope_sha256(envelope) for envelope in expected_nullable_envelopes
+        )
+        assert expected_nullable_envelopes[0] != expected_nullable_envelopes[1]
+
+        key_relation = inspect_clickhouse_canonical_relation(
+            transport=transport,
+            database="dfe_fixture",
+            table="canonical_key_groups",
+            schema=key_schema,
+            column_names=("id", "label"),
+            max_response_bytes=8_192,
+            max_execution_time_seconds=5,
+        )
+        key_groups = read_clickhouse_canonical_key_groups(
+            transport,
+            ClickHouseCanonicalGroupRequest(
+                relation=key_relation,
+                max_groups=4,
+                limits=limits,
+            ),
+        )
+        golden_id, golden_label = key_vector.values
+        assert type(golden_id) is str
+        assert type(golden_label) is str
+        expected_groups = {
+            encode_key(key_schema, (int(golden_id), golden_label)): 2,
+            encode_key(key_schema, (int(golden_id), golden_label[:-1])): 1,
+            encode_key(key_schema, (int(golden_id), "A|Б😀é  ")): 1,
+            encode_key(key_schema, (int(golden_id) + 1, golden_label)): 1,
+        }
+        assert {group.envelope: group.row_count for group in key_groups.groups} == expected_groups
+        assert key_groups.valid_key_count == 5
+        assert key_groups.invalid_key_count == 0
+        assert key_groups.oversized_key_count == 0
+
+        overflow_schema = CanonicalSchema(
+            protocol=PROTOCOL,
+            fields=(
+                FieldSchema(
+                    name="id",
+                    logical_type=LogicalType.INT64,
+                    nullable=False,
+                    parameters=NoParameters(),
+                    normalization=Normalization.NONE,
+                ),
+            ),
+        )
+        overflow_relation = inspect_clickhouse_canonical_relation(
+            transport=transport,
+            database="dfe_fixture",
+            table="canonical_group_overflow",
+            schema=overflow_schema,
+            column_names=("id",),
+            max_response_bytes=8_192,
+            max_execution_time_seconds=5,
+        )
+        with pytest.raises(
+            ClickHouseResultLimitError,
+            match="exceeded its distinct-group bound",
+        ):
+            read_clickhouse_canonical_key_groups(
+                transport,
+                ClickHouseCanonicalGroupRequest(
+                    relation=overflow_relation,
+                    max_groups=4,
+                    limits=limits,
+                ),
+            )
+
+        null_key_relation = inspect_clickhouse_canonical_relation(
+            transport=transport,
+            database="dfe_fixture",
+            table="canonical_null_key",
+            schema=key_schema,
+            column_names=("id", "label"),
+            max_response_bytes=8_192,
+            max_execution_time_seconds=5,
+        )
+        with pytest.raises(
+            ClickHouseDataValidationError,
+            match="invalid_key_count=1",
+        ):
+            read_clickhouse_canonical_key_groups(
+                transport,
+                ClickHouseCanonicalGroupRequest(
+                    relation=null_key_relation,
+                    max_groups=1,
+                    limits=limits,
+                ),
+            )
+    finally:
+        transport.close()
 
 
 def test_clickhouse_lts_profile_is_lossless_bounded_and_read_only() -> None:

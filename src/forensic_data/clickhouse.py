@@ -112,14 +112,14 @@ class ClickHouseConnectionSettings(BaseModel):
     @field_validator("host", "database", "user", "application_name")
     @classmethod
     def validate_nonempty_text(cls, value: str) -> str:
-        _validate_text_scalar(value, "ClickHouse connection text")
+        validate_clickhouse_text_scalar(value, "ClickHouse connection text")
         return value
 
     @field_validator("password")
     @classmethod
     def validate_password(cls, value: SecretStr) -> SecretStr:
         password = value.get_secret_value()
-        _validate_text_scalar(password, "ClickHouse password")
+        validate_clickhouse_text_scalar(password, "ClickHouse password")
         return value
 
     @model_validator(mode="after")
@@ -132,7 +132,7 @@ class ClickHouseConnectionSettings(BaseModel):
             if self.ca_cert is not None:
                 raise ValueError("plaintext ClickHouse transport must not declare a CA certificate")
         elif self.ca_cert is not None:
-            _validate_text_scalar(self.ca_cert, "ClickHouse CA certificate path")
+            validate_clickhouse_text_scalar(self.ca_cert, "ClickHouse CA certificate path")
         return self
 
 
@@ -223,7 +223,7 @@ class ClickHouseExactReadRequest:
     def __post_init__(self) -> None:
         if type(self.relation) is not ClickHouseFidelityRelation:
             raise TypeError("relation must be ClickHouseFidelityRelation")
-        _validate_identifier(self.order_column, "ClickHouse order column")
+        validate_clickhouse_identifier(self.order_column, "ClickHouse order column")
         for name, value in (
             ("max_rows", self.max_rows),
             ("max_response_bytes", self.max_response_bytes),
@@ -309,9 +309,9 @@ class ClickHouseTransport:
         operation: str,
     ) -> ClickHouseRawResult:
         self._require_active(operation)
-        _validate_text_scalar(query, "ClickHouse query")
-        _validate_text_scalar(result_format, "ClickHouse result format")
-        _validate_text_scalar(operation, "ClickHouse operation")
+        validate_clickhouse_text_scalar(query, "ClickHouse query")
+        validate_clickhouse_text_scalar(result_format, "ClickHouse result format")
+        validate_clickhouse_text_scalar(operation, "ClickHouse operation")
         if type(max_response_bytes) is not int or max_response_bytes < 1:
             raise ValueError("max_response_bytes must be a positive integer")
         if "query_id" in settings or "wait_end_of_query" in settings:
@@ -518,7 +518,7 @@ def inspect_clickhouse_server_profile(
         max_response_bytes=_MAX_SETTINGS_RESPONSE_BYTES,
         operation="inspect_resource_constraints",
     )
-    setting_rows = _json_rows(
+    setting_rows = parse_clickhouse_json_rows(
         setting_result.payload,
         _ClickHouseSettingPayload,
         "resource constraints",
@@ -565,7 +565,7 @@ def inspect_clickhouse_fidelity_relation(
         ("ClickHouse decimal column", decimal_column),
         ("ClickHouse DateTime64 column", datetime_column),
     ):
-        _validate_identifier(identifier, label)
+        validate_clickhouse_identifier(identifier, label)
     result = transport.execute_raw(
         query=(
             "SELECT name, type FROM system.columns "
@@ -584,7 +584,11 @@ def inspect_clickhouse_fidelity_relation(
         max_response_bytes=_MAX_CATALOG_RESPONSE_BYTES,
         operation="inspect_fidelity_relation",
     )
-    rows = _json_rows(result.payload, _ClickHouseColumnPayload, "fidelity relation catalog")
+    rows = parse_clickhouse_json_rows(
+        result.payload,
+        _ClickHouseColumnPayload,
+        "fidelity relation catalog",
+    )
     by_name = {row.name: row.type for row in rows}
     if (
         len(rows) != 2
@@ -599,8 +603,8 @@ def inspect_clickhouse_fidelity_relation(
             "ClickHouse fidelity relation must expose both requested physical columns exactly once: "
             f"database={database!r}, table={table!r}, observed_columns={tuple(by_name)!r}"
         )
-    decimal_type = _parse_decimal_type(by_name[decimal_column])
-    datetime_type = _inspect_datetime64_type(transport, by_name[datetime_column])
+    decimal_type = parse_clickhouse_decimal_type(by_name[decimal_column])
+    datetime_type = inspect_clickhouse_datetime64_type(transport, by_name[datetime_column])
     return ClickHouseFidelityRelation(
         database=database,
         table=table,
@@ -615,12 +619,14 @@ def read_clickhouse_exact_values(
     transport: ClickHouseTransport,
     request: ClickHouseExactReadRequest,
 ) -> tuple[ClickHouseExactRow, ...]:
-    decimal_reinterpret = _decimal_reinterpret_function(request.relation.decimal_type.precision)
-    database = _quote_identifier(request.relation.database)
-    table = _quote_identifier(request.relation.table)
-    order_column = _quote_identifier(request.order_column)
-    decimal_column = _quote_identifier(request.relation.decimal_column)
-    datetime_column = _quote_identifier(request.relation.datetime_column)
+    decimal_reinterpret = clickhouse_decimal_reinterpret_function(
+        request.relation.decimal_type.precision
+    )
+    database = quote_clickhouse_identifier(request.relation.database)
+    table = quote_clickhouse_identifier(request.relation.table)
+    order_column = quote_clickhouse_identifier(request.order_column)
+    decimal_column = quote_clickhouse_identifier(request.relation.decimal_column)
+    datetime_column = quote_clickhouse_identifier(request.relation.datetime_column)
     result = transport.execute_raw(
         query=(
             f"SELECT toString({order_column}), "
@@ -758,7 +764,7 @@ def _render_utc_datetime64(ticks: int, precision: int) -> str:
     return f"{rendered}.{fraction:0{precision}d}"
 
 
-def _parse_decimal_type(type_name: str) -> ClickHouseDecimalType:
+def parse_clickhouse_decimal_type(type_name: str) -> ClickHouseDecimalType:
     match = _DECIMAL_TYPE.fullmatch(type_name)
     if match is None:
         raise UnsupportedClickHouseProfileError(
@@ -774,11 +780,11 @@ def _parse_decimal_type(type_name: str) -> ClickHouseDecimalType:
     return ClickHouseDecimalType(precision=precision, scale=scale)
 
 
-def _inspect_datetime64_type(
+def inspect_clickhouse_datetime64_type(
     transport: ClickHouseTransport,
     type_name: str,
 ) -> ClickHouseDateTime64Type:
-    precision, declared_timezone = _parse_datetime64_declaration(type_name)
+    precision, declared_timezone = parse_clickhouse_datetime64_declaration(type_name)
     result = transport.execute_raw(
         query=(
             "SELECT timezoneOf(defaultValueOfTypeName({type_name:String})) AS effective_timezone"
@@ -805,7 +811,7 @@ def _inspect_datetime64_type(
     )
 
 
-def _parse_datetime64_declaration(type_name: str) -> tuple[int, str | None]:
+def parse_clickhouse_datetime64_declaration(type_name: str) -> tuple[int, str | None]:
     match = _DATETIME64_TYPE.fullmatch(type_name)
     if match is None:
         raise UnsupportedClickHouseProfileError(
@@ -818,11 +824,11 @@ def _parse_datetime64_declaration(type_name: str) -> tuple[int, str | None]:
             f"ClickHouse DateTime64 precision is outside canonical v1: type={type_name!r}"
         )
     if timezone is not None:
-        _validate_text_scalar(timezone, "ClickHouse DateTime64 timezone")
+        validate_clickhouse_text_scalar(timezone, "ClickHouse DateTime64 timezone")
     return precision, timezone
 
 
-def _decimal_reinterpret_function(precision: int) -> str:
+def clickhouse_decimal_reinterpret_function(precision: int) -> str:
     if precision <= 9:
         return "reinterpretAsInt32"
     if precision <= 18:
@@ -837,7 +843,7 @@ def _single_json_row[Payload: BaseModel](
     model_type: type[Payload],
     label: str,
 ) -> Payload:
-    rows = _json_rows(payload, model_type, label)
+    rows = parse_clickhouse_json_rows(payload, model_type, label)
     if len(rows) != 1:
         raise ClickHouseDataValidationError(
             f"ClickHouse {label} must return exactly one row: actual={len(rows)}"
@@ -845,7 +851,7 @@ def _single_json_row[Payload: BaseModel](
     return rows[0]
 
 
-def _json_rows[Payload: BaseModel](
+def parse_clickhouse_json_rows[Payload: BaseModel](
     payload: bytes,
     model_type: type[Payload],
     label: str,
@@ -1054,7 +1060,7 @@ def _validated_driver_version(value: str) -> str:
 
 
 def _validated_profile_text(value: str, label: str) -> str:
-    _validate_text_scalar(value, f"ClickHouse {label}")
+    validate_clickhouse_text_scalar(value, f"ClickHouse {label}")
     if len(value.encode("utf-8")) > 512:
         raise ClickHouseDataValidationError(f"ClickHouse {label} exceeds 512 UTF-8 bytes")
     return value
@@ -1089,19 +1095,19 @@ def _parse_nonnegative_decimal(value: str, label: str) -> Decimal:
     return parsed
 
 
-def _quote_identifier(identifier: str) -> str:
-    _validate_identifier(identifier, "ClickHouse SQL identifier")
+def quote_clickhouse_identifier(identifier: str) -> str:
+    validate_clickhouse_identifier(identifier, "ClickHouse SQL identifier")
     escaped = identifier.replace("\\", "\\\\").replace('"', '""')
     return '"' + escaped + '"'
 
 
-def _validate_identifier(identifier: str, label: str) -> None:
-    _validate_text_scalar(identifier, label)
+def validate_clickhouse_identifier(identifier: str, label: str) -> None:
+    validate_clickhouse_text_scalar(identifier, label)
     if len(identifier.encode("utf-8")) > 512:
         raise ValueError(f"{label} exceeds 512 UTF-8 bytes")
 
 
-def _validate_text_scalar(value: str, label: str) -> None:
+def validate_clickhouse_text_scalar(value: str, label: str) -> None:
     if type(value) is not str or not value:
         raise ValueError(f"{label} must be non-empty text")
     if "\x00" in value:

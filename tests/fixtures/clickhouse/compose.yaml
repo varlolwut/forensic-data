@@ -35,8 +35,17 @@ services:
           AND getSetting('max_execution_time') = 30
           AND getSetting('max_result_rows') = 100000
           AND getSetting('max_result_bytes') = 67108864
+          AND getSetting('max_rows_to_group_by') = 1
+          AND getSetting('group_by_overflow_mode') = 'any'
           AND getSetting('result_overflow_mode') = 'throw'
-          AND (SELECT count() FROM fidelity_probe) = 3")" = "1"
+          AND (SELECT count() FROM fidelity_probe) = 3
+          AND (SELECT count() FROM canonical_common_types) = 2
+          AND (SELECT count() FROM canonical_empty_common_types) = 0
+          AND (SELECT count() FROM canonical_lossy_common_types) = 2
+          AND (SELECT count() FROM canonical_nullable_strings) = 2
+          AND (SELECT count() FROM canonical_key_groups) = 5
+          AND (SELECT count() FROM canonical_null_key) = 1
+          AND (SELECT count() FROM canonical_group_overflow) = 5")" = "1"
       interval: 2s
       timeout: 5s
       retries: 60
