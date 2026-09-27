@@ -14,6 +14,7 @@ class Adapter(StrEnum):
     MSSQL = "mssql"
     GREENGAGE = "greengage"
     GREENPLUM = "greenplum"
+    CLICKHOUSE = "clickhouse"
 
 
 class ConnectionRole(StrEnum):
@@ -50,6 +51,7 @@ class MinimumEvidence(StrEnum):
 
 class StableReadKind(StrEnum):
     TRANSACTION_SNAPSHOT = "transaction_snapshot"
+    IMMUTABLE_NAMED_VERSION = "immutable_named_version"
 
 
 class LateArrivalPolicy(StrEnum):

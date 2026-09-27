@@ -14,6 +14,7 @@ from forensic_data.canonical import (
     schema_digest_hex,
     schema_from_metadata_json,
 )
+from forensic_data.clickhouse_profile import CLICKHOUSE_CONNECT_DRIVER, CLICKHOUSE_LTS_PROFILE
 from forensic_data.contracts.identity import sql_parameters_semantic_value
 from forensic_data.contracts.model import (
     Adapter,
@@ -218,6 +219,7 @@ class DatasetVersionDefinition:
             Adapter.MSSQL,
             Adapter.GREENGAGE,
             Adapter.GREENPLUM,
+            Adapter.CLICKHOUSE,
         ):
             raise ValueError(f"dataset adapter is unsupported: adapter={self.adapter.value!r}")
         _require_nonblank_text(self.driver, "dataset driver")
@@ -238,6 +240,15 @@ class DatasetVersionDefinition:
             raise ValueError(
                 "Original Greenplum dataset requires exact driver/profile pair: "
                 f"required=({ORIGINAL_GREENPLUM_DRIVER!r}, {ORIGINAL_GREENPLUM_PROFILE!r}), "
+                f"actual=({self.driver!r}, {self.profile!r})"
+            )
+        if self.adapter is Adapter.CLICKHOUSE and (
+            self.driver,
+            self.profile,
+        ) != (CLICKHOUSE_CONNECT_DRIVER, CLICKHOUSE_LTS_PROFILE):
+            raise ValueError(
+                "ClickHouse dataset requires exact driver/profile pair: "
+                f"required=({CLICKHOUSE_CONNECT_DRIVER!r}, {CLICKHOUSE_LTS_PROFILE!r}), "
                 f"actual=({self.driver!r}, {self.profile!r})"
             )
         _require_enum(self.locator_kind, DatasetLocatorKind, "dataset locator kind")
@@ -267,6 +278,11 @@ class DatasetVersionDefinition:
             or self.relation_scope is not RelationScope.PHYSICAL_ONLY
         ):
             raise ValueError("Original Greenplum datasets require a physical_only relation locator")
+        if self.adapter is Adapter.CLICKHOUSE and (
+            self.locator_kind is not DatasetLocatorKind.RELATION
+            or self.relation_scope is not RelationScope.PHYSICAL_ONLY
+        ):
+            raise ValueError("ClickHouse datasets require a physical_only relation locator")
         _require_canonical_object_json(self.semantic_payload_json, "dataset semantic payload")
         _require_digest_matches_json(
             self.semantic_digest,
@@ -868,6 +884,11 @@ def _require_dataset_body_shape(
         raise ValueError(
             f"{context} original Greenplum connection requires exact driver/profile pair"
         )
+    if adapter is Adapter.CLICKHOUSE and (driver, profile) != (
+        CLICKHOUSE_CONNECT_DRIVER,
+        CLICKHOUSE_LTS_PROFILE,
+    ):
+        raise ValueError(f"{context} ClickHouse connection requires exact driver/profile pair")
     _semantic_text(body["dataset_id"], f"{context} dataset id")
     grain = _require_nonnullable_field_names(
         body["grain"],
@@ -897,12 +918,15 @@ def _require_dataset_body_shape(
     locator_kind = _semantic_text(locator.get("kind"), f"{context} locator kind")
     if locator_kind == DatasetLocatorKind.RELATION.value:
         relation_scope = _require_dataset_relation_locator(locator, f"{context} locator")
-        if adapter in (Adapter.MSSQL, Adapter.GREENGAGE, Adapter.GREENPLUM) and (
-            relation_scope is not RelationScope.PHYSICAL_ONLY
-        ):
+        if adapter in (
+            Adapter.MSSQL,
+            Adapter.GREENGAGE,
+            Adapter.GREENPLUM,
+            Adapter.CLICKHOUSE,
+        ) and (relation_scope is not RelationScope.PHYSICAL_ONLY):
             raise ValueError(f"{context} {adapter.value} relation requires physical_only scope")
     elif locator_kind == DatasetLocatorKind.SQL.value:
-        if adapter in (Adapter.MSSQL, Adapter.GREENGAGE, Adapter.GREENPLUM):
+        if adapter in (Adapter.MSSQL, Adapter.GREENGAGE, Adapter.GREENPLUM, Adapter.CLICKHOUSE):
             raise ValueError(f"{context} {adapter.value} dataset requires a relation locator")
         _sql_artifact_identity(locator, f"{context} locator")
     else:
@@ -1209,7 +1233,7 @@ def _contract_readiness_identities(
         _LATE_ARRIVAL_VALUES,
         "contract semantic payload consistency late arrivals",
     )
-    _require_supported_text(
+    minimum_evidence = _require_supported_text(
         consistency["minimum_evidence"],
         _MINIMUM_EVIDENCE_VALUES,
         "contract semantic payload consistency minimum evidence",
@@ -1240,6 +1264,8 @@ def _contract_readiness_identities(
             strict=True,
         )
     )
+    if expected_connections[0][1] is Adapter.CLICKHOUSE:
+        raise ValueError("contract reference dataset cannot use the target-only ClickHouse adapter")
     identities: list[_SqlArtifactIdentity | None] = []
     for index, (value, expected_dataset_id, connection) in enumerate(
         zip(
@@ -1262,10 +1288,16 @@ def _contract_readiness_identities(
             expected_dataset_id,
             f"{context} identity and contract dataset column",
         )
-        _require_supported_text(
+        stable_read = _require_supported_text(
             dataset["stable_read"],
             _STABLE_READ_VALUES,
             f"{context} stable read",
+        )
+        _require_stable_read_policy(
+            stable_read,
+            minimum_evidence,
+            expected_adapter,
+            context,
         )
         readiness = _semantic_object(dataset["readiness"], f"{context} readiness")
         identities.append(
@@ -1287,7 +1319,12 @@ def _readiness_artifact_identity(
 ) -> _SqlArtifactIdentity | None:
     kind = _semantic_text(readiness.get("kind"), f"{context} kind")
     if kind == _SQL_ARTIFACT_KIND:
-        if expected_adapter in (Adapter.MSSQL, Adapter.GREENGAGE, Adapter.GREENPLUM):
+        if expected_adapter in (
+            Adapter.MSSQL,
+            Adapter.GREENGAGE,
+            Adapter.GREENPLUM,
+            Adapter.CLICKHOUSE,
+        ):
             raise ValueError(
                 f"{context} {expected_adapter.value} readiness requires a relation manifest"
             )
@@ -1325,6 +1362,26 @@ def _readiness_artifact_identity(
     if len(set(resolved_columns)) != len(resolved_columns):
         raise ValueError(f"{context} columns must reference distinct physical columns")
     return None
+
+
+def _require_stable_read_policy(
+    stable_read: str,
+    minimum_evidence: str,
+    adapter: Adapter,
+    context: str,
+) -> None:
+    if adapter is Adapter.CLICKHOUSE:
+        if stable_read != StableReadKind.IMMUTABLE_NAMED_VERSION.value:
+            raise ValueError(f"{context} ClickHouse stable read must be 'immutable_named_version'")
+        if minimum_evidence != MinimumEvidence.ASSERTED.value:
+            raise ValueError(
+                f"{context} ClickHouse immutable named version requires minimum evidence 'asserted'"
+            )
+        return
+    if stable_read == StableReadKind.IMMUTABLE_NAMED_VERSION.value:
+        raise ValueError(
+            f"{context} immutable named version is unsupported for adapter {adapter.value!r}"
+        )
 
 
 def _sql_artifact_identity(
@@ -1465,6 +1522,7 @@ def _require_dataset_adapter(value: SemanticValue, context: str) -> Adapter:
         Adapter.MSSQL,
         Adapter.GREENGAGE,
         Adapter.GREENPLUM,
+        Adapter.CLICKHOUSE,
     ):
         raise ValueError(f"{context} is unsupported: adapter={adapter_text!r}")
     return adapter

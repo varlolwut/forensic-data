@@ -12,10 +12,14 @@ from forensic_data.canonical import CanonicalSchema
 from forensic_data.clickhouse import (
     ClickHouseDataValidationError,
     ClickHouseParameter,
+    ClickHouseResourceSetting,
+    ClickHouseServerProfile,
     ClickHouseTransport,
     UnsupportedClickHouseProfileError,
+    clickhouse_resource_setting_ceiling,
     parse_clickhouse_json_rows,
     quote_clickhouse_identifier,
+    require_clickhouse_resource_setting_value,
     validate_clickhouse_identifier,
     validate_clickhouse_text_scalar,
 )
@@ -648,6 +652,81 @@ def parse_clickhouse_replacing_projection_manifest(
             "ClickHouse projection manifest contains invalid typed values: "
             f"cause_type={type(error).__name__}"
         ) from None
+
+
+def effective_clickhouse_projection_request(
+    request: ClickHouseProjectionRequest,
+    profile: ClickHouseServerProfile,
+) -> ClickHouseProjectionRequest:
+    _require_request(request)
+    if type(profile) is not ClickHouseServerProfile:
+        raise TypeError("ClickHouse projection profile must be ClickHouseServerProfile")
+    for requested_value, setting, operation in (
+        (
+            request.version_request.limits.max_execution_time_seconds,
+            ClickHouseResourceSetting.MAX_EXECUTION_TIME,
+            "admit_clickhouse_readiness_execution_time",
+        ),
+        (
+            request.version_request.limits.max_response_bytes,
+            ClickHouseResourceSetting.MAX_RESULT_BYTES,
+            "admit_clickhouse_readiness_result_bytes",
+        ),
+        (
+            request.canonical_limits.max_execution_time_seconds,
+            ClickHouseResourceSetting.MAX_EXECUTION_TIME,
+            "admit_clickhouse_canonical_execution_time",
+        ),
+        (
+            request.canonical_limits.max_response_bytes,
+            ClickHouseResourceSetting.MAX_RESULT_BYTES,
+            "admit_clickhouse_canonical_result_bytes",
+        ),
+    ):
+        require_clickhouse_resource_setting_value(
+            profile,
+            setting,
+            requested_value,
+            operation,
+        )
+    result_row_ceiling = clickhouse_resource_setting_ceiling(
+        profile,
+        ClickHouseResourceSetting.MAX_RESULT_ROWS,
+        "plan_clickhouse_mutation_inventory",
+    )
+    if result_row_ceiling <= 1:
+        raise UnsupportedClickHouseProfileError(
+            "ClickHouse mutation inventory requires room for one record and its overflow "
+            "sentinel: setting='max_result_rows', required_minimum=2, "
+            f"observed_ceiling={result_row_ceiling}"
+        )
+    group_ceiling = clickhouse_resource_setting_ceiling(
+        profile,
+        ClickHouseResourceSetting.MAX_ROWS_TO_GROUP_BY,
+        "plan_clickhouse_tie_inventory",
+    )
+    effective_mutation_records = min(
+        request.max_mutation_records,
+        result_row_ceiling - 1,
+    )
+    effective_tie_groups = min(request.max_tie_groups, group_ceiling)
+    require_clickhouse_resource_setting_value(
+        profile,
+        ClickHouseResourceSetting.MAX_RESULT_ROWS,
+        effective_mutation_records + 1,
+        "admit_clickhouse_mutation_inventory",
+    )
+    require_clickhouse_resource_setting_value(
+        profile,
+        ClickHouseResourceSetting.MAX_ROWS_TO_GROUP_BY,
+        effective_tie_groups,
+        "admit_clickhouse_tie_inventory",
+    )
+    return replace(
+        request,
+        max_mutation_records=effective_mutation_records,
+        max_tie_groups=effective_tie_groups,
+    )
 
 
 def acquire_clickhouse_merge_tree_projection(

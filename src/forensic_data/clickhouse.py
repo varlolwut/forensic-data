@@ -9,6 +9,7 @@ from decimal import Decimal, InvalidOperation, localcontext
 from enum import StrEnum
 from importlib.metadata import version as package_version
 from ipaddress import IPv6Address
+from typing import cast, final
 from urllib.parse import urlencode
 from uuid import UUID, uuid4
 
@@ -31,7 +32,14 @@ from forensic_data.clickhouse_http import (
     ClickHouseHttpWorkerStartupError,
     start_clickhouse_http_worker,
 )
-from forensic_data.postgres import PostgresReadDeadline
+from forensic_data.postgres import (
+    PostgresReadDeadline,
+    PostgresReadDeadlineExceededError,
+    PostgresSourceBudgetAttempt,
+    PostgresSourceBudgetExceededError,
+    PostgresSourceDirection,
+    PostgresSourceQueryCharge,
+)
 
 LOGGER = logging.getLogger(__name__)
 _LOCAL_FIXTURE_HOSTS = frozenset({"127.0.0.1", "::1", "localhost"})
@@ -51,6 +59,35 @@ _CLICKHOUSE_HOST_LABEL = re.compile(
 _RETRYABLE_HTTP_STATUSES = frozenset((429, 502, 503, 504))
 _HTTP_IPC_OVERHEAD_BYTES = 65_536
 _KILL_QUERY_RESPONSE_OVERHEAD_BYTES = 65_536
+_CLICKHOUSE_ZERO_SCAN_OPERATIONS = frozenset(
+    {
+        "initialize_clickhouse_transport",
+        "initialize_clickhouse_control_transport",
+        "cancel_clickhouse_query",
+        "inspect_server_profile",
+        "inspect_resource_constraints",
+        "inspect_datetime64_timezone",
+        "inspect_fidelity_relation",
+        "inspect_immutable_version_readiness_table",
+        "inspect_immutable_version_table",
+        "inspect_system_row_policy_visibility",
+        "inspect_immutable_version_row_policies",
+        "inspect_immutable_version_columns",
+        "read_immutable_version_readiness",
+        "inspect_logical_projection_mutations",
+        "inspect_logical_projection_runtime",
+        "inspect_logical_projection_parts",
+        "inspect_canonical_relation",
+    }
+)
+_CLICKHOUSE_SINGLE_SCAN_OPERATIONS = frozenset(
+    {
+        "read_exact_decimal_datetime64_values",
+        "read_canonical_rows",
+        "read_canonical_fingerprint",
+        "read_canonical_key_groups",
+    }
+)
 
 type ClickHouseParameter = str | int
 
@@ -202,6 +239,10 @@ class ClickHouseTransportCleanupError(ClickHouseTransportError):
     """An isolated ClickHouse HTTP worker could not be reaped."""
 
 
+class ClickHouseSourceAccountingError(ClickHouseTransportError):
+    """A budgeted ClickHouse request lacks an explicit source-work reservation."""
+
+
 class ClickHouseDataValidationError(ClickHouseTransportError):
     """ClickHouse returned data outside the typed transport contract."""
 
@@ -260,6 +301,7 @@ class ClickHouseResourceSetting(StrEnum):
     MAX_EXECUTION_TIME = "max_execution_time"
     MAX_RESULT_ROWS = "max_result_rows"
     MAX_RESULT_BYTES = "max_result_bytes"
+    MAX_ROWS_TO_GROUP_BY = "max_rows_to_group_by"
 
 
 class ClickHouseConnectionSettings(BaseModel):
@@ -393,11 +435,152 @@ class ClickHouseTransportLimits:
             )
 
 
+def required_clickhouse_ipc_message_bytes(max_response_bytes: int) -> int:
+    if type(max_response_bytes) is not int or max_response_bytes < 1:
+        raise ValueError("max_response_bytes must be a positive integer")
+    return max_response_bytes + CLICKHOUSE_HTTP_EXCEPTION_FRAME_MAX_BYTES + _HTTP_IPC_OVERHEAD_BYTES
+
+
 @dataclass(frozen=True, slots=True)
 class ClickHouseRawResult:
     attempt_id: UUID
     query_id: UUID
     payload: bytes
+
+
+@dataclass(frozen=True, slots=True)
+class _ClickHousePreparedRequest:
+    request: ClickHouseHttpRequest
+    work_deadline: int
+    query_id: UUID
+
+
+type _ClickHouseSourceCharge = PostgresSourceQueryCharge | None
+type _ClickHouseSourceAccountingFailure = (
+    ClickHouseSourceAccountingError
+    | PostgresReadDeadlineExceededError
+    | PostgresSourceBudgetExceededError
+)
+
+
+class _ClickHouseRequestAccounting:
+    def dispatch_known(self, operation: str) -> _ClickHouseSourceCharge:
+        raise NotImplementedError
+
+    def dispatch_explicit(
+        self,
+        operation: str,
+        full_scans: int,
+    ) -> _ClickHouseSourceCharge:
+        raise NotImplementedError
+
+    def consume_payload(
+        self,
+        charge: _ClickHouseSourceCharge,
+        payload: bytes,
+        result_format: str,
+    ) -> None:
+        raise NotImplementedError
+
+    def consume_observed_result_bytes(
+        self,
+        charge: _ClickHouseSourceCharge,
+        result_bytes: int,
+    ) -> None:
+        raise NotImplementedError
+
+
+@final
+class _UnbudgetedClickHouseRequestAccounting(_ClickHouseRequestAccounting):
+    def dispatch_known(self, operation: str) -> _ClickHouseSourceCharge:
+        validate_clickhouse_text_scalar(operation, "ClickHouse unbudgeted operation")
+        return None
+
+    def dispatch_explicit(
+        self,
+        operation: str,
+        full_scans: int,
+    ) -> _ClickHouseSourceCharge:
+        validate_clickhouse_text_scalar(operation, "ClickHouse unbudgeted operation")
+        _validate_nonnegative_source_full_scans(full_scans)
+        return None
+
+    def consume_payload(
+        self,
+        charge: _ClickHouseSourceCharge,
+        payload: bytes,
+        result_format: str,
+    ) -> None:
+        if charge is not None:
+            raise AssertionError("unbudgeted ClickHouse accounting received a source charge")
+        if type(payload) is not bytes or type(result_format) is not str:
+            raise TypeError("ClickHouse response accounting requires bytes and a format name")
+
+    def consume_observed_result_bytes(
+        self,
+        charge: _ClickHouseSourceCharge,
+        result_bytes: int,
+    ) -> None:
+        if charge is not None:
+            raise AssertionError("unbudgeted ClickHouse accounting received a source charge")
+        _validate_nonnegative_source_result_bytes(result_bytes)
+
+
+@final
+class _SourceBudgetClickHouseRequestAccounting(_ClickHouseRequestAccounting):
+    def __init__(
+        self,
+        source_budget: PostgresSourceBudgetAttempt,
+        direction: PostgresSourceDirection,
+    ) -> None:
+        if not isinstance(cast(object, source_budget), PostgresSourceBudgetAttempt):
+            raise TypeError("ClickHouse source accounting requires PostgresSourceBudgetAttempt")
+        if not isinstance(cast(object, direction), PostgresSourceDirection):
+            raise TypeError("ClickHouse source accounting requires PostgresSourceDirection")
+        self._source_budget = source_budget
+        self._direction = direction
+
+    def dispatch_known(self, operation: str) -> _ClickHouseSourceCharge:
+        validate_clickhouse_text_scalar(operation, "ClickHouse budgeted operation")
+        if operation in _CLICKHOUSE_ZERO_SCAN_OPERATIONS:
+            full_scans = 0
+        elif operation in _CLICKHOUSE_SINGLE_SCAN_OPERATIONS:
+            full_scans = 1
+        else:
+            raise ClickHouseSourceAccountingError(
+                "ClickHouse budgeted request lacks an immutable full-scan reservation: "
+                f"operation={operation!r}"
+            )
+        return self._source_budget.dispatch_query(self._direction, full_scans)
+
+    def dispatch_explicit(
+        self,
+        operation: str,
+        full_scans: int,
+    ) -> _ClickHouseSourceCharge:
+        validate_clickhouse_text_scalar(operation, "ClickHouse budgeted operation")
+        _validate_nonnegative_source_full_scans(full_scans)
+        return self._source_budget.dispatch_query(self._direction, full_scans)
+
+    def consume_payload(
+        self,
+        charge: _ClickHouseSourceCharge,
+        payload: bytes,
+        result_format: str,
+    ) -> None:
+        if charge is None:
+            raise AssertionError("budgeted ClickHouse accounting lost its source charge")
+        charge.consume_records(_clickhouse_result_record_bytes(payload, result_format))
+
+    def consume_observed_result_bytes(
+        self,
+        charge: _ClickHouseSourceCharge,
+        result_bytes: int,
+    ) -> None:
+        if charge is None:
+            raise AssertionError("budgeted ClickHouse accounting lost its source charge")
+        _validate_nonnegative_source_result_bytes(result_bytes)
+        charge.consume_observed_result_bytes(result_bytes)
 
 
 @dataclass(frozen=True, slots=True)
@@ -416,6 +599,7 @@ class ClickHouseServerProfile:
     transport_library_name: str
     transport_library_version: str
     server_version: str
+    server_version_number: int
     build_id: str
     server_timezone: str
     session_timezone: str
@@ -491,6 +675,7 @@ class _ClickHouseProfilePayload(BaseModel):
     model_config = ConfigDict(extra="ignore", frozen=True, strict=True)
 
     server_version: str
+    server_version_number: str
     build_id: str
     server_timezone: str
     session_timezone: str
@@ -540,6 +725,7 @@ class ClickHouseTransport:
         data_worker: ClickHouseHttpWorker,
         control_worker: ClickHouseHttpWorker,
         physical_request_count: int,
+        accounting: _ClickHouseRequestAccounting,
     ) -> None:
         self._settings = settings
         self._limits = limits
@@ -549,6 +735,7 @@ class ClickHouseTransport:
         self._data_worker = data_worker
         self._control_worker = control_worker
         self._physical_request_count = physical_request_count
+        self._accounting = accounting
         self._last_query_id: UUID | None = None
         self._state = ClickHouseTransportState.ACTIVE
 
@@ -601,6 +788,65 @@ class ClickHouseTransport:
         max_response_bytes: int,
         operation: str,
     ) -> ClickHouseRawResult:
+        prepared = self._prepare_raw_request(
+            query,
+            parameters,
+            settings,
+            result_format,
+            max_response_bytes,
+            operation,
+        )
+        charge = self._accounting.dispatch_known(operation)
+        return self._execute_request(
+            target_worker=self._data_worker,
+            cancellation_worker=self._control_worker,
+            request=prepared.request,
+            work_deadline=prepared.work_deadline,
+            query_id=prepared.query_id,
+            operation=operation,
+            result_format=result_format,
+            charge=charge,
+        )
+
+    def execute_source_raw(
+        self,
+        query: str,
+        parameters: dict[str, ClickHouseParameter],
+        settings: dict[str, ClickHouseParameter],
+        result_format: str,
+        max_response_bytes: int,
+        operation: str,
+        full_scans: int,
+    ) -> ClickHouseRawResult:
+        prepared = self._prepare_raw_request(
+            query,
+            parameters,
+            settings,
+            result_format,
+            max_response_bytes,
+            operation,
+        )
+        charge = self._accounting.dispatch_explicit(operation, full_scans)
+        return self._execute_request(
+            target_worker=self._data_worker,
+            cancellation_worker=self._control_worker,
+            request=prepared.request,
+            work_deadline=prepared.work_deadline,
+            query_id=prepared.query_id,
+            operation=operation,
+            result_format=result_format,
+            charge=charge,
+        )
+
+    def _prepare_raw_request(
+        self,
+        query: str,
+        parameters: dict[str, ClickHouseParameter],
+        settings: dict[str, ClickHouseParameter],
+        result_format: str,
+        max_response_bytes: int,
+        operation: str,
+    ) -> "_ClickHousePreparedRequest":
         self._require_active(operation)
         validate_clickhouse_text_scalar(query, "ClickHouse query")
         validate_clickhouse_text_scalar(result_format, "ClickHouse result format")
@@ -636,13 +882,10 @@ class ClickHouseTransport:
             max_response_bytes=max_response_bytes,
         )
         self._require_prepared_before_deadline(work_deadline, query_id, operation)
-        return self._execute_request(
-            target_worker=self._data_worker,
-            cancellation_worker=self._control_worker,
+        return _ClickHousePreparedRequest(
             request=request,
             work_deadline=work_deadline,
             query_id=query_id,
-            operation=operation,
         )
 
     def initialize_control_connection(self) -> ClickHouseRawResult:
@@ -670,6 +913,7 @@ class ClickHouseTransport:
             max_response_bytes=self._limits.max_initialization_response_bytes,
         )
         self._require_prepared_before_deadline(work_deadline, query_id, operation)
+        charge = self._accounting.dispatch_known(operation)
         return self._execute_request(
             target_worker=self._control_worker,
             cancellation_worker=self._data_worker,
@@ -677,6 +921,8 @@ class ClickHouseTransport:
             work_deadline=work_deadline,
             query_id=query_id,
             operation=operation,
+            result_format="TabSeparatedRaw",
+            charge=charge,
         )
 
     def _execute_request(
@@ -687,24 +933,76 @@ class ClickHouseTransport:
         work_deadline: int,
         query_id: UUID,
         operation: str,
+        result_format: str,
+        charge: _ClickHouseSourceCharge,
     ) -> ClickHouseRawResult:
         self._physical_request_count += 1
         execution = target_worker.execute(request, work_deadline)
+        accounting_error = self._consume_observed_outcome(
+            charge,
+            execution.outcome,
+            result_format,
+        )
         if execution.deadline_exceeded:
-            self._raise_deadline_outcome(
-                execution,
+            try:
+                self._raise_deadline_outcome(
+                    execution,
+                    query_id,
+                    operation,
+                    cancellation_worker,
+                )
+            except ClickHouseTransportError as error:
+                _preserve_source_accounting_failure(error, accounting_error)
+                raise
+        if execution.outcome is None:
+            raise AssertionError("ClickHouse HTTP execution ended without an outcome")
+        try:
+            result = self._resolve_query_outcome(
+                execution.outcome,
                 query_id,
                 operation,
                 cancellation_worker,
             )
-        if execution.outcome is None:
-            raise AssertionError("ClickHouse HTTP execution ended without an outcome")
-        return self._resolve_query_outcome(
-            execution.outcome,
-            query_id,
-            operation,
-            cancellation_worker,
-        )
+        except ClickHouseTransportError as error:
+            _preserve_source_accounting_failure(error, accounting_error)
+            raise
+        if accounting_error is not None:
+            cleanup_cause = self._retire(ClickHouseTransportState.LOST)
+            if cleanup_cause is not None:
+                raise ClickHouseTransportCleanupError(
+                    "ClickHouse source accounting failed after a completed query and "
+                    "worker cleanup was not confirmed: "
+                    f"attempt_id={self._attempt_id}, query_id={query_id}, "
+                    "operation="
+                    f"{operation!r}, primary_error_type={type(accounting_error).__name__!r}, "
+                    f"cleanup_cause={cleanup_cause!r}"
+                ) from accounting_error
+            raise accounting_error
+        return result
+
+    def _consume_observed_outcome(
+        self,
+        charge: _ClickHouseSourceCharge,
+        outcome: ClickHouseHttpOutcome | None,
+        result_format: str,
+    ) -> _ClickHouseSourceAccountingFailure | None:
+        if outcome is None:
+            return None
+        try:
+            if outcome.kind is ClickHouseHttpOutcomeKind.SUCCESS:
+                self._accounting.consume_payload(charge, outcome.payload, result_format)
+            elif outcome.kind is ClickHouseHttpOutcomeKind.RESULT_LIMIT:
+                self._accounting.consume_observed_result_bytes(
+                    charge,
+                    outcome.received_bytes,
+                )
+        except (
+            ClickHouseSourceAccountingError,
+            PostgresReadDeadlineExceededError,
+            PostgresSourceBudgetExceededError,
+        ) as error:
+            return error
+        return None
 
     def close(self) -> None:
         if self._state is ClickHouseTransportState.CLOSED:
@@ -943,15 +1241,32 @@ class ClickHouseTransport:
         except (ProgrammingError, ValueError) as error:
             self._retire(ClickHouseTransportState.CANCELLATION_UNCONFIRMED)
             return False, type(error).__name__
+        try:
+            charge = self._accounting.dispatch_known("cancel_clickhouse_query")
+        except (
+            ClickHouseSourceAccountingError,
+            PostgresReadDeadlineExceededError,
+            PostgresSourceBudgetExceededError,
+        ) as error:
+            cleanup_cause = self._retire(ClickHouseTransportState.CANCELLATION_UNCONFIRMED)
+            return False, cleanup_cause or type(error).__name__
         self._physical_request_count += 1
         execution = cancellation_worker.execute(
             request,
             cancellation_deadline,
         )
-        if execution.deadline_exceeded or execution.outcome is None:
+        outcome = execution.outcome
+        accounting_error = self._consume_observed_outcome(
+            charge,
+            outcome,
+            "TabSeparatedRaw",
+        )
+        if accounting_error is not None:
+            cleanup_cause = self._retire(ClickHouseTransportState.CANCELLATION_UNCONFIRMED)
+            return False, cleanup_cause or type(accounting_error).__name__
+        if execution.deadline_exceeded or outcome is None:
             cleanup_cause = self._retire(ClickHouseTransportState.CANCELLATION_UNCONFIRMED)
             return False, cleanup_cause or "CancellationAcknowledgementDeadlineExceeded"
-        outcome = execution.outcome
         kill_confirmed = outcome.kind is ClickHouseHttpOutcomeKind.SUCCESS and _kill_query_finished(
             outcome.payload, query_id
         )
@@ -1050,7 +1365,55 @@ def open_clickhouse_transport(
     deadline: PostgresReadDeadline,
     attempt_id: UUID,
 ) -> ClickHouseTransport:
+    return _open_clickhouse_transport(
+        settings,
+        retry_policy,
+        limits,
+        deadline,
+        attempt_id,
+        _UnbudgetedClickHouseRequestAccounting(),
+    )
+
+
+def open_budgeted_clickhouse_transport(
+    settings: ClickHouseConnectionSettings,
+    retry_policy: ClickHouseRetryPolicy,
+    limits: ClickHouseTransportLimits,
+    deadline: PostgresReadDeadline,
+    attempt_id: UUID,
+    source_budget: PostgresSourceBudgetAttempt,
+    direction: PostgresSourceDirection,
+) -> ClickHouseTransport:
+    if not isinstance(cast(object, source_budget), PostgresSourceBudgetAttempt):
+        raise TypeError("budgeted ClickHouse transport requires PostgresSourceBudgetAttempt")
+    if not isinstance(cast(object, direction), PostgresSourceDirection):
+        raise TypeError("budgeted ClickHouse transport requires PostgresSourceDirection")
+    if source_budget.attempt_id != attempt_id:
+        raise ValueError(
+            "budgeted ClickHouse transport attempt ID differs from its source budget: "
+            f"transport_attempt_id={attempt_id}, budget_attempt_id={source_budget.attempt_id}"
+        )
+    return _open_clickhouse_transport(
+        settings,
+        retry_policy,
+        limits,
+        deadline,
+        attempt_id,
+        _SourceBudgetClickHouseRequestAccounting(source_budget, direction),
+    )
+
+
+def _open_clickhouse_transport(
+    settings: ClickHouseConnectionSettings,
+    retry_policy: ClickHouseRetryPolicy,
+    limits: ClickHouseTransportLimits,
+    deadline: PostgresReadDeadline,
+    attempt_id: UUID,
+    accounting: _ClickHouseRequestAccounting,
+) -> ClickHouseTransport:
     _require_open_arguments(settings, retry_policy, limits, deadline, attempt_id)
+    if not isinstance(cast(object, accounting), _ClickHouseRequestAccounting):
+        raise TypeError("ClickHouse transport accounting has an unexpected type")
     last_error: ClickHouseQueryError | None = None
     total_dispatches = 0
     for attempt in range(1, retry_policy.max_attempts + 1):
@@ -1086,6 +1449,7 @@ def open_clickhouse_transport(
                 data_worker=data_worker,
                 control_worker=control_worker,
                 physical_request_count=total_dispatches,
+                accounting=accounting,
             )
             initialized = transport.execute_raw(
                 query=(
@@ -1278,7 +1642,7 @@ def _clickhouse_http_request(
             f"actual_query_bytes={len(query_bytes)}"
         )
     if (
-        max_response_bytes + CLICKHOUSE_HTTP_EXCEPTION_FRAME_MAX_BYTES + _HTTP_IPC_OVERHEAD_BYTES
+        required_clickhouse_ipc_message_bytes(max_response_bytes)
         > transport_limits.max_ipc_message_bytes
     ):
         raise ValueError(
@@ -1630,7 +1994,10 @@ def inspect_clickhouse_server_profile(
 ) -> ClickHouseServerProfile:
     result = transport.execute_raw(
         query=(
-            "SELECT version() AS server_version, buildId() AS build_id, "
+            "SELECT version() AS server_version, "
+            "(SELECT value FROM system.build_options "
+            "WHERE name = 'VERSION_INTEGER') AS server_version_number, "
+            "buildId() AS build_id, "
             "serverTimezone() AS server_timezone, timezone() AS session_timezone, "
             "currentUser() AS current_user, "
             "currentDatabase() AS current_database, "
@@ -1653,7 +2020,8 @@ def inspect_clickhouse_server_profile(
             "SELECT name, value, min, max, readonly FROM system.settings "
             "WHERE name IN "
             "('readonly', 'max_memory_usage', 'max_threads', 'max_execution_time', "
-            "'max_result_rows', 'max_result_bytes', 'result_overflow_mode') "
+            "'max_result_rows', 'max_result_bytes', 'max_rows_to_group_by', "
+            "'result_overflow_mode') "
             "ORDER BY name"
         ),
         parameters={},
@@ -1674,6 +2042,10 @@ def inspect_clickhouse_server_profile(
         transport_library_name="urllib3",
         transport_library_version=_validated_driver_version(package_version("urllib3")),
         server_version=_validated_profile_text(payload.server_version, "server version"),
+        server_version_number=_parse_positive_integer(
+            payload.server_version_number,
+            "server version number",
+        ),
         build_id=_validated_profile_text(payload.build_id, "build ID"),
         server_timezone=_validated_profile_text(payload.server_timezone, "server timezone"),
         session_timezone=_validated_profile_text(payload.session_timezone, "session timezone"),
@@ -2026,6 +2398,7 @@ def _settings_by_name(
         "max_execution_time",
         "max_result_rows",
         "max_result_bytes",
+        "max_rows_to_group_by",
         "result_overflow_mode",
     }
     by_name = {row.name: row for row in rows}
@@ -2094,6 +2467,10 @@ def _require_clickhouse_profile(
     profile: ClickHouseServerProfile,
     settings: ClickHouseConnectionSettings,
 ) -> None:
+    if type(profile.server_version_number) is not int or profile.server_version_number < 1:
+        raise ClickHouseDataValidationError(
+            "ClickHouse source profile requires a positive VERSION_INTEGER catalog value"
+        )
     if profile.current_user != settings.user or profile.current_database != settings.database:
         raise UnsupportedClickHouseProfileError(
             "ClickHouse HTTP session identity does not match its declared connection: "
@@ -2145,7 +2522,7 @@ def _require_clickhouse_profile(
         raise UnsupportedClickHouseProfileError(
             "ClickHouse source profile requires result_overflow_mode to be locked"
         )
-    expected_values = {
+    mirrored_values = {
         ClickHouseResourceSetting.MAX_MEMORY_USAGE: Decimal(profile.max_memory_usage),
         ClickHouseResourceSetting.MAX_THREADS: Decimal(profile.max_threads),
         ClickHouseResourceSetting.MAX_EXECUTION_TIME: (
@@ -2161,8 +2538,7 @@ def _require_clickhouse_profile(
         raise ClickHouseDataValidationError(
             "ClickHouse source profile requires each resource constraint exactly once"
         )
-    for setting, expected_value in expected_values.items():
-        constraint = constraints_by_setting[setting]
+    for setting, constraint in constraints_by_setting.items():
         minimum_is_valid = constraint.minimum is None or (
             0 <= constraint.minimum <= constraint.value
         )
@@ -2170,15 +2546,16 @@ def _require_clickhouse_profile(
             constraint.value <= constraint.maximum
         )
         effective_ceiling_exists = not constraint.changeable_in_readonly or maximum_is_valid
-        if (
-            constraint.value != expected_value
-            or constraint.value <= 0
-            or not minimum_is_valid
-            or not effective_ceiling_exists
-        ):
+        if constraint.value <= 0 or not minimum_is_valid or not effective_ceiling_exists:
             raise UnsupportedClickHouseProfileError(
                 "ClickHouse source resource constraint is unsafe: "
                 f"setting={setting.value!r}, requires_positive_bounded_value=True"
+            )
+    for setting, expected_value in mirrored_values.items():
+        if constraints_by_setting[setting].value != expected_value:
+            raise ClickHouseDataValidationError(
+                "ClickHouse source profile value differs from its resource constraint: "
+                f"setting={setting.value!r}"
             )
     execution_constraint = constraints_by_setting[ClickHouseResourceSetting.MAX_EXECUTION_TIME]
     if execution_constraint.maximum != profile.max_execution_time_seconds:
@@ -2190,12 +2567,83 @@ def _require_clickhouse_profile(
         ClickHouseResourceSetting.MAX_EXECUTION_TIME,
         ClickHouseResourceSetting.MAX_RESULT_ROWS,
         ClickHouseResourceSetting.MAX_RESULT_BYTES,
+        ClickHouseResourceSetting.MAX_ROWS_TO_GROUP_BY,
     ):
         if not constraints_by_setting[setting].changeable_in_readonly:
             raise UnsupportedClickHouseProfileError(
                 "ClickHouse source setting must permit the adapter's bounded downward override: "
                 f"setting={setting.value!r}"
             )
+
+
+def clickhouse_resource_setting_ceiling(
+    profile: ClickHouseServerProfile,
+    setting: ClickHouseResourceSetting,
+    operation: str,
+) -> int:
+    constraint = _resource_constraint_for_setting(profile, setting)
+    _validated_profile_text(operation, "resource operation")
+    ceiling = constraint.maximum if constraint.changeable_in_readonly else constraint.value
+    if ceiling is None or ceiling < 1 or ceiling != ceiling.to_integral_value():
+        raise UnsupportedClickHouseProfileError(
+            "ClickHouse resource setting lacks a positive integer ceiling: "
+            f"operation={operation!r}, setting={setting.value!r}, "
+            f"observed_ceiling={(None if ceiling is None else str(ceiling))!r}"
+        )
+    return int(ceiling)
+
+
+def require_clickhouse_resource_setting_value(
+    profile: ClickHouseServerProfile,
+    setting: ClickHouseResourceSetting,
+    requested_value: int,
+    operation: str,
+) -> None:
+    if type(requested_value) is not int or requested_value < 1:
+        raise ClickHouseDataValidationError(
+            "ClickHouse query resource setting must be a positive integer: "
+            f"operation={operation!r}, setting={setting.value!r}, "
+            f"requested={requested_value!r}"
+        )
+    _validated_profile_text(operation, "resource operation")
+    constraint = _resource_constraint_for_setting(profile, setting)
+    requested = Decimal(requested_value)
+    if constraint.changeable_in_readonly:
+        accepted = (
+            (constraint.minimum is None or constraint.minimum <= requested)
+            and constraint.maximum is not None
+            and requested <= constraint.maximum
+        )
+    else:
+        accepted = requested == constraint.value
+    if not accepted:
+        raise UnsupportedClickHouseProfileError(
+            "ClickHouse query resource setting is outside the observed accepted range: "
+            f"operation={operation!r}, setting={setting.value!r}, "
+            f"requested={requested_value}, current={str(constraint.value)!r}, "
+            f"minimum={(None if constraint.minimum is None else str(constraint.minimum))!r}, "
+            f"maximum={(None if constraint.maximum is None else str(constraint.maximum))!r}, "
+            f"changeable_in_readonly={constraint.changeable_in_readonly}"
+        )
+
+
+def _resource_constraint_for_setting(
+    profile: ClickHouseServerProfile,
+    setting: ClickHouseResourceSetting,
+) -> ClickHouseResourceConstraint:
+    if type(profile) is not ClickHouseServerProfile:
+        raise TypeError("ClickHouse resource profile must be ClickHouseServerProfile")
+    if not isinstance(cast(object, setting), ClickHouseResourceSetting):
+        raise TypeError("ClickHouse resource setting must be ClickHouseResourceSetting")
+    matching = tuple(
+        constraint for constraint in profile.resource_constraints if constraint.setting is setting
+    )
+    if len(matching) != 1:
+        raise ClickHouseDataValidationError(
+            "ClickHouse resource profile does not contain the requested setting exactly once: "
+            f"setting={setting.value!r}, observed={len(matching)}"
+        )
+    return matching[0]
 
 
 def _interface(security: ClickHouseTransportSecurity) -> str:
@@ -2222,6 +2670,13 @@ def _parse_nonnegative_integer(value: str, label: str) -> int:
     return parsed
 
 
+def _parse_positive_integer(value: str, label: str) -> int:
+    parsed = _parse_integer(value, label)
+    if parsed < 1:
+        raise ClickHouseDataValidationError(f"ClickHouse {label} must be positive")
+    return parsed
+
+
 def _parse_integer(value: str, label: str) -> int:
     if _INTEGER_TEXT.fullmatch(value) is None:
         raise ClickHouseDataValidationError(
@@ -2242,6 +2697,46 @@ def _parse_nonnegative_decimal(value: str, label: str) -> Decimal:
             f"ClickHouse {label} must be a finite non-negative decimal"
         )
     return parsed
+
+
+def _validate_nonnegative_source_full_scans(full_scans: int) -> None:
+    if type(full_scans) is not int or full_scans < 0:
+        raise ValueError("ClickHouse source full-scan reservation must be a non-negative integer")
+
+
+def _validate_nonnegative_source_result_bytes(result_bytes: int) -> None:
+    if type(result_bytes) is not int or result_bytes < 0:
+        raise ValueError("ClickHouse observed result bytes must be a non-negative integer")
+
+
+def _preserve_source_accounting_failure(
+    primary_error: BaseException,
+    accounting_error: _ClickHouseSourceAccountingFailure | None,
+) -> None:
+    if accounting_error is None:
+        return
+    primary_error.add_note(
+        "ClickHouse source-result accounting also failed: "
+        f"accounting_error_type={type(accounting_error).__name__!r}"
+    )
+
+
+def _clickhouse_result_record_bytes(
+    payload: bytes,
+    result_format: str,
+) -> tuple[int, ...]:
+    if type(payload) is not bytes:
+        raise TypeError("ClickHouse accounted response payload must be bytes")
+    if result_format == "JSONEachRow":
+        return tuple(len(line) for line in payload.splitlines())
+    if result_format == "TabSeparatedRaw":
+        return tuple(
+            sum(len(field) for field in line.split(b"\t")) for line in payload.splitlines()
+        )
+    raise ClickHouseSourceAccountingError(
+        "ClickHouse budgeted response uses an unsupported accounting format: "
+        f"result_format={result_format!r}"
+    )
 
 
 def quote_clickhouse_identifier(identifier: str) -> str:

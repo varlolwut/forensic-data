@@ -12,6 +12,12 @@ from forensic_data.canonical import (
     TimestampParameters,
     schema_digest_hex,
 )
+from forensic_data.clickhouse_profile import (
+    CLICKHOUSE_CONNECT_DRIVER,
+    CLICKHOUSE_LTS_PROFILE,
+    ClickHouseRuntimeProfile,
+    match_clickhouse_runtime_profile,
+)
 from forensic_data.contracts.errors import (
     ContractReferenceError,
     ContractValidationError,
@@ -259,6 +265,18 @@ def _compile_connection(source: ConnectionSource) -> ConnectionDefinition:
             raise UnsupportedContractError(
                 f"connection {connection_id!r} profile {profile!r} must declare role 'source'"
             )
+    if adapter is Adapter.CLICKHOUSE:
+        if match_clickhouse_runtime_profile(driver, profile) is not ClickHouseRuntimeProfile.LTS:
+            raise UnsupportedContractError(
+                f"connection {connection_id!r} ClickHouse endpoint requires exact "
+                "driver/profile pair "
+                f"({CLICKHOUSE_CONNECT_DRIVER!r}, {CLICKHOUSE_LTS_PROFILE!r})"
+            )
+        if roles != [ConnectionRole.TARGET]:
+            raise UnsupportedContractError(
+                f"connection {connection_id!r} profile {profile!r} is target-only "
+                "and must declare exactly role 'target'"
+            )
     return ConnectionDefinition(
         connection_id=connection_id,
         adapter=adapter,
@@ -389,7 +407,8 @@ def _compile_dataset_locator(
                 f"relation_scope={source.relation_scope!r}"
             ) from None
         if (
-            connection.adapter in (Adapter.MSSQL, Adapter.GREENGAGE, Adapter.GREENPLUM)
+            connection.adapter
+            in (Adapter.MSSQL, Adapter.GREENGAGE, Adapter.GREENPLUM, Adapter.CLICKHOUSE)
             and relation_scope is not RelationScope.PHYSICAL_ONLY
         ):
             raise UnsupportedContractError(
@@ -594,8 +613,13 @@ def _compile_consistency(
                 f"{context} stable-read strategy is unsupported for dataset "
                 f"{dataset.dataset_id!r}: kind={item.stable_read!r}"
             ) from None
+        _validate_stable_read(dataset, stable_read, minimum_evidence, context)
         readiness_context = f"{context} readiness for dataset {dataset.dataset_id!r}"
         if isinstance(item.readiness, SqlArtifactSource):
+            if dataset.connection.adapter is Adapter.CLICKHOUSE:
+                raise UnsupportedContractError(
+                    f"{readiness_context} ClickHouse endpoint requires a relation manifest"
+                )
             readiness = _compile_sql_artifact(
                 item.readiness,
                 dataset.connection.adapter,
@@ -622,6 +646,32 @@ def _compile_consistency(
         late_arrivals=late_arrivals,
         datasets=tuple(compiled_datasets),
     )
+
+
+def _validate_stable_read(
+    dataset: DatasetDefinition,
+    stable_read: StableReadKind,
+    minimum_evidence: MinimumEvidence,
+    context: str,
+) -> None:
+    adapter = dataset.connection.adapter
+    if adapter is Adapter.CLICKHOUSE:
+        if stable_read is not StableReadKind.IMMUTABLE_NAMED_VERSION:
+            raise UnsupportedContractError(
+                f"{context} ClickHouse dataset {dataset.dataset_id!r} requires "
+                "stable_read 'immutable_named_version'"
+            )
+        if minimum_evidence is not MinimumEvidence.ASSERTED:
+            raise UnsupportedContractError(
+                f"{context} ClickHouse immutable named version requires explicit "
+                "minimum_evidence 'asserted'"
+            )
+        return
+    if stable_read is StableReadKind.IMMUTABLE_NAMED_VERSION:
+        raise UnsupportedContractError(
+            f"{context} stable-read strategy 'immutable_named_version' is unsupported for "
+            f"dataset {dataset.dataset_id!r} adapter {adapter.value!r}"
+        )
 
 
 def _compile_relation_manifest_readiness(
@@ -706,6 +756,16 @@ def _compile_check(
             f"{context} target connection {target.connection.connection_id!r} profile "
             f"{target.connection.profile!r} is source-only"
         )
+    if target.connection.adapter is Adapter.CLICKHOUSE:
+        if reference.connection.adapter not in (
+            Adapter.POSTGRESQL,
+            Adapter.MSSQL,
+            Adapter.GREENPLUM,
+        ):
+            raise UnsupportedContractError(
+                f"{context} ClickHouse target supports only PostgreSQL, MSSQL, or "
+                "original Greenplum references"
+            )
     if ConnectionRole.SOURCE not in reference.connection.roles:
         raise ContractValidationError(
             f"{context} reference connection {reference.connection.connection_id!r} "

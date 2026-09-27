@@ -294,7 +294,51 @@ BEGIN
     THROW 51000, N'Cross-engine comparison seed is missing or changed.', 1;
 END;
 
-IF (SELECT COUNT_BIG(*) FROM [dfe_fixture].[comparison_batch_manifest]) <> 1
+IF (SELECT COUNT_BIG(*) FROM [dfe_fixture].[clickhouse_comparison_orders]) <> 4
+   OR EXISTS
+   (
+       SELECT [order_id], [business_date], [precise_amount], [local_time], [instant_time]
+       FROM [dfe_fixture].[clickhouse_comparison_orders]
+       EXCEPT
+       SELECT *
+       FROM
+       (
+           VALUES
+           (
+               CONVERT(bigint, 1),
+               CONVERT(date, N'2024-02-29', 23),
+               CONVERT(decimal(38, 7), N'100.0000000'),
+               CONVERT(datetime2(7), N'2024-02-29T10:00:01.1111110', 126),
+               CONVERT(datetimeoffset(7), N'2024-02-29T08:00:01.1111110+00:00', 127)
+           ),
+           (
+               CONVERT(bigint, 2),
+               CONVERT(date, N'2024-02-29', 23),
+               CONVERT(decimal(38, 7), N'200.0000000'),
+               CONVERT(datetime2(7), N'2024-02-29T10:00:02.2222220', 126),
+               CONVERT(datetimeoffset(7), N'2024-02-29T08:00:02.2222220+00:00', 127)
+           ),
+           (
+               CONVERT(bigint, 3),
+               CONVERT(date, N'2024-02-29', 23),
+               CONVERT(decimal(38, 7), N'300.0000000'),
+               CONVERT(datetime2(7), N'2024-02-29T10:00:03.3333330', 126),
+               CONVERT(datetimeoffset(7), N'2024-02-29T08:00:03.3333330+00:00', 127)
+           ),
+           (
+               CONVERT(bigint, 4),
+               CONVERT(date, N'2024-02-29', 23),
+               CONVERT(decimal(38, 7), N'400.0000000'),
+               CONVERT(datetime2(7), N'2024-02-29T10:00:04.4444440', 126),
+               CONVERT(datetimeoffset(7), N'2024-02-29T08:00:04.4444440+00:00', 127)
+           )
+       ) AS [expected]([order_id], [business_date], [precise_amount], [local_time], [instant_time])
+   )
+BEGIN
+    THROW 51000, N'ClickHouse endpoint comparison seed is missing or changed.', 1;
+END;
+
+IF (SELECT COUNT_BIG(*) FROM [dfe_fixture].[comparison_batch_manifest]) <> 2
    OR NOT EXISTS
    (
        SELECT 1
@@ -310,6 +354,24 @@ IF (SELECT COUNT_BIG(*) FROM [dfe_fixture].[comparison_batch_manifest]) <> 1
          AND [completed_at] = CONVERT(
              datetimeoffset(6),
              N'2026-09-23T12:30:45.123456+00:00',
+             127
+         )
+   )
+   OR NOT EXISTS
+   (
+       SELECT 1
+       FROM [dfe_fixture].[comparison_batch_manifest]
+       WHERE [dataset_id] = N'mssql_reference_orders'
+         AND [scope_digest]
+             = N'13da3e93058f4e53db4d7989380a57597b0fb5a86dc0e9a80ae33bd1b11f9897'
+         AND [batch_id] = N'reference-orders-2024-02-29-v001'
+         AND [state] = N'complete'
+         AND [business_date] = CONVERT(date, N'2024-02-29', 23)
+         AND [source_cut] = N'comparison-orders-cut-000001'
+         AND [dataset_version] = N'mssql-reference-orders-v1'
+         AND [completed_at] = CONVERT(
+             datetimeoffset(6),
+             N'2024-03-01T01:02:03.456789+00:00',
              127
          )
    )

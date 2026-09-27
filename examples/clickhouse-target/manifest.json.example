@@ -1,0 +1,20 @@
+{
+  "version": 1,
+  "issuer": "warehouse-release",
+  "dataset_id": "mart_orders",
+  "scope_digest": "df903aeb9157fcc8da48575be4a841781a2df049299fdf8b3623f719ee5465ab",
+  "expected_batch_id": "mart-v042",
+  "business_date": "2026-09-23",
+  "source_cut": "source-cut-42",
+  "dataset_version": "orders_v042",
+  "completed_at": "2026-09-24T00:00:00.000000Z",
+  "completion_revision": 42,
+  "publication_revision": 42,
+  "version_locator": {
+    "database": "mart",
+    "table": "orders_v042",
+    "uuid": "42424242-4242-4242-8242-424242424242"
+  },
+  "immutability": "asserted",
+  "late_arrivals": "next_batch"
+}

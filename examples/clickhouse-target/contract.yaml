@@ -1,0 +1,156 @@
+version: 1
+connections:
+  reference_pg:
+    adapter: postgresql
+    driver: psycopg
+    profile: postgresql_17
+    roles: [source]
+    secret_ref: file:/run/secrets/reference-dsn
+  target_clickhouse:
+    adapter: clickhouse
+    driver: clickhouse-connect
+    profile: clickhouse_lts
+    roles: [target]
+    secret_ref: file:/run/secrets/clickhouse.json
+  metadata_pg:
+    adapter: postgresql
+    driver: psycopg
+    profile: postgresql_17
+    roles: [metadata]
+    secret_ref: file:/run/secrets/metadata-dsn
+schemas:
+  mart_order_v1:
+    fields:
+      - name: order_id
+        type: {kind: int64}
+        nullable: false
+        normalization: none
+        equality: {kind: exact}
+      - name: business_date
+        type: {kind: date}
+        nullable: false
+        normalization: none
+        equality: {kind: exact}
+      - name: precise_amount
+        type: {kind: decimal, precision: 38, scale: 7}
+        nullable: true
+        normalization: none
+        equality: {kind: exact}
+      - name: local_time
+        type: {kind: timestamp_local, precision: 6}
+        nullable: false
+        normalization: none
+        equality: {kind: exact}
+      - name: instant_time
+        type: {kind: timestamp_instant, precision: 6}
+        nullable: false
+        normalization: none
+        equality: {kind: exact}
+datasets:
+  reference_orders:
+    connection: reference_pg
+    relation:
+      {catalog: null, schema: warehouse, name: orders, relation_scope: physical_only}
+    logical_schema: mart_order_v1
+    projection:
+      - {field: order_id, column: order_id}
+      - {field: business_date, column: business_date}
+      - {field: precise_amount, column: precise_amount}
+      - {field: local_time, column: local_time}
+      - {field: instant_time, column: instant_time}
+    grain: [order_id]
+  mart_orders:
+    connection: target_clickhouse
+    relation:
+      {catalog: null, schema: mart, name: orders_v042, relation_scope: physical_only}
+    logical_schema: mart_order_v1
+    projection:
+      - {field: order_id, column: order_id}
+      - {field: business_date, column: business_date}
+      - {field: precise_amount, column: precise_amount}
+      - {field: local_time, column: local_time}
+      - {field: instant_time, column: instant_time}
+    grain: [order_id]
+scopes:
+  daily_scope:
+    parameters:
+      business_date: {type: {kind: date}}
+    bindings:
+      reference_orders: {column: business_date, operator: eq, parameter: business_date}
+      mart_orders: {column: business_date, operator: eq, parameter: business_date}
+    null_partition: reject
+checks:
+  daily_orders:
+    revision: 1
+    invariant: row_equivalence
+    reference: reference_orders
+    target: mart_orders
+    comparison_schema: mart_order_v1
+    key: [order_id]
+    scope_ref: daily_scope
+    consistency_policy: immutable_mart_cut
+    assurance_policy: fingerprint_allowed
+consistency:
+  immutable_mart_cut:
+    minimum_evidence: asserted
+    alignment_fields: [business_date, source_cut]
+    late_arrivals: next_batch
+    datasets:
+      reference_orders:
+        readiness:
+          kind: relation_manifest
+          relation:
+            {catalog: null, schema: warehouse_control, name: batch_manifest}
+          columns:
+            dataset_id: dataset_id
+            scope_digest: scope_digest
+            batch_id: batch_id
+            state: state
+            business_date: business_date
+            source_cut: source_cut
+            dataset_version: dataset_version
+            completed_at: completed_at
+        stable_read: {kind: transaction_snapshot}
+      mart_orders:
+        readiness:
+          kind: relation_manifest
+          relation:
+            {catalog: null, schema: control, name: immutable_version_readiness}
+          columns:
+            dataset_id: dataset_id
+            scope_digest: scope_digest
+            batch_id: batch_id
+            state: state
+            business_date: business_date
+            source_cut: source_cut
+            dataset_version: dataset_version
+            completed_at: completed_at
+        stable_read: {kind: immutable_named_version}
+execution:
+  version: 1
+  max_queries: 100
+  max_fetched_records: 10000
+  max_application_result_bytes: 1048576
+  max_evidence_rows: 100
+  max_evidence_bytes: 1048576
+  max_fingerprint_nodes: 1000
+  max_coordinator_memory_bytes: 8388608
+  max_depth: 8
+  max_full_scans_per_side: 20
+  statement_timeout_milliseconds: 29000
+  run_timeout_milliseconds: 300000
+  max_attempts: 1
+  max_checks_concurrency: 1
+  max_source_concurrency: 1
+metadata:
+  connection: metadata_pg
+evidence:
+  sql_capture: disabled
+  ddl_capture: enabled
+  fields:
+    order_id: store
+    business_date: omit
+    precise_amount: store
+    local_time: store
+    instant_time: store
+  unspecified_fields: omit

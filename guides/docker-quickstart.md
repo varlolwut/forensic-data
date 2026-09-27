@@ -105,3 +105,13 @@ must be read-only; the metadata runtime login needs both writer and reader capab
 The standalone CLI and orchestrators may continue to use `env:NAME` references. The generated demo
 PostgreSQL DSNs use `sslmode=disable` only on the private local Compose network; use the
 organization's required TLS mode and certificates for external endpoints.
+
+For a ClickHouse target, authenticate the immutable-version manifest through your release process,
+then mount it and the strict JSON connection secret as independent read-only inputs into the
+one-shot check service. DFE checks the expected issuer and records the manifest digest; it does not
+verify signatures. When `ca_cert` is not `null`, also mount that CA bundle read-only. Pass the
+manifest's container path and trusted issuer through
+`--target-manifest /run/manifests/<version>.json` and `--target-manifest-issuer <issuer>`. Absolute
+CA and manifest paths are resolved inside the container, not on the Docker host. See
+[ClickHouse target inputs](cli-and-contracts.md#clickhouse-target-inputs) for the exact JSON fields,
+contract requirements, and complete command shape.

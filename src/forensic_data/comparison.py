@@ -18,6 +18,28 @@ from forensic_data.canonical import (
     LogicalType,
     TimestampParameters,
 )
+from forensic_data.clickhouse import (
+    ClickHouseAttemptDeadlineExceededError,
+    ClickHouseCancellationUnconfirmedError,
+    ClickHouseDataValidationError,
+    ClickHouseQueryCompletion,
+    ClickHouseQueryError,
+    ClickHouseResultLimitError,
+    ClickHouseTransportAttemptMismatchError,
+    ClickHouseTransportCleanupError,
+    ClickHouseTransportClosedError,
+    ClickHouseTransportError,
+    UnsupportedClickHouseProfileError,
+)
+from forensic_data.clickhouse_endpoint import (
+    ClickHouseProtectedContextCleanupError,
+    ClickHouseProtectedContextClosedError,
+    ClickHouseProtectedContextConfirmationError,
+    ClickHouseProtectedContextLostError,
+    ClickHouseProtectedContextState,
+    ClickHouseProtectedReadContext,
+    ClickHouseProtectedRelationInspection,
+)
 from forensic_data.contracts.model import (
     Adapter,
     AssurancePolicy,
@@ -155,12 +177,14 @@ type ComparisonReadContext = (
     | MssqlProtectedReadContext
     | GreengageProtectedReadContext
     | OriginalGreenplumProtectedReadContext
+    | ClickHouseProtectedReadContext
 )
 type ComparisonRelation = (
     PostgresProtectedRelationInspection
     | MssqlInspectedRelation
     | GreengageProtectedRelationInspection
     | OriginalGreenplumProtectedRelationInspection
+    | ClickHouseProtectedRelationInspection
 )
 
 
@@ -518,19 +542,24 @@ class PartialComparisonArtifact:
             raise ValueError("partial comparison requires both protected context identities")
         if self.consistency.stable_reads not in (
             ConsistencyLevel.UNKNOWN,
+            ConsistencyLevel.ASSERTED,
             ConsistencyLevel.VERIFIED,
         ):
-            raise ValueError("partial comparison cannot invent asserted stable-read proof")
+            raise ValueError("partial comparison has an unsupported stable-read evidence level")
         if self.consistency.cut_alignment not in (
             ConsistencyLevel.UNKNOWN,
             ConsistencyLevel.VERIFIED,
         ):
             raise ValueError("partial comparison cannot invent asserted cut-alignment proof")
         if (
-            self.consistency.stable_reads is ConsistencyLevel.VERIFIED
+            self.consistency.stable_reads
+            in (
+                ConsistencyLevel.ASSERTED,
+                ConsistencyLevel.VERIFIED,
+            )
             and self.consistency.cut_alignment is not ConsistencyLevel.VERIFIED
         ):
-            raise ValueError("verified partial stable reads require a verified aligned cut")
+            raise ValueError("known partial stable reads require a verified aligned cut")
         if self.guarantee is not Guarantee.NOT_ESTABLISHED:
             raise ValueError("partial comparison requires not_established guarantee")
         _require_instance(
@@ -562,6 +591,7 @@ type ComparisonInterruptionCause = (
     | PostgresConnectorError
     | MssqlTransportError
     | GreenplumConnectorError
+    | ClickHouseTransportError
 )
 
 
@@ -1037,6 +1067,7 @@ def execute_integer_key_comparison(
         PostgresConnectorError,
         MssqlTransportError,
         GreenplumConnectorError,
+        ClickHouseTransportError,
     ) as cause:
         artifact = _partial_comparison_artifact(
             check,
@@ -1483,7 +1514,10 @@ def _execute_postgres_integer_key_comparison(
         input_cut_digest=input_cut.input_cut_digest,
         verdict=verdict,
         consistency=ConsistencyStatus(
-            stable_reads=ConsistencyLevel.VERIFIED,
+            stable_reads=_completed_stable_read_level(
+                reference_context,
+                target_context,
+            ),
             cut_alignment=ConsistencyLevel.VERIFIED,
             read_context_ids=(
                 reference_context.evidence.context_id,
@@ -1594,10 +1628,10 @@ def _partial_comparison_artifact(
             else Verdict.INCONCLUSIVE
         ),
         consistency=ConsistencyStatus(
-            stable_reads=(
-                ConsistencyLevel.VERIFIED
-                if progress.summaries_verified
-                else ConsistencyLevel.UNKNOWN
+            stable_reads=_comparison_stable_read_level(
+                reference_context,
+                target_context,
+                progress.summaries_verified,
             ),
             cut_alignment=ConsistencyLevel.VERIFIED,
             read_context_ids=(
@@ -1732,6 +1766,25 @@ def _interruption_reason_code(cause: ComparisonInterruptionCause) -> ReasonCode:
     if isinstance(
         cause,
         (
+            ClickHouseCancellationUnconfirmedError,
+            ClickHouseTransportCleanupError,
+            ClickHouseProtectedContextCleanupError,
+        ),
+    ):
+        return ReasonCode.CANCELLATION_UNCONFIRMED
+    if isinstance(cause, ClickHouseQueryError):
+        if cause.completion is ClickHouseQueryCompletion.CANCELLED:
+            return ReasonCode.CANCELLED
+        if cause.completion is ClickHouseQueryCompletion.UNCONFIRMED:
+            return ReasonCode.CANCELLATION_UNCONFIRMED
+    if isinstance(cause, ClickHouseAttemptDeadlineExceededError):
+        if cause.completion is ClickHouseQueryCompletion.UNCONFIRMED:
+            return ReasonCode.CANCELLATION_UNCONFIRMED
+        if cause.completion is ClickHouseQueryCompletion.CANCELLED:
+            return ReasonCode.CANCELLED
+    if isinstance(
+        cause,
+        (
             ComparisonBudgetExceededError,
             GreengageBudgetExceededError,
             OriginalGreenplumBudgetExceededError,
@@ -1740,6 +1793,8 @@ def _interruption_reason_code(cause: ComparisonInterruptionCause) -> ReasonCode:
             PostgresResultLimitError,
             PostgresSourceBudgetExceededError,
             MssqlResultLimitError,
+            ClickHouseAttemptDeadlineExceededError,
+            ClickHouseResultLimitError,
         ),
     ):
         return ReasonCode.BUDGET_EXHAUSTED
@@ -1757,6 +1812,8 @@ def _interruption_reason_code(cause: ComparisonInterruptionCause) -> ReasonCode:
             GreenplumContextLostError,
             GreengageAcquisitionRaceError,
             OriginalGreenplumAcquisitionRaceError,
+            ClickHouseProtectedContextLostError,
+            ClickHouseProtectedContextConfirmationError,
         ),
     ):
         return ReasonCode.SNAPSHOT_LOST
@@ -1770,6 +1827,7 @@ def _interruption_reason_code(cause: ComparisonInterruptionCause) -> ReasonCode:
             UnsupportedMssqlProfileError,
             UnsupportedGreenplumProfileError,
             GreenplumMetadataError,
+            UnsupportedClickHouseProfileError,
         ),
     ):
         return ReasonCode.UNSUPPORTED_CAPABILITY
@@ -1785,6 +1843,10 @@ def _interruption_reason_code(cause: ComparisonInterruptionCause) -> ReasonCode:
             MssqlQueryContextError,
             GreenplumContextClosedError,
             GreenplumDataValidationError,
+            ClickHouseTransportClosedError,
+            ClickHouseTransportAttemptMismatchError,
+            ClickHouseDataValidationError,
+            ClickHouseProtectedContextClosedError,
         ),
     ):
         return ReasonCode.PROTOCOL_VIOLATION
@@ -1795,6 +1857,7 @@ def _interruption_reason_code(cause: ComparisonInterruptionCause) -> ReasonCode:
             MssqlTransportError,
             GreenplumConnectionError,
             GreenplumQueryError,
+            ClickHouseTransportError,
         ),
     ):
         return ReasonCode.QUERY_ERROR
@@ -1828,6 +1891,30 @@ def _without_mismatch_witness(
     return tuple(item for item in witnesses if item.segment.segment_sequence != segment_sequence)
 
 
+def comparison_max_encoded_row_bytes(
+    budgets: ExecutionBudgets,
+    member_count: int,
+) -> int:
+    maximum_segment_id_bytes = len(f"s{max(0, budgets.max_fingerprint_nodes - 1)}".encode("ascii"))
+    available_exact_bytes = min(
+        budgets.max_application_result_bytes,
+        INT64_MAX,
+    )
+    max_encoded_row_bytes = (
+        available_exact_bytes
+        - _MAX_INT64_KEY_ENVELOPE_BYTES
+        - maximum_segment_id_bytes
+        - _EXACT_STATUS_BYTES
+        - _provenance_bytes(member_count)
+        - _HAS_DATA_BYTES
+    )
+    if max_encoded_row_bytes < 1:
+        raise ComparisonBudgetExceededError(
+            "application-result budget cannot hold one canonical exact row"
+        )
+    return max_encoded_row_bytes
+
+
 def _validate_inputs(
     reference_context: ComparisonReadContext,
     reference_relation: ComparisonRelation,
@@ -1842,13 +1929,23 @@ def _validate_inputs(
         check.reference.connection.adapter,
         check.target.connection.adapter,
     )
+    if Adapter.CLICKHOUSE in adapter_pair and adapter_pair not in (
+        (Adapter.POSTGRESQL, Adapter.CLICKHOUSE),
+        (Adapter.MSSQL, Adapter.CLICKHOUSE),
+        (Adapter.GREENPLUM, Adapter.CLICKHOUSE),
+    ):
+        raise UnsupportedComparisonError(
+            "ClickHouse is supported only as a target for PostgreSQL, SQL Server, or "
+            "original Greenplum references"
+        )
     if Adapter.GREENPLUM in adapter_pair and adapter_pair not in (
         (Adapter.GREENPLUM, Adapter.POSTGRESQL),
         (Adapter.GREENPLUM, Adapter.GREENGAGE),
+        (Adapter.GREENPLUM, Adapter.CLICKHOUSE),
     ):
         raise UnsupportedComparisonError(
             "original Greenplum is supported only as a reference source with a PostgreSQL or "
-            "Greengage target"
+            "Greengage or ClickHouse target"
         )
     if len(check.key) != 1:
         raise UnsupportedComparisonError(
@@ -1878,6 +1975,8 @@ def _validate_inputs(
         raise ComparisonProtocolError("reference protected read context must be active")
     if not _comparison_context_is_active(target_context):
         raise ComparisonProtocolError("target protected read context must be active")
+    _context_stable_read_level(reference_context)
+    _context_stable_read_level(target_context)
     if not any(item is reference_relation for item in reference_context.protected_relations):
         raise ComparisonProtocolError(
             "reference relation inspection does not belong to the exact protected context"
@@ -1910,8 +2009,9 @@ def _validate_inputs(
             f"required_per_side={required_summary_scans}, "
             f"max_full_scans_per_side={budgets.max_full_scans_per_side}"
         )
-    for direction, consistency in zip(
+    for direction, dataset, consistency in zip(
         ("reference", "target"),
+        (check.reference, check.target),
         check.consistency.datasets,
         strict=True,
     ):
@@ -1919,9 +2019,14 @@ def _validate_inputs(
             raise UnsupportedComparisonError(
                 f"{direction} comparison requires relation-manifest readiness"
             )
-        if consistency.stable_read is not StableReadKind.TRANSACTION_SNAPSHOT:
+        expected_stable_read = (
+            StableReadKind.IMMUTABLE_NAMED_VERSION
+            if dataset.connection.adapter is Adapter.CLICKHOUSE
+            else StableReadKind.TRANSACTION_SNAPSHOT
+        )
+        if consistency.stable_read is not expected_stable_read:
             raise UnsupportedComparisonError(
-                f"{direction} comparison requires transaction-snapshot stable reads"
+                f"{direction} comparison requires {expected_stable_read.value} stable reads"
             )
     expected_scope = tuple(
         (parameter.name, parameter.field) for parameter in check.scope.parameters
@@ -1934,23 +2039,10 @@ def _validate_inputs(
     reference_scope = _scope_predicate_for_dataset(check, scope, check.reference)
     target_scope = _scope_predicate_for_dataset(check, scope, check.target)
     _validate_input_cut(check, scope, input_cut)
-    maximum_segment_id_bytes = len(f"s{max(0, budgets.max_fingerprint_nodes - 1)}".encode("ascii"))
-    available_exact_bytes = min(
-        budgets.max_application_result_bytes,
-        INT64_MAX,
+    max_encoded_row_bytes = comparison_max_encoded_row_bytes(
+        budgets,
+        max(reference_member_count, target_member_count),
     )
-    max_encoded_row_bytes = (
-        available_exact_bytes
-        - _MAX_INT64_KEY_ENVELOPE_BYTES
-        - maximum_segment_id_bytes
-        - _EXACT_STATUS_BYTES
-        - _provenance_bytes(max(reference_member_count, target_member_count))
-        - _HAS_DATA_BYTES
-    )
-    if max_encoded_row_bytes < 1:
-        raise ComparisonBudgetExceededError(
-            "application-result budget cannot hold one canonical exact row"
-        )
     return _ValidatedInputs(
         key_field_index=key_field_index,
         reference_scope=reference_scope,
@@ -1981,6 +2073,34 @@ def _validate_dataset_relation(
         raise UnsupportedComparisonError(
             f"{direction} integer-range comparison has an unsupported relation scope"
         )
+    if isinstance(relation, ClickHouseProtectedRelationInspection):
+        if direction != "target":
+            raise ComparisonProtocolError(
+                "ClickHouse protected inspection is supported only on the target side"
+            )
+        if dataset.connection.adapter is not Adapter.CLICKHOUSE:
+            raise ComparisonProtocolError(
+                f"{direction} ClickHouse inspection is bound to a non-ClickHouse dataset"
+            )
+        if dataset.locator.relation_scope is not RelationScope.PHYSICAL_ONLY:
+            raise UnsupportedComparisonError(
+                f"{direction} ClickHouse comparison requires physical_only relation scope"
+            )
+        expected_relation = (dataset.locator.schema, dataset.locator.name)
+        if relation.acquisition.relation.components != expected_relation:
+            raise ComparisonProtocolError(
+                f"{direction} ClickHouse acquisition does not match the contract relation"
+            )
+        if relation.acquisition.schema != dataset.logical_schema.schema:
+            raise ComparisonProtocolError(
+                f"{direction} ClickHouse acquisition schema does not match the dataset schema"
+            )
+        expected_columns = tuple(item.column_name for item in dataset.projection)
+        if relation.acquisition.column_names != expected_columns:
+            raise ComparisonProtocolError(
+                f"{direction} ClickHouse acquisition projection does not match the dataset"
+            )
+        return
     if isinstance(relation, MssqlInspectedRelation):
         if dataset.connection.adapter is not Adapter.MSSQL:
             raise ComparisonProtocolError(
@@ -2196,7 +2316,10 @@ def _completed_structural_artifact(
         input_cut_digest=input_cut.input_cut_digest,
         verdict=Verdict.MISMATCH,
         consistency=ConsistencyStatus(
-            stable_reads=ConsistencyLevel.VERIFIED,
+            stable_reads=_completed_stable_read_level(
+                reference_context,
+                target_context,
+            ),
             cut_alignment=ConsistencyLevel.VERIFIED,
             read_context_ids=(
                 reference_context.evidence.context_id,
@@ -2298,8 +2421,11 @@ def _unavailable_contract_totals() -> ComparisonTotals:
 
 
 def _validate_structural_artifact(artifact: CompletedStructuralComparisonArtifact) -> None:
-    if artifact.consistency.stable_reads is not ConsistencyLevel.VERIFIED:
-        raise ValueError("completed structural comparison requires verified stable reads")
+    if artifact.consistency.stable_reads not in (
+        ConsistencyLevel.ASSERTED,
+        ConsistencyLevel.VERIFIED,
+    ):
+        raise ValueError("completed structural comparison requires known stable reads")
     if artifact.consistency.cut_alignment is not ConsistencyLevel.VERIFIED:
         raise ValueError("completed structural comparison requires verified cut alignment")
     if len(artifact.consistency.read_context_ids) != 2:
@@ -2454,7 +2580,10 @@ def _fingerprint_full_scans(
     range_count: int,
     physical_scan_count: int,
 ) -> int:
-    if isinstance(context, GreengageProtectedReadContext):
+    if isinstance(
+        context,
+        (GreengageProtectedReadContext, ClickHouseProtectedReadContext),
+    ):
         return physical_scan_count
     return range_count * physical_scan_count
 
@@ -2488,6 +2617,21 @@ def _read_integer_key_summary(
     deadline: PostgresReadDeadline,
     full_scans: int,
 ) -> PostgresIntegerKeySummaryRead:
+    if isinstance(context, ClickHouseProtectedReadContext):
+        if not isinstance(relation, ClickHouseProtectedRelationInspection):
+            raise ComparisonProtocolError(
+                "ClickHouse comparison context received a relation from another engine"
+            )
+        return context.read_integer_key_summary(
+            relation,
+            key_field_index,
+            scope,
+            max_encoded_envelope_bytes,
+            max_record_bytes,
+            max_total_bytes,
+            deadline,
+            full_scans,
+        )
     if isinstance(context, PostgresProtectedReadContext):
         if not isinstance(relation, PostgresProtectedRelationInspection):
             raise ComparisonProtocolError(
@@ -2695,6 +2839,22 @@ def _read_integer_range_fingerprints(
     deadline: PostgresReadDeadline,
     full_scans: int,
 ) -> PostgresRangeFingerprintRead:
+    if isinstance(context, ClickHouseProtectedReadContext):
+        if not isinstance(relation, ClickHouseProtectedRelationInspection):
+            raise ComparisonProtocolError(
+                "ClickHouse comparison context received a relation from another engine"
+            )
+        return context.read_integer_range_fingerprints(
+            relation,
+            key_field_index,
+            scope,
+            ranges,
+            max_encoded_envelope_bytes,
+            max_record_bytes,
+            max_total_bytes,
+            deadline,
+            full_scans,
+        )
     if isinstance(context, PostgresProtectedReadContext):
         if not isinstance(relation, PostgresProtectedRelationInspection):
             raise ComparisonProtocolError(
@@ -2939,6 +3099,23 @@ def _read_integer_range_rows(
     deadline: PostgresReadDeadline,
     full_scans: int,
 ) -> PostgresIntegerExactRowsRead:
+    if isinstance(context, ClickHouseProtectedReadContext):
+        if not isinstance(relation, ClickHouseProtectedRelationInspection):
+            raise ComparisonProtocolError(
+                "ClickHouse comparison context received a relation from another engine"
+            )
+        return context.read_integer_range_rows(
+            relation,
+            key_field_index,
+            scope,
+            ranges,
+            max_encoded_envelope_bytes,
+            max_records,
+            max_record_bytes,
+            max_total_bytes,
+            deadline,
+            full_scans,
+        )
     if isinstance(context, PostgresProtectedReadContext):
         if not isinstance(relation, PostgresProtectedRelationInspection):
             raise ComparisonProtocolError(
@@ -3929,6 +4106,8 @@ def _exact_frontier_reservation(
         target_member_count,
         target_physical_scan_count,
     )
+    if isinstance(target_context, ClickHouseProtectedReadContext):
+        target = replace(target, full_scans=target_physical_scan_count)
     if (
         isinstance(reference_context, MssqlProtectedReadContext)
         and reference_context.runtime_profile is MssqlRuntimeProfile.MSSQL_2022
@@ -4237,6 +4416,7 @@ def _require_comparison_context(
             MssqlProtectedReadContext,
             GreengageProtectedReadContext,
             OriginalGreenplumProtectedReadContext,
+            ClickHouseProtectedReadContext,
         ),
     ):
         raise TypeError(f"{context} must be a supported protected read context")
@@ -4254,6 +4434,7 @@ def _require_comparison_relation(
             MssqlInspectedRelation,
             GreengageProtectedRelationInspection,
             OriginalGreenplumProtectedRelationInspection,
+            ClickHouseProtectedRelationInspection,
         ),
     ):
         raise TypeError(f"{context} must be a supported protected relation inspection")
@@ -4261,6 +4442,8 @@ def _require_comparison_relation(
 
 
 def _comparison_context_is_active(context: ComparisonReadContext) -> bool:
+    if isinstance(context, ClickHouseProtectedReadContext):
+        return context.state is ClickHouseProtectedContextState.ACTIVE
     if isinstance(context, PostgresProtectedReadContext):
         return context.state is ReadContextState.ACTIVE
     if isinstance(context, GreengageProtectedReadContext):
@@ -4270,7 +4453,55 @@ def _comparison_context_is_active(context: ComparisonReadContext) -> bool:
     return context.state is MssqlReadContextState.ACTIVE
 
 
+def _comparison_stable_read_level(
+    reference_context: ComparisonReadContext,
+    target_context: ComparisonReadContext,
+    reads_established: bool,
+) -> ConsistencyLevel:
+    if not reads_established:
+        return ConsistencyLevel.UNKNOWN
+    levels = tuple(
+        _context_stable_read_level(context) for context in (reference_context, target_context)
+    )
+    if ConsistencyLevel.UNKNOWN in levels:
+        return ConsistencyLevel.UNKNOWN
+    if ConsistencyLevel.ASSERTED in levels:
+        return ConsistencyLevel.ASSERTED
+    return ConsistencyLevel.VERIFIED
+
+
+def _completed_stable_read_level(
+    reference_context: ComparisonReadContext,
+    target_context: ComparisonReadContext,
+) -> ConsistencyLevel:
+    stable_reads = _comparison_stable_read_level(
+        reference_context,
+        target_context,
+        True,
+    )
+    if stable_reads is ConsistencyLevel.UNKNOWN:
+        raise ComparisonProtocolError(
+            "completed comparison cannot publish after protected read context evidence was lost"
+        )
+    return stable_reads
+
+
+def _context_stable_read_level(context: ComparisonReadContext) -> ConsistencyLevel:
+    if not _comparison_context_is_active(context):
+        return ConsistencyLevel.UNKNOWN
+    if not isinstance(context, ClickHouseProtectedReadContext):
+        return ConsistencyLevel.VERIFIED
+    consistency_level = context.evidence.consistency_level
+    if consistency_level is not ConsistencyLevel.ASSERTED:
+        raise ComparisonProtocolError(
+            "ClickHouse immutable named-version evidence must remain explicitly asserted"
+        )
+    return consistency_level
+
+
 def _relation_member_count(relation: ComparisonRelation) -> int:
+    if isinstance(relation, ClickHouseProtectedRelationInspection):
+        return 1
     if isinstance(relation, PostgresProtectedRelationInspection):
         return len(relation.query_relations())
     if isinstance(relation, GreengageProtectedRelationInspection):
@@ -4287,6 +4518,7 @@ def _aggregate_presence_bytes(relation: ComparisonRelation) -> int:
             PostgresProtectedRelationInspection,
             GreengageProtectedRelationInspection,
             OriginalGreenplumProtectedRelationInspection,
+            ClickHouseProtectedRelationInspection,
         ),
     ):
         return 0
@@ -4294,6 +4526,8 @@ def _aggregate_presence_bytes(relation: ComparisonRelation) -> int:
 
 
 def _relation_physical_scan_count(relation: ComparisonRelation) -> int:
+    if isinstance(relation, ClickHouseProtectedRelationInspection):
+        return relation.physical_scan_count()
     if isinstance(relation, PostgresProtectedRelationInspection):
         return relation.physical_scan_count()
     if isinstance(relation, GreengageProtectedRelationInspection):

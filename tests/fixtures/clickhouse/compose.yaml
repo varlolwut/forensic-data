@@ -54,6 +54,7 @@ services:
           --database dfe_fixture
           --query="SELECT
           version() = '26.8.6.5'
+          AND (SELECT value FROM system.build_options WHERE name = 'VERSION_INTEGER') = '26008006'
           AND getSetting('readonly') = 1
           AND getSetting('cancel_http_readonly_queries_on_client_close') = 1
           AND getSetting('max_memory_usage') = 268435456
@@ -78,10 +79,11 @@ services:
           AND (SELECT count() FROM canonical_key_groups) = 5
           AND (SELECT count() FROM canonical_null_key) = 1
           AND (SELECT count() FROM canonical_group_overflow) = 5
-          AND (SELECT count() FROM immutable_version_readiness) = 2
+          AND (SELECT count() FROM immutable_version_readiness) = 3
           AND (SELECT count() FROM immutable_orders_staging) = 3
           AND (SELECT count() FROM immutable_orders_v001) = 2
           AND (SELECT count() FROM immutable_orders_v002) = 3
+          AND (SELECT count() FROM comparison_orders_v001) = 4
           AND (SELECT count() FROM logical_orders_v001) = 5
           AND (SELECT count() FROM logical_orders_v001 FINAL) = 3
           AND (SELECT count() FROM system.row_policies WHERE database = 'system') = 0
@@ -100,6 +102,18 @@ services:
           AND position(engine_full, 'table_readonly = 1') > 0
           FROM system.tables
           WHERE database = 'dfe_fixture' AND name = 'logical_orders_v001'")" = "1"
+          && test "$$(clickhouse-client
+          --user dfe_fixture_reader
+          --password "$${DFE_CLICKHOUSE_READER_PASSWORD}"
+          --database dfe_fixture
+          --query="SELECT
+          uuid = toUUID('44444444-4444-4444-8444-444444444444')
+          AND engine = 'MergeTree'
+          AND sorting_key = 'order_id'
+          AND partition_key = ''
+          AND position(engine_full, 'table_readonly = 1') > 0
+          FROM system.tables
+          WHERE database = 'dfe_fixture' AND name = 'comparison_orders_v001'")" = "1"
           && test "$$(clickhouse-client
           --user dfe_fixture_writer
           --password "$${DFE_CLICKHOUSE_WRITER_PASSWORD}"

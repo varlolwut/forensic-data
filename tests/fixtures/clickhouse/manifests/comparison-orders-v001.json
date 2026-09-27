@@ -1,0 +1,20 @@
+{
+  "version": 1,
+  "issuer": "dfe_fixture_loader",
+  "dataset_id": "clickhouse_target_orders",
+  "scope_digest": "13da3e93058f4e53db4d7989380a57597b0fb5a86dc0e9a80ae33bd1b11f9897",
+  "expected_batch_id": "comparison-orders-2024-02-29-v001",
+  "business_date": "2024-02-29",
+  "source_cut": "comparison-orders-cut-000001",
+  "dataset_version": "comparison_orders_v001",
+  "completed_at": "2024-03-01T01:02:03.456789Z",
+  "completion_revision": 7,
+  "publication_revision": 11,
+  "version_locator": {
+    "database": "dfe_fixture",
+    "table": "comparison_orders_v001",
+    "uuid": "44444444-4444-4444-8444-444444444444"
+  },
+  "immutability": "asserted",
+  "late_arrivals": "next_batch"
+}

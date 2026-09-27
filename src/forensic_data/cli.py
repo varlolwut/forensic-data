@@ -22,11 +22,14 @@ from forensic_data.application import (
     DiffRequest,
     ExecuteCheckRequest,
     HistoryRequest,
+    MssqlClickHouseExecutionServices,
     MssqlGreengageExecutionServices,
     MssqlPostgresExecutionServices,
+    OriginalGreenplumClickHouseExecutionServices,
     OriginalGreenplumGreengageExecutionServices,
     OriginalGreenplumPostgresExecutionServices,
     PlanCheckRequest,
+    PostgresClickHouseExecutionServices,
     PostgresExecutionServices,
     PostgresGreengageExecutionServices,
     PostgresMetadataServices,
@@ -42,6 +45,17 @@ from forensic_data.canonical import (
     LogicalType,
     TimestampParameters,
     decode_payload,
+)
+from forensic_data.clickhouse import (
+    ClickHouseConnectionSettings,
+    ClickHouseRetryPolicy,
+    ClickHouseTransportError,
+    ClickHouseTransportSecurity,
+)
+from forensic_data.clickhouse_limits import build_clickhouse_execution_limits
+from forensic_data.clickhouse_readiness import (
+    ClickHouseImmutableManifestError,
+    parse_clickhouse_immutable_version_manifest,
 )
 from forensic_data.contracts.compiler import load_contract_config
 from forensic_data.contracts.errors import ContractError
@@ -102,6 +116,7 @@ from forensic_data.result import (
 _ENV_SECRET_REF_PATTERN: Final[re.Pattern[str]] = re.compile(r"^env:([A-Za-z_][A-Za-z0-9_]*)$")
 _FILE_SECRET_REF_PREFIX: Final[str] = "file:"
 _MAX_SECRET_FILE_BYTES: Final[int] = 16_384
+_MAX_CLICKHOUSE_MANIFEST_BYTES: Final[int] = 1_048_576
 _REQUIRED_DSN_FIELDS: Final[frozenset[str]] = frozenset(
     {
         "host",
@@ -126,6 +141,19 @@ _REQUIRED_MSSQL_DSN_FIELDS: Final[frozenset[str]] = frozenset(
         "cancellation_acknowledgement_timeout",
     }
 )
+_REQUIRED_CLICKHOUSE_SECRET_FIELDS: Final[frozenset[str]] = frozenset(
+    {
+        "host",
+        "port",
+        "database",
+        "user",
+        "password",
+        "transport_security",
+        "ca_cert",
+        "connect_timeout_seconds",
+        "send_receive_timeout_seconds",
+    }
+)
 _CONNECTION_RETRY_DELAY_SECONDS: Final[float] = 1.0
 _CONNECTION_RETRY_ATTEMPTS: Final[int] = 3
 _MAX_PROTECTED_LOCK_TIMEOUT_MILLISECONDS: Final[int] = 5_000
@@ -146,6 +174,8 @@ _TRUSTED_ARGUMENT_NAMES: Final[frozenset[str]] = frozenset(
         "--scope-json",
         "--statement-timeout-milliseconds",
         "--target-batch",
+        "--target-manifest",
+        "--target-manifest-issuer",
     }
 )
 _STRUCTURAL_SUMMARY_PARAMETER_NAMES: Final[tuple[str, ...]] = (
@@ -188,6 +218,8 @@ class _Arguments(argparse.Namespace):
     output: str
     reference_batch: str
     target_batch: str
+    target_manifest: Path | None
+    target_manifest_issuer: str | None
     request_id: str
     limit: int
     cursor_json: str | None
@@ -226,6 +258,10 @@ def run_cli(
         return _write_error(stderr, output_json, "postgres_error", str(error))
     except GreenplumConnectorError as error:
         return _write_error(stderr, output_json, "greenplum_error", str(error))
+    except ClickHouseTransportError as error:
+        return _write_error(stderr, output_json, "clickhouse_error", str(error))
+    except ClickHouseImmutableManifestError as error:
+        return _write_error(stderr, output_json, "invalid_clickhouse_manifest", str(error))
     except ValidationError:
         return _write_error(
             stderr,
@@ -262,6 +298,15 @@ def _build_parser() -> _SafeArgumentParser:
         "--reference-batch", required=True, help="expected reference batch ID"
     )
     check_parser.add_argument("--target-batch", required=True, help="expected target batch ID")
+    check_parser.add_argument(
+        "--target-manifest",
+        type=Path,
+        help="absolute immutable-version manifest path for a ClickHouse target",
+    )
+    check_parser.add_argument(
+        "--target-manifest-issuer",
+        help="trusted issuer expected in the ClickHouse immutable-version manifest",
+    )
     check_parser.add_argument("--request-id", required=True, help="idempotency request UUID")
     _add_output_argument(check_parser)
 
@@ -393,7 +438,12 @@ def _run_check(
     )
     check = _find_check(config, request.check_id)
     services = _execution_services(
-        config, check.reference.connection, check.target.connection, environment
+        config,
+        check.reference.connection,
+        check.target.connection,
+        environment,
+        arguments.target_manifest,
+        arguments.target_manifest_issuer,
     )
     scope = resolve_scope_values(
         check,
@@ -689,6 +739,8 @@ def _execution_services(
     reference: ConnectionDefinition,
     target: ConnectionDefinition,
     environment: Mapping[str, str],
+    target_manifest_path: Path | None,
+    target_manifest_issuer: str | None,
 ) -> (
     PostgresExecutionServices
     | MssqlPostgresExecutionServices
@@ -696,13 +748,16 @@ def _execution_services(
     | MssqlGreengageExecutionServices
     | OriginalGreenplumPostgresExecutionServices
     | OriginalGreenplumGreengageExecutionServices
+    | PostgresClickHouseExecutionServices
+    | MssqlClickHouseExecutionServices
+    | OriginalGreenplumClickHouseExecutionServices
 ):
     statement_timeout = config.execution.statement_timeout_milliseconds
     if statement_timeout < 2:
         raise CliInputError(
             "execution statement_timeout_milliseconds must be at least 2 for protected reads"
         )
-    if target.adapter not in (Adapter.POSTGRESQL, Adapter.GREENGAGE):
+    if target.adapter not in (Adapter.POSTGRESQL, Adapter.GREENGAGE, Adapter.CLICKHOUSE):
         raise CliInputError(f"target connection adapter {target.adapter.value!r} is unsupported")
     if reference.adapter not in (Adapter.POSTGRESQL, Adapter.MSSQL, Adapter.GREENPLUM):
         raise CliInputError(
@@ -711,12 +766,6 @@ def _execution_services(
     metadata_record_bytes = min(
         config.execution.max_application_result_bytes,
         config.execution.max_coordinator_memory_bytes,
-    )
-    target_settings = _connection_settings(
-        target,
-        environment,
-        statement_timeout,
-        "dfe-cli-check-target",
     )
     metadata_settings = _connection_settings(
         config.metadata.connection,
@@ -727,6 +776,123 @@ def _execution_services(
     protected_lock_timeout_milliseconds = min(
         _MAX_PROTECTED_LOCK_TIMEOUT_MILLISECONDS,
         statement_timeout - 1,
+    )
+    if target.adapter is Adapter.CLICKHOUSE:
+        if target_manifest_path is None or target_manifest_issuer is None:
+            raise CliInputError(
+                "ClickHouse target execution requires --target-manifest and "
+                "--target-manifest-issuer"
+            )
+        manifest_issuer = _nonblank_argument_text(
+            target_manifest_issuer,
+            "ClickHouse target manifest issuer",
+        )
+        target_manifest = parse_clickhouse_immutable_version_manifest(
+            _read_clickhouse_manifest(target_manifest_path),
+            _MAX_CLICKHOUSE_MANIFEST_BYTES,
+        )
+        if target_manifest.issuer != manifest_issuer:
+            raise CliInputError(
+                "ClickHouse target manifest issuer does not match the independently trusted issuer"
+            )
+        target_settings = _clickhouse_connection_settings(
+            target,
+            environment,
+            "dfe-cli-check-target",
+        )
+        target_retry_policy = _clickhouse_retry_policy()
+        target_execution_limits = build_clickhouse_execution_limits(config.execution)
+        target_max_mutation_records = config.execution.max_fetched_records
+        target_max_tie_groups = config.execution.max_fetched_records
+        if reference.adapter is Adapter.GREENPLUM:
+            return OriginalGreenplumClickHouseExecutionServices(
+                reference_connection_id=reference.connection_id,
+                reference_settings=_connection_settings(
+                    reference,
+                    environment,
+                    statement_timeout,
+                    "dfe-cli-check-reference",
+                ),
+                target_connection_id=target.connection_id,
+                target_settings=target_settings,
+                metadata_connection_id=config.metadata.connection.connection_id,
+                metadata_settings=metadata_settings,
+                reference_retry_policy=_retry_policy(),
+                target_retry_policy=target_retry_policy,
+                metadata_retry_policy=_retry_policy(),
+                target_transport_limits=target_execution_limits.transport,
+                target_readiness_limits=target_execution_limits.readiness,
+                target_canonical_limits=target_execution_limits.canonical,
+                target_manifest=target_manifest,
+                target_expected_issuer=manifest_issuer,
+                target_max_mutation_records=target_max_mutation_records,
+                target_max_tie_groups=target_max_tie_groups,
+                protected_lock_timeout_milliseconds=protected_lock_timeout_milliseconds,
+                metadata_record_bytes=metadata_record_bytes,
+                metadata_total_bytes=config.execution.max_coordinator_memory_bytes,
+            )
+        if reference.adapter is Adapter.MSSQL:
+            return MssqlClickHouseExecutionServices(
+                reference_connection_id=reference.connection_id,
+                reference_settings=_mssql_connection_settings(
+                    reference,
+                    environment,
+                    "dfe-cli-check-reference",
+                ),
+                target_connection_id=target.connection_id,
+                target_settings=target_settings,
+                metadata_connection_id=config.metadata.connection.connection_id,
+                metadata_settings=metadata_settings,
+                reference_retry_policy=_mssql_retry_policy(),
+                target_retry_policy=target_retry_policy,
+                metadata_retry_policy=_retry_policy(),
+                target_transport_limits=target_execution_limits.transport,
+                target_readiness_limits=target_execution_limits.readiness,
+                target_canonical_limits=target_execution_limits.canonical,
+                target_manifest=target_manifest,
+                target_expected_issuer=manifest_issuer,
+                target_max_mutation_records=target_max_mutation_records,
+                target_max_tie_groups=target_max_tie_groups,
+                protected_lock_timeout_milliseconds=protected_lock_timeout_milliseconds,
+                metadata_record_bytes=metadata_record_bytes,
+                metadata_total_bytes=config.execution.max_coordinator_memory_bytes,
+            )
+        return PostgresClickHouseExecutionServices(
+            reference_connection_id=reference.connection_id,
+            reference_settings=_connection_settings(
+                reference,
+                environment,
+                statement_timeout,
+                "dfe-cli-check-reference",
+            ),
+            target_connection_id=target.connection_id,
+            target_settings=target_settings,
+            metadata_connection_id=config.metadata.connection.connection_id,
+            metadata_settings=metadata_settings,
+            reference_retry_policy=_retry_policy(),
+            target_retry_policy=target_retry_policy,
+            metadata_retry_policy=_retry_policy(),
+            target_transport_limits=target_execution_limits.transport,
+            target_readiness_limits=target_execution_limits.readiness,
+            target_canonical_limits=target_execution_limits.canonical,
+            target_manifest=target_manifest,
+            target_expected_issuer=manifest_issuer,
+            target_max_mutation_records=target_max_mutation_records,
+            target_max_tie_groups=target_max_tie_groups,
+            protected_lock_timeout_milliseconds=protected_lock_timeout_milliseconds,
+            metadata_record_bytes=metadata_record_bytes,
+            metadata_total_bytes=config.execution.max_coordinator_memory_bytes,
+        )
+    if target_manifest_path is not None or target_manifest_issuer is not None:
+        raise CliInputError(
+            "--target-manifest and --target-manifest-issuer are supported only for a "
+            "ClickHouse target"
+        )
+    target_settings = _connection_settings(
+        target,
+        environment,
+        statement_timeout,
+        "dfe-cli-check-target",
     )
     if reference.adapter is Adapter.GREENPLUM and target.adapter is Adapter.GREENGAGE:
         return OriginalGreenplumGreengageExecutionServices(
@@ -860,6 +1026,13 @@ def _mssql_retry_policy() -> MssqlRetryPolicy:
     )
 
 
+def _clickhouse_retry_policy() -> ClickHouseRetryPolicy:
+    return ClickHouseRetryPolicy(
+        max_attempts=_CONNECTION_RETRY_ATTEMPTS,
+        delay_seconds=_CONNECTION_RETRY_DELAY_SECONDS,
+    )
+
+
 def _metadata_services(
     config: LoadedContractConfig,
     environment: Mapping[str, str],
@@ -956,6 +1129,74 @@ def _mssql_connection_settings(
     )
 
 
+def _clickhouse_connection_settings(
+    connection: ConnectionDefinition,
+    environment: Mapping[str, str],
+    application_name: str,
+) -> ClickHouseConnectionSettings:
+    payload_text, source_description = _resolve_connection_secret(
+        connection.connection_id,
+        connection.secret_ref,
+        environment,
+    )
+    decoded = _decode_json(payload_text, "ClickHouse connection secret")
+    if type(decoded) is not dict:
+        raise CliInputError(
+            f"ClickHouse connection secret from {source_description} must be a JSON object"
+        )
+    values = cast(dict[str, object], decoded)
+    fields = frozenset(values)
+    missing = tuple(sorted(_REQUIRED_CLICKHOUSE_SECRET_FIELDS - fields))
+    unsupported = tuple(sorted(fields - _REQUIRED_CLICKHOUSE_SECRET_FIELDS))
+    if missing:
+        raise CliInputError(
+            f"ClickHouse connection secret from {source_description} is missing required "
+            f"fields: {', '.join(missing)}"
+        )
+    if unsupported:
+        raise CliInputError(
+            f"ClickHouse connection secret from {source_description} contains unsupported "
+            f"fields: {', '.join(unsupported)}"
+        )
+    try:
+        security = ClickHouseTransportSecurity(
+            _required_json_text(
+                values["transport_security"],
+                "ClickHouse transport_security",
+            )
+        )
+    except ValueError:
+        supported = ", ".join(item.value for item in ClickHouseTransportSecurity)
+        raise CliInputError(f"ClickHouse transport_security must be one of: {supported}") from None
+    try:
+        return ClickHouseConnectionSettings(
+            host=_required_json_text(values["host"], "ClickHouse host"),
+            port=_required_json_positive_integer(values["port"], "ClickHouse port"),
+            database=_required_json_text(values["database"], "ClickHouse database"),
+            user=_required_json_text(values["user"], "ClickHouse user"),
+            password=SecretStr(_required_json_text(values["password"], "ClickHouse password")),
+            transport_security=security,
+            ca_cert=_optional_json_absolute_path_text(
+                values["ca_cert"],
+                "ClickHouse CA certificate path",
+            ),
+            connect_timeout_seconds=_required_json_positive_integer(
+                values["connect_timeout_seconds"],
+                "ClickHouse connect timeout",
+            ),
+            send_receive_timeout_seconds=_required_json_positive_integer(
+                values["send_receive_timeout_seconds"],
+                "ClickHouse send/receive timeout",
+            ),
+            application_name=application_name,
+        )
+    except ValidationError:
+        raise CliInputError(
+            f"ClickHouse connection secret from {source_description} violates the strict "
+            "connection schema"
+        ) from None
+
+
 def _resolve_connection_secret(
     connection_id: str,
     secret_ref: str,
@@ -1030,6 +1271,32 @@ def _read_secret_file(path: Path, connection_id: str) -> str:
     return dsn
 
 
+def _read_clickhouse_manifest(path: Path) -> bytes:
+    if not path.is_absolute():
+        raise CliInputError("ClickHouse target manifest path must be absolute")
+    unavailable_message = "ClickHouse target manifest must be a readable regular file"
+    try:
+        path_mode = path.stat().st_mode
+    except (OSError, ValueError):
+        raise CliInputError(unavailable_message) from None
+    if not stat.S_ISREG(path_mode):
+        raise CliInputError(unavailable_message)
+    try:
+        with path.open("rb") as manifest_file:
+            if not stat.S_ISREG(os.fstat(manifest_file.fileno()).st_mode):
+                raise CliInputError(unavailable_message)
+            payload = manifest_file.read(_MAX_CLICKHOUSE_MANIFEST_BYTES + 1)
+    except OSError:
+        raise CliInputError(unavailable_message) from None
+    if len(payload) > _MAX_CLICKHOUSE_MANIFEST_BYTES:
+        raise CliInputError(
+            f"ClickHouse target manifest exceeds the {_MAX_CLICKHOUSE_MANIFEST_BYTES}-byte limit"
+        )
+    if not payload:
+        raise CliInputError("ClickHouse target manifest must not be empty")
+    return payload
+
+
 def _parse_postgres_dsn(dsn: str, source_description: str) -> dict[str, str]:
     try:
         values = conninfo_to_dict(dsn)
@@ -1096,6 +1363,33 @@ def _positive_integer(value: str, context: str) -> int:
     if parsed < 1:
         raise CliInputError(f"{context} must be a positive decimal integer")
     return parsed
+
+
+def _required_json_text(value: object, context: str) -> str:
+    if type(value) is not str or not value:
+        raise CliInputError(f"{context} must be non-empty text")
+    return value
+
+
+def _optional_json_absolute_path_text(value: object, context: str) -> str | None:
+    if value is None:
+        return None
+    text = _required_json_text(value, context)
+    if not Path(text).is_absolute():
+        raise CliInputError(f"{context} must be absolute when provided")
+    return text
+
+
+def _required_json_positive_integer(value: object, context: str) -> int:
+    if type(value) is not int or value < 1:
+        raise CliInputError(f"{context} must be a positive integer")
+    return value
+
+
+def _nonblank_argument_text(value: str, context: str) -> str:
+    if type(value) is not str or not value.strip():
+        raise CliInputError(f"{context} must be nonblank text")
+    return value
 
 
 def _positive_finite_float(value: str, context: str) -> float:

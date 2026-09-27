@@ -31,11 +31,12 @@ cannot be reused for another result.
 For every connection a command resolves, the CLI accepts endpoint secrets through an exact
 `env:NAME` or `file:/absolute/path` contract reference. Either source must contain one complete
 PostgreSQL DSN with `host`, `port`, `dbname`, `user`, `password`, `sslmode`, and `connect_timeout`,
-or one SQL Server DSN with the exact fields shown below. There is no raw-DSN command-line flag or
-provider fallback. A secret file must be a readable regular file of at most 16 KiB containing
-exactly one non-empty UTF-8 DSN line. Errors never print its path or contents. `plan` neither
-resolves secret references nor opens a connection. `history` and `diff` resolve only the metadata
-connection and never query a source or target endpoint.
+one SQL Server DSN with the exact fields shown below, or one exact ClickHouse JSON object as
+described in the next section. There is no raw-DSN command-line flag or provider fallback. A secret
+file must be a readable regular file of at most 16 KiB containing exactly one non-empty UTF-8 line.
+Errors never print its path or contents. `plan` neither resolves secret references nor opens a
+connection. `history` and `diff` resolve only the metadata connection and never query a source or
+target endpoint.
 
 ```text
 host=sql.example.internal port=1433 database=warehouse user=dfe_reader password='replace with secret value' tls_verification=verify-server-certificate login_timeout=5 query_timeout=30 cancellation_acknowledgement_timeout=5
@@ -49,6 +50,68 @@ record in the environment variable named by `env:NAME`, or in the one-line file 
 `file:/absolute/path`. The [mixed-engine fixture contract](../tests/fixtures/mssql-2022/comparison-contract.yaml)
 shows the SQL Server reference plus PostgreSQL target/metadata wiring and uses the same `forensics
 check` invocation shape shown above.
+
+### ClickHouse target inputs
+
+A ClickHouse target secret is strict JSON with exactly these fields:
+
+```json
+{"host":"clickhouse.example.internal","port":8443,"database":"mart","user":"dfe_reader","password":"replace with secret value","transport_security":"tls-verify","ca_cert":"/run/secrets/clickhouse-ca.pem","connect_timeout_seconds":5,"send_receive_timeout_seconds":30}
+```
+
+Use `transport_security: "tls-verify"` for a real endpoint. `ca_cert` is the CA bundle path visible
+inside the DFE container and must be absolute when provided, or `null` when the container's system
+trust store already contains the issuer. The only plaintext mode is `plaintext-local-fixture`,
+which is rejected for non-localhost hosts and requires `ca_cert: null`.
+
+Each ClickHouse check also requires the immutable-version manifest and its independently trusted
+issuer on the command line. The manifest path must be absolute inside the runtime environment, and
+the issuer is a nonblank identifier rather than a path:
+
+```console
+forensics check --config /run/config/contract.yaml --check daily_orders --scope-json '{"business_date":"2026-09-23"}' --reference-batch source-batch-42 --target-batch mart-v042 --target-manifest /run/manifests/mart-v042.json --target-manifest-issuer warehouse-release --request-id 7fa700c4-7c5d-42eb-8f55-50e372ed0e25 --output json
+```
+
+The [ClickHouse target example](../examples/clickhouse-target/contract.yaml) includes a matching
+[connection-secret template](../examples/clickhouse-target/clickhouse-secret.json.example) and
+[immutable manifest template](../examples/clickhouse-target/manifest.json.example). Replace the
+manifest template's scope digest with the `scope_digest` emitted by `forensics plan` for the exact
+scope before the version is published.
+
+The target contract must use adapter `clickhouse`, driver `clickhouse-connect`, profile
+`clickhouse_lts`, role `target`, a `physical_only` relation, relation-manifest readiness,
+`stable_read: immutable_named_version`, and explicit `minimum_evidence: asserted`. The manifest is
+bounded to 1 MiB. The durable target currently accepts a sealed plain `MergeTree` in an `Atomic`
+database; `ReplacingMergeTree` is not exposed by this endpoint. Readiness marked verified does not
+upgrade the stable-read claim: a ClickHouse immutable named version remains asserted, and
+publication succeeds only after a final same-attempt identity and projection confirmation.
+
+The ClickHouse reader needs `SELECT` on the target relations and on `system.build_options`,
+`system.mutations`, `system.parts`, `system.processes`, and `system.projections`, plus `SHOW ROW
+POLICIES ON *.*`. These read-only catalog grants let the adapter record exact server provenance and
+verify that no mutation or row-policy state invalidates the immutable-version claim.
+
+The example uses a 29,000 ms statement timeout beneath a 30-second ClickHouse
+`max_execution_time` ceiling. Keep the server ceiling at least one second above the rounded-up
+statement timeout so the adapter retains time to confirm or cancel the server query itself.
+
+The CLI and Python API share the same ClickHouse limit calculation. For Python integrations,
+derive the three target limits from the loaded contract's execution budgets:
+
+```python
+from forensic_data.clickhouse_limits import build_clickhouse_execution_limits
+
+limits = build_clickhouse_execution_limits(config.execution)
+```
+
+Pass `limits.transport`, `limits.readiness`, and `limits.canonical` as `target_transport_limits`,
+`target_readiness_limits`, and `target_canonical_limits` when constructing the matching
+`PostgresClickHouseExecutionServices`, `OriginalGreenplumClickHouseExecutionServices`, or
+`MssqlClickHouseExecutionServices`. Manually supplied limits must fit the transport capacity and
+the comparison's encoded-row requirement. Transport capacity is checked at service construction;
+for physical-only sources, row capacity is checked before metadata registration or source reads.
+For a PostgreSQL physical union, row capacity also depends on the discovered members and is checked
+after discovery. A rejected configuration does not silently widen or clamp the supplied limits.
 
 The metadata login used by `check` or `execute_check` must be a member of both
 `dfe_metadata_writer` and `dfe_metadata_reader`. The login used by `history`, `diff`,

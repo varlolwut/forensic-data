@@ -1,5 +1,5 @@
 from collections.abc import Mapping
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from datetime import UTC, datetime, timedelta
 from typing import Final, cast, final
 from uuid import UUID, uuid4
@@ -25,6 +25,45 @@ from forensic_data.canonical import (
     Normalization,
     TimestampParameters,
 )
+from forensic_data.clickhouse import (
+    ClickHouseAttemptDeadlineExceededError,
+    ClickHouseCancellationUnconfirmedError,
+    ClickHouseConnectionError,
+    ClickHouseConnectionSettings,
+    ClickHouseDataValidationError,
+    ClickHouseQueryError,
+    ClickHouseResultLimitError,
+    ClickHouseRetryPolicy,
+    ClickHouseTransportAttemptMismatchError,
+    ClickHouseTransportCleanupError,
+    ClickHouseTransportClosedError,
+    ClickHouseTransportError,
+    ClickHouseTransportLimits,
+    UnsupportedClickHouseProfileError,
+    required_clickhouse_ipc_message_bytes,
+)
+from forensic_data.clickhouse_canonical import ClickHouseCanonicalLimits
+from forensic_data.clickhouse_endpoint import (
+    ClickHouseProtectedContextCleanupError,
+    ClickHouseProtectedContextClosedError,
+    ClickHouseProtectedContextConfirmationError,
+    ClickHouseProtectedContextLostError,
+    ClickHouseProtectedContextState,
+    ClickHouseProtectedReadContext,
+    ClickHouseProtectedReadinessInspection,
+    ClickHouseProtectedRelationInspection,
+    open_clickhouse_protected_read_context,
+)
+from forensic_data.clickhouse_profile import (
+    ClickHouseRuntimeProfile,
+    match_clickhouse_runtime_profile,
+)
+from forensic_data.clickhouse_projection import ClickHouseProjectionRequest
+from forensic_data.clickhouse_readiness import (
+    ClickHouseImmutableVersionManifest,
+    ClickHouseImmutableVersionRequest,
+    ClickHouseReadinessLimits,
+)
 from forensic_data.comparison import (
     ComparisonBudgetExceededError,
     ComparisonInterruptedError,
@@ -34,6 +73,7 @@ from forensic_data.comparison import (
     CompletedStructuralComparisonArtifact,
     PartialComparisonArtifact,
     UnsupportedComparisonError,
+    comparison_max_encoded_row_bytes,
     execute_integer_key_comparison,
     partial_comparison_artifact_from_completed,
 )
@@ -43,11 +83,13 @@ from forensic_data.contracts.model import (
     ConsistencyDatasetDefinition,
     DatasetDefinition,
     LoadedContractConfig,
+    MinimumEvidence,
     ReadinessManifestColumns,
     RelationLocator,
     RelationManifestReadiness,
     RelationScope,
     RowCheckDefinition,
+    StableReadKind,
 )
 from forensic_data.greengage_endpoint import (
     GreengageAcquisitionRaceError,
@@ -127,6 +169,7 @@ from forensic_data.persistence.lifecycle import (
     RelationManifestObservationPersistence,
     RunAttemptRecord,
     claim_postgres_run,
+    close_postgres_clickhouse_read_context,
     close_postgres_read_context,
     completed_comparison_persistence_from_artifact,
     completed_structural_comparison_persistence_from_artifact,
@@ -219,11 +262,14 @@ __all__: Final[tuple[str, ...]] = (
     "DiffRequest",
     "ExecuteCheckRequest",
     "HistoryRequest",
+    "MssqlClickHouseExecutionServices",
     "MssqlGreengageExecutionServices",
     "MssqlPostgresExecutionServices",
+    "OriginalGreenplumClickHouseExecutionServices",
     "OriginalGreenplumGreengageExecutionServices",
     "OriginalGreenplumPostgresExecutionServices",
     "PlanCheckRequest",
+    "PostgresClickHouseExecutionServices",
     "PostgresExecutionServices",
     "PostgresGreengageExecutionServices",
     "PostgresMetadataServices",
@@ -613,6 +659,230 @@ class MssqlGreengageExecutionServices:
             raise ValueError("metadata record bytes cannot exceed metadata total bytes")
 
 
+@final
+@dataclass(frozen=True, slots=True)
+class PostgresClickHouseExecutionServices:
+    reference_connection_id: str
+    reference_settings: PostgresConnectionSettings
+    target_connection_id: str
+    target_settings: ClickHouseConnectionSettings
+    metadata_connection_id: str
+    metadata_settings: PostgresConnectionSettings
+    reference_retry_policy: PostgresRetryPolicy
+    target_retry_policy: ClickHouseRetryPolicy
+    metadata_retry_policy: PostgresRetryPolicy
+    protected_lock_timeout_milliseconds: int
+    target_transport_limits: ClickHouseTransportLimits
+    target_readiness_limits: ClickHouseReadinessLimits
+    target_canonical_limits: ClickHouseCanonicalLimits
+    target_manifest: ClickHouseImmutableVersionManifest
+    target_expected_issuer: str
+    target_max_mutation_records: int
+    target_max_tie_groups: int
+    metadata_record_bytes: int
+    metadata_total_bytes: int
+
+    def __post_init__(self) -> None:
+        _validate_clickhouse_service_common(
+            self.reference_connection_id,
+            self.target_connection_id,
+            self.metadata_connection_id,
+            self.target_settings,
+            self.metadata_settings,
+            self.target_retry_policy,
+            self.metadata_retry_policy,
+            self.target_transport_limits,
+            self.target_readiness_limits,
+            self.target_canonical_limits,
+            self.target_manifest,
+            self.target_expected_issuer,
+            self.target_max_mutation_records,
+            self.target_max_tie_groups,
+            self.metadata_record_bytes,
+            self.metadata_total_bytes,
+        )
+        if not isinstance(cast(object, self.reference_settings), PostgresConnectionSettings):
+            raise TypeError("reference connection settings must be PostgresConnectionSettings")
+        if not isinstance(cast(object, self.reference_retry_policy), PostgresRetryPolicy):
+            raise TypeError("reference retry policy must be PostgresRetryPolicy")
+        _require_positive_integer(
+            self.protected_lock_timeout_milliseconds,
+            "protected lock timeout milliseconds",
+        )
+
+
+@final
+@dataclass(frozen=True, slots=True)
+class MssqlClickHouseExecutionServices:
+    reference_connection_id: str
+    reference_settings: MssqlConnectionSettings
+    target_connection_id: str
+    target_settings: ClickHouseConnectionSettings
+    metadata_connection_id: str
+    metadata_settings: PostgresConnectionSettings
+    reference_retry_policy: MssqlRetryPolicy
+    target_retry_policy: ClickHouseRetryPolicy
+    metadata_retry_policy: PostgresRetryPolicy
+    protected_lock_timeout_milliseconds: int
+    target_transport_limits: ClickHouseTransportLimits
+    target_readiness_limits: ClickHouseReadinessLimits
+    target_canonical_limits: ClickHouseCanonicalLimits
+    target_manifest: ClickHouseImmutableVersionManifest
+    target_expected_issuer: str
+    target_max_mutation_records: int
+    target_max_tie_groups: int
+    metadata_record_bytes: int
+    metadata_total_bytes: int
+
+    def __post_init__(self) -> None:
+        _validate_clickhouse_service_common(
+            self.reference_connection_id,
+            self.target_connection_id,
+            self.metadata_connection_id,
+            self.target_settings,
+            self.metadata_settings,
+            self.target_retry_policy,
+            self.metadata_retry_policy,
+            self.target_transport_limits,
+            self.target_readiness_limits,
+            self.target_canonical_limits,
+            self.target_manifest,
+            self.target_expected_issuer,
+            self.target_max_mutation_records,
+            self.target_max_tie_groups,
+            self.metadata_record_bytes,
+            self.metadata_total_bytes,
+        )
+        if not isinstance(cast(object, self.reference_settings), MssqlConnectionSettings):
+            raise TypeError("reference connection settings must be MssqlConnectionSettings")
+        if type(self.reference_retry_policy) is not MssqlRetryPolicy:
+            raise TypeError("reference retry policy must be MssqlRetryPolicy")
+        _require_positive_integer(
+            self.protected_lock_timeout_milliseconds,
+            "protected lock timeout milliseconds",
+        )
+
+
+@final
+@dataclass(frozen=True, slots=True)
+class OriginalGreenplumClickHouseExecutionServices:
+    reference_connection_id: str
+    reference_settings: PostgresConnectionSettings
+    target_connection_id: str
+    target_settings: ClickHouseConnectionSettings
+    metadata_connection_id: str
+    metadata_settings: PostgresConnectionSettings
+    reference_retry_policy: PostgresRetryPolicy
+    target_retry_policy: ClickHouseRetryPolicy
+    metadata_retry_policy: PostgresRetryPolicy
+    protected_lock_timeout_milliseconds: int
+    target_transport_limits: ClickHouseTransportLimits
+    target_readiness_limits: ClickHouseReadinessLimits
+    target_canonical_limits: ClickHouseCanonicalLimits
+    target_manifest: ClickHouseImmutableVersionManifest
+    target_expected_issuer: str
+    target_max_mutation_records: int
+    target_max_tie_groups: int
+    metadata_record_bytes: int
+    metadata_total_bytes: int
+
+    def __post_init__(self) -> None:
+        _validate_clickhouse_service_common(
+            self.reference_connection_id,
+            self.target_connection_id,
+            self.metadata_connection_id,
+            self.target_settings,
+            self.metadata_settings,
+            self.target_retry_policy,
+            self.metadata_retry_policy,
+            self.target_transport_limits,
+            self.target_readiness_limits,
+            self.target_canonical_limits,
+            self.target_manifest,
+            self.target_expected_issuer,
+            self.target_max_mutation_records,
+            self.target_max_tie_groups,
+            self.metadata_record_bytes,
+            self.metadata_total_bytes,
+        )
+        if not isinstance(cast(object, self.reference_settings), PostgresConnectionSettings):
+            raise TypeError("reference connection settings must be PostgresConnectionSettings")
+        if not isinstance(cast(object, self.reference_retry_policy), PostgresRetryPolicy):
+            raise TypeError("reference retry policy must be PostgresRetryPolicy")
+        _require_positive_integer(
+            self.protected_lock_timeout_milliseconds,
+            "protected lock timeout milliseconds",
+        )
+
+
+def _validate_clickhouse_service_common(
+    reference_connection_id: str,
+    target_connection_id: str,
+    metadata_connection_id: str,
+    target_settings: ClickHouseConnectionSettings,
+    metadata_settings: PostgresConnectionSettings,
+    target_retry_policy: ClickHouseRetryPolicy,
+    metadata_retry_policy: PostgresRetryPolicy,
+    target_transport_limits: ClickHouseTransportLimits,
+    target_readiness_limits: ClickHouseReadinessLimits,
+    target_canonical_limits: ClickHouseCanonicalLimits,
+    target_manifest: ClickHouseImmutableVersionManifest,
+    target_expected_issuer: str,
+    target_max_mutation_records: int,
+    target_max_tie_groups: int,
+    metadata_record_bytes: int,
+    metadata_total_bytes: int,
+) -> None:
+    for value, context in (
+        (reference_connection_id, "reference connection id"),
+        (target_connection_id, "target connection id"),
+        (metadata_connection_id, "metadata connection id"),
+        (target_expected_issuer, "target expected manifest issuer"),
+    ):
+        _require_nonblank(value, context)
+    if not isinstance(cast(object, target_settings), ClickHouseConnectionSettings):
+        raise TypeError("target connection settings must be ClickHouseConnectionSettings")
+    if not isinstance(cast(object, metadata_settings), PostgresConnectionSettings):
+        raise TypeError("metadata connection settings must be PostgresConnectionSettings")
+    if type(target_retry_policy) is not ClickHouseRetryPolicy:
+        raise TypeError("target retry policy must be ClickHouseRetryPolicy")
+    if not isinstance(cast(object, metadata_retry_policy), PostgresRetryPolicy):
+        raise TypeError("metadata retry policy must be PostgresRetryPolicy")
+    if type(target_transport_limits) is not ClickHouseTransportLimits:
+        raise TypeError("target transport limits must be ClickHouseTransportLimits")
+    if type(target_readiness_limits) is not ClickHouseReadinessLimits:
+        raise TypeError("target readiness limits must be ClickHouseReadinessLimits")
+    if type(target_canonical_limits) is not ClickHouseCanonicalLimits:
+        raise TypeError("target canonical limits must be ClickHouseCanonicalLimits")
+    for name, response_bytes in (
+        ("target_readiness_limits.max_response_bytes", target_readiness_limits.max_response_bytes),
+        ("target_canonical_limits.max_response_bytes", target_canonical_limits.max_response_bytes),
+    ):
+        required_ipc_bytes = required_clickhouse_ipc_message_bytes(response_bytes)
+        if required_ipc_bytes > target_transport_limits.max_ipc_message_bytes:
+            raise ValueError(
+                "ClickHouse execution response limit exceeds the transport IPC capacity: "
+                f"limit={name!r}, max_response_bytes={response_bytes}, "
+                f"required_ipc_message_bytes={required_ipc_bytes}, "
+                f"max_ipc_message_bytes={target_transport_limits.max_ipc_message_bytes}"
+            )
+    if type(target_manifest) is not ClickHouseImmutableVersionManifest:
+        raise TypeError("target manifest must be ClickHouseImmutableVersionManifest")
+    if target_manifest.issuer != target_expected_issuer:
+        raise ValueError(
+            "target manifest issuer differs from the explicitly trusted ClickHouse issuer"
+        )
+    _require_positive_integer(
+        target_max_mutation_records,
+        "target ClickHouse mutation record limit",
+    )
+    _require_positive_integer(target_max_tie_groups, "target ClickHouse tie group limit")
+    _require_positive_integer(metadata_record_bytes, "metadata record bytes")
+    _require_positive_integer(metadata_total_bytes, "metadata total bytes")
+    if metadata_record_bytes > metadata_total_bytes:
+        raise ValueError("metadata record bytes cannot exceed metadata total bytes")
+
+
 type ExecutionServices = (
     PostgresExecutionServices
     | MssqlPostgresExecutionServices
@@ -620,19 +890,25 @@ type ExecutionServices = (
     | OriginalGreenplumPostgresExecutionServices
     | OriginalGreenplumGreengageExecutionServices
     | MssqlGreengageExecutionServices
+    | PostgresClickHouseExecutionServices
+    | MssqlClickHouseExecutionServices
+    | OriginalGreenplumClickHouseExecutionServices
 )
 type ProtectedReadContext = (
     PostgresProtectedReadContext
     | MssqlProtectedReadContext
     | GreengageProtectedReadContext
     | OriginalGreenplumProtectedReadContext
+    | ClickHouseProtectedReadContext
 )
 type ProtectedRelation = (
     PostgresProtectedRelationInspection
     | MssqlInspectedRelation
     | GreengageProtectedRelationInspection
     | OriginalGreenplumProtectedRelationInspection
+    | ClickHouseProtectedRelationInspection
 )
+type ProtectedReadiness = ProtectedRelation | ClickHouseProtectedReadinessInspection
 
 
 @final
@@ -656,7 +932,7 @@ class _ProtectedSide:
     direction: PlanDirection
     context: ProtectedReadContext
     dataset_relation: ProtectedRelation
-    readiness_relation: ProtectedRelation
+    readiness_relation: ProtectedReadiness
 
 
 @final
@@ -689,6 +965,13 @@ class _AttemptFailure:
     metrics: ResultMetrics
     partial_artifact: PartialComparisonArtifact | None
     persisted_cut: PersistedInputCut | None
+
+
+@final
+@dataclass(frozen=True, slots=True)
+class _CleanupFailure:
+    reason: ResultReason
+    additional_reasons: tuple[ResultReason, ...]
 
 
 @final
@@ -861,95 +1144,127 @@ def _execute_attempt(
     failure: _AttemptFailure | None = None
     greenplum_endpoint_direction: PlanDirection | None = PlanDirection.REFERENCE
     try:
-        reference = _open_side(check, PlanDirection.REFERENCE, source_budget, services)
-        resources.append(_AttemptResource(reference, None))
-        reference_receipt = _persist_context(
-            attempt,
-            registration.reference_dataset,
-            reference,
-            services,
-        )
-        resources[-1] = _AttemptResource(reference, reference_receipt)
-        reference_readiness = _read_readiness(
+        reference_opened = _open_side(
             check,
             scope,
-            reference,
             attempt.run.request.expected_batches[0].batch_id,
+            PlanDirection.REFERENCE,
+            source_budget,
             services,
         )
-        if isinstance(reference_readiness, EarlyExecutionOutcome):
+        if isinstance(reference_opened, EarlyExecutionOutcome):
             failure = _failure_from_early_outcome(
-                reference_readiness,
-                _context_ids(resources),
+                reference_opened,
+                (),
                 False,
                 _result_metrics_from_source_budget(source_budget),
             )
         else:
-            greenplum_endpoint_direction = PlanDirection.TARGET
-            target = _open_side(check, PlanDirection.TARGET, source_budget, services)
-            resources.append(_AttemptResource(target, None))
-            target_receipt = _persist_context(
+            reference = reference_opened
+            resources.append(_AttemptResource(reference, None))
+            reference_receipt = _persist_context(
                 attempt,
-                registration.target_dataset,
-                target,
+                registration.reference_dataset,
+                reference,
                 services,
             )
-            resources[-1] = _AttemptResource(target, target_receipt)
-            target_readiness = _read_readiness(
+            resources[-1] = _AttemptResource(reference, reference_receipt)
+            reference_readiness = _read_readiness(
                 check,
                 scope,
-                target,
-                attempt.run.request.expected_batches[1].batch_id,
+                reference,
+                attempt.run.request.expected_batches[0].batch_id,
                 services,
             )
-            if isinstance(target_readiness, EarlyExecutionOutcome):
+            if isinstance(reference_readiness, EarlyExecutionOutcome):
                 failure = _failure_from_early_outcome(
-                    target_readiness,
+                    reference_readiness,
                     _context_ids(resources),
                     False,
                     _result_metrics_from_source_budget(source_budget),
                 )
             else:
-                greenplum_endpoint_direction = None
-                input_cut = build_input_cut_definition(
-                    reference_readiness,
-                    target_readiness,
+                greenplum_endpoint_direction = PlanDirection.TARGET
+                target_opened = _open_side(
+                    check,
+                    scope,
+                    attempt.run.request.expected_batches[1].batch_id,
+                    PlanDirection.TARGET,
+                    source_budget,
+                    services,
                 )
-                alignment_outcome = classify_input_cut_alignment(input_cut)
-                if alignment_outcome is not None:
+                if isinstance(target_opened, EarlyExecutionOutcome):
                     failure = _failure_from_early_outcome(
-                        alignment_outcome,
+                        target_opened,
                         _context_ids(resources),
                         False,
                         _result_metrics_from_source_budget(source_budget),
                     )
                 else:
-                    ready_reference = _ReadySide(reference, reference_readiness)
-                    ready_target = _ReadySide(target, target_readiness)
-                    persisted_cut = persist_postgres_aligned_input_cut(
-                        services.metadata_settings,
-                        services.metadata_retry_policy,
+                    target = target_opened
+                    resources.append(_AttemptResource(target, None))
+                    target_receipt = _persist_context(
                         attempt,
-                        _cut_persistence(
-                            input_cut,
-                            registration,
-                            ready_reference,
-                            ready_target,
-                            cut_binding_operation_id,
-                        ),
+                        registration.target_dataset,
+                        target,
+                        services,
                     )
-                    artifact = execute_integer_key_comparison(
-                        reference.context,
-                        reference.dataset_relation,
-                        target.context,
-                        target.dataset_relation,
+                    resources[-1] = _AttemptResource(target, target_receipt)
+                    target_readiness = _read_readiness(
                         check,
                         scope,
-                        input_cut,
-                        attempt.execution_budgets,
-                        attempt.run.request.evidence_policy,
-                        source_budget,
+                        target,
+                        attempt.run.request.expected_batches[1].batch_id,
+                        services,
                     )
+                    if isinstance(target_readiness, EarlyExecutionOutcome):
+                        failure = _failure_from_early_outcome(
+                            target_readiness,
+                            _context_ids(resources),
+                            False,
+                            _result_metrics_from_source_budget(source_budget),
+                        )
+                    else:
+                        greenplum_endpoint_direction = None
+                        input_cut = build_input_cut_definition(
+                            reference_readiness,
+                            target_readiness,
+                        )
+                        alignment_outcome = classify_input_cut_alignment(input_cut)
+                        if alignment_outcome is not None:
+                            failure = _failure_from_early_outcome(
+                                alignment_outcome,
+                                _context_ids(resources),
+                                False,
+                                _result_metrics_from_source_budget(source_budget),
+                            )
+                        else:
+                            ready_reference = _ReadySide(reference, reference_readiness)
+                            ready_target = _ReadySide(target, target_readiness)
+                            persisted_cut = persist_postgres_aligned_input_cut(
+                                services.metadata_settings,
+                                services.metadata_retry_policy,
+                                attempt,
+                                _cut_persistence(
+                                    input_cut,
+                                    registration,
+                                    ready_reference,
+                                    ready_target,
+                                    cut_binding_operation_id,
+                                ),
+                            )
+                            artifact = execute_integer_key_comparison(
+                                reference.context,
+                                reference.dataset_relation,
+                                target.context,
+                                target.dataset_relation,
+                                check,
+                                scope,
+                                input_cut,
+                                attempt.execution_budgets,
+                                attempt.run.request.evidence_policy,
+                                source_budget,
+                            )
     except ComparisonInterruptedError as error:
         failure = _failure_from_comparison_interruption(
             error,
@@ -958,22 +1273,26 @@ def _execute_attempt(
         )
     except ComparisonKeyMappingError as error:
         contract_reason = error.contract_violation_reason
-        failure = _AttemptFailure(
-            execution_status=ExecutionStatus.ERROR,
-            verdict=(Verdict.MISMATCH if contract_reason is not None else Verdict.INCONCLUSIVE),
-            reason=_reason(
+        mapping_state = _consistency_state_for_active_cut(resources, persisted_cut is not None)
+        mapping_reason = _reason_with_failure_consistency(
+            _reason(
                 ReasonCode.LOSSY_TRANSPORT,
                 "validate_key_mapping",
                 "scoped key values cannot map losslessly to logical INT64",
-                _mapping_error_parameters(error, _context_ids(resources)),
+                _mapping_error_parameters(error, mapping_state.context_ids),
             ),
+            mapping_state,
+            error.metrics,
+        )
+        failure = _AttemptFailure(
+            execution_status=ExecutionStatus.ERROR,
+            verdict=(Verdict.MISMATCH if contract_reason is not None else Verdict.INCONCLUSIVE),
+            reason=mapping_reason,
             additional_reasons=(() if contract_reason is None else (contract_reason,)),
             retryable=False,
-            context_ids=_context_ids(resources),
-            stable_reads=(
-                ConsistencyLevel.VERIFIED if persisted_cut is not None else ConsistencyLevel.UNKNOWN
-            ),
-            cut_aligned=persisted_cut is not None,
+            context_ids=mapping_state.context_ids,
+            stable_reads=mapping_state.stable_reads,
+            cut_aligned=mapping_state.cut_aligned,
             comparison_coverage=ComparisonCoverage(
                 total_partitions=1,
                 covered_partitions=0,
@@ -993,240 +1312,89 @@ def _execute_attempt(
             partial_artifact=None,
             persisted_cut=persisted_cut,
         )
-    except UnsupportedComparisonError as error:
-        failure = _failure_from_unsupported_comparison(
-            error,
-            resources,
-            persisted_cut is not None,
-            source_budget,
-        )
-    except MssqlQueryTimeoutError as error:
-        failure = _failure_from_terminal_source_reason(
-            _mssql_query_timeout_reason(error),
-            resources,
-            persisted_cut is not None,
-            source_budget,
-        )
-    except OriginalGreenplumResultLimitError as error:
-        failure = _failure_from_error(
-            ExecutionStatus.INCOMPLETE,
-            ReasonCode.BUDGET_EXHAUSTED,
-            "read_source",
-            "a bounded source read exceeded its configured result budget",
-            error,
-            False,
-            resources,
-            persisted_cut is not None,
-            source_budget,
-        )
-    except (
-        ComparisonBudgetExceededError,
-        GreengageBudgetExceededError,
-        OriginalGreenplumBudgetExceededError,
-        PostgresReadDeadlineExceededError,
-        PostgresSourceBudgetExceededError,
-    ) as error:
-        failure = _failure_from_error(
-            ExecutionStatus.INCOMPLETE,
-            ReasonCode.BUDGET_EXHAUSTED,
-            "compare",
-            "the check exhausted an immutable execution budget",
-            error,
-            False,
-            resources,
-            persisted_cut is not None,
-            source_budget,
-        )
-    except MssqlCancellationConfirmedError as error:
-        failure = _failure_from_terminal_source_reason(
-            _mssql_confirmed_cancellation_reason(error),
-            resources,
-            persisted_cut is not None,
-            source_budget,
-        )
-    except MssqlCancellationUnconfirmedError as error:
-        failure = _failure_from_terminal_source_reason(
-            _mssql_unconfirmed_cancellation_reason(error),
-            resources,
-            persisted_cut is not None,
-            source_budget,
-        )
-    except (PostgresResultLimitError, MssqlResultLimitError) as error:
-        failure = _failure_from_error(
-            ExecutionStatus.INCOMPLETE,
-            ReasonCode.BUDGET_EXHAUSTED,
-            "read_source",
-            "a bounded source read exceeded its configured result budget",
-            error,
-            False,
-            resources,
-            persisted_cut is not None,
-            source_budget,
-        )
-    except UnsupportedMssqlRelationError as error:
-        failure = _failure_from_error(
-            ExecutionStatus.ERROR,
-            ReasonCode.UNSUPPORTED_CAPABILITY,
-            "inspect_source_relation",
-            _actionable_mssql_error_message(error, "SQL Server relation refusal"),
-            error,
-            False,
-            resources,
-            persisted_cut is not None,
-            source_budget,
-        )
-    except MssqlLoweringError as error:
-        failure = _failure_from_error(
-            ExecutionStatus.ERROR,
-            ReasonCode.UNSUPPORTED_CAPABILITY,
-            "compile_source_query",
-            _actionable_mssql_error_message(error, "SQL Server query lowering refusal"),
-            error,
-            False,
-            resources,
-            persisted_cut is not None,
-            source_budget,
-        )
-    except (
-        PostgresContextLostError,
-        PostgresAcquisitionRaceError,
-        MssqlContextLostError,
-        MssqlMetadataError,
-        GreenplumContextLostError,
-        GreengageAcquisitionRaceError,
-        OriginalGreenplumAcquisitionRaceError,
-    ) as error:
-        failure = _failure_from_error(
-            ExecutionStatus.INCOMPLETE,
-            ReasonCode.SNAPSHOT_LOST,
-            "read_source",
-            "a protected source snapshot was lost before completion",
-            error,
-            True,
-            resources,
-            persisted_cut is not None,
-            source_budget,
-        )
-    except (
-        PostgresConnectionError,
-        PostgresQueryError,
-        PostgresMetadataError,
-        MssqlConnectionError,
-        MssqlQueryError,
-        GreenplumConnectionError,
-        GreenplumQueryError,
-    ) as error:
-        failure = _failure_from_error(
-            ExecutionStatus.ERROR,
-            ReasonCode.QUERY_ERROR,
-            "read_source",
-            "a source operation failed",
-            error,
-            True,
-            resources,
-            persisted_cut is not None,
-            source_budget,
-        )
-    except UnsupportedPostgresProfileError as error:
-        failure = _failure_from_error(
-            ExecutionStatus.ERROR,
-            ReasonCode.UNSUPPORTED_CAPABILITY,
-            "open_source",
-            "a source does not satisfy the required runtime profile",
-            error,
-            False,
-            resources,
-            persisted_cut is not None,
-            source_budget,
-        )
-    except UnsupportedMssqlProfileError as error:
-        failure = _failure_from_error(
-            ExecutionStatus.ERROR,
-            ReasonCode.UNSUPPORTED_CAPABILITY,
-            "open_source",
-            _actionable_mssql_error_message(error, "SQL Server profile refusal"),
-            error,
-            False,
-            resources,
-            persisted_cut is not None,
-            source_budget,
-        )
-    except (UnsupportedGreenplumProfileError, GreenplumMetadataError) as error:
-        if greenplum_endpoint_direction is PlanDirection.REFERENCE:
-            operation = "open_reference"
-            message = (
-                "the original Greenplum reference does not satisfy the required runtime capability"
-            )
-        elif greenplum_endpoint_direction is PlanDirection.TARGET:
-            operation = "open_target"
-            message = "the Greengage target does not satisfy the required runtime capability"
-        else:
-            operation = "compare"
-            message = "a Greenplum-family endpoint does not satisfy the required runtime capability"
-        failure = _failure_from_error(
-            ExecutionStatus.ERROR,
-            ReasonCode.UNSUPPORTED_CAPABILITY,
-            operation,
-            message,
-            error,
-            False,
-            resources,
-            persisted_cut is not None,
-            source_budget,
-        )
     except (
         AcquisitionValidationError,
+        ClickHouseAttemptDeadlineExceededError,
+        ClickHouseCancellationUnconfirmedError,
+        ClickHouseDataValidationError,
+        ClickHouseProtectedContextCleanupError,
+        ClickHouseProtectedContextClosedError,
+        ClickHouseProtectedContextConfirmationError,
+        ClickHouseProtectedContextLostError,
+        ClickHouseResultLimitError,
+        ClickHouseTransportError,
+        ComparisonBudgetExceededError,
         ComparisonProtocolError,
-        PostgresContextClosedError,
-        PostgresDataValidationError,
-        PostgresQueryContextError,
-        MssqlContextClosedError,
-        MssqlDataValidationError,
-        MssqlQueryContextError,
+        GreenplumConnectionError,
         GreenplumContextClosedError,
+        GreenplumContextLostError,
         GreenplumDataValidationError,
+        GreenplumMetadataError,
+        GreenplumQueryError,
+        GreengageAcquisitionRaceError,
+        GreengageBudgetExceededError,
+        MssqlCancellationConfirmedError,
+        MssqlCancellationUnconfirmedError,
+        MssqlConnectionError,
+        MssqlContextClosedError,
+        MssqlContextLostError,
+        MssqlDataValidationError,
+        MssqlLoweringError,
+        MssqlMetadataError,
+        MssqlQueryContextError,
+        MssqlQueryError,
+        MssqlQueryTimeoutError,
+        MssqlResultLimitError,
+        MssqlTransportError,
+        OriginalGreenplumAcquisitionRaceError,
+        OriginalGreenplumBudgetExceededError,
+        OriginalGreenplumResultLimitError,
+        PostgresAcquisitionRaceError,
+        PostgresConnectionError,
+        PostgresContextClosedError,
+        PostgresContextLostError,
+        PostgresDataValidationError,
+        PostgresMetadataError,
+        PostgresQueryContextError,
+        PostgresQueryError,
+        PostgresReadDeadlineExceededError,
+        PostgresResultLimitError,
+        PostgresSourceBudgetExceededError,
+        UnsupportedClickHouseProfileError,
+        UnsupportedComparisonError,
+        UnsupportedGreenplumProfileError,
+        UnsupportedMssqlProfileError,
+        UnsupportedMssqlRelationError,
+        UnsupportedPostgresProfileError,
     ) as error:
-        failure = _failure_from_error(
-            ExecutionStatus.ERROR,
-            ReasonCode.PROTOCOL_VIOLATION,
-            "execute_check",
-            "source evidence violated the declared check protocol",
+        failure = _failure_from_attempt_error(
             error,
-            False,
             resources,
             persisted_cut is not None,
             source_budget,
-        )
-    except MssqlTransportError as error:
-        failure = _failure_from_error(
-            ExecutionStatus.ERROR,
-            ReasonCode.QUERY_ERROR,
-            "read_source",
-            "a SQL Server source operation failed",
-            error,
-            True,
-            resources,
-            persisted_cut is not None,
-            source_budget,
+            greenplum_endpoint_direction,
         )
     finally:
-        context_lost = _close_attempt_resources(attempt, tuple(resources), services)
+        cleanup_failure = _close_attempt_resources(attempt, tuple(resources), services)
 
-    if context_lost:
-        context_loss_reason = _context_loss_reason()
+    if artifact is not None:
+        artifact = _artifact_with_final_source_usage(artifact, source_budget)
+    if failure is not None:
+        failure = _failure_with_final_source_usage(failure, source_budget)
+    if cleanup_failure is not None:
         if failure is not None:
-            failure = _failure_with_secondary_context_loss(failure, context_loss_reason)
+            failure = _failure_with_secondary_context_loss(failure, cleanup_failure)
         elif artifact is not None:
             if persisted_cut is None:
                 raise AssertionError("completed comparison is missing its persisted input cut")
             failure = _failure_from_artifact_context_loss(
                 artifact,
                 persisted_cut,
-                context_loss_reason,
+                cleanup_failure,
             )
         else:
             failure = _failure_from_cleanup_context_loss(
-                context_loss_reason,
+                cleanup_failure,
                 _context_ids(resources),
                 persisted_cut is not None,
                 _result_metrics_from_source_budget(source_budget),
@@ -1269,10 +1437,12 @@ def _execute_attempt(
 
 def _open_side(
     check: RowCheckDefinition,
+    scope: ResolvedScope,
+    expected_batch_id: str,
     direction: PlanDirection,
     source_budget: PostgresSourceBudgetAttempt,
     services: ExecutionServices,
-) -> _ProtectedSide:
+) -> _ProtectedSide | EarlyExecutionOutcome:
     dataset, consistency = _side_definitions(check, direction)
     locator = dataset.locator
     readiness = consistency.readiness
@@ -1316,6 +1486,17 @@ def _open_side(
         )
     if dataset.connection.adapter is Adapter.POSTGRESQL:
         return _open_postgres_side(
+            dataset,
+            readiness,
+            direction,
+            source_budget,
+            services,
+        )
+    if dataset.connection.adapter is Adapter.CLICKHOUSE:
+        return _open_clickhouse_side(
+            check,
+            scope,
+            expected_batch_id,
             dataset,
             readiness,
             direction,
@@ -1410,7 +1591,11 @@ def _open_mssql_side(
         raise UnsupportedMssqlProfileError("SQL Server is supported only as a reference source")
     if not isinstance(
         services,
-        (MssqlPostgresExecutionServices, MssqlGreengageExecutionServices),
+        (
+            MssqlPostgresExecutionServices,
+            MssqlGreengageExecutionServices,
+            MssqlClickHouseExecutionServices,
+        ),
     ):
         raise TypeError("SQL Server reference execution requires mixed-engine execution services")
     locator = dataset.locator
@@ -1577,6 +1762,7 @@ def _open_original_greenplum_side(
         (
             OriginalGreenplumPostgresExecutionServices,
             OriginalGreenplumGreengageExecutionServices,
+            OriginalGreenplumClickHouseExecutionServices,
         ),
     ):
         raise TypeError(
@@ -1642,6 +1828,101 @@ def _open_original_greenplum_side(
     )
 
 
+def _open_clickhouse_side(
+    check: RowCheckDefinition,
+    scope: ResolvedScope,
+    expected_batch_id: str,
+    dataset: DatasetDefinition,
+    readiness: RelationManifestReadiness,
+    direction: PlanDirection,
+    source_budget: PostgresSourceBudgetAttempt,
+    services: ExecutionServices,
+) -> _ProtectedSide | EarlyExecutionOutcome:
+    if direction is not PlanDirection.TARGET:
+        raise UnsupportedClickHouseProfileError(
+            "ClickHouse endpoint execution is implemented only for the target direction"
+        )
+    if not isinstance(
+        services,
+        (
+            PostgresClickHouseExecutionServices,
+            MssqlClickHouseExecutionServices,
+            OriginalGreenplumClickHouseExecutionServices,
+        ),
+    ):
+        raise TypeError("ClickHouse target execution requires ClickHouse execution services")
+    locator = dataset.locator
+    if not isinstance(locator, RelationLocator):
+        raise UnsupportedComparisonError("ClickHouse target execution requires a physical relation")
+    if locator.relation_scope is not RelationScope.PHYSICAL_ONLY:
+        raise UnsupportedComparisonError(
+            "ClickHouse target execution requires physical_only relation scope"
+        )
+    if (
+        match_clickhouse_runtime_profile(
+            dataset.connection.driver,
+            dataset.connection.profile,
+        )
+        is not ClickHouseRuntimeProfile.LTS
+    ):
+        raise UnsupportedClickHouseProfileError(
+            "ClickHouse target requires driver='clickhouse-connect' and profile='clickhouse_lts'"
+        )
+    consistency = check.consistency
+    if consistency.minimum_evidence is not MinimumEvidence.ASSERTED:
+        raise UnsupportedClickHouseProfileError(
+            "ClickHouse immutable named-version execution requires explicit "
+            "minimum_evidence='asserted'"
+        )
+    _, target_consistency = _side_definitions(check, direction)
+    if target_consistency.stable_read is not StableReadKind.IMMUTABLE_NAMED_VERSION:
+        raise UnsupportedClickHouseProfileError(
+            "ClickHouse target requires stable_read='immutable_named_version'"
+        )
+    request = ClickHouseProjectionRequest(
+        version_request=ClickHouseImmutableVersionRequest(
+            direction=direction,
+            endpoint_profile="direct_single_server",
+            readiness_database=readiness.relation.schema,
+            readiness_table=readiness.relation.name,
+            expected_issuer=services.target_expected_issuer,
+            dataset_id=dataset.dataset_id,
+            scope_digest=scope.scope_digest,
+            expected_batch_id=expected_batch_id,
+            alignment_fields=consistency.alignment_fields,
+            minimum_evidence=consistency.minimum_evidence,
+            late_arrivals=consistency.late_arrivals,
+            limits=services.target_readiness_limits,
+        ),
+        schema=dataset.logical_schema.schema,
+        column_names=tuple(field.column_name for field in dataset.projection),
+        canonical_limits=services.target_canonical_limits,
+        max_mutation_records=services.target_max_mutation_records,
+        max_tie_groups=services.target_max_tie_groups,
+    )
+    opened = open_clickhouse_protected_read_context(
+        services.target_settings,
+        services.target_retry_policy,
+        services.target_transport_limits,
+        source_budget,
+        PostgresSourceDirection.TARGET,
+        request,
+        services.target_manifest,
+    )
+    if isinstance(opened, EarlyExecutionOutcome):
+        return opened
+    dataset_relation = _protected_clickhouse_relation(
+        opened,
+        (locator.schema, locator.name),
+    )
+    return _ProtectedSide(
+        direction=direction,
+        context=opened,
+        dataset_relation=dataset_relation,
+        readiness_relation=opened.protected_readiness,
+    )
+
+
 def _persist_context(
     attempt: RunAttemptRecord,
     dataset: DatasetVersionRecord,
@@ -1674,6 +1955,17 @@ def _read_readiness(
         raise UnsupportedComparisonError(
             f"{protected.direction.value} execution requires relation-manifest readiness"
         )
+    if isinstance(protected.context, ClickHouseProtectedReadContext):
+        clickhouse_readiness = protected.readiness_relation
+        if not isinstance(clickhouse_readiness, ClickHouseProtectedReadinessInspection):
+            raise ApplicationStateError(
+                "ClickHouse protected context is paired with another engine's readiness relation"
+            )
+        if clickhouse_readiness.context_id != protected.context.evidence.context_id:
+            raise ApplicationStateError(
+                "ClickHouse readiness inspection belongs to a different protected context"
+            )
+        return clickhouse_readiness.evidence
     rows = _read_relation_manifest(
         protected,
         readiness.columns,
@@ -1704,6 +1996,10 @@ def _read_relation_manifest(
 ) -> tuple[RelationManifestRow, ...]:
     context = protected.context
     relation = protected.readiness_relation
+    if isinstance(context, ClickHouseProtectedReadContext):
+        raise ApplicationStateError(
+            "ClickHouse readiness must use its immutable named-version observation"
+        )
     if isinstance(context, PostgresProtectedReadContext):
         if not isinstance(relation, PostgresProtectedRelationInspection):
             raise ApplicationStateError(
@@ -1807,20 +2103,97 @@ def _close_attempt_resources(
     attempt: RunAttemptRecord,
     resources: tuple[_AttemptResource, ...],
     services: ExecutionServices,
-) -> bool:
-    context_lost = False
+) -> _CleanupFailure | None:
+    cleanup_failure: _CleanupFailure | None = None
     persistence_error: LifecyclePersistenceError | None = None
     for resource in resources:
-        state_before_close = resource.protected.context.state
+        protected_context = resource.protected.context
+        state_before_close = protected_context.state
         close_failed = False
+        resource_reason: ResultReason | None = None
+        resource_additional_reasons: tuple[ResultReason, ...] = ()
         try:
-            resource.protected.context.close()
-        except (PostgresCloseError, MssqlCloseError, GreenplumCloseError):
+            protected_context.close()
+        except ClickHouseProtectedContextConfirmationError as error:
             close_failed = True
-            context_lost = True
+            resource_reason = _clickhouse_confirmation_loss_reason(error)
+            resource_additional_reasons = (error.outcome.reason,)
+        except (
+            ClickHouseProtectedContextCleanupError,
+            ClickHouseTransportCleanupError,
+        ) as error:
+            close_failed = True
+            resource_reason = _clickhouse_cleanup_uncertainty_reason(error)
+        except ClickHouseCancellationUnconfirmedError as error:
+            close_failed = True
+            resource_reason = _clickhouse_unconfirmed_cancellation_reason(error)
+        except (
+            ClickHouseAttemptDeadlineExceededError,
+            ClickHouseResultLimitError,
+            PostgresReadDeadlineExceededError,
+            PostgresSourceBudgetExceededError,
+        ) as error:
+            close_failed = True
+            resource_reason = _reason_from_source_error(
+                ReasonCode.BUDGET_EXHAUSTED,
+                "confirm_target",
+                "ClickHouse final confirmation exhausted an immutable execution budget",
+                error,
+            )
+        except UnsupportedClickHouseProfileError as error:
+            close_failed = True
+            resource_reason = _reason_from_source_error(
+                ReasonCode.UNSUPPORTED_CAPABILITY,
+                "confirm_target",
+                "ClickHouse final confirmation no longer satisfies the required profile",
+                error,
+            )
+        except (
+            ClickHouseDataValidationError,
+            ClickHouseTransportAttemptMismatchError,
+            ClickHouseTransportClosedError,
+            PostgresDataValidationError,
+        ) as error:
+            close_failed = True
+            resource_reason = _reason_from_source_error(
+                ReasonCode.PROTOCOL_VIOLATION,
+                "confirm_target",
+                "ClickHouse final confirmation violated its typed evidence protocol",
+                error,
+            )
+        except ClickHouseTransportError as error:
+            close_failed = True
+            resource_reason = _reason_from_source_error(
+                ReasonCode.QUERY_ERROR,
+                "confirm_target",
+                "ClickHouse final confirmation query failed",
+                error,
+            )
+        except (
+            PostgresCloseError,
+            MssqlCloseError,
+            GreenplumCloseError,
+        ):
+            close_failed = True
+            resource_reason = _context_loss_reason()
+        if (
+            type(protected_context) is ClickHouseProtectedReadContext
+            and not close_failed
+            and protected_context.state is not ClickHouseProtectedContextState.CLOSED
+        ):
+            close_failed = True
+            resource_reason = _context_loss_reason()
         was_active = _protected_context_state_is_active(state_before_close)
-        if not was_active:
-            context_lost = True
+        if not was_active and resource_reason is None:
+            resource_reason = _context_loss_reason()
+        if resource_reason is not None:
+            cleanup_failure = _combine_cleanup_failures(
+                cleanup_failure,
+                _CleanupFailure(
+                    reason=resource_reason,
+                    additional_reasons=resource_additional_reasons,
+                ),
+            )
         if resource.persisted is None:
             continue
         try:
@@ -1829,6 +2202,16 @@ def _close_attempt_resources(
                     services.metadata_settings,
                     services.metadata_retry_policy,
                     attempt,
+                    resource.persisted.read_context_id,
+                    uuid4(),
+                    datetime.now(UTC),
+                )
+            elif type(protected_context) is ClickHouseProtectedReadContext:
+                close_postgres_clickhouse_read_context(
+                    services.metadata_settings,
+                    services.metadata_retry_policy,
+                    attempt,
+                    protected_context,
                     resource.persisted.read_context_id,
                     uuid4(),
                     datetime.now(UTC),
@@ -1847,7 +2230,54 @@ def _close_attempt_resources(
                 persistence_error = error
     if persistence_error is not None:
         raise persistence_error
-    return context_lost
+    return cleanup_failure
+
+
+def _combine_cleanup_failures(
+    current: _CleanupFailure | None,
+    candidate: _CleanupFailure,
+) -> _CleanupFailure:
+    if current is None:
+        return candidate
+    if _cleanup_failure_dominates(candidate, current):
+        return _CleanupFailure(
+            reason=candidate.reason,
+            additional_reasons=(
+                *candidate.additional_reasons,
+                current.reason,
+                *current.additional_reasons,
+            ),
+        )
+    return _CleanupFailure(
+        reason=current.reason,
+        additional_reasons=(
+            *current.additional_reasons,
+            candidate.reason,
+            *candidate.additional_reasons,
+        ),
+    )
+
+
+def _cleanup_failure_dominates(
+    candidate: _CleanupFailure,
+    current: _CleanupFailure,
+) -> bool:
+    if (
+        candidate.reason.code is ReasonCode.CANCELLATION_UNCONFIRMED
+        and current.reason.code is ReasonCode.SNAPSHOT_LOST
+    ):
+        return True
+    if (
+        candidate.reason.code is ReasonCode.SNAPSHOT_LOST
+        and candidate.reason.operation == "confirm_target"
+        and current.reason.code is ReasonCode.SNAPSHOT_LOST
+        and current.reason.operation == "close_read_context"
+    ):
+        return True
+    return (
+        _execution_status_for_cleanup_failure(candidate) is ExecutionStatus.ERROR
+        and _execution_status_for_cleanup_failure(current) is ExecutionStatus.INCOMPLETE
+    )
 
 
 def _context_loss_reason() -> ResultReason:
@@ -1859,37 +2289,175 @@ def _context_loss_reason() -> ResultReason:
     )
 
 
+def _clickhouse_confirmation_loss_reason(
+    error: ClickHouseProtectedContextConfirmationError,
+) -> ResultReason:
+    return _reason(
+        ReasonCode.SNAPSHOT_LOST,
+        "confirm_target",
+        "ClickHouse immutable target provenance could not be confirmed after comparison",
+        (
+            SafeParameter(name="error_type", value=type(error).__name__),
+            SafeParameter(name="confirmation_code", value=error.outcome.reason.code.value),
+            SafeParameter(name="confirmation_operation", value=error.outcome.reason.operation),
+        ),
+    )
+
+
+def _clickhouse_cleanup_uncertainty_reason(error: Exception) -> ResultReason:
+    return _reason(
+        ReasonCode.CANCELLATION_UNCONFIRMED,
+        "close_read_context",
+        "ClickHouse final confirmation transport cleanup could not be established",
+        (SafeParameter(name="error_type", value=type(error).__name__),),
+    )
+
+
 def _protected_context_state_is_active(
-    state: ReadContextState | MssqlReadContextState,
+    state: ReadContextState | MssqlReadContextState | ClickHouseProtectedContextState,
 ) -> bool:
-    return state is ReadContextState.ACTIVE or state is MssqlReadContextState.ACTIVE
+    return (
+        state is ReadContextState.ACTIVE
+        or state is MssqlReadContextState.ACTIVE
+        or state is ClickHouseProtectedContextState.ACTIVE
+    )
+
+
+def _artifact_with_final_source_usage(
+    artifact: CompletedComparisonArtifact | CompletedStructuralComparisonArtifact,
+    source_budget: PostgresSourceBudgetAttempt,
+) -> CompletedComparisonArtifact | CompletedStructuralComparisonArtifact:
+    snapshot = source_budget.snapshot()
+    metrics = ResultMetrics(
+        queries=snapshot.queries,
+        fetched_records=snapshot.fetched_records,
+        result_bytes=snapshot.result_bytes,
+        fingerprint_nodes=artifact.metrics.fingerprint_nodes,
+        coordinator_peak_bytes=artifact.metrics.coordinator_peak_bytes,
+        elapsed_milliseconds=snapshot.elapsed_milliseconds,
+    )
+    return replace(
+        artifact,
+        metrics=metrics,
+        reference_full_scans=snapshot.reference_full_scans,
+        target_full_scans=snapshot.target_full_scans,
+    )
+
+
+def _failure_with_final_source_usage(
+    failure: _AttemptFailure,
+    source_budget: PostgresSourceBudgetAttempt,
+) -> _AttemptFailure:
+    snapshot = source_budget.snapshot()
+    metrics = ResultMetrics(
+        queries=snapshot.queries,
+        fetched_records=snapshot.fetched_records,
+        result_bytes=snapshot.result_bytes,
+        fingerprint_nodes=failure.metrics.fingerprint_nodes,
+        coordinator_peak_bytes=failure.metrics.coordinator_peak_bytes,
+        elapsed_milliseconds=snapshot.elapsed_milliseconds,
+    )
+    partial_artifact = failure.partial_artifact
+    if partial_artifact is not None:
+        partial_artifact = replace(
+            partial_artifact,
+            metrics=metrics,
+            reference_full_scans=snapshot.reference_full_scans,
+            target_full_scans=snapshot.target_full_scans,
+        )
+    return replace(
+        failure,
+        reason=_reason_with_replaced_failure_metrics(failure.reason, metrics),
+        metrics=metrics,
+        partial_artifact=partial_artifact,
+    )
+
+
+def _reason_with_replaced_failure_metrics(
+    reason: ResultReason,
+    metrics: ResultMetrics,
+) -> ResultReason:
+    metric_names = {parameter.name for parameter in _failure_metrics_parameters(metrics)}
+    retained_parameters = tuple(
+        parameter for parameter in reason.safe_parameters if parameter.name not in metric_names
+    )
+    return ResultReason(
+        code=reason.code,
+        operation=reason.operation,
+        message=reason.message,
+        safe_parameters=(*retained_parameters, *_failure_metrics_parameters(metrics)),
+        native_error_code=reason.native_error_code,
+        query_id=reason.query_id,
+        redacted_response=reason.redacted_response,
+    )
 
 
 def _failure_with_secondary_context_loss(
     failure: _AttemptFailure,
-    context_loss_reason: ResultReason,
+    cleanup_failure: _CleanupFailure,
 ) -> _AttemptFailure:
+    context_loss_reason = cleanup_failure.reason
     state = _ConsistencyState(
         context_ids=failure.context_ids,
         stable_reads=_degraded_stable_reads(failure.stable_reads),
         cut_aligned=failure.cut_aligned,
     )
-    return _AttemptFailure(
-        execution_status=failure.execution_status,
-        verdict=failure.verdict,
-        reason=_reason_with_cleanup_state(
+    partial_artifact = failure.partial_artifact
+    if partial_artifact is not None:
+        partial_artifact = replace(
+            partial_artifact,
+            consistency=ConsistencyStatus(
+                stable_reads=state.stable_reads,
+                cut_alignment=partial_artifact.consistency.cut_alignment,
+                read_context_ids=partial_artifact.consistency.read_context_ids,
+            ),
+        )
+    cleanup_status = _execution_status_for_failure_reason(context_loss_reason)
+    escalates = (
+        failure.execution_status is ExecutionStatus.INCOMPLETE
+        and cleanup_status is ExecutionStatus.ERROR
+    )
+    if escalates:
+        primary_reason = _reason_with_cleanup_state(
+            _reason_with_failure_metrics(context_loss_reason, failure.metrics),
+            state,
+        )
+        additional_reasons = (
+            _reason_without_failure_consistency(failure.reason),
+            *failure.additional_reasons,
+            *cleanup_failure.additional_reasons,
+        )
+    else:
+        primary_reason = _reason_with_cleanup_state(
             _reason_without_failure_consistency(failure.reason),
             state,
+        )
+        additional_reasons = (
+            *failure.additional_reasons,
+            context_loss_reason,
+            *cleanup_failure.additional_reasons,
+        )
+    verdict, additional_reasons = _partial_failure_publication_values(
+        partial_artifact,
+        failure.verdict,
+        additional_reasons,
+    )
+    return _AttemptFailure(
+        execution_status=_combined_execution_status(
+            failure.execution_status,
+            cleanup_failure,
         ),
-        additional_reasons=(*failure.additional_reasons, context_loss_reason),
-        retryable=failure.retryable,
+        verdict=verdict,
+        reason=primary_reason,
+        additional_reasons=additional_reasons,
+        retryable=(failure.retryable and _cleanup_failure_is_retryable(cleanup_failure)),
         context_ids=failure.context_ids,
         stable_reads=state.stable_reads,
         cut_aligned=failure.cut_aligned,
         comparison_coverage=failure.comparison_coverage,
         evidence_coverage=failure.evidence_coverage,
         metrics=failure.metrics,
-        partial_artifact=failure.partial_artifact,
+        partial_artifact=partial_artifact,
         persisted_cut=failure.persisted_cut,
     )
 
@@ -1897,55 +2465,72 @@ def _failure_with_secondary_context_loss(
 def _failure_from_artifact_context_loss(
     artifact: CompletedComparisonArtifact | CompletedStructuralComparisonArtifact,
     persisted_cut: PersistedInputCut,
-    context_loss_reason: ResultReason,
+    cleanup_failure: _CleanupFailure,
 ) -> _AttemptFailure:
+    context_loss_reason = cleanup_failure.reason
     state = _ConsistencyState(
         context_ids=artifact.consistency.read_context_ids,
         stable_reads=_degraded_stable_reads(artifact.consistency.stable_reads),
         cut_aligned=artifact.consistency.cut_alignment is not ConsistencyLevel.UNKNOWN,
     )
-    return _AttemptFailure(
-        execution_status=ExecutionStatus.INCOMPLETE,
-        verdict=(
-            Verdict.MISMATCH if artifact.verdict is Verdict.MISMATCH else Verdict.INCONCLUSIVE
+    partial_artifact = partial_comparison_artifact_from_completed(
+        artifact,
+        context_loss_reason.code,
+    )
+    partial_artifact = replace(
+        partial_artifact,
+        consistency=ConsistencyStatus(
+            stable_reads=state.stable_reads,
+            cut_alignment=artifact.consistency.cut_alignment,
+            read_context_ids=artifact.consistency.read_context_ids,
         ),
+    )
+    verdict, additional_reasons = _partial_failure_publication_values(
+        partial_artifact,
+        Verdict.MISMATCH if artifact.verdict is Verdict.MISMATCH else Verdict.INCONCLUSIVE,
+        (*artifact.reasons, *cleanup_failure.additional_reasons),
+    )
+    return _AttemptFailure(
+        execution_status=_execution_status_for_cleanup_failure(cleanup_failure),
+        verdict=verdict,
         reason=_reason_with_cleanup_state(context_loss_reason, state),
-        additional_reasons=artifact.reasons,
-        retryable=artifact.verdict is not Verdict.MISMATCH,
+        additional_reasons=additional_reasons,
+        retryable=(
+            artifact.verdict is not Verdict.MISMATCH
+            and _cleanup_failure_is_retryable(cleanup_failure)
+        ),
         context_ids=state.context_ids,
         stable_reads=state.stable_reads,
         cut_aligned=state.cut_aligned,
         comparison_coverage=artifact.comparison_coverage,
         evidence_coverage=artifact.evidence_coverage,
         metrics=artifact.metrics,
-        partial_artifact=partial_comparison_artifact_from_completed(
-            artifact,
-            ReasonCode.SNAPSHOT_LOST,
-        ),
+        partial_artifact=partial_artifact,
         persisted_cut=persisted_cut,
     )
 
 
 def _failure_from_cleanup_context_loss(
-    context_loss_reason: ResultReason,
+    cleanup_failure: _CleanupFailure,
     context_ids: tuple[UUID, ...],
     cut_aligned: bool,
     metrics: ResultMetrics,
 ) -> _AttemptFailure:
+    context_loss_reason = cleanup_failure.reason
     state = _ConsistencyState(
         context_ids=context_ids,
         stable_reads=ConsistencyLevel.UNKNOWN,
         cut_aligned=cut_aligned,
     )
     return _AttemptFailure(
-        execution_status=ExecutionStatus.INCOMPLETE,
+        execution_status=_execution_status_for_cleanup_failure(cleanup_failure),
         verdict=Verdict.INCONCLUSIVE,
         reason=_reason_with_cleanup_state(
             _reason_with_failure_metrics(context_loss_reason, metrics),
             state,
         ),
-        additional_reasons=(),
-        retryable=True,
+        additional_reasons=cleanup_failure.additional_reasons,
+        retryable=_cleanup_failure_is_retryable(cleanup_failure),
         context_ids=context_ids,
         stable_reads=state.stable_reads,
         cut_aligned=cut_aligned,
@@ -1957,10 +2542,78 @@ def _failure_from_cleanup_context_loss(
     )
 
 
+def _combined_execution_status(
+    current: ExecutionStatus,
+    cleanup_failure: _CleanupFailure,
+) -> ExecutionStatus:
+    additional = _execution_status_for_cleanup_failure(cleanup_failure)
+    if current is ExecutionStatus.ERROR or additional is ExecutionStatus.ERROR:
+        return ExecutionStatus.ERROR
+    return ExecutionStatus.INCOMPLETE
+
+
+def _execution_status_for_cleanup_failure(
+    cleanup_failure: _CleanupFailure,
+) -> ExecutionStatus:
+    statuses = tuple(
+        _execution_status_for_failure_reason(reason)
+        for reason in (cleanup_failure.reason, *cleanup_failure.additional_reasons)
+    )
+    if ExecutionStatus.ERROR in statuses:
+        return ExecutionStatus.ERROR
+    return ExecutionStatus.INCOMPLETE
+
+
+def _execution_status_for_failure_reason(reason: ResultReason) -> ExecutionStatus:
+    if reason.code in (
+        ReasonCode.INVALID_CONTRACT,
+        ReasonCode.UNSUPPORTED_CAPABILITY,
+        ReasonCode.LOSSY_TRANSPORT,
+        ReasonCode.QUERY_ERROR,
+        ReasonCode.PERSISTENCE_ERROR,
+        ReasonCode.COMMIT_UNKNOWN,
+        ReasonCode.PROTOCOL_VIOLATION,
+    ):
+        return ExecutionStatus.ERROR
+    return ExecutionStatus.INCOMPLETE
+
+
+def _cleanup_failure_is_retryable(cleanup_failure: _CleanupFailure) -> bool:
+    return all(
+        reason.code
+        in (
+            ReasonCode.NOT_READY,
+            ReasonCode.CUT_MISMATCH,
+            ReasonCode.SNAPSHOT_LOST,
+            ReasonCode.QUERY_ERROR,
+        )
+        for reason in (cleanup_failure.reason, *cleanup_failure.additional_reasons)
+    )
+
+
 def _degraded_stable_reads(level: ConsistencyLevel) -> ConsistencyLevel:
     if level is ConsistencyLevel.VERIFIED:
         return ConsistencyLevel.VERIFIED
     return ConsistencyLevel.UNKNOWN
+
+
+def _partial_failure_publication_values(
+    artifact: PartialComparisonArtifact | None,
+    verdict: Verdict,
+    additional_reasons: tuple[ResultReason, ...],
+) -> tuple[Verdict, tuple[ResultReason, ...]]:
+    if (
+        artifact is None
+        or artifact.consistency.stable_reads is not ConsistencyLevel.UNKNOWN
+        or (not artifact.frontier.topology and not artifact.frontier.unresolved)
+    ):
+        return verdict, additional_reasons
+    return (
+        Verdict.INCONCLUSIVE,
+        tuple(
+            reason for reason in additional_reasons if reason.code is not ReasonCode.DATA_MISMATCH
+        ),
+    )
 
 
 def _reason_with_failure_consistency(
@@ -2257,6 +2910,312 @@ def _failure_from_early_outcome(
     )
 
 
+def _failure_from_attempt_error(
+    error: Exception,
+    resources: list[_AttemptResource],
+    cut_aligned: bool,
+    source_budget: PostgresSourceBudgetAttempt,
+    greenplum_endpoint_direction: PlanDirection | None,
+) -> _AttemptFailure:
+    if isinstance(error, UnsupportedComparisonError):
+        return _failure_from_unsupported_comparison(
+            error,
+            resources,
+            cut_aligned,
+            source_budget,
+        )
+    if isinstance(error, MssqlQueryTimeoutError):
+        return _failure_from_terminal_source_reason(
+            _mssql_query_timeout_reason(error),
+            resources,
+            cut_aligned,
+            source_budget,
+        )
+    if isinstance(
+        error,
+        (
+            ClickHouseResultLimitError,
+            MssqlResultLimitError,
+            OriginalGreenplumResultLimitError,
+            PostgresResultLimitError,
+        ),
+    ):
+        return _failure_from_error(
+            ExecutionStatus.INCOMPLETE,
+            ReasonCode.BUDGET_EXHAUSTED,
+            "read_source",
+            "a bounded source read exceeded its configured result budget",
+            error,
+            False,
+            resources,
+            cut_aligned,
+            source_budget,
+        )
+    if isinstance(
+        error,
+        (
+            ClickHouseAttemptDeadlineExceededError,
+            ComparisonBudgetExceededError,
+            GreengageBudgetExceededError,
+            OriginalGreenplumBudgetExceededError,
+            PostgresReadDeadlineExceededError,
+            PostgresSourceBudgetExceededError,
+        ),
+    ):
+        return _failure_from_error(
+            ExecutionStatus.INCOMPLETE,
+            ReasonCode.BUDGET_EXHAUSTED,
+            "compare",
+            "the check exhausted an immutable execution budget",
+            error,
+            False,
+            resources,
+            cut_aligned,
+            source_budget,
+        )
+    if isinstance(error, MssqlCancellationConfirmedError):
+        reason = _mssql_confirmed_cancellation_reason(error)
+        return _failure_from_terminal_source_reason(
+            reason,
+            resources,
+            cut_aligned,
+            source_budget,
+        )
+    if isinstance(error, MssqlCancellationUnconfirmedError):
+        reason = _mssql_unconfirmed_cancellation_reason(error)
+        return _failure_from_terminal_source_reason(
+            reason,
+            resources,
+            cut_aligned,
+            source_budget,
+        )
+    if isinstance(error, ClickHouseCancellationUnconfirmedError):
+        reason = _clickhouse_unconfirmed_cancellation_reason(error)
+        return _failure_from_terminal_source_reason(
+            reason,
+            resources,
+            cut_aligned,
+            source_budget,
+        )
+    if isinstance(error, UnsupportedMssqlRelationError):
+        operation = "inspect_source_relation"
+        message = _actionable_mssql_error_message(error, "SQL Server relation refusal")
+        return _failure_from_unsupported_source_error(
+            operation,
+            message,
+            error,
+            resources,
+            cut_aligned,
+            source_budget,
+        )
+    if isinstance(error, MssqlLoweringError):
+        operation = "compile_source_query"
+        message = _actionable_mssql_error_message(error, "SQL Server query lowering refusal")
+        return _failure_from_unsupported_source_error(
+            operation,
+            message,
+            error,
+            resources,
+            cut_aligned,
+            source_budget,
+        )
+    if isinstance(
+        error,
+        (
+            ClickHouseProtectedContextConfirmationError,
+            ClickHouseProtectedContextLostError,
+            GreenplumContextLostError,
+            GreengageAcquisitionRaceError,
+            MssqlContextLostError,
+            MssqlMetadataError,
+            OriginalGreenplumAcquisitionRaceError,
+            PostgresAcquisitionRaceError,
+            PostgresContextLostError,
+        ),
+    ):
+        return _failure_from_error(
+            ExecutionStatus.INCOMPLETE,
+            ReasonCode.SNAPSHOT_LOST,
+            "read_source",
+            "a protected source snapshot was lost before completion",
+            error,
+            True,
+            resources,
+            cut_aligned,
+            source_budget,
+        )
+    if isinstance(
+        error,
+        (
+            GreenplumConnectionError,
+            GreenplumQueryError,
+            MssqlConnectionError,
+            MssqlQueryError,
+            PostgresConnectionError,
+            PostgresMetadataError,
+            PostgresQueryError,
+        ),
+    ):
+        return _failure_from_error(
+            ExecutionStatus.ERROR,
+            ReasonCode.QUERY_ERROR,
+            "read_source",
+            "a source operation failed",
+            error,
+            True,
+            resources,
+            cut_aligned,
+            source_budget,
+        )
+    if isinstance(error, UnsupportedPostgresProfileError):
+        return _failure_from_unsupported_source_error(
+            "open_source",
+            "a source does not satisfy the required runtime profile",
+            error,
+            resources,
+            cut_aligned,
+            source_budget,
+        )
+    if isinstance(error, UnsupportedMssqlProfileError):
+        return _failure_from_unsupported_source_error(
+            "open_source",
+            _actionable_mssql_error_message(error, "SQL Server profile refusal"),
+            error,
+            resources,
+            cut_aligned,
+            source_budget,
+        )
+    if isinstance(error, UnsupportedClickHouseProfileError):
+        return _failure_from_unsupported_source_error(
+            "open_target",
+            "the ClickHouse target does not satisfy the immutable named-version profile",
+            error,
+            resources,
+            cut_aligned,
+            source_budget,
+        )
+    if isinstance(error, (UnsupportedGreenplumProfileError, GreenplumMetadataError)):
+        operation, message = _greenplum_unsupported_error_context(greenplum_endpoint_direction)
+        return _failure_from_unsupported_source_error(
+            operation,
+            message,
+            error,
+            resources,
+            cut_aligned,
+            source_budget,
+        )
+    if isinstance(
+        error,
+        (
+            AcquisitionValidationError,
+            ClickHouseDataValidationError,
+            ClickHouseProtectedContextClosedError,
+            ClickHouseTransportAttemptMismatchError,
+            ClickHouseTransportClosedError,
+            ComparisonProtocolError,
+            GreenplumContextClosedError,
+            GreenplumDataValidationError,
+            MssqlContextClosedError,
+            MssqlDataValidationError,
+            MssqlQueryContextError,
+            PostgresContextClosedError,
+            PostgresDataValidationError,
+            PostgresQueryContextError,
+        ),
+    ):
+        return _failure_from_error(
+            ExecutionStatus.ERROR,
+            ReasonCode.PROTOCOL_VIOLATION,
+            "execute_check",
+            "source evidence violated the declared check protocol",
+            error,
+            False,
+            resources,
+            cut_aligned,
+            source_budget,
+        )
+    if isinstance(error, MssqlTransportError):
+        return _failure_from_error(
+            ExecutionStatus.ERROR,
+            ReasonCode.QUERY_ERROR,
+            "read_source",
+            "a SQL Server source operation failed",
+            error,
+            True,
+            resources,
+            cut_aligned,
+            source_budget,
+        )
+    if isinstance(
+        error,
+        (ClickHouseProtectedContextCleanupError, ClickHouseTransportCleanupError),
+    ):
+        return _failure_from_error(
+            ExecutionStatus.INCOMPLETE,
+            ReasonCode.CANCELLATION_UNCONFIRMED,
+            "cleanup_target",
+            "ClickHouse target transport cleanup could not be established",
+            error,
+            False,
+            resources,
+            cut_aligned,
+            source_budget,
+        )
+    if isinstance(error, ClickHouseTransportError):
+        return _failure_from_error(
+            ExecutionStatus.ERROR,
+            ReasonCode.QUERY_ERROR,
+            "read_target",
+            "a ClickHouse target operation failed",
+            error,
+            True,
+            resources,
+            cut_aligned,
+            source_budget,
+        )
+    raise AssertionError(f"unhandled attempt error {type(error).__name__}")
+
+
+def _failure_from_unsupported_source_error(
+    operation: str,
+    message: str,
+    error: Exception,
+    resources: list[_AttemptResource],
+    cut_aligned: bool,
+    source_budget: PostgresSourceBudgetAttempt,
+) -> _AttemptFailure:
+    return _failure_from_error(
+        ExecutionStatus.ERROR,
+        ReasonCode.UNSUPPORTED_CAPABILITY,
+        operation,
+        message,
+        error,
+        False,
+        resources,
+        cut_aligned,
+        source_budget,
+    )
+
+
+def _greenplum_unsupported_error_context(
+    endpoint_direction: PlanDirection | None,
+) -> tuple[str, str]:
+    if endpoint_direction is PlanDirection.REFERENCE:
+        return (
+            "open_reference",
+            "the original Greenplum reference does not satisfy the required runtime capability",
+        )
+    if endpoint_direction is PlanDirection.TARGET:
+        return (
+            "open_target",
+            "the Greengage target does not satisfy the required runtime capability",
+        )
+    return (
+        "compare",
+        "a Greenplum-family endpoint does not satisfy the required runtime capability",
+    )
+
+
 def _failure_from_comparison_interruption(
     error: ComparisonInterruptedError,
     resources: list[_AttemptResource],
@@ -2299,6 +3258,8 @@ def _failure_from_comparison_interruption(
             ComparisonBudgetExceededError,
             GreengageBudgetExceededError,
             OriginalGreenplumBudgetExceededError,
+            ClickHouseAttemptDeadlineExceededError,
+            ClickHouseResultLimitError,
             PostgresReadDeadlineExceededError,
             PostgresResultLimitError,
             PostgresSourceBudgetExceededError,
@@ -2321,6 +3282,10 @@ def _failure_from_comparison_interruption(
         execution_status = ExecutionStatus.INCOMPLETE
         reason = _mssql_unconfirmed_cancellation_reason(cause)
         retryable = False
+    elif isinstance(cause, ClickHouseCancellationUnconfirmedError):
+        execution_status = ExecutionStatus.INCOMPLETE
+        reason = _clickhouse_unconfirmed_cancellation_reason(cause)
+        retryable = False
     elif isinstance(
         cause,
         (
@@ -2331,6 +3296,8 @@ def _failure_from_comparison_interruption(
             GreenplumContextLostError,
             GreengageAcquisitionRaceError,
             OriginalGreenplumAcquisitionRaceError,
+            ClickHouseProtectedContextLostError,
+            ClickHouseProtectedContextConfirmationError,
         ),
     ):
         execution_status = ExecutionStatus.INCOMPLETE
@@ -2379,6 +3346,15 @@ def _failure_from_comparison_interruption(
             (SafeParameter(name="error_type", value=type(cause).__name__),),
         )
         retryable = False
+    elif isinstance(cause, UnsupportedClickHouseProfileError):
+        execution_status = ExecutionStatus.ERROR
+        reason = _reason(
+            ReasonCode.UNSUPPORTED_CAPABILITY,
+            "open_target",
+            "the ClickHouse target does not satisfy the immutable named-version profile",
+            (SafeParameter(name="error_type", value=type(cause).__name__),),
+        )
+        retryable = False
     elif isinstance(cause, (UnsupportedGreenplumProfileError, GreenplumMetadataError)):
         execution_status = ExecutionStatus.ERROR
         reason = _reason(
@@ -2401,6 +3377,10 @@ def _failure_from_comparison_interruption(
             MssqlQueryContextError,
             GreenplumContextClosedError,
             GreenplumDataValidationError,
+            ClickHouseProtectedContextClosedError,
+            ClickHouseDataValidationError,
+            ClickHouseTransportAttemptMismatchError,
+            ClickHouseTransportClosedError,
         ),
     ):
         execution_status = ExecutionStatus.ERROR
@@ -2420,6 +3400,22 @@ def _failure_from_comparison_interruption(
             (SafeParameter(name="error_type", value=type(cause).__name__),),
         )
         retryable = True
+    elif isinstance(
+        cause,
+        (ClickHouseProtectedContextCleanupError, ClickHouseTransportCleanupError),
+    ):
+        execution_status = ExecutionStatus.INCOMPLETE
+        reason = _clickhouse_cleanup_uncertainty_reason(cause)
+        retryable = False
+    elif isinstance(cause, ClickHouseTransportError):
+        execution_status = ExecutionStatus.ERROR
+        reason = _reason_from_source_error(
+            ReasonCode.QUERY_ERROR,
+            "read_target",
+            "a ClickHouse target operation failed",
+            cause,
+        )
+        retryable = True
     else:
         raise AssertionError(f"unhandled comparison interruption cause {type(cause).__name__}")
 
@@ -2433,9 +3429,14 @@ def _failure_from_comparison_interruption(
         raise ApplicationStateError(
             "partial comparison context identity differs from the active attempt resources"
         )
+    verdict, additional_reasons = _partial_failure_publication_values(
+        artifact,
+        artifact.verdict,
+        additional_reasons,
+    )
     return _AttemptFailure(
         execution_status=execution_status,
-        verdict=artifact.verdict,
+        verdict=verdict,
         reason=reason,
         additional_reasons=additional_reasons,
         retryable=retryable,
@@ -2522,6 +3523,20 @@ def _reason_from_source_error(
     reason = _reason(code, operation, message, _source_error_parameters(error))
     if isinstance(error, GreenplumQueryError):
         return reason.model_copy(update={"native_error_code": error.sqlstate})
+    if isinstance(error, ClickHouseQueryError):
+        return reason.model_copy(
+            update={
+                "native_error_code": (None if error.error_code is None else str(error.error_code)),
+                "query_id": str(error.query_id),
+            }
+        )
+    if isinstance(error, ClickHouseConnectionError) and error.query_id is not None:
+        return reason.model_copy(
+            update={
+                "native_error_code": (None if error.error_code is None else str(error.error_code)),
+                "query_id": str(error.query_id),
+            }
+        )
     return reason
 
 
@@ -2539,6 +3554,43 @@ def _source_error_parameters(error: Exception) -> tuple[SafeParameter, ...]:
         (GreengageBudgetExceededError, OriginalGreenplumBudgetExceededError),
     ):
         parameters.append(SafeParameter(name="budget_detail", value=str(error)))
+    if isinstance(error, ClickHouseQueryError):
+        parameters.extend(
+            (
+                SafeParameter(name="target_operation", value=error.operation),
+                SafeParameter(
+                    name="http_status",
+                    value="none" if error.http_status is None else str(error.http_status),
+                ),
+                SafeParameter(
+                    name="error_code",
+                    value="none" if error.error_code is None else str(error.error_code),
+                ),
+                SafeParameter(
+                    name="error_name",
+                    value="none" if error.error_name is None else error.error_name,
+                ),
+                SafeParameter(name="completion", value=error.completion.value),
+            )
+        )
+    elif isinstance(error, ClickHouseConnectionError):
+        parameters.extend(
+            (
+                SafeParameter(
+                    name="http_status",
+                    value="none" if error.http_status is None else str(error.http_status),
+                ),
+                SafeParameter(
+                    name="error_code",
+                    value="none" if error.error_code is None else str(error.error_code),
+                ),
+                SafeParameter(
+                    name="error_name",
+                    value="none" if error.error_name is None else error.error_name,
+                ),
+                SafeParameter(name="connection_attempts", value=str(error.connection_attempts)),
+            )
+        )
     return tuple(parameters)
 
 
@@ -2636,6 +3688,46 @@ def _mssql_unconfirmed_cancellation_reason(
     )
 
 
+def _clickhouse_unconfirmed_cancellation_reason(
+    error: ClickHouseCancellationUnconfirmedError,
+) -> ResultReason:
+    return ResultReason(
+        code=ReasonCode.CANCELLATION_UNCONFIRMED,
+        operation="cancel_target_query",
+        message="ClickHouse target-query completion could not be confirmed after cancellation",
+        safe_parameters=(
+            SafeParameter(name="error_type", value=type(error).__name__),
+            SafeParameter(name="attempt_id", value=str(error.attempt_id)),
+            SafeParameter(name="target_operation", value=error.operation),
+            SafeParameter(name="trigger_cause", value=error.trigger_cause),
+            SafeParameter(name="cancellation_cause", value=error.cancellation_cause),
+            SafeParameter(
+                name="http_status",
+                value="none" if error.http_status is None else str(error.http_status),
+            ),
+            SafeParameter(
+                name="error_code",
+                value="none" if error.error_code is None else str(error.error_code),
+            ),
+            SafeParameter(
+                name="error_name",
+                value="none" if error.error_name is None else error.error_name,
+            ),
+            SafeParameter(
+                name="received_response_bytes",
+                value=str(error.received_response_bytes),
+            ),
+            SafeParameter(
+                name="response_truncated",
+                value="1" if error.response_truncated else "0",
+            ),
+        ),
+        native_error_code=(None if error.error_code is None else str(error.error_code)),
+        query_id=str(error.query_id),
+        redacted_response=None,
+    )
+
+
 def _failure_from_unsupported_comparison(
     error: UnsupportedComparisonError,
     resources: list[_AttemptResource],
@@ -2705,9 +3797,9 @@ def _run_result_from_terminal_readback(
     metrics = failure_metrics if failure_metrics is not None else _mapping_metrics(outcome.reason)
     mapping_failure = outcome.reason.code is ReasonCode.LOSSY_TRANSPORT
     failure_state = _failure_consistency_from_reason(outcome.reason)
-    if failure_state is not None and (cleanup_state is not None or mapping_failure):
+    if failure_state is not None and cleanup_state is not None:
         raise ApplicationStateError(
-            "stored terminal reason mixes generic and specialized consistency state"
+            "stored terminal reason mixes failure and cleanup consistency state"
         )
     if cleanup_state is not None:
         state = cleanup_state
@@ -2805,8 +3897,6 @@ def _failure_consistency_from_reason(reason: ResultReason) -> _ConsistencyState 
         stable_reads = ConsistencyLevel(stable_reads_text)
     except (TypeError, ValueError):
         raise ApplicationStateError("stored failure stable-read level is invalid") from None
-    if stable_reads is ConsistencyLevel.ASSERTED:
-        raise ApplicationStateError("stored failure consistency cannot assert stable reads")
     cut_aligned_text = values.get("failure_cut_aligned")
     if cut_aligned_text not in ("0", "1"):
         raise ApplicationStateError("stored failure cut-alignment marker is invalid")
@@ -2815,6 +3905,8 @@ def _failure_consistency_from_reason(reason: ResultReason) -> _ConsistencyState 
         raise ApplicationStateError("stored aligned failure state requires two contexts")
     if stable_reads is ConsistencyLevel.VERIFIED and len(context_ids) != 2:
         raise ApplicationStateError("stored verified failure state requires two contexts")
+    if stable_reads is ConsistencyLevel.ASSERTED and len(context_ids) != 2:
+        raise ApplicationStateError("stored asserted failure state requires two contexts")
     return _ConsistencyState(
         context_ids=context_ids,
         stable_reads=stable_reads,
@@ -3169,6 +4261,38 @@ def _context_ids(resources: list[_AttemptResource]) -> tuple[UUID, ...]:
     )
 
 
+def _consistency_state_for_active_cut(
+    resources: list[_AttemptResource],
+    cut_aligned: bool,
+) -> _ConsistencyState:
+    context_ids = _context_ids(resources)
+    if not cut_aligned or len(context_ids) != 2:
+        return _ConsistencyState(
+            context_ids=context_ids,
+            stable_reads=ConsistencyLevel.UNKNOWN,
+            cut_aligned=cut_aligned,
+        )
+    clickhouse_contexts = tuple(
+        resource.protected.context
+        for resource in resources
+        if isinstance(resource.protected.context, ClickHouseProtectedReadContext)
+    )
+    if any(
+        context.state is not ClickHouseProtectedContextState.ACTIVE
+        for context in clickhouse_contexts
+    ):
+        stable_reads = ConsistencyLevel.UNKNOWN
+    elif clickhouse_contexts:
+        stable_reads = ConsistencyLevel.ASSERTED
+    else:
+        stable_reads = ConsistencyLevel.VERIFIED
+    return _ConsistencyState(
+        context_ids=context_ids,
+        stable_reads=stable_reads,
+        cut_aligned=cut_aligned,
+    )
+
+
 def _side_definitions(
     check: RowCheckDefinition,
     direction: PlanDirection,
@@ -3193,7 +4317,11 @@ def _postgres_settings(
         return services.target_settings
     if direction is PlanDirection.REFERENCE and isinstance(
         services,
-        (PostgresExecutionServices, PostgresGreengageExecutionServices),
+        (
+            PostgresExecutionServices,
+            PostgresGreengageExecutionServices,
+            PostgresClickHouseExecutionServices,
+        ),
     ):
         return services.reference_settings
     raise TypeError("execution services do not provide PostgreSQL settings for this direction")
@@ -3212,7 +4340,7 @@ def _postgres_retry_policy(
         return services.target_retry_policy
     if direction is PlanDirection.REFERENCE and isinstance(
         services,
-        PostgresGreengageExecutionServices,
+        (PostgresGreengageExecutionServices, PostgresClickHouseExecutionServices),
     ):
         return services.reference_retry_policy
     raise TypeError(
@@ -3271,6 +4399,22 @@ def _protected_original_greenplum_relation(
         raise GreenplumMetadataError(
             "protected original Greenplum relation set does not contain exactly one requested "
             "relation"
+        )
+    return matches[0]
+
+
+def _protected_clickhouse_relation(
+    context: ClickHouseProtectedReadContext,
+    relation_components: tuple[str, str],
+) -> ClickHouseProtectedRelationInspection:
+    matches = tuple(
+        item
+        for item in context.protected_relations
+        if item.acquisition.relation.components == relation_components
+    )
+    if len(matches) != 1:
+        raise ClickHouseDataValidationError(
+            "protected ClickHouse relation set does not contain exactly one requested relation"
         )
     return matches[0]
 
@@ -3353,6 +4497,11 @@ def _validate_service_closure(
         if not isinstance(services, MssqlGreengageExecutionServices):
             raise TypeError("MSSQL to Greengage execution requires matching services")
         return
+    if pair == (Adapter.MSSQL, Adapter.CLICKHOUSE):
+        if not isinstance(services, MssqlClickHouseExecutionServices):
+            raise TypeError("MSSQL to ClickHouse execution requires matching services")
+        _validate_clickhouse_comparison_capacity(config, check, services.target_canonical_limits)
+        return
     if pair == (Adapter.POSTGRESQL, Adapter.POSTGRESQL):
         if not isinstance(services, PostgresExecutionServices):
             raise TypeError("PostgreSQL endpoint execution requires matching services")
@@ -3360,6 +4509,11 @@ def _validate_service_closure(
     if pair == (Adapter.POSTGRESQL, Adapter.GREENGAGE):
         if not isinstance(services, PostgresGreengageExecutionServices):
             raise TypeError("PostgreSQL to Greengage execution requires matching services")
+        return
+    if pair == (Adapter.POSTGRESQL, Adapter.CLICKHOUSE):
+        if not isinstance(services, PostgresClickHouseExecutionServices):
+            raise TypeError("PostgreSQL to ClickHouse execution requires matching services")
+        _validate_clickhouse_comparison_capacity(config, check, services.target_canonical_limits)
         return
     if pair == (Adapter.GREENPLUM, Adapter.POSTGRESQL):
         if not isinstance(services, OriginalGreenplumPostgresExecutionServices):
@@ -3369,10 +4523,40 @@ def _validate_service_closure(
         if not isinstance(services, OriginalGreenplumGreengageExecutionServices):
             raise TypeError("original Greenplum to Greengage execution requires matching services")
         return
+    if pair == (Adapter.GREENPLUM, Adapter.CLICKHOUSE):
+        if not isinstance(services, OriginalGreenplumClickHouseExecutionServices):
+            raise TypeError("original Greenplum to ClickHouse execution requires matching services")
+        _validate_clickhouse_comparison_capacity(config, check, services.target_canonical_limits)
+        return
     raise UnsupportedComparisonError(
         "execution adapter pair is not implemented: "
         f"reference={pair[0].value!r}, target={pair[1].value!r}"
     )
+
+
+def _validate_clickhouse_comparison_capacity(
+    config: LoadedContractConfig,
+    check: RowCheckDefinition,
+    limits: ClickHouseCanonicalLimits,
+) -> None:
+    locator = check.reference.locator
+    if not isinstance(locator, RelationLocator):
+        return
+    if locator.relation_scope is not RelationScope.PHYSICAL_ONLY:
+        # Union provenance depends on discovered members; the endpoint validates it after discovery.
+        return
+    member_count = 1
+    if check.reference.connection.adapter is Adapter.MSSQL:
+        # SQL Server inspection requires one binding per canonical field, plus three relation IDs.
+        member_count = 3 + len(check.reference.logical_schema.schema.fields)
+    required_row_bytes = comparison_max_encoded_row_bytes(config.execution, member_count)
+    if required_row_bytes > limits.max_encoded_envelope_bytes:
+        raise ValueError(
+            "ClickHouse canonical row limit cannot contain the configured comparison request: "
+            f"check_id={check.check_id!r}, required_encoded_row_bytes={required_row_bytes}, "
+            f"max_encoded_envelope_bytes={limits.max_encoded_envelope_bytes}; "
+            "derive compatible target limits with build_clickhouse_execution_limits(config.execution)"
+        )
 
 
 def _validate_runtime_profiles(
@@ -3429,6 +4613,15 @@ def _validate_runtime_profiles(
         ):
             raise UnsupportedGreenplumProfileError(
                 "Greengage target requires driver='psycopg' and profile='greengage'"
+            )
+    elif target.adapter is Adapter.CLICKHOUSE:
+        if (
+            match_clickhouse_runtime_profile(target.driver, target.profile)
+            is not ClickHouseRuntimeProfile.LTS
+        ):
+            raise UnsupportedClickHouseProfileError(
+                "ClickHouse target requires driver='clickhouse-connect' "
+                "and profile='clickhouse_lts'"
             )
     else:
         raise UnsupportedComparisonError(

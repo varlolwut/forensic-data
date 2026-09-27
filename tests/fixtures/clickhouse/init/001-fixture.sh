@@ -238,6 +238,20 @@ INSERT INTO dfe_fixture.immutable_version_readiness VALUES
     toUInt64(1)
 );
 
+INSERT INTO dfe_fixture.immutable_version_readiness VALUES
+(
+    'clickhouse_target_orders',
+    '13da3e93058f4e53db4d7989380a57597b0fb5a86dc0e9a80ae33bd1b11f9897',
+    'comparison-orders-2024-02-29-v001',
+    'complete',
+    toDate('2024-02-29'),
+    'comparison-orders-cut-000001',
+    'comparison_orders_v001',
+    toDateTime64('2024-03-01 01:02:03.456789', 6, 'UTC'),
+    toUInt64(7),
+    toUInt64(11)
+);
+
 DROP TABLE IF EXISTS dfe_fixture.immutable_orders_staging;
 
 CREATE TABLE dfe_fixture.immutable_orders_staging
@@ -291,6 +305,52 @@ INSERT INTO dfe_fixture.immutable_orders_v002 VALUES
     (3, '30.000', toDate('2024-02-29'), 'immutable-orders-2024-02-29-v002');
 
 ALTER TABLE dfe_fixture.immutable_orders_v002 MODIFY SETTING table_readonly = 1;
+
+DROP TABLE IF EXISTS dfe_fixture.comparison_orders_v001 SYNC;
+
+CREATE TABLE dfe_fixture.comparison_orders_v001
+UUID '44444444-4444-4444-8444-444444444444'
+(
+    order_id Int64,
+    business_date Date,
+    precise_amount Decimal(38, 7),
+    local_time DateTime64(6, 'UTC'),
+    instant_time DateTime64(6, 'UTC')
+)
+ENGINE = MergeTree
+ORDER BY order_id;
+
+INSERT INTO dfe_fixture.comparison_orders_v001 VALUES
+(
+    1,
+    toDate('2024-02-29'),
+    '100.0000000',
+    toDateTime64('2024-02-29 10:00:01.111111', 6, 'UTC'),
+    toDateTime64('2024-02-29 08:00:01.111111', 6, 'UTC')
+),
+(
+    2,
+    toDate('2024-02-29'),
+    '200.0000001',
+    toDateTime64('2024-02-29 10:00:02.222223', 6, 'UTC'),
+    toDateTime64('2024-02-29 08:00:02.222223', 6, 'UTC')
+),
+(
+    4,
+    toDate('2024-02-29'),
+    '400.0000000',
+    toDateTime64('2024-02-29 10:00:04.444444', 6, 'UTC'),
+    toDateTime64('2024-02-29 08:00:04.444444', 6, 'UTC')
+),
+(
+    5,
+    toDate('2024-02-29'),
+    '500.0000000',
+    toDateTime64('2024-02-29 10:00:05.555555', 6, 'UTC'),
+    toDateTime64('2024-02-29 08:00:05.555555', 6, 'UTC')
+);
+
+ALTER TABLE dfe_fixture.comparison_orders_v001 MODIFY SETTING table_readonly = 1;
 
 DROP TABLE IF EXISTS dfe_fixture.logical_orders_v001 SYNC;
 
@@ -348,6 +408,7 @@ SETTINGS
     do_not_merge_across_partitions_select_final = 0 CONST;
 
 GRANT SELECT ON dfe_fixture.* TO dfe_fixture_reader;
+GRANT SELECT ON system.build_options TO dfe_fixture_reader;
 GRANT SELECT ON system.mutations TO dfe_fixture_reader;
 GRANT SELECT ON system.parts TO dfe_fixture_reader;
 GRANT SELECT ON system.processes TO dfe_fixture_reader;

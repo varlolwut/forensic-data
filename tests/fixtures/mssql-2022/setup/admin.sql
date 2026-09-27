@@ -114,6 +114,16 @@ CREATE TABLE [dfe_fixture].[comparison_orders]
     CONSTRAINT [PK_dfe_fixture_comparison_orders] PRIMARY KEY ([order_id])
 );
 
+CREATE TABLE [dfe_fixture].[clickhouse_comparison_orders]
+(
+    [order_id] bigint NOT NULL,
+    [business_date] date NOT NULL,
+    [precise_amount] decimal(38, 7) NOT NULL,
+    [local_time] datetime2(7) NOT NULL,
+    [instant_time] datetimeoffset(7) NOT NULL,
+    CONSTRAINT [PK_dfe_fixture_clickhouse_comparison_orders] PRIMARY KEY ([order_id])
+);
+
 CREATE TABLE [dfe_fixture].[comparison_batch_manifest]
 (
     [dataset_id] nvarchar(128) NOT NULL,

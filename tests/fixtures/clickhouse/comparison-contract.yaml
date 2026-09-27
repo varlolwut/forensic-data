@@ -1,0 +1,302 @@
+version: 1
+connections:
+  reference_pg:
+    adapter: postgresql
+    driver: psycopg
+    profile: postgresql_17
+    roles: [source]
+    secret_ref: env:DFE_P0506_POSTGRES_REFERENCE_DSN
+  reference_original_greenplum:
+    adapter: greenplum
+    driver: psycopg2
+    profile: original_greenplum
+    roles: [source]
+    secret_ref: env:DFE_P0506_ORIGINAL_GREENPLUM_REFERENCE_DSN
+  reference_mssql:
+    adapter: mssql
+    driver: pyodbc
+    profile: mssql_2022
+    roles: [source]
+    secret_ref: env:DFE_P0506_MSSQL_REFERENCE_DSN
+  target_clickhouse:
+    adapter: clickhouse
+    driver: clickhouse-connect
+    profile: clickhouse_lts
+    roles: [target]
+    secret_ref: env:DFE_P0506_CLICKHOUSE_TARGET_SECRET
+  metadata_pg:
+    adapter: postgresql
+    driver: psycopg
+    profile: postgresql_17
+    roles: [metadata]
+    secret_ref: env:DFE_P0506_METADATA_DSN
+schemas:
+  comparison_order_v1:
+    fields:
+      - name: order_id
+        type: {kind: int64}
+        nullable: false
+        normalization: none
+        equality: {kind: exact}
+      - name: business_date
+        type: {kind: date}
+        nullable: false
+        normalization: none
+        equality: {kind: exact}
+      - name: precise_amount
+        type: {kind: decimal, precision: 38, scale: 7}
+        nullable: false
+        normalization: none
+        equality: {kind: exact}
+      - name: local_time
+        type: {kind: timestamp_local, precision: 6}
+        nullable: false
+        normalization: none
+        equality: {kind: exact}
+      - name: instant_time
+        type: {kind: timestamp_instant, precision: 6}
+        nullable: false
+        normalization: none
+        equality: {kind: exact}
+datasets:
+  postgres_reference_orders:
+    connection: reference_pg
+    relation:
+      {catalog: null, schema: dfe_demo, name: reference_orders, relation_scope: physical_only}
+    logical_schema: comparison_order_v1
+    projection:
+      - {field: order_id, column: order_id}
+      - {field: business_date, column: business_date}
+      - {field: precise_amount, column: precise_amount}
+      - {field: local_time, column: local_time}
+      - {field: instant_time, column: instant_time}
+    grain: [order_id]
+  original_greenplum_reference_orders:
+    connection: reference_original_greenplum
+    relation:
+      {catalog: null, schema: dfe_fixture, name: comparison_orders, relation_scope: physical_only}
+    logical_schema: comparison_order_v1
+    projection:
+      - {field: order_id, column: order_id}
+      - {field: business_date, column: business_date}
+      - {field: precise_amount, column: precise_amount}
+      - {field: local_time, column: local_time}
+      - {field: instant_time, column: instant_time}
+    grain: [order_id]
+  mssql_reference_orders:
+    connection: reference_mssql
+    relation:
+      {catalog: null, schema: dfe_fixture, name: clickhouse_comparison_orders, relation_scope: physical_only}
+    logical_schema: comparison_order_v1
+    projection:
+      - {field: order_id, column: order_id}
+      - {field: business_date, column: business_date}
+      - {field: precise_amount, column: precise_amount}
+      - {field: local_time, column: local_time}
+      - {field: instant_time, column: instant_time}
+    grain: [order_id]
+  clickhouse_target_orders:
+    connection: target_clickhouse
+    relation:
+      {catalog: null, schema: dfe_fixture, name: comparison_orders_v001, relation_scope: physical_only}
+    logical_schema: comparison_order_v1
+    projection:
+      - {field: order_id, column: order_id}
+      - {field: business_date, column: business_date}
+      - {field: precise_amount, column: precise_amount}
+      - {field: local_time, column: local_time}
+      - {field: instant_time, column: instant_time}
+    grain: [order_id]
+scopes:
+  postgres_daily_scope:
+    parameters:
+      business_date: {type: {kind: date}}
+    bindings:
+      postgres_reference_orders:
+        {column: business_date, operator: eq, parameter: business_date}
+      clickhouse_target_orders:
+        {column: business_date, operator: eq, parameter: business_date}
+    null_partition: reject
+  original_greenplum_daily_scope:
+    parameters:
+      business_date: {type: {kind: date}}
+    bindings:
+      original_greenplum_reference_orders:
+        {column: business_date, operator: eq, parameter: business_date}
+      clickhouse_target_orders:
+        {column: business_date, operator: eq, parameter: business_date}
+    null_partition: reject
+  mssql_daily_scope:
+    parameters:
+      business_date: {type: {kind: date}}
+    bindings:
+      mssql_reference_orders:
+        {column: business_date, operator: eq, parameter: business_date}
+      clickhouse_target_orders:
+        {column: business_date, operator: eq, parameter: business_date}
+    null_partition: reject
+checks:
+  postgres_to_clickhouse_orders:
+    revision: 1
+    invariant: row_equivalence
+    reference: postgres_reference_orders
+    target: clickhouse_target_orders
+    comparison_schema: comparison_order_v1
+    key: [order_id]
+    scope_ref: postgres_daily_scope
+    consistency_policy: postgres_immutable_cut
+    assurance_policy: fingerprint_allowed
+  original_greenplum_to_clickhouse_orders:
+    revision: 1
+    invariant: row_equivalence
+    reference: original_greenplum_reference_orders
+    target: clickhouse_target_orders
+    comparison_schema: comparison_order_v1
+    key: [order_id]
+    scope_ref: original_greenplum_daily_scope
+    consistency_policy: original_greenplum_immutable_cut
+    assurance_policy: fingerprint_allowed
+  mssql_to_clickhouse_orders:
+    revision: 1
+    invariant: row_equivalence
+    reference: mssql_reference_orders
+    target: clickhouse_target_orders
+    comparison_schema: comparison_order_v1
+    key: [order_id]
+    scope_ref: mssql_daily_scope
+    consistency_policy: mssql_immutable_cut
+    assurance_policy: fingerprint_allowed
+consistency:
+  postgres_immutable_cut:
+    minimum_evidence: asserted
+    alignment_fields: [business_date, source_cut]
+    late_arrivals: next_batch
+    datasets:
+      postgres_reference_orders:
+        readiness:
+          kind: relation_manifest
+          relation:
+            {catalog: null, schema: dfe_control, name: batch_manifest}
+          columns:
+            dataset_id: dataset_id
+            scope_digest: scope_digest
+            batch_id: batch_id
+            state: state
+            business_date: business_date
+            source_cut: source_cut
+            dataset_version: dataset_version
+            completed_at: completed_at
+        stable_read: {kind: transaction_snapshot}
+      clickhouse_target_orders:
+        readiness:
+          kind: relation_manifest
+          relation:
+            {catalog: null, schema: dfe_fixture, name: immutable_version_readiness}
+          columns:
+            dataset_id: dataset_id
+            scope_digest: scope_digest
+            batch_id: batch_id
+            state: state
+            business_date: business_date
+            source_cut: source_cut
+            dataset_version: dataset_version
+            completed_at: completed_at
+        stable_read: {kind: immutable_named_version}
+  original_greenplum_immutable_cut:
+    minimum_evidence: asserted
+    alignment_fields: [business_date, source_cut]
+    late_arrivals: next_batch
+    datasets:
+      original_greenplum_reference_orders:
+        readiness:
+          kind: relation_manifest
+          relation:
+            {catalog: null, schema: dfe_fixture, name: comparison_batch_manifest}
+          columns:
+            dataset_id: dataset_id
+            scope_digest: scope_digest
+            batch_id: batch_id
+            state: state
+            business_date: business_date
+            source_cut: source_cut
+            dataset_version: dataset_version
+            completed_at: completed_at
+        stable_read: {kind: transaction_snapshot}
+      clickhouse_target_orders:
+        readiness:
+          kind: relation_manifest
+          relation:
+            {catalog: null, schema: dfe_fixture, name: immutable_version_readiness}
+          columns:
+            dataset_id: dataset_id
+            scope_digest: scope_digest
+            batch_id: batch_id
+            state: state
+            business_date: business_date
+            source_cut: source_cut
+            dataset_version: dataset_version
+            completed_at: completed_at
+        stable_read: {kind: immutable_named_version}
+  mssql_immutable_cut:
+    minimum_evidence: asserted
+    alignment_fields: [business_date, source_cut]
+    late_arrivals: next_batch
+    datasets:
+      mssql_reference_orders:
+        readiness:
+          kind: relation_manifest
+          relation:
+            {catalog: null, schema: dfe_fixture, name: comparison_batch_manifest}
+          columns:
+            dataset_id: dataset_id
+            scope_digest: scope_digest
+            batch_id: batch_id
+            state: state
+            business_date: business_date
+            source_cut: source_cut
+            dataset_version: dataset_version
+            completed_at: completed_at
+        stable_read: {kind: transaction_snapshot}
+      clickhouse_target_orders:
+        readiness:
+          kind: relation_manifest
+          relation:
+            {catalog: null, schema: dfe_fixture, name: immutable_version_readiness}
+          columns:
+            dataset_id: dataset_id
+            scope_digest: scope_digest
+            batch_id: batch_id
+            state: state
+            business_date: business_date
+            source_cut: source_cut
+            dataset_version: dataset_version
+            completed_at: completed_at
+        stable_read: {kind: immutable_named_version}
+execution:
+  version: 1
+  max_queries: 200
+  max_fetched_records: 120000
+  max_application_result_bytes: 33554432
+  max_evidence_rows: 20
+  max_evidence_bytes: 1048576
+  max_fingerprint_nodes: 8
+  max_coordinator_memory_bytes: 67108864
+  max_depth: 4
+  max_full_scans_per_side: 5
+  statement_timeout_milliseconds: 29000
+  run_timeout_milliseconds: 300000
+  max_attempts: 1
+  max_checks_concurrency: 1
+  max_source_concurrency: 1
+metadata:
+  connection: metadata_pg
+evidence:
+  sql_capture: disabled
+  ddl_capture: enabled
+  fields:
+    order_id: store
+    business_date: omit
+    precise_amount: store
+    local_time: store
+    instant_time: store
+  unspecified_fields: omit

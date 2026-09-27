@@ -404,6 +404,13 @@ def test_clickhouse_lts_profile_is_lossless_bounded_and_read_only() -> None:
                 Decimal("67108864"),
                 True,
             ),
+            ClickHouseResourceConstraint(
+                setting=ClickHouseResourceSetting.MAX_ROWS_TO_GROUP_BY,
+                value=Decimal("1"),
+                minimum=Decimal("1"),
+                maximum=Decimal("100000"),
+                changeable_in_readonly=True,
+            ),
         )
 
         relation = inspect_clickhouse_fidelity_relation(
@@ -1497,11 +1504,23 @@ def _reset_immutable_version_readiness(settings: ClickHouseConnectionSettings) -
             "toDateTime64('2024-03-01 00:10:00.000000', 6, 'UTC'), "
             "toUInt64(1), toUInt64(1))"
         )
+        admin.command(  # pyright: ignore[reportUnknownMemberType]
+            "INSERT INTO dfe_fixture.immutable_version_readiness VALUES "
+            "('clickhouse_target_orders', "
+            "'13da3e93058f4e53db4d7989380a57597b0fb5a86dc0e9a80ae33bd1b11f9897', "
+            "'comparison-orders-2024-02-29-v001', 'complete', "
+            "toDate('2024-02-29'), 'comparison-orders-cut-000001', "
+            "'comparison_orders_v001', "
+            "toDateTime64('2024-03-01 01:02:03.456789', 6, 'UTC'), "
+            "toUInt64(7), toUInt64(11))"
+        )
         restored_datasets = admin.raw_query(  # pyright: ignore[reportUnknownMemberType]
             "SELECT dataset_id FROM dfe_fixture.immutable_version_readiness ORDER BY dataset_id",
             fmt="TabSeparatedRaw",
         )
-        assert restored_datasets == b"immutable_orders\nlogical_orders\n"
+        assert restored_datasets == (
+            b"clickhouse_target_orders\nimmutable_orders\nlogical_orders\n"
+        )
     finally:
         admin.close_connections()
 

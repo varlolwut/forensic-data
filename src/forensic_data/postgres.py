@@ -657,6 +657,21 @@ class PostgresSourceBudgetLedger:
                     "source reads exceeded immutable whole-run max_application_result_bytes"
                 )
 
+    def consume_observed_result_bytes(self, result_bytes: int) -> None:
+        """Charge observed response bytes without claiming a completed result record."""
+        _validate_nonnegative_integer(result_bytes, "source observed result_bytes")
+        with self._lock:
+            self._usage.result_bytes += result_bytes
+            if time.monotonic_ns() >= self._deadline_nanoseconds:
+                raise PostgresReadDeadlineExceededError(
+                    "PostgreSQL source work exceeded the immutable whole-run deadline "
+                    "while receiving an unmaterialized result"
+                )
+            if self._usage.result_bytes > self._budgets.max_application_result_bytes:
+                raise PostgresSourceBudgetExceededError(
+                    "source reads exceeded immutable whole-run max_application_result_bytes"
+                )
+
     def require_result_fetch_deadline(self) -> None:
         with self._lock:
             _require_source_deadline(self._deadline_nanoseconds, "source result fetch")
@@ -741,6 +756,9 @@ class PostgresSourceQueryCharge:
 
     def consume_records(self, record_bytes: tuple[int, ...]) -> None:
         self._ledger.consume_records(record_bytes)
+
+    def consume_observed_result_bytes(self, result_bytes: int) -> None:
+        self._ledger.consume_observed_result_bytes(result_bytes)
 
     def require_fetch_deadline(self) -> None:
         self._ledger.require_result_fetch_deadline()

@@ -38,6 +38,30 @@ from forensic_data.canonical import (
     schema_digest_hex,
     schema_from_metadata_json,
 )
+from forensic_data.clickhouse import ClickHouseServerProfile
+from forensic_data.clickhouse_canonical import (
+    ClickHouseCanonicalFieldBinding,
+    ClickHouseCanonicalFingerprint,
+)
+from forensic_data.clickhouse_endpoint import (
+    ClickHouseFinalConfirmationEvidence,
+    ClickHouseProtectedContextState,
+    ClickHouseProtectedReadContext,
+    ClickHouseProtectedReadinessInspection,
+    ClickHouseProtectedRelationInspection,
+)
+from forensic_data.clickhouse_projection import (
+    ClickHouseMergeTreeProjectionBinding,
+    ClickHouseMutationWitness,
+    ClickHouseProjectionRuntimeWitness,
+)
+from forensic_data.clickhouse_readiness import (
+    ClickHouseColumnIdentity,
+    ClickHouseImmutableVersionManifest,
+    ClickHouseImmutableVersionRequest,
+    ClickHouseRelationManifestRecord,
+    ClickHouseTableIdentity,
+)
 from forensic_data.comparison import (
     ComparisonSegmentRecord,
     CompletedComparisonArtifact,
@@ -49,10 +73,13 @@ from forensic_data.comparison import (
     partial_comparison_frontier_from_canonical_bytes,
 )
 from forensic_data.contracts.model import (
+    Adapter,
     EvidenceAction,
     ExecutionBudgets,
+    MinimumEvidence,
     RelationScope,
     SqlDialect,
+    StableReadKind,
 )
 from forensic_data.contracts.semantics import (
     SemanticValue,
@@ -205,6 +232,7 @@ __all__ = (
     "RunAttemptRecord",
     "abandon_expired_postgres_attempt",
     "claim_postgres_run",
+    "close_postgres_clickhouse_read_context",
     "close_postgres_read_context",
     "completed_comparison_persistence_from_artifact",
     "completed_structural_comparison_persistence_from_artifact",
@@ -237,17 +265,57 @@ _WRITER_ROLE: Final[str] = "dfe_metadata_writer"
 _READER_ROLE: Final[str] = "dfe_metadata_reader"
 _CANONICAL_PROTOCOL: Final[str] = "dfe_canon_v1"
 _FINGERPRINT_PROTOCOL: Final[str] = "sha256_sum32_v1"
+_CLICKHOUSE_CLOSURE_KIND: Final[str] = "clickhouse_merge_tree_final_confirmation"
+_CLICKHOUSE_CLOSURE_PAYLOAD_KEYS: Final[frozenset[str]] = frozenset(
+    {
+        "acquisition_evidence_sha256",
+        "attempt_id",
+        "binding_sha256",
+        "confirmed_at",
+        "end_operation_id",
+        "ended_at",
+        "final_logical_fingerprint",
+        "final_mutation_witness",
+        "final_readiness_evidence",
+        "final_readiness_identity",
+        "final_readiness_record",
+        "final_runtime_witness",
+        "final_version_identity",
+        "immutable_confirmed_at",
+        "manifest_completion_revision",
+        "manifest_publication_revision",
+        "physical_query_provenance",
+        "raw_manifest_sha256",
+        "read_context_id",
+        "run_id",
+    }
+)
+_POST_COMPARISON_CONTEXT_LOSS_CODES: Final[frozenset[ReasonCode]] = frozenset(
+    {
+        ReasonCode.SNAPSHOT_LOST,
+        ReasonCode.BUDGET_EXHAUSTED,
+        ReasonCode.CANCELLATION_UNCONFIRMED,
+        ReasonCode.UNSUPPORTED_CAPABILITY,
+        ReasonCode.QUERY_ERROR,
+        ReasonCode.PROTOCOL_VIOLATION,
+    }
+)
 type _ProtectedReadContext = (
     PostgresProtectedReadContext
     | MssqlProtectedReadContext
     | GreengageProtectedReadContext
     | OriginalGreenplumProtectedReadContext
+    | ClickHouseProtectedReadContext
 )
 type _ProtectedRelationInspection = (
     PostgresProtectedRelationInspection
     | MssqlInspectedRelation
     | GreengageProtectedRelationInspection
     | OriginalGreenplumProtectedRelationInspection
+    | ClickHouseProtectedRelationInspection
+)
+type _ProtectedReadinessInspection = (
+    _ProtectedRelationInspection | ClickHouseProtectedReadinessInspection
 )
 _STRUCTURAL_SUMMARY_PARAMETER_NAMES: Final[tuple[str, ...]] = (
     "reference_row_count",
@@ -604,6 +672,10 @@ class ReadContextPersistence:
             _original_greenplum_context_relations(context)
             if context.state is not ReadContextState.ACTIVE:
                 raise ValueError("only an active protected context can be persisted")
+        elif isinstance(context, ClickHouseProtectedReadContext):
+            _validate_clickhouse_context_definition(context)
+            if context.state is not ClickHouseProtectedContextState.ACTIVE:
+                raise ValueError("only an active protected context can be persisted")
         else:
             _mssql_context_relations(context)
             if context.state is not MssqlReadContextState.ACTIVE:
@@ -622,6 +694,7 @@ class PersistedReadContext:
     started_at: datetime
     end_operation_id: UUID | None
     ended_at: datetime | None
+    closure_evidence_json: str | None
 
     def __post_init__(self) -> None:
         _require_uuid(self.read_context_id, "read context id")
@@ -633,6 +706,15 @@ class PersistedReadContext:
         _require_utc_datetime(self.started_at, "read context started_at")
         _require_optional_uuid(self.end_operation_id, "read context end operation id")
         _require_optional_utc_datetime(self.ended_at, "read context ended_at")
+        if self.closure_evidence_json is not None:
+            try:
+                canonical = canonicalize_semantic_json(self.closure_evidence_json)
+            except ValueError as error:
+                raise ValueError(
+                    f"read context closure evidence must be semantic JSON: reason={error}"
+                ) from None
+            if canonical != self.closure_evidence_json:
+                raise ValueError("read context closure evidence must be canonical semantic JSON")
 
 
 @final
@@ -645,7 +727,7 @@ class RelationManifestObservationPersistence:
     readiness: RelationManifestEvidence
     protected_context: _ProtectedReadContext
     dataset_relation: _ProtectedRelationInspection
-    readiness_relation: _ProtectedRelationInspection
+    readiness_relation: _ProtectedReadinessInspection
     projection_code_artifact: CodeArtifactRecord | None
     observed_at: datetime
 
@@ -669,11 +751,17 @@ class RelationManifestObservationPersistence:
             self.dataset_relation,
             "observation dataset relation",
         )
-        readiness_relation = _require_context_relation(
+        readiness_relation = _require_context_readiness(
             context,
             self.readiness_relation,
             "observation readiness relation",
         )
+        if isinstance(readiness_relation, ClickHouseProtectedReadinessInspection) and (
+            readiness_relation.evidence != self.readiness
+        ):
+            raise ValueError(
+                "observation readiness evidence differs from its ClickHouse inspection"
+            )
         if self.projection_code_artifact is not None:
             _require_instance(
                 self.projection_code_artifact,
@@ -689,22 +777,23 @@ class RelationManifestObservationPersistence:
             raise ValueError("relation-manifest lifecycle supports only relation datasets")
         if self.projection_code_artifact is not None:
             raise ValueError("relation datasets cannot persist a projection code capture")
-        if _relation_context_id(dataset_relation) != _relation_context_id(readiness_relation):
+        if _relation_context_id(dataset_relation) != _readiness_context_id(readiness_relation):
             raise ValueError(
                 "observation dataset and readiness relations must share one protected context"
             )
         if context.evidence.context_id != _relation_context_id(dataset_relation):
             raise ValueError("observation relations must belong to its protected context")
-        protected_relations = _context_relations(context)
         if not _context_is_active(context):
             raise ValueError("observation protected context must still be active")
-        if not any(item is dataset_relation for item in protected_relations) or not any(
-            item is readiness_relation for item in protected_relations
-        ):
+        if not _context_contains_exact_dataset_relation(context, dataset_relation):
             raise ValueError(
-                "observation relations must be the exact sealed protected-context objects"
+                "observation dataset relation must be an exact sealed protected-context object"
             )
-        if _relation_physical_identity(dataset_relation) == _relation_physical_identity(
+        if not _context_contains_exact_readiness(context, readiness_relation):
+            raise ValueError(
+                "observation readiness must be the exact sealed protected-context object"
+            )
+        if _relation_physical_identity(dataset_relation) == _readiness_physical_identity(
             readiness_relation
         ):
             raise ValueError(
@@ -829,6 +918,18 @@ class _ContextExpectation:
     definition: ReadContextPersistence
     limitations_json: str
     acquisition_evidence_json: str
+
+
+@final
+@dataclass(frozen=True, slots=True)
+class _ClickHouseContextClosureExpectation:
+    attempt: RunAttemptRecord
+    protected_context: ClickHouseProtectedReadContext
+    read_context_id: UUID
+    end_operation_id: UUID
+    ended_at: datetime
+    acquisition_evidence_json: str
+    closure_evidence_json: str
 
 
 @final
@@ -1226,6 +1327,11 @@ def partial_comparison_persistence_from_artifact(
         raise ValueError("partial reference full scans exceed the immutable attempt budget")
     if artifact.target_full_scans > attempt.execution_budgets.max_full_scans_per_side:
         raise ValueError("partial target full scans exceed the immutable attempt budget")
+    verdict, totals, public_additional_reasons = _partial_publication_values(
+        artifact,
+        primary_reason,
+        additional_reasons,
+    )
     reference_observation_id, target_observation_id = persisted_cut.observation_ids
     definition = PartialComparisonDefinition(
         check_id=artifact.check_id,
@@ -1233,15 +1339,15 @@ def partial_comparison_persistence_from_artifact(
         scope_digest=artifact.scope_digest,
         input_cut_digest=artifact.input_cut_digest,
         execution_status=execution_status,
-        verdict=artifact.verdict,
+        verdict=verdict,
         consistency=artifact.consistency,
         guarantee=artifact.guarantee,
         comparison_coverage=artifact.comparison_coverage,
-        totals=artifact.totals,
+        totals=totals,
         evidence_coverage=artifact.evidence_coverage,
         metrics=artifact.metrics,
         primary_reason=primary_reason,
-        additional_reasons=additional_reasons,
+        additional_reasons=public_additional_reasons,
         frontier=artifact.frontier,
         reference_observation_id=reference_observation_id,
         target_observation_id=target_observation_id,
@@ -1249,6 +1355,36 @@ def partial_comparison_persistence_from_artifact(
     )
     _validate_partial_definition(attempt.execution_budgets, definition)
     return definition
+
+
+def _partial_publication_values(
+    artifact: PartialComparisonArtifact,
+    primary_reason: ResultReason,
+    additional_reasons: tuple[ResultReason, ...],
+) -> tuple[Verdict, ComparisonTotals, tuple[ResultReason, ...]]:
+    if artifact.consistency.stable_reads is not ConsistencyLevel.UNKNOWN or (
+        not artifact.frontier.topology and not artifact.frontier.unresolved
+    ):
+        return artifact.verdict, artifact.totals, additional_reasons
+    if primary_reason.code is ReasonCode.DATA_MISMATCH:
+        raise ValueError("unknown-consistency partial publication requires a governing failure")
+    unavailable = UnavailableTotal(
+        precision="unavailable",
+        value=None,
+        reason=primary_reason.code,
+    )
+    return (
+        Verdict.INCONCLUSIVE,
+        ComparisonTotals(
+            matched=unavailable,
+            missing=unavailable,
+            extra=unavailable,
+            modified=unavailable,
+        ),
+        tuple(
+            reason for reason in additional_reasons if reason.code is not ReasonCode.DATA_MISMATCH
+        ),
+    )
 
 
 def completed_structural_comparison_persistence_from_artifact(
@@ -1667,6 +1803,72 @@ def close_postgres_read_context(
         ended_at,
         ReadContextStatus.CLOSED,
         "close_read_context",
+    )
+
+
+def close_postgres_clickhouse_read_context(
+    settings: PostgresConnectionSettings,
+    retry_policy: PostgresRetryPolicy,
+    attempt: RunAttemptRecord,
+    protected_context: ClickHouseProtectedReadContext,
+    read_context_id: UUID,
+    end_operation_id: UUID,
+    ended_at: datetime,
+) -> PersistedReadContext:
+    _validate_context_end_arguments(
+        settings,
+        retry_policy,
+        attempt,
+        read_context_id,
+        end_operation_id,
+        ended_at,
+    )
+    if type(protected_context) is not ClickHouseProtectedReadContext:
+        raise TypeError(
+            "ClickHouse context closure requires the exact ClickHouseProtectedReadContext type"
+        )
+    normalized_ended_at = ended_at.astimezone(UTC)
+    _validate_clickhouse_context_closure(
+        attempt,
+        protected_context,
+        read_context_id,
+        normalized_ended_at,
+    )
+    acquisition_evidence_json = canonical_semantic_json(
+        _clickhouse_acquisition_evidence_semantic_value(protected_context)
+    )
+    expectation = _ClickHouseContextClosureExpectation(
+        attempt=attempt,
+        protected_context=protected_context,
+        read_context_id=read_context_id,
+        end_operation_id=end_operation_id,
+        ended_at=normalized_ended_at,
+        acquisition_evidence_json=acquisition_evidence_json,
+        closure_evidence_json=canonical_semantic_json(
+            _clickhouse_closure_evidence_semantic_value(
+                attempt,
+                protected_context,
+                read_context_id,
+                end_operation_id,
+                normalized_ended_at,
+                acquisition_evidence_json,
+            )
+        ),
+    )
+    return _run_with_reconciliation(
+        settings,
+        retry_policy,
+        "close_clickhouse_read_context",
+        (read_context_id, end_operation_id),
+        lambda connection: _close_clickhouse_context_once(
+            connection,
+            settings,
+            expectation,
+        ),
+        lambda connection: _lookup_closed_clickhouse_context(
+            connection,
+            expectation,
+        ),
     )
 
 
@@ -2787,7 +2989,7 @@ def _prepare_new_context_end(
     attempt: RunAttemptRecord,
     attempt_lock_row: DatabaseRow,
     read_context_id: UUID,
-) -> datetime:
+) -> tuple[datetime, DatabaseRow]:
     _require_attempt_fence_row(connection, attempt_lock_row, attempt)
     pre_mutation_lease_expiry = _row_datetime(
         attempt_lock_row[9],
@@ -2803,7 +3005,7 @@ def _prepare_new_context_end(
         raise RunLifecycleStateError("read context is outside the fenced attempt")
     if _row_text(row[18], "read context state") != ReadContextStatus.ACTIVE.value:
         raise RunLifecycleStateError("read context is not active")
-    return pre_mutation_lease_expiry
+    return pre_mutation_lease_expiry, row
 
 
 def _finish_context_once(
@@ -2823,6 +3025,7 @@ def _finish_context_once(
         end_operation_id,
     )
     if operation_row is not None:
+        _require_generic_context_end_supported(operation_row, target_state)
         return _commit_result(
             connection,
             _require_finished_context(
@@ -2834,12 +3037,13 @@ def _finish_context_once(
                 target_state,
             ),
         )
-    pre_mutation_lease_expiry = _prepare_new_context_end(
+    pre_mutation_lease_expiry, context_row = _prepare_new_context_end(
         connection,
         attempt,
         attempt_lock_row,
         read_context_id,
     )
+    _require_generic_context_end_supported(context_row, target_state)
     cursor = connection.execute(
         "UPDATE dfe_metadata.attempt_read_contexts SET state = %s, "
         "end_operation_id = %s, ended_at = %s "
@@ -2895,6 +3099,7 @@ def _lookup_finished_context(
     if row is None:
         connection.execute("COMMIT")
         return None
+    _require_generic_context_end_supported(row, target_state)
     return _commit_result(
         connection,
         _require_finished_context(
@@ -2906,6 +3111,401 @@ def _lookup_finished_context(
             target_state,
         ),
     )
+
+
+def _require_generic_context_end_supported(
+    row: DatabaseRow,
+    target_state: ReadContextStatus,
+) -> None:
+    if (
+        target_state is ReadContextStatus.CLOSED
+        and _row_text(row[7], "read context engine") == Adapter.CLICKHOUSE.value
+    ):
+        raise RunLifecycleStateError(
+            "ClickHouse read contexts require close_postgres_clickhouse_read_context so final "
+            "confirmation evidence is persisted atomically"
+        )
+
+
+def _close_clickhouse_context_once(
+    connection: psycopg.Connection[DatabaseRow],
+    settings: PostgresConnectionSettings,
+    expected: _ClickHouseContextClosureExpectation,
+) -> PersistedReadContext:
+    operation_row, attempt_lock_row = _begin_context_end_transaction(
+        connection,
+        settings,
+        expected.attempt,
+        expected.read_context_id,
+        expected.end_operation_id,
+    )
+    if operation_row is not None:
+        return _commit_result(
+            connection,
+            _require_closed_clickhouse_context(operation_row, expected),
+        )
+    pre_mutation_lease_expiry, context_row = _prepare_new_context_end(
+        connection,
+        expected.attempt,
+        attempt_lock_row,
+        expected.read_context_id,
+    )
+    _require_clickhouse_context_acquisition_row(context_row, expected)
+    cursor = connection.execute(
+        "UPDATE dfe_metadata.attempt_read_contexts SET state = 'closed', "
+        "end_operation_id = %s, ended_at = %s, closure_evidence = %s::jsonb "
+        "WHERE read_context_id = %s AND state = 'active' "
+        "AND engine = 'clickhouse' AND closure_evidence IS NULL "
+        "AND EXISTS (SELECT 1 FROM dfe_metadata.run_attempts AS fence "
+        "WHERE fence.run_id = %s AND fence.attempt_id = %s "
+        "AND fence.owner_token = %s AND fence.lease_revision = %s "
+        "AND fence.status = 'running' "
+        "AND fence.lease_expires_at > pg_catalog.clock_timestamp())",
+        (
+            expected.end_operation_id,
+            expected.ended_at,
+            expected.closure_evidence_json,
+            expected.read_context_id,
+            expected.attempt.run.run_id,
+            expected.attempt.attempt_id,
+            expected.attempt.owner_token,
+            expected.attempt.lease_revision,
+        ),
+    )
+    if cursor.rowcount != 1:
+        raise AttemptFenceError("ClickHouse read context closure fence expired before persistence")
+    updated = _select_context_by_end_operation(connection, expected.end_operation_id)
+    if updated is None:
+        raise StoredLifecycleIntegrityError(
+            "ClickHouse read context closure produced no durable operation receipt"
+        )
+    result = _require_closed_clickhouse_context(updated, expected)
+    return _commit_fenced_result(
+        connection,
+        result,
+        pre_mutation_lease_expiry,
+        "ClickHouse read context closure",
+    )
+
+
+def _lookup_closed_clickhouse_context(
+    connection: psycopg.Connection[DatabaseRow],
+    expected: _ClickHouseContextClosureExpectation,
+) -> PersistedReadContext | None:
+    row = _select_context_by_end_operation(connection, expected.end_operation_id)
+    if row is None:
+        connection.execute("COMMIT")
+        return None
+    return _commit_result(
+        connection,
+        _require_closed_clickhouse_context(row, expected),
+    )
+
+
+def _require_clickhouse_context_acquisition_row(
+    row: DatabaseRow,
+    expected: _ClickHouseContextClosureExpectation,
+) -> None:
+    if (
+        _row_text(row[7], "ClickHouse read context engine") != Adapter.CLICKHOUSE.value
+        or _row_text(row[4], "ClickHouse read context direction") != PlanDirection.TARGET.value
+        or _canonical_database_json(row[16], "ClickHouse acquisition evidence")
+        != expected.acquisition_evidence_json
+    ):
+        raise LifecycleOperationConflictError(
+            "persisted ClickHouse read context differs from its exact immutable acquisition"
+        )
+
+
+def _require_closed_clickhouse_context(
+    row: DatabaseRow,
+    expected: _ClickHouseContextClosureExpectation,
+) -> PersistedReadContext:
+    _require_clickhouse_context_acquisition_row(row, expected)
+    closure_json = _row_optional_canonical_json(row[21], "ClickHouse closure evidence")
+    if closure_json != expected.closure_evidence_json:
+        raise LifecycleOperationConflictError(
+            "ClickHouse context end operation UUID is bound to different closure evidence"
+        )
+    _validate_stored_clickhouse_closure(row, closure_json)
+    return _require_finished_context(
+        row,
+        expected.attempt,
+        expected.read_context_id,
+        expected.end_operation_id,
+        expected.ended_at,
+        ReadContextStatus.CLOSED,
+    )
+
+
+def _validate_stored_clickhouse_closure(
+    row: DatabaseRow,
+    closure_json: str | None,
+) -> None:
+    engine = _row_text(row[7], "read context closure engine")
+    state = _row_text(row[18], "read context closure state")
+    if engine != Adapter.CLICKHOUSE.value:
+        if closure_json is not None:
+            raise StoredLifecycleIntegrityError(
+                "non-ClickHouse read context contains ClickHouse closure evidence"
+            )
+        return
+    if state != ReadContextStatus.CLOSED.value:
+        if closure_json is not None:
+            raise StoredLifecycleIntegrityError(
+                "active or lost ClickHouse context must not satisfy final closure"
+            )
+        return
+    if closure_json is None:
+        raise StoredLifecycleIntegrityError(
+            "closed ClickHouse context lacks durable final-confirmation evidence"
+        )
+    try:
+        semantic = semantic_value_from_json(closure_json)
+    except ValueError as error:
+        raise StoredLifecycleIntegrityError(
+            f"ClickHouse closure evidence is invalid semantic JSON: reason={error}"
+        ) from None
+    closure = _semantic_object(semantic, "ClickHouse closure evidence")
+    _require_semantic_keys(
+        closure,
+        frozenset({"evidence_version", "kind", "payload"}),
+        "ClickHouse closure evidence",
+    )
+    if (
+        _semantic_integer(closure.get("evidence_version"), "ClickHouse closure version") != 1
+        or _semantic_text(closure.get("kind"), "ClickHouse closure kind")
+        != _CLICKHOUSE_CLOSURE_KIND
+    ):
+        raise StoredLifecycleIntegrityError(
+            "ClickHouse closure evidence has an unsupported version or kind"
+        )
+    payload = _semantic_object(closure.get("payload"), "ClickHouse closure payload")
+    _require_semantic_keys(
+        payload,
+        _CLICKHOUSE_CLOSURE_PAYLOAD_KEYS,
+        "ClickHouse closure payload",
+    )
+    ended_at = _row_optional_datetime(row[20], "ClickHouse context ended_at")
+    end_operation_id = _row_optional_uuid(row[19], "ClickHouse context end operation id")
+    if ended_at is None or end_operation_id is None:
+        raise StoredLifecycleIntegrityError(
+            "closed ClickHouse context lacks its durable end receipt"
+        )
+    if (
+        _semantic_text(payload.get("run_id"), "ClickHouse closure run id")
+        != str(_row_uuid(row[1], "ClickHouse closure run row id"))
+        or _semantic_text(payload.get("attempt_id"), "ClickHouse closure attempt id")
+        != str(_row_uuid(row[2], "ClickHouse closure attempt row id"))
+        or _semantic_text(payload.get("read_context_id"), "ClickHouse closure context id")
+        != str(_row_uuid(row[0], "ClickHouse closure context row id"))
+        or _semantic_text(
+            payload.get("end_operation_id"),
+            "ClickHouse closure end operation id",
+        )
+        != str(end_operation_id)
+        or _semantic_utc_datetime(payload.get("ended_at"), "ClickHouse closure ended_at")
+        != ended_at
+    ):
+        raise StoredLifecycleIntegrityError(
+            "ClickHouse closure evidence differs from its durable context receipt"
+        )
+    acquisition_json = _canonical_database_json(
+        row[16],
+        "ClickHouse closure acquisition evidence",
+    )
+    acquisition_sha256 = hashlib.sha256(
+        acquisition_json.encode("utf-8", errors="strict")
+    ).hexdigest()
+    if (
+        _semantic_sha256(
+            payload.get("acquisition_evidence_sha256"),
+            "ClickHouse closure acquisition digest",
+        )
+        != acquisition_sha256
+    ):
+        raise StoredLifecycleIntegrityError(
+            "ClickHouse closure evidence differs from immutable acquisition evidence"
+        )
+    try:
+        acquisition_semantic = semantic_value_from_json(acquisition_json)
+    except ValueError as error:
+        raise StoredLifecycleIntegrityError(
+            f"ClickHouse closure acquisition evidence is invalid semantic JSON: reason={error}"
+        ) from None
+    acquisition = _semantic_object(
+        acquisition_semantic,
+        "ClickHouse closure acquisition evidence",
+    )
+    if (
+        _semantic_integer(
+            acquisition.get("evidence_version"),
+            "ClickHouse acquisition version",
+        )
+        != 1
+        or _semantic_text(acquisition.get("kind"), "ClickHouse acquisition kind")
+        != "clickhouse_immutable_named_version_projection"
+    ):
+        raise StoredLifecycleIntegrityError(
+            "ClickHouse closure references unsupported acquisition evidence"
+        )
+    acquisition_payload = _semantic_object(
+        acquisition.get("payload"),
+        "ClickHouse acquisition payload",
+    )
+    acquisition_context = _semantic_object(
+        acquisition_payload.get("context"),
+        "ClickHouse acquisition context",
+    )
+    projection = _semantic_object(
+        acquisition_payload.get("projection"),
+        "ClickHouse acquisition projection",
+    )
+    immutable = _semantic_object(
+        projection.get("immutable_binding"),
+        "ClickHouse acquisition immutable binding",
+    )
+    if (
+        _semantic_text(acquisition_context.get("context_id"), "acquisition context id")
+        != _semantic_text(payload.get("read_context_id"), "closure context id")
+        or _semantic_text(acquisition_context.get("attempt_id"), "acquisition attempt id")
+        != _semantic_text(payload.get("attempt_id"), "closure attempt id")
+        or _semantic_text(immutable.get("context_id"), "immutable context id")
+        != _semantic_text(payload.get("read_context_id"), "closure context id")
+        or _semantic_text(immutable.get("attempt_id"), "immutable attempt id")
+        != _semantic_text(payload.get("attempt_id"), "closure attempt id")
+        or _semantic_sha256(payload.get("binding_sha256"), "ClickHouse binding digest")
+        != semantic_digest_hex(projection)
+    ):
+        raise StoredLifecycleIntegrityError(
+            "ClickHouse closure is not tied to its immutable context and projection binding"
+        )
+    manifest = _semantic_object(immutable.get("manifest"), "ClickHouse acquisition manifest")
+    completion_revision = _semantic_nonnegative_integer(
+        payload.get("manifest_completion_revision"),
+        "ClickHouse closure completion revision",
+    )
+    publication_revision = _semantic_nonnegative_integer(
+        payload.get("manifest_publication_revision"),
+        "ClickHouse closure publication revision",
+    )
+    if (
+        _semantic_sha256(payload.get("raw_manifest_sha256"), "ClickHouse raw manifest digest")
+        != _semantic_sha256(manifest.get("artifact_sha256"), "acquired manifest digest")
+        or completion_revision
+        != _semantic_nonnegative_integer(
+            manifest.get("completion_revision"),
+            "acquired manifest completion revision",
+        )
+        or publication_revision
+        != _semantic_nonnegative_integer(
+            manifest.get("publication_revision"),
+            "acquired manifest publication revision",
+        )
+    ):
+        raise StoredLifecycleIntegrityError(
+            "ClickHouse closure manifest provenance differs from immutable acquisition"
+        )
+    expected_readiness_identity = _clickhouse_safe_table_identity_from_semantic(
+        immutable.get("readiness_identity"),
+        "ClickHouse acquired readiness identity",
+    )
+    expected_version_identity = _clickhouse_safe_table_identity_from_semantic(
+        immutable.get("version_identity"),
+        "ClickHouse acquired version identity",
+    )
+    if any(
+        canonical_semantic_json(actual) != canonical_semantic_json(expected)
+        for actual, expected in (
+            (payload.get("final_readiness_evidence"), immutable.get("readiness_evidence")),
+            (payload.get("final_readiness_record"), immutable.get("readiness_record")),
+            (payload.get("final_readiness_identity"), expected_readiness_identity),
+            (payload.get("final_version_identity"), expected_version_identity),
+            (payload.get("final_mutation_witness"), projection.get("mutation_witness")),
+            (payload.get("final_runtime_witness"), projection.get("runtime_witness")),
+            (payload.get("final_logical_fingerprint"), projection.get("logical_fingerprint")),
+        )
+    ):
+        raise StoredLifecycleIntegrityError(
+            "ClickHouse final witnesses differ from immutable acquisition evidence"
+        )
+    final_record = _semantic_object(
+        payload.get("final_readiness_record"),
+        "ClickHouse final readiness record",
+    )
+    if (
+        _semantic_nonnegative_integer(
+            final_record.get("completion_revision"),
+            "ClickHouse final readiness completion revision",
+        )
+        != completion_revision
+        or _semantic_nonnegative_integer(
+            final_record.get("publication_revision"),
+            "ClickHouse final readiness publication revision",
+        )
+        != publication_revision
+    ):
+        raise StoredLifecycleIntegrityError(
+            "ClickHouse final readiness revisions differ from its raw manifest"
+        )
+    provenance = _semantic_object(
+        payload.get("physical_query_provenance"),
+        "ClickHouse physical query provenance",
+    )
+    _require_semantic_keys(
+        provenance,
+        frozenset(
+            {"attempt_id", "connection_attempts", "final_query_id", "physical_request_count"}
+        ),
+        "ClickHouse physical query provenance",
+    )
+    _semantic_positive_integer(
+        provenance.get("connection_attempts"),
+        "ClickHouse connection attempts",
+    )
+    _semantic_positive_integer(
+        provenance.get("physical_request_count"),
+        "ClickHouse physical request count",
+    )
+    if _semantic_text(
+        provenance.get("attempt_id"),
+        "query provenance attempt id",
+    ) != _semantic_text(payload.get("attempt_id"), "closure attempt id"):
+        raise StoredLifecycleIntegrityError(
+            "ClickHouse physical query provenance differs from its closure attempt"
+        )
+    _semantic_uuid_text(provenance.get("final_query_id"), "ClickHouse final query id")
+    immutable_opened_at = _semantic_utc_datetime(
+        immutable.get("opened_at"),
+        "ClickHouse immutable binding opened_at",
+    )
+    projection_opened_at = _semantic_utc_datetime(
+        projection.get("opened_at"),
+        "ClickHouse projection binding opened_at",
+    )
+    context_started_at = _semantic_utc_datetime(
+        acquisition_context.get("started_at"),
+        "ClickHouse acquisition context started_at",
+    )
+    immutable_confirmed_at = _semantic_utc_datetime(
+        payload.get("immutable_confirmed_at"),
+        "ClickHouse immutable confirmed_at",
+    )
+    confirmed_at = _semantic_utc_datetime(
+        payload.get("confirmed_at"),
+        "ClickHouse projection confirmed_at",
+    )
+    if (
+        immutable_opened_at > projection_opened_at
+        or projection_opened_at != context_started_at
+        or context_started_at > immutable_confirmed_at
+        or immutable_confirmed_at > confirmed_at
+        or confirmed_at > ended_at
+    ):
+        raise StoredLifecycleIntegrityError(
+            "ClickHouse acquisition, binding, confirmation, and closure timestamps are out of "
+            "canonical order"
+        )
 
 
 def _persist_retryable_outcome_once(
@@ -4219,9 +4819,10 @@ def _validate_partial_frontier_closure(
 ) -> None:
     if consistency.stable_reads not in (
         ConsistencyLevel.UNKNOWN,
+        ConsistencyLevel.ASSERTED,
         ConsistencyLevel.VERIFIED,
     ):
-        raise ValueError("partial comparison cannot claim asserted stable-read proof")
+        raise ValueError("partial comparison has an unsupported stable-read evidence level")
     if consistency.cut_alignment is not ConsistencyLevel.VERIFIED:
         raise ValueError("partial comparison requires its verified persisted aligned cut")
     topology = frontier.topology
@@ -4299,20 +4900,64 @@ def _validate_partial_frontier_closure(
         raise ValueError("partial comparison cannot contain duplicate contract proofs")
     has_contract_proof = bool(contract_reasons)
     if contract_reasons:
-        if consistency.stable_reads is not ConsistencyLevel.VERIFIED:
-            raise ValueError("partial contract proof requires verified summary reads")
+        if consistency.stable_reads not in (
+            ConsistencyLevel.ASSERTED,
+            ConsistencyLevel.VERIFIED,
+        ) and not _is_degraded_structural_context_loss(
+            consistency,
+            structural_empty_frontier,
+            reasons,
+        ):
+            raise ValueError("partial contract proof requires asserted or verified summary reads")
         if structural_empty_frontier:
             _validate_structural_summary_reason(contract_reasons[0])
         else:
             _validate_partial_contract_summary_reason(contract_reasons[0])
-    if (ReasonCode.DATA_MISMATCH in reason_codes) != has_proven_mismatch:
-        raise ValueError("partial data_mismatch reason must exactly match persisted row evidence")
-    if (verdict is Verdict.MISMATCH) != (has_proven_mismatch or has_contract_proof):
-        raise ValueError(
-            "partial mismatch verdict requires persisted row evidence or contract-violation proof"
-        )
+    unknown_row_observations = (
+        consistency.stable_reads is ConsistencyLevel.UNKNOWN and not structural_empty_frontier
+    )
+    if unknown_row_observations:
+        if verdict is not Verdict.INCONCLUSIVE:
+            raise ValueError("unknown-consistency row observations require inconclusive verdict")
+        if ReasonCode.DATA_MISMATCH in reason_codes:
+            raise ValueError("unknown-consistency row observations cannot prove data_mismatch")
+        primary_reason_code = reasons[0].code
+        if any(
+            not isinstance(total, UnavailableTotal) or total.reason is not primary_reason_code
+            for total in totals.values()
+        ):
+            raise ValueError(
+                "unknown-consistency row observations require unavailable governing-reason totals"
+            )
+    else:
+        if (ReasonCode.DATA_MISMATCH in reason_codes) != has_proven_mismatch:
+            raise ValueError(
+                "partial data_mismatch reason must exactly match persisted row evidence"
+            )
+        if (verdict is Verdict.MISMATCH) != (has_proven_mismatch or has_contract_proof):
+            raise ValueError(
+                "partial mismatch verdict requires persisted row evidence or contract-violation proof"
+            )
     if structural_empty_frontier and not has_contract_proof:
         raise ValueError("structural partial comparison requires contract-violation proof")
+
+
+def _is_degraded_structural_context_loss(
+    consistency: ConsistencyStatus,
+    structural_empty_frontier: bool,
+    reasons: tuple[ResultReason, ...],
+) -> bool:
+    if (
+        consistency.stable_reads is not ConsistencyLevel.UNKNOWN
+        or not structural_empty_frontier
+        or not reasons
+    ):
+        return False
+    primary = reasons[0]
+    return primary.code in _POST_COMPARISON_CONTEXT_LOSS_CODES and primary.operation in (
+        "close_read_context",
+        "confirm_target",
+    )
 
 
 def _validate_partial_frontier_tree(frontier: PartialComparisonFrontier) -> None:
@@ -4439,12 +5084,14 @@ def _validate_completed_structural_definition(
     if comparison.guarantee is not Guarantee.STRUCTURAL:
         raise ValueError("completed structural comparison requires structural guarantee")
     if (
-        comparison.consistency.stable_reads is not ConsistencyLevel.VERIFIED
+        comparison.consistency.stable_reads
+        not in (ConsistencyLevel.ASSERTED, ConsistencyLevel.VERIFIED)
         or comparison.consistency.cut_alignment is not ConsistencyLevel.VERIFIED
         or len(comparison.consistency.read_context_ids) != 2
     ):
         raise ValueError(
-            "completed structural comparison requires two verified aligned read contexts"
+            "completed structural comparison requires two aligned asserted or verified read "
+            "contexts"
         )
     coverage = comparison.comparison_coverage
     if (
@@ -4818,6 +5465,10 @@ def _validate_context_definition(
         _validate_greengage_context_definition(context)
     elif isinstance(context, OriginalGreenplumProtectedReadContext):
         _validate_original_greenplum_context_definition(context)
+    elif isinstance(context, ClickHouseProtectedReadContext):
+        _validate_clickhouse_context_definition(context)
+        if context.evidence.attempt_id != attempt.attempt_id:
+            raise ValueError("ClickHouse read context attempt differs from its lifecycle attempt")
     else:
         evidence = context.evidence
         profile = context.profile
@@ -4849,6 +5500,135 @@ def _validate_context_definition(
     expected_dataset_id = _expected_batch(attempt.run.request, definition.direction).dataset_id
     if definition.dataset.definition.dataset_id != expected_dataset_id:
         raise ValueError("read context dataset is outside the run request direction closure")
+
+
+def _validate_clickhouse_context_binding(
+    context: ClickHouseProtectedReadContext,
+) -> None:
+    evidence = context.evidence
+    profile = context.profile
+    binding = context.projection_binding
+    immutable = binding.immutable_binding
+    relations = _clickhouse_context_relations(context)
+    readiness = context.protected_readiness
+    if evidence.engine != "ClickHouse":
+        raise ValueError("ClickHouse lifecycle read context requires engine='ClickHouse'")
+    if context.source_direction is not PostgresSourceDirection.TARGET:
+        raise ValueError("ClickHouse lifecycle read context is supported only as a target")
+    if immutable.request.direction is not PlanDirection.TARGET:
+        raise ValueError("ClickHouse immutable-version request must use the target direction")
+    if (
+        immutable.request.minimum_evidence is not MinimumEvidence.ASSERTED
+        or immutable.stable_read_evidence is not ConsistencyLevel.ASSERTED
+        or immutable.overall_evidence is not ConsistencyLevel.ASSERTED
+        or binding.overall_evidence is not ConsistencyLevel.ASSERTED
+        or evidence.consistency_level is not ConsistencyLevel.ASSERTED
+    ):
+        raise ValueError("ClickHouse lifecycle stable-read evidence must remain asserted")
+    if immutable.readiness_evidence.evidence_level is not ConsistencyLevel.VERIFIED:
+        raise ValueError("ClickHouse lifecycle readiness query evidence must remain verified")
+    if (
+        evidence.context_id != immutable.context_id
+        or evidence.attempt_id != immutable.attempt_id
+        or evidence.attempt_id != context.source_budget.attempt_id
+        or evidence.strategy != binding.strategy
+        or evidence.snapshot_locator != str(immutable.version_identity.uuid)
+        or evidence.started_at != binding.opened_at
+        or evidence.limitations != binding.limitations
+        or evidence.allowed_concurrency != 1
+    ):
+        raise ValueError(
+            "ClickHouse lifecycle context evidence differs from its immutable projection binding"
+        )
+    if (
+        evidence.server_version != profile.server_version
+        or evidence.server_version_number != profile.server_version_number
+    ):
+        raise ValueError("ClickHouse lifecycle context evidence differs from its server profile")
+    if (
+        not profile.binding_library_name.strip()
+        or not profile.binding_library_version.strip()
+        or not profile.transport_library_name.strip()
+        or not profile.transport_library_version.strip()
+        or not profile.build_id.strip()
+    ):
+        raise ValueError("ClickHouse lifecycle profile lacks transport or native build identity")
+    if len(relations) != 1 or relations[0].projection_binding is not binding:
+        raise ValueError("ClickHouse lifecycle context must protect its exact projection binding")
+    if (
+        readiness.context_id != evidence.context_id
+        or readiness.identity != immutable.readiness_identity
+        or readiness.record != immutable.readiness_record
+        or readiness.evidence != immutable.readiness_evidence
+        or readiness.request != immutable.request
+    ):
+        raise ValueError(
+            "ClickHouse lifecycle readiness inspection differs from its immutable binding"
+        )
+
+
+def _validate_clickhouse_context_definition(
+    context: ClickHouseProtectedReadContext,
+) -> None:
+    _validate_clickhouse_context_binding(context)
+    if context.confirmation is not None or context.confirmation_evidence is not None:
+        raise ValueError("an active ClickHouse context cannot already contain final confirmation")
+
+
+def _validate_clickhouse_context_closure(
+    attempt: RunAttemptRecord,
+    context: ClickHouseProtectedReadContext,
+    read_context_id: UUID,
+    ended_at: datetime,
+) -> None:
+    if attempt.status is not AttemptStatus.RUNNING:
+        raise ValueError("ClickHouse context closure requires a running attempt")
+    _validate_clickhouse_context_binding(context)
+    if context.state is not ClickHouseProtectedContextState.CLOSED:
+        raise ValueError("ClickHouse context closure requires a successfully closed context")
+    evidence = context.confirmation_evidence
+    confirmation = context.confirmation
+    if type(evidence) is not ClickHouseFinalConfirmationEvidence or confirmation is None:
+        raise ValueError("closed ClickHouse context lacks typed final-confirmation evidence")
+    if evidence.confirmation is not confirmation:
+        raise ValueError("ClickHouse final-confirmation evidence is not the context confirmation")
+    if confirmation.binding is not context.projection_binding:
+        raise ValueError("ClickHouse final confirmation has a different projection binding")
+    if (
+        read_context_id != context.evidence.context_id
+        or evidence.context_id != read_context_id
+        or evidence.attempt_id != attempt.attempt_id
+        or context.evidence.attempt_id != attempt.attempt_id
+    ):
+        raise ValueError(
+            "ClickHouse final confirmation differs from its persisted context or attempt"
+        )
+    if confirmation.immutable_confirmation.binding is not (
+        context.projection_binding.immutable_binding
+    ):
+        raise ValueError("ClickHouse final confirmation has a different immutable binding")
+    immutable_opened_at = context.projection_binding.immutable_binding.opened_at
+    projection_opened_at = context.projection_binding.opened_at
+    immutable_confirmed_at = confirmation.immutable_confirmation.confirmed_at
+    if (
+        immutable_opened_at > projection_opened_at
+        or projection_opened_at != context.evidence.started_at
+        or context.evidence.started_at > immutable_confirmed_at
+        or immutable_confirmed_at > confirmation.confirmed_at
+        or confirmation.confirmed_at > ended_at
+    ):
+        raise ValueError(
+            "ClickHouse acquisition, binding, confirmation, and durable closure timestamps must "
+            "remain in canonical order"
+        )
+    expected_batch = _expected_batch(attempt.run.request, PlanDirection.TARGET)
+    request = context.projection_binding.immutable_binding.request
+    if (
+        request.dataset_id != expected_batch.dataset_id
+        or request.expected_batch_id != expected_batch.batch_id
+        or request.scope_digest != attempt.run.request.scope.scope_digest
+    ):
+        raise ValueError("ClickHouse final confirmation is outside the run request target closure")
 
 
 def _validate_greengage_context_definition(
@@ -5237,6 +6017,13 @@ def _context_storage_identity(context: _ProtectedReadContext) -> _ContextStorage
             server_version_number=context.server.compatibility_version_number,
             backend_process_id=context.evidence.backend_process_id,
         )
+    if isinstance(context, ClickHouseProtectedReadContext):
+        return _ContextStorageIdentity(
+            driver_version=context.profile.binding_library_version,
+            server_version=context.profile.server_version,
+            server_version_number=context.profile.server_version_number,
+            backend_process_id=None,
+        )
     profile = context.profile
     return _ContextStorageIdentity(
         driver_version=profile.driver.pyodbc_version,
@@ -5251,6 +6038,8 @@ def _context_engine(context: _ProtectedReadContext) -> str:
         return "greengage"
     if isinstance(context, OriginalGreenplumProtectedReadContext):
         return "greenplum"
+    if isinstance(context, ClickHouseProtectedReadContext):
+        return Adapter.CLICKHOUSE.value
     return context.evidence.engine
 
 
@@ -5262,6 +6051,7 @@ def _require_supported_read_context(value: object, context: str) -> _ProtectedRe
             MssqlProtectedReadContext,
             GreengageProtectedReadContext,
             OriginalGreenplumProtectedReadContext,
+            ClickHouseProtectedReadContext,
         ),
     ):
         return value
@@ -5292,7 +6082,45 @@ def _require_context_relation(
         return _require_instance(value, GreengageProtectedRelationInspection, label)
     if isinstance(context, OriginalGreenplumProtectedReadContext):
         return _require_instance(value, OriginalGreenplumProtectedRelationInspection, label)
+    if isinstance(context, ClickHouseProtectedReadContext):
+        return _require_instance(value, ClickHouseProtectedRelationInspection, label)
     return _require_instance(value, MssqlInspectedRelation, label)
+
+
+def _require_context_readiness(
+    context: _ProtectedReadContext,
+    value: object,
+    label: str,
+) -> _ProtectedReadinessInspection:
+    if isinstance(context, ClickHouseProtectedReadContext):
+        return _require_instance(value, ClickHouseProtectedReadinessInspection, label)
+    return _require_context_relation(context, value, label)
+
+
+def _clickhouse_context_relations(
+    context: ClickHouseProtectedReadContext,
+) -> tuple[ClickHouseProtectedRelationInspection, ...]:
+    relations = context.protected_relations
+    if type(relations) is not tuple or len(relations) != 1:
+        raise ValueError("ClickHouse protected context must contain exactly one relation")
+    relation = relations[0]
+    if type(relation) is not ClickHouseProtectedRelationInspection:
+        raise TypeError(
+            "ClickHouse protected context relations must contain exact "
+            "ClickHouseProtectedRelationInspection values"
+        )
+    if relation.context_id != context.evidence.context_id:
+        raise ValueError("ClickHouse protected relation belongs to a different context")
+    if relation.projection_binding is not context.projection_binding:
+        raise ValueError("ClickHouse protected relation does not retain its exact binding")
+    readiness = context.protected_readiness
+    if type(readiness) is not ClickHouseProtectedReadinessInspection:
+        raise TypeError(
+            "ClickHouse protected readiness must be an exact ClickHouseProtectedReadinessInspection"
+        )
+    if readiness.context_id != context.evidence.context_id:
+        raise ValueError("ClickHouse protected readiness belongs to a different context")
+    return relations
 
 
 def _mssql_context_relations(
@@ -5464,6 +6292,8 @@ def _context_relations(
         return _greengage_context_relations(context)
     if isinstance(context, OriginalGreenplumProtectedReadContext):
         return _original_greenplum_context_relations(context)
+    if isinstance(context, ClickHouseProtectedReadContext):
+        return _clickhouse_context_relations(context)
     return _mssql_context_relations(context)
 
 
@@ -5475,6 +6305,8 @@ def _context_is_active(context: _ProtectedReadContext) -> bool:
         (GreengageProtectedReadContext, OriginalGreenplumProtectedReadContext),
     ):
         return context.state is ReadContextState.ACTIVE
+    if isinstance(context, ClickHouseProtectedReadContext):
+        return context.state is ClickHouseProtectedContextState.ACTIVE
     return context.state is MssqlReadContextState.ACTIVE
 
 
@@ -5485,7 +6317,15 @@ def _relation_context_id(relation: _ProtectedRelationInspection) -> UUID:
         return relation.inspection.context_id
     if isinstance(relation, OriginalGreenplumProtectedRelationInspection):
         return relation.inspection.context_id
+    if isinstance(relation, ClickHouseProtectedRelationInspection):
+        return relation.context_id
     return relation.context_id
+
+
+def _readiness_context_id(relation: _ProtectedReadinessInspection) -> UUID:
+    if isinstance(relation, ClickHouseProtectedReadinessInspection):
+        return relation.context_id
+    return _relation_context_id(relation)
 
 
 def _relation_physical_identity(
@@ -5497,7 +6337,25 @@ def _relation_physical_identity(
         return ("greengage", 0, relation.inspection.relation_oid)
     if isinstance(relation, OriginalGreenplumProtectedRelationInspection):
         return ("greenplum", 0, relation.inspection.relation_oid)
+    if isinstance(relation, ClickHouseProtectedRelationInspection):
+        return (
+            Adapter.CLICKHOUSE.value,
+            relation.version_identity.database_uuid.int,
+            relation.version_identity.uuid.int,
+        )
     return ("mssql", relation.database_id, relation.object_id)
+
+
+def _readiness_physical_identity(
+    relation: _ProtectedReadinessInspection,
+) -> tuple[str, int, int]:
+    if isinstance(relation, ClickHouseProtectedReadinessInspection):
+        return (
+            Adapter.CLICKHOUSE.value,
+            relation.identity.database_uuid.int,
+            relation.identity.uuid.int,
+        )
+    return _relation_physical_identity(relation)
 
 
 def _relation_components(relation: _ProtectedRelationInspection) -> tuple[str, str]:
@@ -5510,7 +6368,17 @@ def _relation_components(relation: _ProtectedRelationInspection) -> tuple[str, s
         return relation.acquisition.relation.components
     if isinstance(relation, OriginalGreenplumProtectedRelationInspection):
         return relation.acquisition.relation.components
+    if isinstance(relation, ClickHouseProtectedRelationInspection):
+        return relation.acquisition.relation.components
     return (relation.relation.schema_name, relation.relation.table_name)
+
+
+def _readiness_components(
+    relation: _ProtectedReadinessInspection,
+) -> tuple[str, str]:
+    if isinstance(relation, ClickHouseProtectedReadinessInspection):
+        return (relation.identity.database, relation.identity.table)
+    return _relation_components(relation)
 
 
 def _relation_column_names(relation: _ProtectedRelationInspection) -> tuple[str, ...]:
@@ -5520,7 +6388,33 @@ def _relation_column_names(relation: _ProtectedRelationInspection) -> tuple[str,
         return relation.acquisition.column_names
     if isinstance(relation, OriginalGreenplumProtectedRelationInspection):
         return relation.acquisition.column_names
+    if isinstance(relation, ClickHouseProtectedRelationInspection):
+        return relation.acquisition.column_names
     return tuple(binding.column_name for binding in relation.bindings)
+
+
+def _readiness_column_names(
+    relation: _ProtectedReadinessInspection,
+) -> tuple[str, ...]:
+    if isinstance(relation, ClickHouseProtectedReadinessInspection):
+        return tuple(column.name for column in relation.identity.columns[:8])
+    return _relation_column_names(relation)
+
+
+def _context_contains_exact_dataset_relation(
+    context: _ProtectedReadContext,
+    relation: _ProtectedRelationInspection,
+) -> bool:
+    return any(item is relation for item in _context_relations(context))
+
+
+def _context_contains_exact_readiness(
+    context: _ProtectedReadContext,
+    readiness: _ProtectedReadinessInspection,
+) -> bool:
+    if isinstance(context, ClickHouseProtectedReadContext):
+        return context.protected_readiness is readiness
+    return any(item is readiness for item in _context_relations(context))
 
 
 def _observation_schema_digest(
@@ -5532,6 +6426,8 @@ def _observation_schema_digest(
     if isinstance(relation, GreengageProtectedRelationInspection):
         return schema_digest_hex(relation.acquisition.schema)
     if isinstance(relation, OriginalGreenplumProtectedRelationInspection):
+        return schema_digest_hex(relation.acquisition.schema)
+    if isinstance(relation, ClickHouseProtectedRelationInspection):
         return schema_digest_hex(relation.acquisition.schema)
     schema = _dataset_canonical_schema(definition.dataset)
     validate_mssql_inspection(schema, relation)
@@ -5632,6 +6528,13 @@ def _require_protected_context_active(context: _ProtectedReadContext) -> None:
             raise RunLifecycleStateError(
                 f"protected original Greenplum context relation closure is invalid: reason={error}"
             ) from None
+    elif isinstance(context, ClickHouseProtectedReadContext):
+        try:
+            _validate_clickhouse_context_definition(context)
+        except (TypeError, ValueError) as error:
+            raise RunLifecycleStateError(
+                f"protected ClickHouse context closure is invalid: reason={error}"
+            ) from None
     else:
         try:
             _mssql_context_relations(context)
@@ -5662,7 +6565,7 @@ def _require_observation_definition(
     if batch_value != expected_batch.batch_id:
         raise ValueError("observation readiness batch differs from the requested batch")
     context_id = _relation_context_id(definition.dataset_relation)
-    if _relation_context_id(definition.readiness_relation) != context_id:
+    if _readiness_context_id(definition.readiness_relation) != context_id:
         raise ValueError("observation protected relations must share one context")
     dataset_schema_digest = _observation_schema_digest(definition)
     if dataset_schema_digest != definition.dataset.definition.logical_schema_digest:
@@ -5694,6 +6597,8 @@ def _require_dataset_relation_closure(
     elif isinstance(protected, GreengageProtectedRelationInspection):
         actual_scope = protected.acquisition.relation_scope
     elif isinstance(protected, OriginalGreenplumProtectedRelationInspection):
+        actual_scope = protected.acquisition.relation_scope
+    elif isinstance(protected, ClickHouseProtectedRelationInspection):
         actual_scope = protected.acquisition.relation_scope
     else:
         actual_scope = RelationScope.PHYSICAL_ONLY
@@ -5801,10 +6706,25 @@ def _require_readiness_relation_closure(
         raise StoredLifecycleIntegrityError(
             "contract consistency dataset is outside the run direction closure"
         )
-    if (
-        _semantic_text(item.get("stable_read"), "contract stable-read strategy")
-        != "transaction_snapshot"
-    ):
+    stable_read = _semantic_text(item.get("stable_read"), "contract stable-read strategy")
+    if isinstance(definition.protected_context, ClickHouseProtectedReadContext):
+        if definition.direction is not PlanDirection.TARGET:
+            raise ValueError("ClickHouse lifecycle observations are supported only as a target")
+        if stable_read != StableReadKind.IMMUTABLE_NAMED_VERSION.value:
+            raise ValueError(
+                "ClickHouse lifecycle runtime requires contract immutable_named_version reads"
+            )
+        if (
+            _semantic_text(
+                consistency.get("minimum_evidence"),
+                "contract minimum evidence",
+            )
+            != MinimumEvidence.ASSERTED.value
+        ):
+            raise ValueError(
+                "ClickHouse immutable named-version lifecycle requires explicit asserted evidence"
+            )
+    elif stable_read != StableReadKind.TRANSACTION_SNAPSHOT.value:
         raise ValueError("lifecycle runtime requires contract transaction_snapshot reads")
     readiness = _semantic_object(item.get("readiness"), "contract readiness")
     if _semantic_text(readiness.get("kind"), "contract readiness kind") != "relation_manifest":
@@ -5814,7 +6734,7 @@ def _require_readiness_relation_closure(
         _semantic_text(relation.get("schema"), "readiness relation schema"),
         _semantic_text(relation.get("name"), "readiness relation name"),
     )
-    if _relation_components(definition.readiness_relation) != expected_relation:
+    if _readiness_components(definition.readiness_relation) != expected_relation:
         raise ValueError("protected readiness relation differs from the contract provider")
     columns = _semantic_object(readiness.get("columns"), "readiness columns")
     expected_columns = tuple(
@@ -5830,7 +6750,7 @@ def _require_readiness_relation_closure(
             "completed_at",
         )
     )
-    if _relation_column_names(definition.readiness_relation) != expected_columns:
+    if _readiness_column_names(definition.readiness_relation) != expected_columns:
         raise ValueError("protected readiness columns differ from the contract mapping")
 
 
@@ -5848,7 +6768,19 @@ def _require_stable_read_context(
     strategy = _row_text(row[0], "readiness context strategy")
     snapshot_locator = _row_optional_text(row[1], "readiness snapshot locator")
     context = definition.protected_context
-    if isinstance(context, PostgresProtectedReadContext):
+    if isinstance(context, ClickHouseProtectedReadContext):
+        if strategy != context.evidence.strategy or strategy != context.projection_binding.strategy:
+            raise ValueError(
+                "readiness context does not provide the persisted ClickHouse projection strategy"
+            )
+        if snapshot_locator != str(
+            context.projection_binding.immutable_binding.version_identity.uuid
+        ):
+            raise ValueError(
+                "ClickHouse readiness context lacks its immutable named-version locator"
+            )
+        expected_kind = "clickhouse_immutable_named_version_projection"
+    elif isinstance(context, PostgresProtectedReadContext):
         if strategy != "protected_read_only_repeatable_read":
             raise ValueError("readiness context does not provide the contract transaction snapshot")
         if snapshot_locator is None or not snapshot_locator.strip():
@@ -5879,7 +6811,67 @@ def _require_stable_read_context(
         "readiness acquisition evidence",
     )
     if _semantic_text(evidence.get("kind"), "readiness acquisition kind") != expected_kind:
-        raise ValueError("readiness context lacks verified protected-relation evidence")
+        raise ValueError("readiness context lacks its exact protected acquisition evidence")
+    if isinstance(context, ClickHouseProtectedReadContext):
+        payload = _semantic_object(
+            evidence.get("payload"),
+            "ClickHouse readiness acquisition payload",
+        )
+        persisted_context = _semantic_object(
+            payload.get("context"),
+            "ClickHouse persisted context evidence",
+        )
+        projection = _semantic_object(
+            payload.get("projection"),
+            "ClickHouse persisted projection evidence",
+        )
+        immutable = _semantic_object(
+            projection.get("immutable_binding"),
+            "ClickHouse persisted immutable binding",
+        )
+        if (
+            _semantic_text(
+                persisted_context.get("consistency_level"),
+                "ClickHouse persisted context consistency",
+            )
+            != ConsistencyLevel.ASSERTED.value
+            or _semantic_text(
+                projection.get("overall_evidence"),
+                "ClickHouse persisted projection evidence level",
+            )
+            != ConsistencyLevel.ASSERTED.value
+            or _semantic_text(
+                immutable.get("stable_read_evidence"),
+                "ClickHouse persisted stable-read evidence level",
+            )
+            != ConsistencyLevel.ASSERTED.value
+            or _semantic_text(
+                immutable.get("overall_evidence"),
+                "ClickHouse persisted overall evidence level",
+            )
+            != ConsistencyLevel.ASSERTED.value
+        ):
+            raise ValueError("persisted ClickHouse stable-read evidence must remain asserted")
+        if (
+            _semantic_text(
+                persisted_context.get("context_id"),
+                "ClickHouse persisted context id",
+            )
+            != str(context.evidence.context_id)
+            or _semantic_text(
+                persisted_context.get("attempt_id"),
+                "ClickHouse persisted attempt id",
+            )
+            != str(context.evidence.attempt_id)
+            or _semantic_text(
+                persisted_context.get("snapshot_locator"),
+                "ClickHouse persisted version locator",
+            )
+            != context.evidence.snapshot_locator
+        ):
+            raise ValueError(
+                "persisted ClickHouse stable-read evidence has a different attempt or version"
+            )
 
 
 def _require_context_contains_observation_relations(
@@ -5899,7 +6891,7 @@ def _require_context_contains_observation_relations(
     )
     expected = (
         _relation_semantic_value(definition.dataset_relation),
-        _relation_semantic_value(definition.readiness_relation),
+        _readiness_semantic_value(definition.readiness_relation),
     )
     for relation in expected:
         if relation not in relations:
@@ -5912,6 +6904,8 @@ def _acquisition_evidence_semantic_value(
     definition: ReadContextPersistence,
 ) -> dict[str, SemanticValue]:
     context = definition.protected_context
+    if isinstance(context, ClickHouseProtectedReadContext):
+        return _clickhouse_acquisition_evidence_semantic_value(context)
     if isinstance(context, MssqlProtectedReadContext):
         return {
             "evidence_version": 1,
@@ -5966,10 +6960,47 @@ def _acquisition_evidence_semantic_value(
     }
 
 
+def _clickhouse_acquisition_evidence_semantic_value(
+    context: ClickHouseProtectedReadContext,
+) -> dict[str, SemanticValue]:
+    relations: list[SemanticValue] = [
+        _clickhouse_relation_semantic_value(item) for item in _clickhouse_context_relations(context)
+    ]
+    relations.append(_clickhouse_readiness_semantic_value(context.protected_readiness))
+    return {
+        "evidence_version": 1,
+        "kind": "clickhouse_immutable_named_version_projection",
+        "payload": {
+            **_clickhouse_context_provenance_semantic_value(context),
+            "relations": relations,
+        },
+    }
+
+
 def _physical_binding_semantic_value(
     definition: RelationManifestObservationPersistence,
 ) -> dict[str, SemanticValue]:
     context = definition.protected_context
+    if isinstance(context, ClickHouseProtectedReadContext):
+        dataset_relation = _require_instance(
+            definition.dataset_relation,
+            ClickHouseProtectedRelationInspection,
+            "ClickHouse dataset relation",
+        )
+        readiness_relation = _require_instance(
+            definition.readiness_relation,
+            ClickHouseProtectedReadinessInspection,
+            "ClickHouse readiness relation",
+        )
+        return {
+            "binding_version": 1,
+            "engine": Adapter.CLICKHOUSE.value,
+            "payload": {
+                **_clickhouse_context_provenance_semantic_value(context),
+                "dataset_relation": _clickhouse_relation_semantic_value(dataset_relation),
+                "readiness_relation": _clickhouse_readiness_semantic_value(readiness_relation),
+            },
+        }
     if isinstance(context, MssqlProtectedReadContext):
         dataset_relation = _require_instance(
             definition.dataset_relation,
@@ -6063,7 +7094,535 @@ def _relation_semantic_value(
         return _greengage_relation_semantic_value(relation)
     if isinstance(relation, OriginalGreenplumProtectedRelationInspection):
         return _original_greenplum_relation_semantic_value(relation)
+    if isinstance(relation, ClickHouseProtectedRelationInspection):
+        return _clickhouse_relation_semantic_value(relation)
     return _mssql_relation_semantic_value(relation)
+
+
+def _readiness_semantic_value(
+    readiness: _ProtectedReadinessInspection,
+) -> dict[str, SemanticValue]:
+    if isinstance(readiness, ClickHouseProtectedReadinessInspection):
+        return _clickhouse_readiness_semantic_value(readiness)
+    return _relation_semantic_value(readiness)
+
+
+def _clickhouse_closure_evidence_semantic_value(
+    attempt: RunAttemptRecord,
+    context: ClickHouseProtectedReadContext,
+    read_context_id: UUID,
+    end_operation_id: UUID,
+    ended_at: datetime,
+    acquisition_evidence_json: str,
+) -> dict[str, SemanticValue]:
+    evidence = context.confirmation_evidence
+    if type(evidence) is not ClickHouseFinalConfirmationEvidence:
+        raise ValueError("ClickHouse closure evidence requires typed final confirmation")
+    confirmation = evidence.confirmation
+    immutable_confirmation = confirmation.immutable_confirmation
+    manifest = confirmation.binding.immutable_binding.manifest
+    return {
+        "evidence_version": 1,
+        "kind": _CLICKHOUSE_CLOSURE_KIND,
+        "payload": {
+            "acquisition_evidence_sha256": hashlib.sha256(
+                acquisition_evidence_json.encode("utf-8", errors="strict")
+            ).hexdigest(),
+            "attempt_id": str(attempt.attempt_id),
+            "binding_sha256": semantic_digest_hex(
+                _clickhouse_projection_semantic_value(confirmation.binding)
+            ),
+            "confirmed_at": confirmation.confirmed_at.astimezone(UTC).isoformat(),
+            "end_operation_id": str(end_operation_id),
+            "ended_at": ended_at.astimezone(UTC).isoformat(),
+            "final_logical_fingerprint": _clickhouse_fingerprint_semantic_value(
+                confirmation.final_logical_fingerprint
+            ),
+            "final_mutation_witness": _clickhouse_mutation_witness_semantic_value(
+                confirmation.final_mutation_witness
+            ),
+            "final_readiness_evidence": {
+                "consistency_level": (
+                    immutable_confirmation.final_readiness_evidence.evidence_level.value
+                ),
+                "payload": readiness_evidence_semantic_value(
+                    immutable_confirmation.final_readiness_evidence
+                ),
+            },
+            "final_readiness_identity": _clickhouse_safe_table_identity_semantic_value(
+                immutable_confirmation.final_readiness_identity
+            ),
+            "final_readiness_record": _clickhouse_readiness_record_semantic_value(
+                immutable_confirmation.final_readiness_record
+            ),
+            "final_runtime_witness": _clickhouse_runtime_witness_semantic_value(
+                confirmation.final_runtime_witness
+            ),
+            "final_version_identity": _clickhouse_safe_table_identity_semantic_value(
+                immutable_confirmation.final_version_identity
+            ),
+            "immutable_confirmed_at": (
+                immutable_confirmation.confirmed_at.astimezone(UTC).isoformat()
+            ),
+            "manifest_completion_revision": manifest.completion_revision,
+            "manifest_publication_revision": manifest.publication_revision,
+            "physical_query_provenance": {
+                "attempt_id": str(evidence.attempt_id),
+                "connection_attempts": evidence.connection_attempts,
+                "final_query_id": str(evidence.final_query_id),
+                "physical_request_count": evidence.physical_request_count,
+            },
+            "raw_manifest_sha256": manifest.artifact_sha256,
+            "read_context_id": str(read_context_id),
+            "run_id": str(attempt.run.run_id),
+        },
+    }
+
+
+def _clickhouse_context_provenance_semantic_value(
+    context: ClickHouseProtectedReadContext,
+) -> dict[str, SemanticValue]:
+    evidence = context.evidence
+    return {
+        "context": {
+            "allowed_concurrency": evidence.allowed_concurrency,
+            "attempt_id": str(evidence.attempt_id),
+            "consistency_level": evidence.consistency_level.value,
+            "context_id": str(evidence.context_id),
+            "engine": Adapter.CLICKHOUSE.value,
+            "limitations": list(evidence.limitations),
+            "snapshot_locator": evidence.snapshot_locator,
+            "source_direction": context.source_direction.value,
+            "started_at": evidence.started_at.astimezone(UTC).isoformat(),
+            "strategy": evidence.strategy,
+        },
+        "profile": _clickhouse_profile_semantic_value(context.profile),
+        "projection": _clickhouse_projection_semantic_value(context.projection_binding),
+    }
+
+
+def _clickhouse_profile_semantic_value(
+    profile: ClickHouseServerProfile,
+) -> dict[str, SemanticValue]:
+    return {
+        "binding_library": {
+            "name": profile.binding_library_name,
+            "version": profile.binding_library_version,
+        },
+        "build_id": profile.build_id,
+        "current_database": profile.current_database,
+        "current_user": profile.current_user,
+        "effective_max_execution_time_seconds": str(profile.effective_max_execution_time_seconds),
+        "max_execution_time_seconds": str(profile.max_execution_time_seconds),
+        "max_memory_usage": profile.max_memory_usage,
+        "max_result_bytes": profile.max_result_bytes,
+        "max_result_rows": profile.max_result_rows,
+        "max_threads": profile.max_threads,
+        "readonly": profile.readonly,
+        "readonly_locked": profile.readonly_locked,
+        "resource_constraints": [
+            {
+                "changeable_in_readonly": item.changeable_in_readonly,
+                "maximum": None if item.maximum is None else str(item.maximum),
+                "minimum": None if item.minimum is None else str(item.minimum),
+                "setting": item.setting.value,
+                "value": str(item.value),
+            }
+            for item in profile.resource_constraints
+        ],
+        "result_overflow_mode": profile.result_overflow_mode,
+        "result_overflow_mode_locked": profile.result_overflow_mode_locked,
+        "server_timezone": profile.server_timezone,
+        "server_version": profile.server_version,
+        "server_version_number": profile.server_version_number,
+        "session_timezone": profile.session_timezone,
+        "transport_library": {
+            "name": profile.transport_library_name,
+            "version": profile.transport_library_version,
+        },
+    }
+
+
+def _clickhouse_projection_semantic_value(
+    binding: ClickHouseMergeTreeProjectionBinding,
+) -> dict[str, SemanticValue]:
+    return {
+        "immutable_binding": _clickhouse_immutable_binding_semantic_value(binding),
+        "limitations": list(binding.limitations),
+        "logical_fingerprint": _clickhouse_fingerprint_semantic_value(binding.logical_fingerprint),
+        "mutation_witness": _clickhouse_mutation_witness_semantic_value(binding.mutation_witness),
+        "opened_at": binding.opened_at.astimezone(UTC).isoformat(),
+        "overall_evidence": binding.overall_evidence.value,
+        "projection_request": {
+            "canonical_limits": {
+                "max_encoded_envelope_bytes": (
+                    binding.request.canonical_limits.max_encoded_envelope_bytes
+                ),
+                "max_execution_time_seconds": (
+                    binding.request.canonical_limits.max_execution_time_seconds
+                ),
+                "max_response_bytes": binding.request.canonical_limits.max_response_bytes,
+            },
+            "column_names": list(binding.request.column_names),
+            "logical_schema": semantic_value_from_json(
+                canonical_schema_json(binding.request.schema)
+            ),
+            "max_mutation_records": binding.request.max_mutation_records,
+            "max_tie_groups": binding.request.max_tie_groups,
+        },
+        "relation": _clickhouse_canonical_relation_semantic_value(binding),
+        "runtime_witness": _clickhouse_runtime_witness_semantic_value(binding.runtime_witness),
+        "strategy": binding.strategy,
+    }
+
+
+def _clickhouse_immutable_binding_semantic_value(
+    binding: ClickHouseMergeTreeProjectionBinding,
+) -> dict[str, SemanticValue]:
+    immutable = binding.immutable_binding
+    return {
+        "attempt_id": str(immutable.attempt_id),
+        "context_id": str(immutable.context_id),
+        "limitations": list(immutable.limitations),
+        "manifest": _clickhouse_manifest_semantic_value(immutable.manifest),
+        "opened_at": immutable.opened_at.astimezone(UTC).isoformat(),
+        "overall_evidence": immutable.overall_evidence.value,
+        "readiness_evidence": {
+            "consistency_level": immutable.readiness_evidence.evidence_level.value,
+            "payload": readiness_evidence_semantic_value(immutable.readiness_evidence),
+        },
+        "readiness_identity": _clickhouse_table_identity_semantic_value(
+            immutable.readiness_identity
+        ),
+        "readiness_record": _clickhouse_readiness_record_semantic_value(immutable.readiness_record),
+        "request": _clickhouse_request_semantic_value(immutable.request),
+        "stable_read_evidence": immutable.stable_read_evidence.value,
+        "strategy": immutable.strategy,
+        "version_identity": _clickhouse_table_identity_semantic_value(immutable.version_identity),
+    }
+
+
+def _clickhouse_request_semantic_value(
+    request: ClickHouseImmutableVersionRequest,
+) -> dict[str, SemanticValue]:
+    return {
+        "alignment_fields": list(request.alignment_fields),
+        "dataset_id": request.dataset_id,
+        "direction": request.direction.value,
+        "endpoint_profile": request.endpoint_profile,
+        "expected_batch_id": request.expected_batch_id,
+        "expected_issuer": request.expected_issuer,
+        "late_arrivals": request.late_arrivals.value,
+        "limits": {
+            "max_execution_time_seconds": request.limits.max_execution_time_seconds,
+            "max_response_bytes": request.limits.max_response_bytes,
+        },
+        "minimum_evidence": request.minimum_evidence.value,
+        "readiness_database": request.readiness_database,
+        "readiness_table": request.readiness_table,
+        "scope_digest": request.scope_digest,
+    }
+
+
+def _clickhouse_manifest_semantic_value(
+    manifest: ClickHouseImmutableVersionManifest,
+) -> dict[str, SemanticValue]:
+    return {
+        "artifact_sha256": manifest.artifact_sha256,
+        "business_date": manifest.business_date.isoformat(),
+        "completed_at": manifest.completed_at.astimezone(UTC).isoformat(),
+        "completion_revision": manifest.completion_revision,
+        "dataset_id": manifest.dataset_id,
+        "dataset_version": manifest.dataset_version,
+        "expected_batch_id": manifest.expected_batch_id,
+        "immutability_evidence": manifest.immutability_evidence.value,
+        "issuer": manifest.issuer,
+        "late_arrivals": manifest.late_arrivals.value,
+        "manifest_version": manifest.manifest_version,
+        "publication_revision": manifest.publication_revision,
+        "scope_digest": manifest.scope_digest,
+        "source_cut": manifest.source_cut,
+        "version_locator": {
+            "database": manifest.version_locator.database,
+            "table": manifest.version_locator.table,
+            "uuid": str(manifest.version_locator.uuid),
+        },
+    }
+
+
+def _clickhouse_readiness_record_semantic_value(
+    record: ClickHouseRelationManifestRecord,
+) -> dict[str, SemanticValue]:
+    return {
+        "batch_id": record.batch_id,
+        "business_date": record.business_date.isoformat(),
+        "completed_at": (
+            None if record.completed_at is None else record.completed_at.astimezone(UTC).isoformat()
+        ),
+        "completion_revision": record.completion_revision,
+        "dataset_id": record.dataset_id,
+        "dataset_version": record.dataset_version,
+        "publication_revision": record.publication_revision,
+        "scope_digest": record.scope_digest,
+        "source_cut": record.source_cut,
+        "state": record.state,
+    }
+
+
+def _clickhouse_table_identity_semantic_value(
+    identity: ClickHouseTableIdentity,
+) -> dict[str, SemanticValue]:
+    return {
+        "columns": [
+            _clickhouse_column_identity_semantic_value(column) for column in identity.columns
+        ],
+        "database": identity.database,
+        "database_engine": identity.database_engine,
+        "database_uuid": str(identity.database_uuid),
+        "definition_sha256": identity.definition_sha256,
+        "engine_full": identity.engine_full,
+        "partition_key": identity.partition_key,
+        "server_uuid": str(identity.server_uuid),
+        "sorting_key": identity.sorting_key,
+        "table": identity.table,
+        "table_engine": identity.table_engine,
+        "table_readonly": identity.table_readonly,
+        "uuid": str(identity.uuid),
+    }
+
+
+def _clickhouse_safe_table_identity_semantic_value(
+    identity: ClickHouseTableIdentity,
+) -> dict[str, SemanticValue]:
+    return {
+        "columns": [
+            {
+                "declared_type": column.declared_type,
+                "default_expression_sha256": _text_sha256(column.default_expression),
+                "default_kind": column.default_kind,
+                "name": column.name,
+                "position": column.position,
+            }
+            for column in identity.columns
+        ],
+        "database": identity.database,
+        "database_engine": identity.database_engine,
+        "database_uuid": str(identity.database_uuid),
+        "definition_sha256": identity.definition_sha256,
+        "engine_full_sha256": _text_sha256(identity.engine_full),
+        "partition_key_sha256": _text_sha256(identity.partition_key),
+        "server_uuid": str(identity.server_uuid),
+        "sorting_key_sha256": _text_sha256(identity.sorting_key),
+        "table": identity.table,
+        "table_engine": identity.table_engine,
+        "table_readonly": identity.table_readonly,
+        "uuid": str(identity.uuid),
+    }
+
+
+def _clickhouse_safe_table_identity_from_semantic(
+    value: SemanticValue | None,
+    context: str,
+) -> dict[str, SemanticValue]:
+    identity = _semantic_object(value, context)
+    columns = _semantic_array(identity.get("columns"), f"{context} columns")
+    return {
+        "columns": [
+            {
+                "declared_type": _semantic_text(
+                    _semantic_object(column, f"{context} column").get("declared_type"),
+                    f"{context} column declared type",
+                ),
+                "default_expression_sha256": _text_sha256(
+                    _semantic_optional_text(
+                        _semantic_object(column, f"{context} column").get("default_expression"),
+                        f"{context} column default expression",
+                    )
+                ),
+                "default_kind": _semantic_optional_text(
+                    _semantic_object(column, f"{context} column").get("default_kind"),
+                    f"{context} column default kind",
+                ),
+                "name": _semantic_text(
+                    _semantic_object(column, f"{context} column").get("name"),
+                    f"{context} column name",
+                ),
+                "position": _semantic_positive_integer(
+                    _semantic_object(column, f"{context} column").get("position"),
+                    f"{context} column position",
+                ),
+            }
+            for column in columns
+        ],
+        "database": _semantic_text(identity.get("database"), f"{context} database"),
+        "database_engine": _semantic_text(
+            identity.get("database_engine"),
+            f"{context} database engine",
+        ),
+        "database_uuid": _semantic_uuid_text(
+            identity.get("database_uuid"),
+            f"{context} database UUID",
+        ),
+        "definition_sha256": _semantic_sha256(
+            identity.get("definition_sha256"),
+            f"{context} definition digest",
+        ),
+        "engine_full_sha256": _text_sha256(
+            _semantic_text(identity.get("engine_full"), f"{context} engine declaration")
+        ),
+        "partition_key_sha256": _text_sha256(
+            _semantic_optional_text(
+                identity.get("partition_key"),
+                f"{context} partition key",
+            )
+        ),
+        "server_uuid": _semantic_uuid_text(
+            identity.get("server_uuid"),
+            f"{context} server UUID",
+        ),
+        "sorting_key_sha256": _text_sha256(
+            _semantic_optional_text(identity.get("sorting_key"), f"{context} sorting key")
+        ),
+        "table": _semantic_text(identity.get("table"), f"{context} table"),
+        "table_engine": _semantic_text(
+            identity.get("table_engine"),
+            f"{context} table engine",
+        ),
+        "table_readonly": _semantic_boolean(
+            identity.get("table_readonly"),
+            f"{context} readonly flag",
+        ),
+        "uuid": _semantic_uuid_text(identity.get("uuid"), f"{context} table UUID"),
+    }
+
+
+def _text_sha256(value: str) -> str:
+    return hashlib.sha256(value.encode("utf-8", errors="strict")).hexdigest()
+
+
+def _clickhouse_column_identity_semantic_value(
+    column: ClickHouseColumnIdentity,
+) -> dict[str, SemanticValue]:
+    return {
+        "declared_type": column.declared_type,
+        "default_expression": column.default_expression,
+        "default_kind": column.default_kind,
+        "name": column.name,
+        "position": column.position,
+    }
+
+
+def _clickhouse_mutation_witness_semantic_value(
+    witness: ClickHouseMutationWitness,
+) -> dict[str, SemanticValue]:
+    return {
+        "records": [
+            {
+                "command_sha256": record.command_sha256,
+                "create_time_epoch": record.create_time_epoch,
+                "failure_error_code_name": record.failure_error_code_name,
+                "failure_reason_sha256": record.failure_reason_sha256,
+                "has_failed_part": record.has_failed_part,
+                "is_done": record.is_done,
+                "is_killed": record.is_killed,
+                "mutation_id": record.mutation_id,
+                "parts_in_progress": record.parts_in_progress,
+                "parts_to_do": record.parts_to_do,
+            }
+            for record in witness.records
+        ]
+    }
+
+
+def _clickhouse_runtime_witness_semantic_value(
+    witness: ClickHouseProjectionRuntimeWitness,
+) -> dict[str, SemanticValue]:
+    return {
+        "active_part_count": witness.active_part_count,
+        "active_row_count": witness.active_row_count,
+        "apply_mutations_on_fly": witness.apply_mutations_on_fly,
+        "apply_patch_parts": witness.apply_patch_parts,
+        "final_setting": witness.final_setting,
+        "lightweight_delete_part_count": witness.lightweight_delete_part_count,
+        "merge_across_partitions_final": witness.merge_across_partitions_final,
+        "patch_part_count": witness.patch_part_count,
+        "projection_count": witness.projection_count,
+        "server_uuid": str(witness.server_uuid),
+    }
+
+
+def _clickhouse_fingerprint_semantic_value(
+    fingerprint: ClickHouseCanonicalFingerprint,
+) -> dict[str, SemanticValue]:
+    return {
+        "count": fingerprint.fingerprint.count,
+        "invalid_row_count": fingerprint.invalid_row_count,
+        "limb_sums": list(fingerprint.fingerprint.limb_sums),
+        "oversized_row_count": fingerprint.oversized_row_count,
+    }
+
+
+def _clickhouse_canonical_relation_semantic_value(
+    binding: ClickHouseMergeTreeProjectionBinding,
+) -> dict[str, SemanticValue]:
+    relation = binding.relation
+    return {
+        "bindings": [
+            _clickhouse_canonical_binding_semantic_value(item) for item in relation.bindings
+        ],
+        "database": relation.database,
+        "logical_schema": semantic_value_from_json(canonical_schema_json(relation.schema)),
+        "source_kind": "merge_tree_logical_projection",
+        "table": relation.table,
+    }
+
+
+def _clickhouse_canonical_binding_semantic_value(
+    binding: ClickHouseCanonicalFieldBinding,
+) -> dict[str, SemanticValue]:
+    return {
+        "base_type": binding.base_type,
+        "column_name": binding.column_name,
+        "datetime_timezone": binding.datetime_timezone,
+        "declared_type": binding.declared_type,
+        "field_name": binding.field_name,
+        "nullable": binding.nullable,
+    }
+
+
+def _clickhouse_relation_semantic_value(
+    protected: ClickHouseProtectedRelationInspection,
+) -> dict[str, SemanticValue]:
+    return {
+        "acquisition": {
+            "column_names": list(protected.acquisition.column_names),
+            "logical_schema": semantic_value_from_json(
+                canonical_schema_json(protected.acquisition.schema)
+            ),
+            "relation_scope": protected.acquisition.relation_scope.value,
+            "requested_relation": list(protected.acquisition.relation.components),
+        },
+        "canonical_relation": _clickhouse_canonical_relation_semantic_value(
+            protected.projection_binding
+        ),
+        "context_id": str(protected.context_id),
+        "version_identity": _clickhouse_table_identity_semantic_value(protected.version_identity),
+    }
+
+
+def _clickhouse_readiness_semantic_value(
+    protected: ClickHouseProtectedReadinessInspection,
+) -> dict[str, SemanticValue]:
+    return {
+        "context_id": str(protected.context_id),
+        "evidence": {
+            "consistency_level": protected.evidence.evidence_level.value,
+            "payload": readiness_evidence_semantic_value(protected.evidence),
+        },
+        "identity": _clickhouse_table_identity_semantic_value(protected.identity),
+        "record": _clickhouse_readiness_record_semantic_value(protected.record),
+        "request": _clickhouse_request_semantic_value(protected.request),
+    }
 
 
 def _protected_relation_semantic_value(
@@ -6749,7 +8308,8 @@ _CONTEXT_SELECT: Final[LiteralString] = (
     "acquisition_operation_id, scope_digest, engine, driver_version, server_version, "
     "server_version_number, strategy, snapshot_locator, backend_process_id, "
     "allowed_concurrency, limitations::text, acquisition_evidence::text, started_at, "
-    "state, end_operation_id, ended_at FROM dfe_metadata.attempt_read_contexts"
+    "state, end_operation_id, ended_at, closure_evidence::text "
+    "FROM dfe_metadata.attempt_read_contexts"
 )
 
 _OBSERVATION_SELECT: Final[LiteralString] = (
@@ -7212,6 +8772,11 @@ def _persisted_context_from_row(
     row: DatabaseRow,
     expected: _ContextExpectation,
 ) -> PersistedReadContext:
+    closure_evidence_json = _row_optional_canonical_json(
+        row[21],
+        "read context closure evidence",
+    )
+    _validate_stored_clickhouse_closure(row, closure_evidence_json)
     definition = expected.definition
     evidence = definition.protected_context.evidence
     storage_identity = _context_storage_identity(definition.protected_context)
@@ -7273,6 +8838,7 @@ def _persisted_context_from_row(
         started_at=evidence.started_at.astimezone(UTC),
         end_operation_id=_row_optional_uuid(row[19], "read context end operation id"),
         ended_at=_row_optional_datetime(row[20], "read context ended_at"),
+        closure_evidence_json=closure_evidence_json,
     )
 
 
@@ -7339,6 +8905,11 @@ def _require_finished_context(
     ended_at: datetime,
     target_state: ReadContextStatus,
 ) -> PersistedReadContext:
+    closure_evidence_json = _row_optional_canonical_json(
+        row[21],
+        "read context closure evidence",
+    )
+    _validate_stored_clickhouse_closure(row, closure_evidence_json)
     actual = (
         _row_uuid(row[0], "read context id"),
         _row_uuid(row[1], "read context run id"),
@@ -7375,6 +8946,7 @@ def _require_finished_context(
         started_at=_row_datetime(row[17], "read context started_at"),
         end_operation_id=end_operation_id,
         ended_at=ended_at,
+        closure_evidence_json=closure_evidence_json,
     )
 
 
@@ -9666,6 +11238,11 @@ def _require_partial_closure_rows(
             ended_at,
         ),
     )
+    _require_partial_stable_read_closure(
+        result.consistency.stable_reads,
+        reference_context,
+        target_context,
+    )
     if len(observation_rows) != 2:
         raise RunLifecycleStateError(
             "partial comparison requires exactly two bound-cut observations"
@@ -9748,6 +11325,10 @@ def _require_terminal_partial_context(
     direction: PlanDirection,
     ended_at: datetime,
 ) -> datetime:
+    _validate_stored_clickhouse_closure(
+        row,
+        _row_optional_canonical_json(row[21], "partial context closure evidence"),
+    )
     if (
         _row_uuid(row[1], "partial context run id") != result.run_id
         or _row_uuid(row[2], "partial context attempt id") != result.attempt_id
@@ -9771,6 +11352,24 @@ def _require_terminal_partial_context(
             "partial context end timestamp is absent or later than its result"
         )
     return context_ended_at
+
+
+def _require_partial_stable_read_closure(
+    stable_reads: ConsistencyLevel,
+    reference_context: DatabaseRow,
+    target_context: DatabaseRow,
+) -> None:
+    if stable_reads is ConsistencyLevel.UNKNOWN:
+        return
+    if stable_reads is ConsistencyLevel.VERIFIED:
+        _require_verified_non_clickhouse_contexts(reference_context, target_context)
+        return
+    if stable_reads is ConsistencyLevel.ASSERTED:
+        _require_asserted_clickhouse_target_closure(reference_context, target_context)
+        return
+    raise StoredLifecycleIntegrityError(
+        "partial comparison has an unsupported stable-read evidence level"
+    )
 
 
 def _require_completed_database_closure(
@@ -9820,11 +11419,13 @@ def _require_completed_closure_rows(
     observation_rows: list[DatabaseRow],
 ) -> None:
     if (
-        result.consistency.stable_reads is not ConsistencyLevel.VERIFIED
+        result.consistency.stable_reads
+        not in (ConsistencyLevel.ASSERTED, ConsistencyLevel.VERIFIED)
         or result.consistency.cut_alignment is not ConsistencyLevel.VERIFIED
     ):
         raise RunLifecycleStateError(
-            "completed comparison requires verified stable reads and cut alignment"
+            "completed comparison requires asserted or verified stable reads and verified cut "
+            "alignment"
         )
     if len(context_rows) != 2:
         raise RunLifecycleStateError(
@@ -9861,6 +11462,11 @@ def _require_completed_closure_rows(
             PlanDirection.TARGET,
             completed_at,
         ),
+    )
+    _require_completed_stable_read_closure(
+        result.consistency.stable_reads,
+        reference_context,
+        target_context,
     )
     if len(observation_rows) != 2:
         raise RunLifecycleStateError(
@@ -9974,6 +11580,10 @@ def _require_closed_completed_context(
     direction: PlanDirection,
     completed_at: datetime,
 ) -> datetime:
+    _validate_stored_clickhouse_closure(
+        row,
+        _row_optional_canonical_json(row[21], "completed context closure evidence"),
+    )
     if (
         _row_uuid(row[1], "completed context run id") != result.run_id
         or _row_uuid(row[2], "completed context attempt id") != result.attempt_id
@@ -9997,6 +11607,77 @@ def _require_closed_completed_context(
             "completed comparison cannot precede protected context closure"
         )
     return ended_at
+
+
+def _require_completed_stable_read_closure(
+    stable_reads: ConsistencyLevel,
+    reference_context: DatabaseRow,
+    target_context: DatabaseRow,
+) -> None:
+    if stable_reads is ConsistencyLevel.VERIFIED:
+        _require_verified_non_clickhouse_contexts(reference_context, target_context)
+        return
+    if stable_reads is ConsistencyLevel.ASSERTED:
+        _require_asserted_clickhouse_target_closure(reference_context, target_context)
+        return
+    raise StoredLifecycleIntegrityError(
+        "completed comparison has an unsupported stable-read evidence level"
+    )
+
+
+def _require_verified_non_clickhouse_contexts(
+    reference_context: DatabaseRow,
+    target_context: DatabaseRow,
+) -> None:
+    if any(
+        _row_text(row[7], "verified context engine") == Adapter.CLICKHOUSE.value
+        for row in (reference_context, target_context)
+    ):
+        raise StoredLifecycleIntegrityError(
+            "ClickHouse immutable named-version contexts cannot claim verified stable reads"
+        )
+
+
+def _require_asserted_clickhouse_target_closure(
+    reference_context: DatabaseRow,
+    target_context: DatabaseRow,
+) -> None:
+    _require_closed_stable_read_contexts(reference_context, target_context)
+    if (
+        _row_text(reference_context[7], "asserted reference context engine")
+        == Adapter.CLICKHOUSE.value
+        or _row_text(target_context[7], "asserted target context engine")
+        != Adapter.CLICKHOUSE.value
+    ):
+        raise StoredLifecycleIntegrityError(
+            "asserted stable reads require exactly one target-side ClickHouse context"
+        )
+    closure_json = _row_optional_canonical_json(
+        target_context[21],
+        "asserted ClickHouse target closure evidence",
+    )
+    if (
+        _row_text(target_context[18], "asserted ClickHouse target context state")
+        != ReadContextStatus.CLOSED.value
+        or closure_json is None
+    ):
+        raise RunLifecycleStateError(
+            "asserted stable reads require a durably confirmed closed ClickHouse target context"
+        )
+    _validate_stored_clickhouse_closure(target_context, closure_json)
+
+
+def _require_closed_stable_read_contexts(
+    reference_context: DatabaseRow,
+    target_context: DatabaseRow,
+) -> None:
+    if any(
+        _row_text(row[18], "stable-read context state") != ReadContextStatus.CLOSED.value
+        for row in (reference_context, target_context)
+    ):
+        raise RunLifecycleStateError(
+            "asserted or verified stable reads require both protected contexts to be closed"
+        )
 
 
 def _require_completed_observation(
@@ -10807,6 +12488,79 @@ def _semantic_integer(value: SemanticValue | None, context: str) -> int:
     if type(value) is not int:
         raise StoredLifecycleIntegrityError(f"{context} must be a semantic integer")
     return value
+
+
+def _semantic_nonnegative_integer(value: SemanticValue | None, context: str) -> int:
+    integer = _semantic_integer(value, context)
+    if integer < 0:
+        raise StoredLifecycleIntegrityError(f"{context} must be non-negative")
+    return integer
+
+
+def _semantic_positive_integer(value: SemanticValue | None, context: str) -> int:
+    integer = _semantic_integer(value, context)
+    if integer < 1:
+        raise StoredLifecycleIntegrityError(f"{context} must be positive")
+    return integer
+
+
+def _semantic_optional_text(value: SemanticValue | None, context: str) -> str:
+    if type(value) is not str:
+        raise StoredLifecycleIntegrityError(f"{context} must be semantic text")
+    return value
+
+
+def _semantic_boolean(value: SemanticValue | None, context: str) -> bool:
+    if type(value) is not bool:
+        raise StoredLifecycleIntegrityError(f"{context} must be a semantic boolean")
+    return value
+
+
+def _semantic_sha256(value: SemanticValue | None, context: str) -> str:
+    text = _semantic_text(value, context)
+    if len(text) != 64 or any(character not in "0123456789abcdef" for character in text):
+        raise StoredLifecycleIntegrityError(f"{context} must be lowercase SHA-256 hex")
+    return text
+
+
+def _semantic_uuid_text(value: SemanticValue | None, context: str) -> str:
+    text = _semantic_text(value, context)
+    try:
+        parsed = UUID(text)
+    except ValueError:
+        raise StoredLifecycleIntegrityError(f"{context} must be a canonical UUID") from None
+    if parsed.int == 0 or str(parsed) != text:
+        raise StoredLifecycleIntegrityError(f"{context} must be a canonical non-zero UUID")
+    return text
+
+
+def _semantic_utc_datetime(value: SemanticValue | None, context: str) -> datetime:
+    text = _semantic_text(value, context)
+    try:
+        parsed = datetime.fromisoformat(text)
+    except ValueError:
+        raise StoredLifecycleIntegrityError(
+            f"{context} must be a canonical UTC timestamp"
+        ) from None
+    if parsed.tzinfo is None:
+        raise StoredLifecycleIntegrityError(f"{context} must be timezone-aware")
+    normalized = parsed.astimezone(UTC)
+    if normalized.isoformat() != text:
+        raise StoredLifecycleIntegrityError(f"{context} must be canonical UTC text")
+    return normalized
+
+
+def _require_semantic_keys(
+    value: dict[str, SemanticValue],
+    expected: frozenset[str],
+    context: str,
+) -> None:
+    actual = frozenset(value)
+    if actual != expected:
+        raise StoredLifecycleIntegrityError(
+            f"{context} has unsupported fields: expected={sorted(expected)!r}, "
+            f"actual={sorted(actual)!r}"
+        )
 
 
 def _require_instance[ExpectedT](

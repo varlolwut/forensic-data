@@ -8,6 +8,7 @@ DELETE FROM [dfe_fixture].[canonical_probe];
 DELETE FROM [dfe_fixture].[canonical_common_types];
 DELETE FROM [dfe_fixture].[canonical_key_probe];
 DELETE FROM [dfe_fixture].[comparison_orders];
+DELETE FROM [dfe_fixture].[clickhouse_comparison_orders];
 DELETE FROM [dfe_fixture].[comparison_batch_manifest];
 DELETE FROM [dfe_fixture].[rls_probe];
 
@@ -144,6 +145,44 @@ VALUES
     CONVERT(datetimeoffset(7), N'2026-09-22T08:22:33.1234560+00:00', 127)
 );
 
+INSERT INTO [dfe_fixture].[clickhouse_comparison_orders]
+(
+    [order_id],
+    [business_date],
+    [precise_amount],
+    [local_time],
+    [instant_time]
+)
+VALUES
+(
+    1,
+    CONVERT(date, N'2024-02-29', 23),
+    CONVERT(decimal(38, 7), N'100.0000000'),
+    CONVERT(datetime2(7), N'2024-02-29T10:00:01.1111110', 126),
+    CONVERT(datetimeoffset(7), N'2024-02-29T08:00:01.1111110+00:00', 127)
+),
+(
+    2,
+    CONVERT(date, N'2024-02-29', 23),
+    CONVERT(decimal(38, 7), N'200.0000000'),
+    CONVERT(datetime2(7), N'2024-02-29T10:00:02.2222220', 126),
+    CONVERT(datetimeoffset(7), N'2024-02-29T08:00:02.2222220+00:00', 127)
+),
+(
+    3,
+    CONVERT(date, N'2024-02-29', 23),
+    CONVERT(decimal(38, 7), N'300.0000000'),
+    CONVERT(datetime2(7), N'2024-02-29T10:00:03.3333330', 126),
+    CONVERT(datetimeoffset(7), N'2024-02-29T08:00:03.3333330+00:00', 127)
+),
+(
+    4,
+    CONVERT(date, N'2024-02-29', 23),
+    CONVERT(decimal(38, 7), N'400.0000000'),
+    CONVERT(datetime2(7), N'2024-02-29T10:00:04.4444440', 126),
+    CONVERT(datetimeoffset(7), N'2024-02-29T08:00:04.4444440+00:00', 127)
+);
+
 INSERT INTO [dfe_fixture].[comparison_batch_manifest]
 (
     [dataset_id],
@@ -165,6 +204,16 @@ VALUES
     N'orders-cut-baseline',
     N'reference-orders-v1',
     CONVERT(datetimeoffset(6), N'2026-09-23T12:30:45.123456+00:00', 127)
+),
+(
+    N'mssql_reference_orders',
+    N'13da3e93058f4e53db4d7989380a57597b0fb5a86dc0e9a80ae33bd1b11f9897',
+    N'reference-orders-2024-02-29-v001',
+    N'complete',
+    CONVERT(date, N'2024-02-29', 23),
+    N'comparison-orders-cut-000001',
+    N'mssql-reference-orders-v1',
+    CONVERT(datetimeoffset(6), N'2024-03-01T01:02:03.456789+00:00', 127)
 );
 
 INSERT INTO [dfe_fixture].[rls_probe]
@@ -193,6 +242,8 @@ SELECT
         AS [canonical_key_rows],
     (SELECT COUNT_BIG(*) FROM [dfe_fixture].[comparison_orders])
         AS [comparison_order_rows],
+    (SELECT COUNT_BIG(*) FROM [dfe_fixture].[clickhouse_comparison_orders])
+        AS [clickhouse_comparison_order_rows],
     (SELECT COUNT_BIG(*) FROM [dfe_fixture].[comparison_batch_manifest])
         AS [comparison_manifest_rows],
     (SELECT COUNT_BIG(*) FROM [dfe_fixture].[rls_probe])

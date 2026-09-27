@@ -1,6 +1,6 @@
 import re
 from dataclasses import dataclass
-from typing import final
+from typing import cast, final
 
 from pydantic import BaseModel, ConfigDict
 
@@ -35,6 +35,7 @@ from forensic_data.clickhouse import (
     validate_clickhouse_identifier,
     validate_clickhouse_text_scalar,
 )
+from forensic_data.postgres_sql import PostgresScopePredicate
 
 _LOWER_HEX_BYTES = re.compile(r"(?:[0-9a-f]{2})+\Z", re.ASCII)
 _LOWER_SHA256 = re.compile(r"[0-9a-f]{64}\Z", re.ASCII)
@@ -263,6 +264,24 @@ class ClickHouseCanonicalKeyGroups:
     valid_key_count: int
     invalid_key_count: int
     oversized_key_count: int
+
+
+@final
+@dataclass(frozen=True, slots=True)
+class ClickHouseIntegerComparisonExpressions:
+    source_sql: str
+    encoded_row_envelope: str
+    row_envelope: str
+    invalid_row: str
+    oversized_row: str
+    key_column: str
+    key_is_valid: str
+    key_envelope: str
+    scope_filter: str
+    parameters: tuple[tuple[str, ClickHouseParameter], ...]
+
+    def parameter_dict(self) -> dict[str, ClickHouseParameter]:
+        return _merged_parameter_dict(self.parameters)
 
 
 class _ClickHouseColumnPayload(BaseModel):
@@ -568,6 +587,96 @@ def read_clickhouse_canonical_key_groups(
         "canonical key groups",
     )
     return _parse_key_groups(payloads, context, request)
+
+
+def lower_clickhouse_integer_comparison(
+    relation: ClickHouseCanonicalRelation,
+    key_field_index: int,
+    scope: PostgresScopePredicate | None,
+    limits: ClickHouseCanonicalLimits,
+) -> ClickHouseIntegerComparisonExpressions:
+    _require_relation(relation)
+    _require_limits(limits)
+    if type(key_field_index) is not int or not 0 <= key_field_index < len(relation.schema.fields):
+        raise ValueError("ClickHouse integer comparison key index must identify a field")
+    key_field = relation.schema.fields[key_field_index]
+    key_binding = relation.bindings[key_field_index]
+    if key_field.logical_type is not LogicalType.INT64 or key_field.nullable:
+        raise ValueError(
+            "ClickHouse integer comparison requires one non-null logical INT64 key field"
+        )
+    context = prepare_envelope_context(relation.schema)
+    row = _lower_row_envelope(relation, context, limits)
+    key_field_lowering = _field_lowering(key_field, key_binding, key_field_index)
+    key_context = prepare_envelope_context(
+        CanonicalSchema(protocol=relation.schema.protocol, fields=(key_field,))
+    )
+    scope_filter, scope_parameters = _clickhouse_scope_filter(relation, scope)
+    return ClickHouseIntegerComparisonExpressions(
+        source_sql=_aliased_source_sql(relation.source),
+        encoded_row_envelope=row.encoded_envelope,
+        row_envelope=row.accepted_envelope,
+        invalid_row=row.invalid_value,
+        oversized_row=row.oversized_value,
+        key_column=_column_sql(key_binding),
+        key_is_valid=key_field_lowering.payload_is_valid,
+        key_envelope=("concat({canonical_key_header:String}, " + key_field_lowering.frame + ")"),
+        scope_filter=scope_filter,
+        parameters=_merged_parameters(
+            (
+                *row.parameters,
+                *key_field_lowering.parameters,
+                ("canonical_key_header", key_context.key_header),
+                *scope_parameters,
+            )
+        ),
+    )
+
+
+def clickhouse_comparison_aggregate_settings(
+    relation: ClickHouseCanonicalRelation,
+    limits: ClickHouseCanonicalLimits,
+    max_result_rows: int,
+    max_result_bytes: int,
+) -> dict[str, ClickHouseParameter]:
+    _require_relation(relation)
+    _require_limits(limits)
+    _validate_positive_integer(
+        max_result_rows,
+        "ClickHouse comparison result row limit",
+        INT64_MAX,
+    )
+    _validate_positive_integer(
+        max_result_bytes,
+        "ClickHouse comparison result byte limit",
+        INT64_MAX,
+    )
+    if max_result_bytes > limits.max_response_bytes:
+        raise ValueError(
+            "ClickHouse comparison result byte limit exceeds the accepted response limit: "
+            f"requested={max_result_bytes}, accepted={limits.max_response_bytes}"
+        )
+    return {
+        **_common_query_settings(limits, max_result_rows, relation.source),
+        "max_result_bytes": max_result_bytes,
+    }
+
+
+def clickhouse_comparison_ordered_settings(
+    relation: ClickHouseCanonicalRelation,
+    limits: ClickHouseCanonicalLimits,
+    max_result_rows: int,
+    max_result_bytes: int,
+) -> dict[str, ClickHouseParameter]:
+    return {
+        **clickhouse_comparison_aggregate_settings(
+            relation,
+            limits,
+            max_result_rows,
+            max_result_bytes,
+        ),
+        "sort_overflow_mode": "throw",
+    }
 
 
 def _inspect_field_binding(
@@ -1213,6 +1322,63 @@ def _parameter_dict(
             raise ValueError(f"duplicate ClickHouse query parameter name: {name!r}")
         result[name] = value
     return result
+
+
+def _merged_parameters(
+    parameters: tuple[tuple[str, ClickHouseParameter], ...],
+) -> tuple[tuple[str, ClickHouseParameter], ...]:
+    merged = _merged_parameter_dict(parameters)
+    return tuple(merged.items())
+
+
+def _merged_parameter_dict(
+    parameters: tuple[tuple[str, ClickHouseParameter], ...],
+) -> dict[str, ClickHouseParameter]:
+    result: dict[str, ClickHouseParameter] = {}
+    for name, value in parameters:
+        previous = result.get(name)
+        if previous is not None and previous != value:
+            raise ValueError(
+                "ClickHouse comparison lowering produced conflicting query parameters: "
+                f"name={name!r}"
+            )
+        result[name] = value
+    return result
+
+
+def _clickhouse_scope_filter(
+    relation: ClickHouseCanonicalRelation,
+    scope: PostgresScopePredicate | None,
+) -> tuple[str, tuple[tuple[str, ClickHouseParameter], ...]]:
+    if scope is None:
+        return "true", ()
+    if not isinstance(cast(object, scope), PostgresScopePredicate):
+        raise TypeError("ClickHouse comparison scope must be PostgresScopePredicate or None")
+    matches = tuple(
+        (index, binding)
+        for index, binding in enumerate(relation.bindings)
+        if binding.column_name == scope.column_name
+    )
+    if len(matches) != 1:
+        raise ValueError(
+            "ClickHouse comparison scope column must map to exactly one canonical field: "
+            f"column={scope.column_name!r}, matching_fields={len(matches)}"
+        )
+    field_index, binding = matches[0]
+    field = relation.schema.fields[field_index]
+    if field != scope.field:
+        raise ValueError(
+            "ClickHouse comparison scope field differs from its bound canonical schema: "
+            f"column={scope.column_name!r}, field_index={field_index}"
+        )
+    column = _column_sql(binding)
+    value = f"assumeNotNull({column})" if binding.nullable else column
+    payload = _payload_lowering(field, binding, value, field_index)
+    filter_sql = (
+        f"NOT isNull({column}) AND ({payload.is_valid}) AND "
+        f"lower(hex({payload.payload})) = {{scope_payload_hex:String}}"
+    )
+    return filter_sql, (*payload.parameters, ("scope_payload_hex", scope.canonical_payload.hex()))
 
 
 def _common_query_settings(
