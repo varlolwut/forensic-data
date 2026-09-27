@@ -1,0 +1,20 @@
+{
+  "version": 1,
+  "issuer": "dfe_fixture_loader",
+  "dataset_id": "immutable_orders",
+  "scope_digest": "5689623b7c5d8424c827123d15d6fdbb011108a79efa1c7586d0f392230697e1",
+  "expected_batch_id": "immutable-orders-2024-02-29-v001",
+  "business_date": "2024-02-29",
+  "source_cut": "source-orders-cut-000001",
+  "dataset_version": "immutable_orders_v001",
+  "completed_at": "2024-03-01T00:00:00.000000Z",
+  "completion_revision": 1,
+  "publication_revision": 1,
+  "version_locator": {
+    "database": "dfe_fixture",
+    "table": "immutable_orders_v001",
+    "uuid": "11111111-1111-4111-8111-111111111111"
+  },
+  "immutability": "asserted",
+  "late_arrivals": "next_batch"
+}

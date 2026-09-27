@@ -1,9 +1,12 @@
 from decimal import Decimal
+from pathlib import Path
 
 import clickhouse_connect
 import pytest
+from clickhouse_connect.driver.client import Client
 from clickhouse_connect.driver.exceptions import DatabaseError
 
+from forensic_data.acquisition import EarlyExecutionOutcome
 from forensic_data.canonical import (
     PROTOCOL,
     CanonicalSchema,
@@ -26,6 +29,7 @@ from forensic_data.clickhouse import (
     ClickHouseResourceSetting,
     ClickHouseResultLimitError,
     ClickHouseTransportState,
+    UnsupportedClickHouseProfileError,
     inspect_clickhouse_fidelity_relation,
     inspect_clickhouse_server_profile,
     open_clickhouse_transport,
@@ -40,9 +44,24 @@ from forensic_data.clickhouse_canonical import (
     read_clickhouse_canonical_key_groups,
     read_clickhouse_canonical_rows,
 )
+from forensic_data.clickhouse_readiness import (
+    ClickHouseImmutableVersionBinding,
+    ClickHouseImmutableVersionConfirmation,
+    ClickHouseImmutableVersionManifest,
+    ClickHouseImmutableVersionRequest,
+    ClickHouseReadinessLimits,
+    acquire_clickhouse_immutable_version,
+    confirm_clickhouse_immutable_version,
+    parse_clickhouse_immutable_version_manifest,
+)
+from forensic_data.contracts.model import LateArrivalPolicy, MinimumEvidence
+from forensic_data.planning import PlanDirection
+from forensic_data.result import ConsistencyLevel, ExecutionStatus, ReasonCode
 from tests.canonical_vectors import vector_named
 from tests.clickhouse_support import (
+    required_clickhouse_admin_settings,
     required_clickhouse_reader_settings,
+    required_clickhouse_writer_settings,
     single_attempt_clickhouse_retry_policy,
 )
 
@@ -58,6 +77,7 @@ _COMMON_TYPE_COLUMNS = (
     "instant_time",
 )
 _ZERO_LIMBS = (0, 0, 0, 0, 0, 0, 0, 0)
+_CLICKHOUSE_MANIFESTS = Path(__file__).parent / "fixtures" / "clickhouse" / "manifests"
 
 
 def test_clickhouse_canonical_bytes_fingerprint_and_binary_groups_match_shared_oracle() -> None:
@@ -421,6 +441,180 @@ def test_clickhouse_lts_profile_is_lossless_bounded_and_read_only() -> None:
     )
 
 
+def test_clickhouse_immutable_versions_bind_only_complete_append_only_publications() -> None:
+    v001_manifest = parse_clickhouse_immutable_version_manifest(
+        (_CLICKHOUSE_MANIFESTS / "immutable-orders-v001.json").read_bytes(),
+        1_024,
+    )
+    v002_manifest = parse_clickhouse_immutable_version_manifest(
+        (_CLICKHOUSE_MANIFESTS / "immutable-orders-v002.json").read_bytes(),
+        1_024,
+    )
+    v001_request = _immutable_version_request(v001_manifest)
+    v002_request = _immutable_version_request(v002_manifest)
+    admin_settings = required_clickhouse_admin_settings("dfe-phase05-readiness-reset")
+    reader_settings = required_clickhouse_reader_settings("dfe-phase05-readiness-reader")
+    writer_settings = required_clickhouse_writer_settings("dfe-phase05-readiness-writer")
+
+    try:
+        _reset_immutable_version_readiness(admin_settings)
+        reader = open_clickhouse_transport(
+            reader_settings,
+            single_attempt_clickhouse_retry_policy(),
+        )
+        try:
+            v001_binding = acquire_clickhouse_immutable_version(
+                reader,
+                v001_request,
+                v001_manifest,
+            )
+            assert isinstance(v001_binding, ClickHouseImmutableVersionBinding)
+            assert v001_binding.readiness_evidence.evidence_level is ConsistencyLevel.VERIFIED
+            assert v001_binding.stable_read_evidence is ConsistencyLevel.ASSERTED
+            assert v001_binding.overall_evidence is ConsistencyLevel.ASSERTED
+            v001_confirmation = confirm_clickhouse_immutable_version(reader, v001_binding)
+            assert isinstance(
+                v001_confirmation,
+                ClickHouseImmutableVersionConfirmation,
+            )
+
+            before_write = reader.execute_raw(
+                query="SELECT count() FROM dfe_fixture.immutable_orders_v001",
+                parameters={},
+                settings={
+                    "session_timezone": "UTC",
+                    "max_execution_time": 5,
+                    "max_result_rows": 1,
+                    "max_result_bytes": 64,
+                    "result_overflow_mode": "throw",
+                },
+                result_format="TabSeparatedRaw",
+                max_response_bytes=64,
+                operation="count_sealed_immutable_version_before_rejected_write",
+            )
+            assert before_write.payload == b"2\n"
+
+            sealed_writer = _open_clickhouse_fixture_client(writer_settings)
+            try:
+                insert_grant = sealed_writer.command(  # pyright: ignore[reportUnknownMemberType]
+                    "CHECK GRANT INSERT ON dfe_fixture.immutable_orders_v001"
+                )
+                assert insert_grant == 1
+                alter_grant = sealed_writer.command(  # pyright: ignore[reportUnknownMemberType]
+                    "CHECK GRANT ALTER TABLE ON dfe_fixture.immutable_orders_v001"
+                )
+                assert alter_grant == 0
+                with pytest.raises(DatabaseError) as rejected_write:
+                    sealed_writer.command(  # pyright: ignore[reportUnknownMemberType]
+                        "INSERT INTO dfe_fixture.immutable_orders_v001 VALUES "
+                        "(3, '30.000', toDate('2024-02-29'), "
+                        "'immutable-orders-2024-02-29-v001')"
+                    )
+                assert rejected_write.value.name == "TABLE_IS_PERMANENTLY_READ_ONLY"
+            finally:
+                sealed_writer.close_connections()
+
+            after_write = reader.execute_raw(
+                query="SELECT count() FROM dfe_fixture.immutable_orders_v001",
+                parameters={},
+                settings={
+                    "session_timezone": "UTC",
+                    "max_execution_time": 5,
+                    "max_result_rows": 1,
+                    "max_result_bytes": 64,
+                    "result_overflow_mode": "throw",
+                },
+                result_format="TabSeparatedRaw",
+                max_response_bytes=64,
+                operation="count_sealed_immutable_version_after_rejected_write",
+            )
+            assert after_write.payload == before_write.payload
+
+            readiness_writer = _open_clickhouse_fixture_client(writer_settings)
+            try:
+                _append_building_readiness(readiness_writer, v002_manifest, 2)
+                building_outcome = acquire_clickhouse_immutable_version(
+                    reader,
+                    v002_request,
+                    v002_manifest,
+                )
+                assert isinstance(building_outcome, EarlyExecutionOutcome)
+                assert building_outcome.execution_status is ExecutionStatus.INCOMPLETE
+                assert building_outcome.reason.code is ReasonCode.NOT_READY
+
+                _append_complete_readiness(readiness_writer, v002_manifest)
+            finally:
+                readiness_writer.close_connections()
+
+            superseded_v001 = confirm_clickhouse_immutable_version(reader, v001_binding)
+            assert isinstance(superseded_v001, EarlyExecutionOutcome)
+            assert superseded_v001.execution_status is ExecutionStatus.INCOMPLETE
+            assert superseded_v001.reason.code is ReasonCode.NOT_READY
+
+            v002_binding = acquire_clickhouse_immutable_version(
+                reader,
+                v002_request,
+                v002_manifest,
+            )
+            assert isinstance(v002_binding, ClickHouseImmutableVersionBinding)
+            assert v002_binding.readiness_evidence.evidence_level is ConsistencyLevel.VERIFIED
+            assert v002_binding.stable_read_evidence is ConsistencyLevel.ASSERTED
+            assert v002_binding.overall_evidence is ConsistencyLevel.ASSERTED
+            v002_confirmation = confirm_clickhouse_immutable_version(reader, v002_binding)
+            assert isinstance(
+                v002_confirmation,
+                ClickHouseImmutableVersionConfirmation,
+            )
+
+            policy_admin = _open_clickhouse_fixture_client(admin_settings)
+            try:
+                _drop_readiness_row_policy(policy_admin)
+                policy_admin.command(  # pyright: ignore[reportUnknownMemberType]
+                    "CREATE ROW POLICY dfe_p05_readiness_head_visibility "
+                    "ON dfe_fixture.immutable_version_readiness FOR SELECT "
+                    "USING publication_revision < 2 TO dfe_fixture_reader"
+                )
+                filtered_revisions = reader.execute_raw(
+                    query=(
+                        "SELECT toString(publication_revision) FROM "
+                        "dfe_fixture.immutable_version_readiness "
+                        "WHERE dataset_id = {dataset_id:String} "
+                        "AND scope_digest = {scope_digest:String} "
+                        "ORDER BY publication_revision"
+                    ),
+                    parameters={
+                        "dataset_id": v001_manifest.dataset_id,
+                        "scope_digest": v001_manifest.scope_digest,
+                    },
+                    settings={
+                        "session_timezone": "UTC",
+                        "max_execution_time": 5,
+                        "max_result_rows": 3,
+                        "max_result_bytes": 64,
+                        "result_overflow_mode": "throw",
+                    },
+                    result_format="TabSeparatedRaw",
+                    max_response_bytes=64,
+                    operation="prove_readiness_row_policy_hides_newer_publications",
+                )
+                assert filtered_revisions.payload == b"1\n"
+                with pytest.raises(UnsupportedClickHouseProfileError):
+                    acquire_clickhouse_immutable_version(
+                        reader,
+                        v001_request,
+                        v001_manifest,
+                    )
+            finally:
+                try:
+                    _drop_readiness_row_policy(policy_admin)
+                finally:
+                    policy_admin.close_connections()
+        finally:
+            reader.close()
+    finally:
+        _reset_immutable_version_readiness(admin_settings)
+
+
 def _expected_row(
     order_value: int,
     decimal_scaled: int,
@@ -521,3 +715,148 @@ def _require_server_rejects_setting_raise(settings: ClickHouseConnectionSettings
             )
     finally:
         client.close_connections()
+
+
+def _immutable_version_request(
+    manifest: ClickHouseImmutableVersionManifest,
+) -> ClickHouseImmutableVersionRequest:
+    return ClickHouseImmutableVersionRequest(
+        direction=PlanDirection.REFERENCE,
+        endpoint_profile="direct_single_server",
+        readiness_database="dfe_fixture",
+        readiness_table="immutable_version_readiness",
+        expected_issuer="dfe_fixture_loader",
+        dataset_id=manifest.dataset_id,
+        scope_digest=manifest.scope_digest,
+        expected_batch_id=manifest.expected_batch_id,
+        alignment_fields=("business_date", "source_cut"),
+        minimum_evidence=MinimumEvidence.ASSERTED,
+        late_arrivals=LateArrivalPolicy.NEXT_BATCH,
+        limits=ClickHouseReadinessLimits(
+            max_response_bytes=8_192,
+            max_execution_time_seconds=5,
+        ),
+    )
+
+
+def _reset_immutable_version_readiness(settings: ClickHouseConnectionSettings) -> None:
+    admin = _open_clickhouse_fixture_client(settings)
+    try:
+        _drop_readiness_row_policy(admin)
+        admin.command(  # pyright: ignore[reportUnknownMemberType]
+            "DROP TABLE IF EXISTS dfe_fixture.immutable_orders_v001 SYNC"
+        )
+        admin.command(  # pyright: ignore[reportUnknownMemberType]
+            "CREATE TABLE dfe_fixture.immutable_orders_v001 "
+            "UUID '11111111-1111-4111-8111-111111111111' "
+            "(order_id Int64, amount Decimal(38, 3), business_date Date, batch_id String) "
+            "ENGINE = MergeTree ORDER BY order_id"
+        )
+        admin.command(  # pyright: ignore[reportUnknownMemberType]
+            "INSERT INTO dfe_fixture.immutable_orders_v001 VALUES "
+            "(1, '10.000', toDate('2024-02-29'), "
+            "'immutable-orders-2024-02-29-v001'), "
+            "(2, '20.000', toDate('2024-02-29'), "
+            "'immutable-orders-2024-02-29-v001')"
+        )
+        admin.command(  # pyright: ignore[reportUnknownMemberType]
+            "ALTER TABLE dfe_fixture.immutable_orders_v001 MODIFY SETTING table_readonly = 1"
+        )
+        admin.command(  # pyright: ignore[reportUnknownMemberType]
+            "TRUNCATE TABLE dfe_fixture.immutable_version_readiness SYNC"
+        )
+        admin.command(  # pyright: ignore[reportUnknownMemberType]
+            "INSERT INTO dfe_fixture.immutable_version_readiness VALUES "
+            "('immutable_orders', "
+            "'5689623b7c5d8424c827123d15d6fdbb011108a79efa1c7586d0f392230697e1', "
+            "'immutable-orders-2024-02-29-v001', 'complete', "
+            "toDate('2024-02-29'), 'source-orders-cut-000001', "
+            "'immutable_orders_v001', "
+            "toDateTime64('2024-03-01 00:00:00.000000', 6, 'UTC'), "
+            "toUInt64(1), toUInt64(1))"
+        )
+    finally:
+        admin.close_connections()
+
+
+def _append_building_readiness(
+    client: Client,
+    manifest: ClickHouseImmutableVersionManifest,
+    publication_revision: int,
+) -> None:
+    client.command(  # pyright: ignore[reportUnknownMemberType]
+        (
+            "INSERT INTO dfe_fixture.immutable_version_readiness VALUES "
+            "({dataset_id:String}, {scope_digest:String}, {batch_id:String}, "
+            "'building', toDate({business_date:String}), NULL, NULL, NULL, NULL, "
+            "{publication_revision:UInt64})"
+        ),
+        parameters={
+            "dataset_id": manifest.dataset_id,
+            "scope_digest": manifest.scope_digest,
+            "batch_id": manifest.expected_batch_id,
+            "business_date": manifest.business_date.isoformat(),
+            "publication_revision": publication_revision,
+        },
+    )
+
+
+def _append_complete_readiness(
+    client: Client,
+    manifest: ClickHouseImmutableVersionManifest,
+) -> None:
+    client.command(  # pyright: ignore[reportUnknownMemberType]
+        (
+            "INSERT INTO dfe_fixture.immutable_version_readiness VALUES "
+            "({dataset_id:String}, {scope_digest:String}, {batch_id:String}, "
+            "'complete', toDate({business_date:String}), {source_cut:String}, "
+            "{dataset_version:String}, "
+            "toDateTime64({completed_at:String}, 6, 'UTC'), "
+            "{completion_revision:UInt64}, {publication_revision:UInt64})"
+        ),
+        parameters={
+            "dataset_id": manifest.dataset_id,
+            "scope_digest": manifest.scope_digest,
+            "batch_id": manifest.expected_batch_id,
+            "business_date": manifest.business_date.isoformat(),
+            "source_cut": manifest.source_cut,
+            "dataset_version": manifest.dataset_version,
+            "completed_at": manifest.completed_at.strftime("%Y-%m-%d %H:%M:%S.%f"),
+            "completion_revision": manifest.completion_revision,
+            "publication_revision": manifest.publication_revision,
+        },
+    )
+
+
+def _drop_readiness_row_policy(client: Client) -> None:
+    client.command(  # pyright: ignore[reportUnknownMemberType]
+        "DROP ROW POLICY IF EXISTS dfe_p05_readiness_head_visibility "
+        "ON dfe_fixture.immutable_version_readiness"
+    )
+
+
+def _open_clickhouse_fixture_client(settings: ClickHouseConnectionSettings) -> Client:
+    return clickhouse_connect.get_client(  # pyright: ignore[reportUnknownMemberType]
+        host=settings.host,
+        username=settings.user,
+        password=settings.password.get_secret_value(),
+        database=settings.database,
+        interface="http",
+        port=settings.port,
+        secure=False,
+        settings={"session_timezone": "UTC"},
+        compress=False,
+        query_limit=0,
+        query_retries=0,
+        connect_timeout=settings.connect_timeout_seconds,
+        send_receive_timeout=settings.send_receive_timeout_seconds,
+        client_name=settings.application_name,
+        verify=True,
+        tz_source="server",
+        tz_mode="schema",
+        show_clickhouse_errors="scrub",
+        autogenerate_session_id=False,
+        autogenerate_query_id=False,
+        form_encode_query_params=True,
+        native_codec="python",
+    )

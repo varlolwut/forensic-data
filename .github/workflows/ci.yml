@@ -77,11 +77,14 @@ jobs:
         run: |
           admin_password="$(openssl rand -hex 32)"
           reader_password="$(openssl rand -hex 32)"
+          writer_password="$(openssl rand -hex 32)"
           echo "::add-mask::${admin_password}"
           echo "::add-mask::${reader_password}"
+          echo "::add-mask::${writer_password}"
           {
             echo "DFE_CLICKHOUSE_ADMIN_PASSWORD=${admin_password}"
             echo "DFE_CLICKHOUSE_READER_PASSWORD=${reader_password}"
+            echo "DFE_CLICKHOUSE_WRITER_PASSWORD=${writer_password}"
           } >> "${GITHUB_ENV}"
       - name: Lint
         run: uv run ruff check .

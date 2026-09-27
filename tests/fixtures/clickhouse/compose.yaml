@@ -14,6 +14,7 @@ services:
       CLICKHOUSE_PASSWORD: ${DFE_CLICKHOUSE_ADMIN_PASSWORD:?set DFE_CLICKHOUSE_ADMIN_PASSWORD}
       CLICKHOUSE_DEFAULT_ACCESS_MANAGEMENT: "1"
       DFE_CLICKHOUSE_READER_PASSWORD: ${DFE_CLICKHOUSE_READER_PASSWORD:?set DFE_CLICKHOUSE_READER_PASSWORD}
+      DFE_CLICKHOUSE_WRITER_PASSWORD: ${DFE_CLICKHOUSE_WRITER_PASSWORD:?set DFE_CLICKHOUSE_WRITER_PASSWORD}
     ports:
       - 127.0.0.1:${DFE_CLICKHOUSE_HTTP_PORT:?set DFE_CLICKHOUSE_HTTP_PORT}:8123
     volumes:
@@ -45,7 +46,19 @@ services:
           AND (SELECT count() FROM canonical_nullable_strings) = 2
           AND (SELECT count() FROM canonical_key_groups) = 5
           AND (SELECT count() FROM canonical_null_key) = 1
-          AND (SELECT count() FROM canonical_group_overflow) = 5")" = "1"
+          AND (SELECT count() FROM canonical_group_overflow) = 5
+          AND (SELECT count() FROM immutable_version_readiness) = 1
+          AND (SELECT count() FROM immutable_orders_staging) = 3
+          AND (SELECT count() FROM immutable_orders_v001) = 2
+          AND (SELECT count() FROM immutable_orders_v002) = 3
+          AND (SELECT count() FROM system.row_policies WHERE database = 'system') = 0
+          AND (SELECT position(engine_full, 'table_readonly = 1') > 0 FROM system.tables WHERE database = 'dfe_fixture' AND name = 'immutable_orders_v001')
+          AND (SELECT position(engine_full, 'table_readonly = 1') > 0 FROM system.tables WHERE database = 'dfe_fixture' AND name = 'immutable_orders_v002')")" = "1"
+          && test "$$(clickhouse-client
+          --user dfe_fixture_writer
+          --password "$${DFE_CLICKHOUSE_WRITER_PASSWORD}"
+          --database dfe_fixture
+          --query="SELECT count() FROM immutable_orders_staging")" = "3"
       interval: 2s
       timeout: 5s
       retries: 60

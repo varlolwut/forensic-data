@@ -4,11 +4,13 @@ set -euo pipefail
 : "${CLICKHOUSE_USER:?CLICKHOUSE_USER is required}"
 : "${CLICKHOUSE_PASSWORD:?CLICKHOUSE_PASSWORD is required}"
 : "${DFE_CLICKHOUSE_READER_PASSWORD:?DFE_CLICKHOUSE_READER_PASSWORD is required}"
+: "${DFE_CLICKHOUSE_WRITER_PASSWORD:?DFE_CLICKHOUSE_WRITER_PASSWORD is required}"
 
 clickhouse-client \
   --user "${CLICKHOUSE_USER}" \
   --password "${CLICKHOUSE_PASSWORD}" \
   --param_reader_password "${DFE_CLICKHOUSE_READER_PASSWORD}" \
+  --param_writer_password "${DFE_CLICKHOUSE_WRITER_PASSWORD}" \
   --multiquery <<'SQL'
 SELECT throwIf(version() != '26.8.6.5', 'fixture requires ClickHouse 26.8.6.5');
 
@@ -190,7 +192,94 @@ SELECT toInt64(4) AS id
 UNION ALL
 SELECT toInt64(5) AS id;
 
+DROP TABLE IF EXISTS dfe_fixture.immutable_version_readiness;
+
+CREATE TABLE dfe_fixture.immutable_version_readiness
+(
+    dataset_id String,
+    scope_digest FixedString(64),
+    batch_id String,
+    state Enum8('building' = 1, 'complete' = 2),
+    business_date Date,
+    source_cut Nullable(String),
+    dataset_version Nullable(String),
+    completed_at Nullable(DateTime64(6, 'UTC')),
+    completion_revision Nullable(UInt64),
+    publication_revision UInt64
+)
+ENGINE = MergeTree
+ORDER BY (dataset_id, scope_digest, publication_revision);
+
+INSERT INTO dfe_fixture.immutable_version_readiness VALUES
+(
+    'immutable_orders',
+    '5689623b7c5d8424c827123d15d6fdbb011108a79efa1c7586d0f392230697e1',
+    'immutable-orders-2024-02-29-v001',
+    'complete',
+    toDate('2024-02-29'),
+    'source-orders-cut-000001',
+    'immutable_orders_v001',
+    toDateTime64('2024-03-01 00:00:00.000000', 6, 'UTC'),
+    toUInt64(1),
+    toUInt64(1)
+);
+
+DROP TABLE IF EXISTS dfe_fixture.immutable_orders_staging;
+
+CREATE TABLE dfe_fixture.immutable_orders_staging
+(
+    order_id Int64,
+    amount Decimal(38, 3),
+    business_date Date,
+    batch_id String
+)
+ENGINE = MergeTree
+ORDER BY order_id;
+
+INSERT INTO dfe_fixture.immutable_orders_staging VALUES
+    (1, '10.000', toDate('2024-02-29'), 'immutable-orders-2024-02-29-v002'),
+    (2, '21.000', toDate('2024-02-29'), 'immutable-orders-2024-02-29-v002'),
+    (3, '30.000', toDate('2024-02-29'), 'immutable-orders-2024-02-29-v002');
+
+DROP TABLE IF EXISTS dfe_fixture.immutable_orders_v001 SYNC;
+
+CREATE TABLE dfe_fixture.immutable_orders_v001 UUID '11111111-1111-4111-8111-111111111111'
+(
+    order_id Int64,
+    amount Decimal(38, 3),
+    business_date Date,
+    batch_id String
+)
+ENGINE = MergeTree
+ORDER BY order_id;
+
+INSERT INTO dfe_fixture.immutable_orders_v001 VALUES
+    (1, '10.000', toDate('2024-02-29'), 'immutable-orders-2024-02-29-v001'),
+    (2, '20.000', toDate('2024-02-29'), 'immutable-orders-2024-02-29-v001');
+
+ALTER TABLE dfe_fixture.immutable_orders_v001 MODIFY SETTING table_readonly = 1;
+
+DROP TABLE IF EXISTS dfe_fixture.immutable_orders_v002 SYNC;
+
+CREATE TABLE dfe_fixture.immutable_orders_v002 UUID '22222222-2222-4222-8222-222222222222'
+(
+    order_id Int64,
+    amount Decimal(38, 3),
+    business_date Date,
+    batch_id String
+)
+ENGINE = MergeTree
+ORDER BY order_id;
+
+INSERT INTO dfe_fixture.immutable_orders_v002 VALUES
+    (1, '10.000', toDate('2024-02-29'), 'immutable-orders-2024-02-29-v002'),
+    (2, '21.000', toDate('2024-02-29'), 'immutable-orders-2024-02-29-v002'),
+    (3, '30.000', toDate('2024-02-29'), 'immutable-orders-2024-02-29-v002');
+
+ALTER TABLE dfe_fixture.immutable_orders_v002 MODIFY SETTING table_readonly = 1;
+
 DROP USER IF EXISTS dfe_fixture_reader;
+DROP USER IF EXISTS dfe_fixture_writer;
 
 CREATE USER dfe_fixture_reader
 IDENTIFIED WITH sha256_password BY {reader_password:String}
@@ -207,4 +296,22 @@ SETTINGS
     result_overflow_mode = 'throw' CONST;
 
 GRANT SELECT ON dfe_fixture.* TO dfe_fixture_reader;
+GRANT SHOW ROW POLICIES ON *.* TO dfe_fixture_reader;
+
+CREATE USER dfe_fixture_writer
+IDENTIFIED WITH sha256_password BY {writer_password:String}
+SETTINGS
+    readonly = 0 CONST,
+    session_timezone = 'UTC' CONST,
+    max_memory_usage = 268435456 CONST,
+    max_threads = 2 CONST,
+    max_execution_time = 30 MIN 1 MAX 30,
+    max_result_rows = 100000 MIN 1 MAX 100000,
+    max_result_bytes = 67108864 MIN 1 MAX 67108864,
+    result_overflow_mode = 'throw' CONST;
+
+GRANT SELECT, INSERT ON dfe_fixture.immutable_orders_staging TO dfe_fixture_writer;
+GRANT INSERT ON dfe_fixture.immutable_version_readiness TO dfe_fixture_writer;
+GRANT INSERT ON dfe_fixture.immutable_orders_v001 TO dfe_fixture_writer;
+GRANT INSERT ON dfe_fixture.immutable_orders_v002 TO dfe_fixture_writer;
 SQL
