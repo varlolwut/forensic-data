@@ -119,7 +119,7 @@ jobs:
       - name: Run database integration suite
         if: github.event_name == 'workflow_dispatch'
         run: >-
-          uv run pytest -m "not mssql_legacy and not greenplum"
+          uv run pytest -m "not mssql_legacy and not greenplum and not oracle"
           --ignore=tests/test_clickhouse_legacy_endpoint_integration.py
       - name: Capture ClickHouse fixture logs
         if: failure() && github.event_name == 'workflow_dispatch'

@@ -55,6 +55,33 @@ from forensic_data.contracts.model import (
     StableReadKind,
 )
 from forensic_data.contracts.semantics import semantic_value_from_json
+from forensic_data.coordinator_memory import (
+    ASCII_TEXT_HEADER_BYTES as _ASCII_TEXT_HEADER_BYTES,
+)
+from forensic_data.coordinator_memory import (
+    BYTES_HEADER_BYTES as _BYTES_HEADER_BYTES,
+)
+from forensic_data.coordinator_memory import (
+    EMPTY_LIST_BYTES as _EMPTY_LIST_BYTES,
+)
+from forensic_data.coordinator_memory import (
+    EMPTY_TUPLE_BYTES as _EMPTY_TUPLE_BYTES,
+)
+from forensic_data.coordinator_memory import (
+    POINTER_BYTES as _POINTER_BYTES,
+)
+from forensic_data.coordinator_memory import (
+    dict_storage_bytes as _dict_storage_bytes,
+)
+from forensic_data.coordinator_memory import (
+    list_storage_bytes as _list_storage_bytes,
+)
+from forensic_data.coordinator_memory import (
+    slot_object_bytes as _slot_object_bytes,
+)
+from forensic_data.coordinator_memory import (
+    tuple_storage_bytes as _tuple_storage_bytes,
+)
 from forensic_data.greengage_endpoint import (
     GreengageAcquisitionRaceError,
     GreengageBudgetExceededError,
@@ -160,13 +187,6 @@ _MAX_ROW_TYPE_OID_BYTES = 10
 _HAS_DATA_BYTES = 1
 _DEADLINE_CHECK_RECORDS = 64
 _MAX_MSSQL_INTEGER_RANGES = 524
-_POINTER_BYTES = getsizeof((None,)) - getsizeof(())
-_EMPTY_TUPLE_BYTES = getsizeof(())
-_EMPTY_LIST_BYTES = getsizeof([])
-_EMPTY_DICT_BYTES = getsizeof({})
-_DICT_ENTRY_RESERVATION_BYTES = getsizeof({0: None}) - _EMPTY_DICT_BYTES
-_ASCII_TEXT_HEADER_BYTES = getsizeof("")
-_BYTES_HEADER_BYTES = getsizeof(b"")
 _DECODE_ENVELOPE_EXPANSION = 6
 _DECODE_FIELD_RESERVATION_BYTES = (
     (6 * _POINTER_BYTES) + _ASCII_TEXT_HEADER_BYTES + _BYTES_HEADER_BYTES + getsizeof(Decimal(0))
@@ -3645,28 +3665,6 @@ def _fingerprint_record_bytes(segment_id: str) -> int:
 def _provenance_bytes(member_count: int) -> int:
     _require_nonnegative_integer(member_count, "protected relation member count")
     return member_count * _MAX_ROW_TYPE_OID_BYTES
-
-
-def _slot_object_bytes(value_type: type[object]) -> int:
-    return getsizeof(object.__new__(value_type))
-
-
-def _tuple_storage_bytes(item_count: int) -> int:
-    _require_nonnegative_integer(item_count, "tuple item count")
-    return _EMPTY_TUPLE_BYTES + (item_count * _POINTER_BYTES)
-
-
-def _list_storage_bytes(item_count: int) -> int:
-    _require_nonnegative_integer(item_count, "list item count")
-    if item_count == 0:
-        return _EMPTY_LIST_BYTES
-    reserved_items = item_count + (item_count // 8) + 6
-    return _EMPTY_LIST_BYTES + (reserved_items * _POINTER_BYTES)
-
-
-def _dict_storage_bytes(item_count: int) -> int:
-    _require_nonnegative_integer(item_count, "dictionary item count")
-    return _EMPTY_DICT_BYTES + (item_count * _DICT_ENTRY_RESERVATION_BYTES)
 
 
 def _maximum_integer_object_bytes(budgets: ExecutionBudgets) -> int:

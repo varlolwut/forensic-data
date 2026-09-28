@@ -10,6 +10,7 @@ readme = "README.md"
 requires-python = ">=3.12,<3.13"
 dependencies = [
     "clickhouse-connect==1.9.0",
+    "oracledb==3.4.2",
     "psycopg[c]==3.3.6",
     "psycopg2==2.9.13",
     "pydantic>=2.13.5,<3",
@@ -46,6 +47,7 @@ markers = [
     "greenplum: tests that require real original Greenplum and Greengage services",
     "mssql: tests that require a real Microsoft SQL Server service",
     "mssql_legacy: tests that require the exact SQL Server 2016 SP3 GDR fixture",
+    "oracle: tests that require a real Oracle Database service",
     "postgres: tests that require a real PostgreSQL service",
 ]
 testpaths = ["tests"]
