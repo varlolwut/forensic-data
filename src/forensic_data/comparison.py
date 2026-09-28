@@ -71,6 +71,12 @@ from forensic_data.coordinator_memory import (
     POINTER_BYTES as _POINTER_BYTES,
 )
 from forensic_data.coordinator_memory import (
+    canonical_decode_field_reservation_bytes as _canonical_decode_field_reservation_bytes,
+)
+from forensic_data.coordinator_memory import (
+    canonical_decode_scratch_bytes as _canonical_decode_scratch_bytes,
+)
+from forensic_data.coordinator_memory import (
     dict_storage_bytes as _dict_storage_bytes,
 )
 from forensic_data.coordinator_memory import (
@@ -187,9 +193,9 @@ _MAX_ROW_TYPE_OID_BYTES = 10
 _HAS_DATA_BYTES = 1
 _DEADLINE_CHECK_RECORDS = 64
 _MAX_MSSQL_INTEGER_RANGES = 524
-_DECODE_ENVELOPE_EXPANSION = 6
-_DECODE_FIELD_RESERVATION_BYTES = (
-    (6 * _POINTER_BYTES) + _ASCII_TEXT_HEADER_BYTES + _BYTES_HEADER_BYTES + getsizeof(Decimal(0))
+_DECODE_VALUE_OBJECT_BYTES = getsizeof(Decimal(0))
+_DECODE_FIELD_RESERVATION_BYTES = _canonical_decode_field_reservation_bytes(
+    _DECODE_VALUE_OBJECT_BYTES
 )
 
 type ComparisonReadContext = (
@@ -4061,8 +4067,10 @@ def _exact_decode_scratch_bytes(
         reservation.envelope_bytes,
         max_encoded_row_bytes + _MAX_INT64_KEY_ENVELOPE_BYTES,
     )
-    return _DECODE_ENVELOPE_EXPANSION * maximum_single_envelope_bytes + (
-        schema_field_count * _DECODE_FIELD_RESERVATION_BYTES
+    return _canonical_decode_scratch_bytes(
+        maximum_single_envelope_bytes,
+        schema_field_count,
+        _DECODE_VALUE_OBJECT_BYTES,
     )
 
 

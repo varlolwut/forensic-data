@@ -5,10 +5,24 @@ from uuid import uuid4
 import pytest
 from pydantic import SecretStr
 
+from forensic_data.canonical import (
+    PROTOCOL,
+    CanonicalSchema,
+    DecimalParameters,
+    FieldSchema,
+    LogicalType,
+    NoParameters,
+    Normalization,
+    TimestampParameters,
+    encode_row,
+    envelope_sha256,
+    schema_from_metadata_json,
+)
 from forensic_data.contracts.model import ExecutionBudgets
 from forensic_data.oracle import (
     OracleBindParameter,
     OracleConnectionSettings,
+    OracleDataValidationError,
     OracleProjection,
     OracleProtocol,
     OracleQuery,
@@ -18,12 +32,20 @@ from forensic_data.oracle import (
     OracleRetryPolicy,
     open_oracle_read_context,
 )
+from forensic_data.oracle_canonical import (
+    OracleCanonicalFieldBinding,
+    OracleCanonicalPhysicalType,
+    OracleCanonicalSelectSource,
+    read_oracle_canonical_fingerprint,
+    read_oracle_canonical_rows,
+)
 from forensic_data.oracle_limits import (
     OracleProjectionKind,
     build_oracle_transport_limits,
 )
 from forensic_data.oracle_profile import OracleRuntimeProfile
 from forensic_data.postgres import PostgresSourceBudgetLedger, PostgresSourceDirection
+from tests.canonical_vectors import vector_named
 
 pytestmark = [pytest.mark.integration, pytest.mark.oracle]
 
@@ -36,8 +58,8 @@ _ORACLE_SERVER_VERSION = "23.26.3.0.0"
 
 _EXECUTION_BUDGETS = ExecutionBudgets(
     version=1,
-    max_queries=4,
-    max_fetched_records=4,
+    max_queries=10,
+    max_fetched_records=11,
     max_application_result_bytes=65_536,
     max_evidence_rows=0,
     max_evidence_bytes=0,
@@ -68,10 +90,11 @@ def test_oracle_context_preserves_scalars_and_rejects_row_locks() -> None:
         application_name="dfe-p06-oracle-free",
     )
     source_budget = PostgresSourceBudgetLedger(_EXECUTION_BUDGETS).start_attempt(uuid4())
+    transport_limits = build_oracle_transport_limits(_EXECUTION_BUDGETS)
     context = open_oracle_read_context(
         settings,
         OracleRetryPolicy(1, 0.0),
-        build_oracle_transport_limits(_EXECUTION_BUDGETS),
+        transport_limits,
         source_budget,
         PostgresSourceDirection.REFERENCE,
         OracleRuntimeProfile.THIN_3_4,
@@ -100,6 +123,7 @@ def test_oracle_context_preserves_scalars_and_rejects_row_locks() -> None:
                     0,
                 ),
                 1,
+                0,
             )
         usage_after_non_query = source_budget.snapshot()
         assert usage_after_non_query.queries == usage_before_non_query.queries
@@ -115,7 +139,7 @@ def test_oracle_context_preserves_scalars_and_rejects_row_locks() -> None:
 
         usage_before_rejection = source_budget.snapshot()
         with pytest.raises(OracleResultLimitError, match="max_request_bytes"):
-            context.read(_repeated_bind_limit_query(), 1)
+            context.read(_repeated_bind_limit_query(), 1, 0)
         usage_after_rejection = source_budget.snapshot()
         assert usage_after_rejection.queries == usage_before_rejection.queries
         assert usage_after_rejection.fetched_records == usage_before_rejection.fetched_records
@@ -123,7 +147,7 @@ def test_oracle_context_preserves_scalars_and_rejects_row_locks() -> None:
         assert context.state is OracleReadContextState.ACTIVE
         assert context.active_query_id is None
 
-        result = context.read(_scalar_fidelity_query(), 1)
+        result = context.read(_scalar_fidelity_query(), 1, 0)
         expected_number = Decimal("-1234567890123456789012345678901.2345678")
         assert result.rows == (
             (
@@ -146,9 +170,83 @@ def test_oracle_context_preserves_scalars_and_rejects_row_locks() -> None:
         assert result.metrics.fetch_calls == 2
         assert result.metrics.largest_batch_records == 1
 
+        vector = vector_named("all_common_types")
+        schema = schema_from_metadata_json(vector.metadata_json)
+        canonical_rows = read_oracle_canonical_rows(
+            context,
+            _common_canonical_source(schema),
+            2,
+        )
+        expected_envelope = vector.envelope_ascii.encode("ascii")
+        expected_sha256 = bytes.fromhex(vector.sha256_hex)
+        assert tuple(row.envelope for row in canonical_rows) == (
+            expected_envelope,
+            expected_envelope,
+        )
+        assert tuple(row.sha256 for row in canonical_rows) == (
+            expected_sha256,
+            expected_sha256,
+        )
+
+        nanosecond_source = _nanosecond_canonical_source()
+        nanosecond_rows = read_oracle_canonical_rows(
+            context,
+            nanosecond_source,
+            1,
+        )
+        expected_nanosecond_envelope = encode_row(
+            nanosecond_source.schema,
+            (
+                "2024-02-29T23:59:58.123456789",
+                "2024-02-29T21:29:58.123456789Z",
+            ),
+        )
+        assert tuple(row.envelope for row in nanosecond_rows) == (expected_nanosecond_envelope,)
+        assert tuple(row.sha256 for row in nanosecond_rows) == (
+            envelope_sha256(expected_nanosecond_envelope),
+        )
+
+        fingerprint = read_oracle_canonical_fingerprint(
+            context,
+            _common_canonical_source(schema),
+        )
+        assert vector.duplicate_twice_count is not None
+        assert vector.duplicate_twice_limb_sums is not None
+        assert fingerprint.count == vector.duplicate_twice_count
+        assert fingerprint.limb_sums == vector.duplicate_twice_limb_sums
+
+        empty_fingerprint = read_oracle_canonical_fingerprint(
+            context,
+            _empty_common_canonical_source(schema),
+        )
+        assert empty_fingerprint.count == 0
+        assert empty_fingerprint.limb_sums == (0, 0, 0, 0, 0, 0, 0, 0)
+
+        with pytest.raises(
+            OracleDataValidationError,
+            match="invalid_row_count=2",
+        ):
+            read_oracle_canonical_fingerprint(
+                context,
+                _lossy_decimal_canonical_source(),
+            )
+        assert context.state is OracleReadContextState.ACTIVE
+        assert context.active_query_id is None
+
+        with pytest.raises(
+            OracleResultLimitError,
+            match="oversized_row_count=1",
+        ):
+            read_oracle_canonical_fingerprint(
+                context,
+                _oversized_string_canonical_source(),
+            )
+        assert context.state is OracleReadContextState.ACTIVE
+        assert context.active_query_id is None
+
         lock_query = _read_only_lock_query()
         with pytest.raises(OracleQueryError) as raised:
-            context.read(lock_query, 1)
+            context.read(lock_query, 1, 0)
         error = raised.value
         assert error.query_id == lock_query.query_id
         assert error.session_id == context.evidence.session_id
@@ -166,6 +264,257 @@ def test_oracle_context_preserves_scalars_and_rejects_row_locks() -> None:
     finally:
         if context.state is not OracleReadContextState.CLOSED:
             context.close()
+
+
+def _common_canonical_source(schema: CanonicalSchema) -> OracleCanonicalSelectSource:
+    return OracleCanonicalSelectSource(
+        statement=_common_canonical_statement(),
+        parameters=(),
+        schema=schema,
+        bindings=_common_canonical_bindings(),
+        full_scans=0,
+    )
+
+
+def _empty_common_canonical_source(schema: CanonicalSchema) -> OracleCanonicalSelectSource:
+    statement = f"SELECT * FROM (\n{_common_canonical_statement()}\n) DFE_EMPTY_SOURCE WHERE 1 = 0"
+    return OracleCanonicalSelectSource(
+        statement=statement,
+        parameters=(),
+        schema=schema,
+        bindings=_common_canonical_bindings(),
+        full_scans=0,
+    )
+
+
+def _common_canonical_statement() -> str:
+    return """
+SELECT
+    CAST(-9223372036854775808 AS NUMBER(19, 0)) AS ID,
+    CAST(-1780.000 AS NUMBER(38, 3)) AS AMOUNT,
+    CAST(1 AS NUMBER(1, 0)) AS ACTIVE,
+    CAST(
+        'A|' || UNISTR('\\0411\\D83D\\DE00') || 'e' || UNISTR('\\0301')
+        AS CHAR(13 BYTE)
+    ) AS LABEL,
+    DATE '2024-02-29' AS BUSINESS_DATE,
+    CAST(TIMESTAMP '2024-02-29 23:59:58.123456000' AS TIMESTAMP(9)) AS LOCAL_TIME,
+    CAST(
+        TIMESTAMP '2024-02-29 23:59:58.123456000 +02:30'
+        AS TIMESTAMP(9) WITH TIME ZONE
+    ) AS INSTANT_TIME
+FROM SYS.DUAL
+CONNECT BY LEVEL <= 2
+""".strip()
+
+
+def _common_canonical_bindings() -> tuple[OracleCanonicalFieldBinding, ...]:
+    return (
+        OracleCanonicalFieldBinding(
+            field_name="id",
+            column_name="ID",
+            physical_type=OracleCanonicalPhysicalType.NUMBER,
+            nullable=False,
+            numeric_precision=19,
+            numeric_scale=0,
+            max_bytes=None,
+            fractional_seconds_precision=None,
+        ),
+        OracleCanonicalFieldBinding(
+            field_name="amount",
+            column_name="AMOUNT",
+            physical_type=OracleCanonicalPhysicalType.NUMBER,
+            nullable=False,
+            numeric_precision=38,
+            numeric_scale=3,
+            max_bytes=None,
+            fractional_seconds_precision=None,
+        ),
+        OracleCanonicalFieldBinding(
+            field_name="active",
+            column_name="ACTIVE",
+            physical_type=OracleCanonicalPhysicalType.NUMBER,
+            nullable=False,
+            numeric_precision=1,
+            numeric_scale=0,
+            max_bytes=None,
+            fractional_seconds_precision=None,
+        ),
+        OracleCanonicalFieldBinding(
+            field_name="label",
+            column_name="LABEL",
+            physical_type=OracleCanonicalPhysicalType.CHAR,
+            nullable=False,
+            numeric_precision=None,
+            numeric_scale=None,
+            max_bytes=13,
+            fractional_seconds_precision=None,
+        ),
+        OracleCanonicalFieldBinding(
+            field_name="business_date",
+            column_name="BUSINESS_DATE",
+            physical_type=OracleCanonicalPhysicalType.DATE,
+            nullable=False,
+            numeric_precision=None,
+            numeric_scale=None,
+            max_bytes=None,
+            fractional_seconds_precision=None,
+        ),
+        OracleCanonicalFieldBinding(
+            field_name="local_time",
+            column_name="LOCAL_TIME",
+            physical_type=OracleCanonicalPhysicalType.TIMESTAMP,
+            nullable=False,
+            numeric_precision=None,
+            numeric_scale=None,
+            max_bytes=None,
+            fractional_seconds_precision=9,
+        ),
+        OracleCanonicalFieldBinding(
+            field_name="instant_time",
+            column_name="INSTANT_TIME",
+            physical_type=OracleCanonicalPhysicalType.TIMESTAMP_WITH_TIME_ZONE,
+            nullable=False,
+            numeric_precision=None,
+            numeric_scale=None,
+            max_bytes=None,
+            fractional_seconds_precision=9,
+        ),
+    )
+
+
+def _lossy_decimal_canonical_source() -> OracleCanonicalSelectSource:
+    schema = CanonicalSchema(
+        protocol=PROTOCOL,
+        fields=(
+            FieldSchema(
+                name="amount",
+                logical_type=LogicalType.DECIMAL,
+                nullable=False,
+                parameters=DecimalParameters(precision=3, scale=2),
+                normalization=Normalization.NONE,
+            ),
+        ),
+    )
+    return OracleCanonicalSelectSource(
+        statement="""
+SELECT CAST(
+    CASE LEVEL WHEN 1 THEN 1.234 ELSE 10.000 END
+    AS NUMBER(5, 3)
+) AS AMOUNT
+FROM SYS.DUAL
+CONNECT BY LEVEL <= 2
+""".strip(),
+        parameters=(),
+        schema=schema,
+        bindings=(
+            OracleCanonicalFieldBinding(
+                field_name="amount",
+                column_name="AMOUNT",
+                physical_type=OracleCanonicalPhysicalType.NUMBER,
+                nullable=False,
+                numeric_precision=5,
+                numeric_scale=3,
+                max_bytes=None,
+                fractional_seconds_precision=None,
+            ),
+        ),
+        full_scans=0,
+    )
+
+
+def _nanosecond_canonical_source() -> OracleCanonicalSelectSource:
+    schema = CanonicalSchema(
+        protocol=PROTOCOL,
+        fields=(
+            FieldSchema(
+                name="local_time",
+                logical_type=LogicalType.TIMESTAMP_LOCAL,
+                nullable=False,
+                parameters=TimestampParameters(precision=9),
+                normalization=Normalization.NONE,
+            ),
+            FieldSchema(
+                name="instant_time",
+                logical_type=LogicalType.TIMESTAMP_INSTANT,
+                nullable=False,
+                parameters=TimestampParameters(precision=9),
+                normalization=Normalization.NONE,
+            ),
+        ),
+    )
+    return OracleCanonicalSelectSource(
+        statement="""
+SELECT
+    CAST(TIMESTAMP '2024-02-29 23:59:58.123456789' AS TIMESTAMP(9)) AS LOCAL_TIME,
+    CAST(
+        TIMESTAMP '2024-02-29 23:59:58.123456789 +02:30'
+        AS TIMESTAMP(9) WITH TIME ZONE
+    ) AS INSTANT_TIME
+FROM SYS.DUAL
+""".strip(),
+        parameters=(),
+        schema=schema,
+        bindings=(
+            OracleCanonicalFieldBinding(
+                field_name="local_time",
+                column_name="LOCAL_TIME",
+                physical_type=OracleCanonicalPhysicalType.TIMESTAMP,
+                nullable=False,
+                numeric_precision=None,
+                numeric_scale=None,
+                max_bytes=None,
+                fractional_seconds_precision=9,
+            ),
+            OracleCanonicalFieldBinding(
+                field_name="instant_time",
+                column_name="INSTANT_TIME",
+                physical_type=OracleCanonicalPhysicalType.TIMESTAMP_WITH_TIME_ZONE,
+                nullable=False,
+                numeric_precision=None,
+                numeric_scale=None,
+                max_bytes=None,
+                fractional_seconds_precision=9,
+            ),
+        ),
+        full_scans=0,
+    )
+
+
+def _oversized_string_canonical_source() -> OracleCanonicalSelectSource:
+    schema = CanonicalSchema(
+        protocol=PROTOCOL,
+        fields=(
+            FieldSchema(
+                name="label",
+                logical_type=LogicalType.STRING,
+                nullable=False,
+                parameters=NoParameters(),
+                normalization=Normalization.NONE,
+            ),
+        ),
+    )
+    return OracleCanonicalSelectSource(
+        statement="""
+SELECT CAST(RPAD('x', 1000, 'x') AS VARCHAR2(1000 BYTE)) AS LABEL
+FROM SYS.DUAL
+""".strip(),
+        parameters=(),
+        schema=schema,
+        bindings=(
+            OracleCanonicalFieldBinding(
+                field_name="label",
+                column_name="LABEL",
+                physical_type=OracleCanonicalPhysicalType.VARCHAR2,
+                nullable=False,
+                numeric_precision=None,
+                numeric_scale=None,
+                max_bytes=1000,
+                fractional_seconds_precision=None,
+            ),
+        ),
+        full_scans=0,
+    )
 
 
 def _scalar_fidelity_query() -> OracleQuery:

@@ -433,7 +433,7 @@ class OracleQuery:
                 f"statement_bytes={statement_bytes + _QUERY_ID_PREFIX_BYTES}, "
                 f"maximum={MAX_ORACLE_QUERY_BYTES}"
             )
-        _require_oracle_select_statement(self.statement)
+        validate_oracle_select_statement(self.statement)
         if type(self.parameters) is not tuple:
             raise TypeError("Oracle query parameters must be a tuple")
         if len(self.parameters) > MAX_ORACLE_BIND_PARAMETERS:
@@ -442,7 +442,7 @@ class OracleQuery:
                 f"bind_parameters={len(self.parameters)}, "
                 f"maximum={MAX_ORACLE_BIND_PARAMETERS}"
             )
-        bind_occurrence_names = _oracle_bind_occurrence_names(self.statement)
+        bind_occurrence_names = oracle_bind_occurrence_names(self.statement)
         bind_occurrences = len(bind_occurrence_names)
         if bind_occurrences > MAX_ORACLE_BIND_OCCURRENCES:
             raise ValueError(
@@ -1299,6 +1299,12 @@ class OracleTransport:
         )
         raise network_error from None
 
+    def retire_completed_query_after_local_failure(self, query_id: UUID) -> bool:
+        self._require_owner_thread()
+        if type(query_id) is not UUID:
+            raise TypeError("Oracle completed query_id must be a UUID")
+        return self._retire_after_local_failure(query_id, None)
+
     def _retire_after_local_failure(
         self,
         query_id: UUID,
@@ -1469,6 +1475,10 @@ class OracleReadContext:
         return self._source_direction
 
     @property
+    def transport_limits(self) -> OracleTransportLimits:
+        return self._transport.limits
+
+    @property
     def state(self) -> OracleReadContextState:
         return self._state
 
@@ -1480,6 +1490,7 @@ class OracleReadContext:
         self,
         query: OracleQuery,
         max_records: int,
+        local_completion_bytes: int,
     ) -> OracleReadResult:
         self._require_active()
         self._transport.require_owner_thread()
@@ -1493,6 +1504,7 @@ class OracleReadContext:
             tuple(projection.max_bytes for projection in query.projections),
             tuple(projection.max_driver_bytes for projection in query.projections),
             self._transport.retained_thin_chunk_buffer_bytes,
+            local_completion_bytes,
         )
         _require_source_capacity(self._source_budget, fetch_limits, 1)
         _validate_query_against_limits(query, fetch_limits, self._transport.limits)
@@ -1514,6 +1526,37 @@ class OracleReadContext:
             PostgresSourceBudgetExceededError,
         ):
             self._state = OracleReadContextState.LOST
+            raise
+
+    def require_result_completion(
+        self,
+        query_id: UUID,
+        result: OracleReadResult,
+        operation: str,
+    ) -> None:
+        self._require_active()
+        self._transport.require_owner_thread()
+        if type(query_id) is not UUID:
+            raise TypeError("Oracle result completion query_id must be a UUID")
+        if type(result) is not OracleReadResult:
+            raise TypeError("Oracle result completion requires OracleReadResult")
+        if type(operation) is not str or not operation:
+            raise ValueError("Oracle result completion operation must be non-empty text")
+        try:
+            _oracle_call_timeout_milliseconds(
+                result.completion_deadline_nanoseconds,
+                operation,
+            )
+        except PostgresReadDeadlineExceededError as error:
+            self._state = OracleReadContextState.LOST
+            cleanup_failed = self._transport.retire_completed_query_after_local_failure(query_id)
+            _preserve_cleanup_failure(
+                error,
+                cleanup_failed,
+                self._transport.cleanup_failures,
+                query_id,
+                self._profile.session_id,
+            )
             raise
 
     def close(self) -> None:
@@ -1574,6 +1617,7 @@ def open_oracle_read_context(
         tuple(projection.max_bytes for projection in profile_query.projections),
         tuple(projection.max_driver_bytes for projection in profile_query.projections),
         ORACLE_THIN_BASELINE_RETAINED_BYTES,
+        0,
     )
     _validate_read_only_transaction_against_limits(transaction_control, transport_limits)
     _validate_query_against_limits(profile_query, profile_limits, transport_limits)
@@ -2093,7 +2137,7 @@ def _validate_query_against_limits(
     fetch_limits: OracleFetchLimits,
     transport_limits: OracleTransportLimits,
 ) -> None:
-    _require_oracle_select_statement(query.statement)
+    validate_oracle_select_statement(query.statement)
     _require_query_owned_capacity(query, transport_limits)
     if len(query.projections) != len(fetch_limits.projection_max_bytes):
         raise ValueError("Oracle query projections differ from the assembled fetch limits")
@@ -2117,7 +2161,7 @@ def _validate_query_against_limits(
             f"query_id={query.query_id}, bind_parameters={len(query.parameters)}, "
             f"max_bind_parameters={transport_limits.max_bind_parameters}"
         )
-    bind_occurrences = len(_oracle_bind_occurrence_names(query.statement))
+    bind_occurrences = len(oracle_bind_occurrence_names(query.statement))
     if bind_occurrences > transport_limits.max_bind_occurrences:
         raise OracleResultLimitError(
             "Oracle query exceeds max_bind_occurrences before dispatch: "
@@ -2966,7 +3010,9 @@ def _bind_values(parameters: tuple[OracleBindParameter, ...]) -> dict[str, Oracl
     return {parameter.name: parameter.value for parameter in parameters}
 
 
-def _oracle_bind_occurrence_names(statement: str) -> tuple[str, ...]:
+def oracle_bind_occurrence_names(statement: str) -> tuple[str, ...]:
+    if type(statement) is not str or not statement:
+        raise ValueError("Oracle statement must be non-empty text")
     names: list[str] = []
     index = 0
     statement_length = len(statement)
@@ -3029,7 +3075,9 @@ def _oracle_bind_occurrence_names(statement: str) -> tuple[str, ...]:
     return tuple(names)
 
 
-def _require_oracle_select_statement(statement: str) -> None:
+def validate_oracle_select_statement(statement: str) -> None:
+    if type(statement) is not str or not statement:
+        raise ValueError("Oracle data-query statement must be non-empty text")
     index = 0
     while index < len(statement) and statement[index] in _ORACLE_SQL_WHITESPACE:
         index += 1

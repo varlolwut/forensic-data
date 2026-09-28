@@ -18,6 +18,8 @@ MAX_ORACLE_BIND_PARAMETERS = 256
 MAX_ORACLE_BIND_OCCURRENCES = 256
 MAX_ORACLE_RESULT_COLUMNS = 256
 MAX_ORACLE_CALL_TIMEOUT_MILLISECONDS = (1 << 32) - 1
+MAX_ORACLE_SQL_RAW_BYTES = 2_000
+MAX_ORACLE_SQL_VARCHAR2_BYTES = 4_000
 MAX_ORACLE_DECIMAL_OBJECT_BYTES = getsizeof(Decimal("9" * 38))
 MAX_ORACLE_DECIMAL_INSPECTION_DIGITS = 76
 if (
@@ -67,6 +69,8 @@ class OracleTransportLimits:
     max_coordinator_bytes: int
     max_fetch_batch_records: int
     max_result_columns: int
+    max_sql_raw_bytes: int
+    max_sql_varchar2_bytes: int
     max_encoded_envelope_bytes: int
     cancellation_reserve_milliseconds: int
     cleanup_timeout_milliseconds: int
@@ -83,6 +87,8 @@ class OracleTransportLimits:
             ("max_coordinator_bytes", self.max_coordinator_bytes),
             ("max_fetch_batch_records", self.max_fetch_batch_records),
             ("max_result_columns", self.max_result_columns),
+            ("max_sql_raw_bytes", self.max_sql_raw_bytes),
+            ("max_sql_varchar2_bytes", self.max_sql_varchar2_bytes),
             ("max_encoded_envelope_bytes", self.max_encoded_envelope_bytes),
             ("cancellation_reserve_milliseconds", self.cancellation_reserve_milliseconds),
             ("cleanup_timeout_milliseconds", self.cleanup_timeout_milliseconds),
@@ -97,6 +103,14 @@ class OracleTransportLimits:
             raise ValueError("Oracle bind total limit cannot exceed the request limit")
         if self.max_encoded_envelope_bytes > self.max_response_bytes:
             raise ValueError("Oracle envelope limit cannot exceed the response limit")
+        if self.max_sql_raw_bytes > MAX_ORACLE_SQL_RAW_BYTES:
+            raise ValueError("Oracle SQL RAW limit exceeds the supported standard profile")
+        if self.max_sql_varchar2_bytes > MAX_ORACLE_SQL_VARCHAR2_BYTES:
+            raise ValueError("Oracle SQL VARCHAR2 limit exceeds the supported standard profile")
+        if self.max_encoded_envelope_bytes > self.max_sql_raw_bytes:
+            raise ValueError("Oracle envelope limit cannot exceed the SQL RAW limit")
+        if self.max_encoded_envelope_bytes > self.max_sql_varchar2_bytes:
+            raise ValueError("Oracle envelope limit cannot exceed the SQL VARCHAR2 limit")
         if self.cleanup_timeout_milliseconds > self.cancellation_reserve_milliseconds:
             raise ValueError("Oracle cleanup timeout cannot exceed the cancellation reserve")
         if self.cancellation_reserve_milliseconds > MAX_ORACLE_CALL_TIMEOUT_MILLISECONDS:
@@ -117,6 +131,7 @@ class OracleFetchLimits:
     max_total_bytes: int
     max_received_bytes: int
     coordinator_response_bytes: int
+    local_completion_bytes: int
     prior_thin_chunk_buffer_bytes: int
     retained_thin_chunk_buffer_bytes: int
     projection_kinds: tuple[OracleProjectionKind, ...]
@@ -137,6 +152,8 @@ class OracleFetchLimits:
         ):
             if type(value) is not int or value < 1:
                 raise ValueError(f"Oracle {name} must be a positive integer")
+        if type(self.local_completion_bytes) is not int or self.local_completion_bytes < 0:
+            raise ValueError("Oracle local_completion_bytes must be a non-negative integer")
         for name, value in (
             ("prior_thin_chunk_buffer_bytes", self.prior_thin_chunk_buffer_bytes),
             ("retained_thin_chunk_buffer_bytes", self.retained_thin_chunk_buffer_bytes),
@@ -199,6 +216,7 @@ class OracleFetchLimits:
             self.projection_max_bytes,
             self.projection_driver_max_bytes,
             self.prior_thin_chunk_buffer_bytes,
+            self.local_completion_bytes,
         )
         if self.coordinator_response_bytes != expected_response_bytes:
             raise ValueError(
@@ -269,8 +287,12 @@ def build_oracle_transport_limits(budgets: ExecutionBudgets) -> OracleTransportL
             budgets.max_fetched_records,
         ),
         max_result_columns=MAX_ORACLE_RESULT_COLUMNS,
+        max_sql_raw_bytes=MAX_ORACLE_SQL_RAW_BYTES,
+        max_sql_varchar2_bytes=MAX_ORACLE_SQL_VARCHAR2_BYTES,
         max_encoded_envelope_bytes=min(
             _MAX_ORACLE_CANONICAL_ENVELOPE_BYTES,
+            MAX_ORACLE_SQL_RAW_BYTES,
+            MAX_ORACLE_SQL_VARCHAR2_BYTES,
             response_bytes,
         ),
         cancellation_reserve_milliseconds=cancellation_reserve,
@@ -285,11 +307,14 @@ def build_oracle_fetch_limits(
     projection_max_bytes: tuple[int, ...],
     projection_driver_max_bytes: tuple[int, ...],
     prior_thin_chunk_buffer_bytes: int,
+    local_completion_bytes: int,
 ) -> OracleFetchLimits:
     if type(transport) is not OracleTransportLimits:
         raise TypeError("Oracle fetch limits require OracleTransportLimits")
     if type(max_records) is not int or max_records < 1:
         raise ValueError("Oracle max_records must be a positive integer")
+    if type(local_completion_bytes) is not int or local_completion_bytes < 0:
+        raise ValueError("Oracle local completion reservation must be a non-negative integer")
     if (
         type(prior_thin_chunk_buffer_bytes) is not int
         or prior_thin_chunk_buffer_bytes < ORACLE_THIN_BASELINE_RETAINED_BYTES
@@ -359,11 +384,13 @@ def build_oracle_fetch_limits(
         projection_max_bytes,
         projection_driver_max_bytes,
         prior_thin_chunk_buffer_bytes,
+        local_completion_bytes,
     )
     if coordinator_response_bytes > transport.max_coordinator_bytes:
         raise ValueError(
             "Oracle declared result exceeds the coordinator memory budget before dispatch: "
             f"coordinator_response_bytes={coordinator_response_bytes}, "
+            f"local_completion_bytes={local_completion_bytes}, "
             f"max_coordinator_bytes={transport.max_coordinator_bytes}"
         )
     return OracleFetchLimits(
@@ -376,6 +403,7 @@ def build_oracle_fetch_limits(
         max_total_bytes=declared_result_bytes,
         max_received_bytes=(max_records + 1) * sum(projection_driver_max_bytes),
         coordinator_response_bytes=coordinator_response_bytes,
+        local_completion_bytes=local_completion_bytes,
         prior_thin_chunk_buffer_bytes=prior_thin_chunk_buffer_bytes,
         retained_thin_chunk_buffer_bytes=max(
             prior_thin_chunk_buffer_bytes,
@@ -397,6 +425,7 @@ def _oracle_response_memory_bytes(
     projection_max_bytes: tuple[int, ...],
     projection_driver_max_bytes: tuple[int, ...],
     prior_thin_chunk_buffer_bytes: int,
+    local_completion_bytes: int,
 ) -> int:
     column_count = len(projection_max_bytes)
     row_tuple_bytes = tuple_storage_bytes(column_count)
@@ -467,7 +496,14 @@ def _oracle_response_memory_bytes(
         + retained_thin_chunk_buffer_bytes
         + _ORACLE_RESULT_RESERVATION_BYTES
     )
-    return max(fetch_peak_bytes, finalization_peak_bytes)
+    consumer_peak_bytes = (
+        tuple_storage_bytes(max_records)
+        + (max_records * retained_row_bytes)
+        + retained_thin_chunk_buffer_bytes
+        + _ORACLE_RESULT_RESERVATION_BYTES
+        + local_completion_bytes
+    )
+    return max(fetch_peak_bytes, finalization_peak_bytes, consumer_peak_bytes)
 
 
 def _oracle_thin_chunk_buffer_peak_bytes(
