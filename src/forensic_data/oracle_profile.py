@@ -2,7 +2,6 @@ from enum import StrEnum
 
 ORACLE_THIN_DRIVER = "oracledb"
 ORACLE_THIN_3_4_PROFILE = "oracle_thin_3_4"
-ORACLE_THIN_3_4_DRIVER_VERSION = "3.4.2"
 
 
 class OracleRuntimeProfile(StrEnum):

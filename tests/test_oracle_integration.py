@@ -89,6 +89,30 @@ def test_oracle_context_preserves_scalars_and_rejects_row_locks() -> None:
         assert context.evidence.strategy == "transaction_read_only_session_unprotected"
         assert context.evidence.allowed_concurrency == 1
 
+        usage_before_non_query = source_budget.snapshot()
+        with pytest.raises(ValueError, match="must start with SELECT"):
+            context.read(
+                OracleQuery(
+                    uuid4(),
+                    "CREATE TABLE DFE_FIXTURE_READER.DFE_P06_MUTATION_PROBE (ID NUMBER)",
+                    (),
+                    (OracleProjection("ID", OracleProjectionKind.DECIMAL, False, 1, 1),),
+                    0,
+                ),
+                1,
+            )
+        usage_after_non_query = source_budget.snapshot()
+        assert usage_after_non_query.queries == usage_before_non_query.queries
+        assert usage_after_non_query.fetched_records == usage_before_non_query.fetched_records
+        assert usage_after_non_query.result_bytes == usage_before_non_query.result_bytes
+        assert (
+            usage_after_non_query.reference_full_scans
+            == usage_before_non_query.reference_full_scans
+        )
+        assert usage_after_non_query.target_full_scans == usage_before_non_query.target_full_scans
+        assert context.state is OracleReadContextState.ACTIVE
+        assert context.active_query_id is None
+
         usage_before_rejection = source_budget.snapshot()
         with pytest.raises(OracleResultLimitError, match="max_request_bytes"):
             context.read(_repeated_bind_limit_query(), 1)

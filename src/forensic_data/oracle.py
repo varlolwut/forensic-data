@@ -32,7 +32,7 @@ from forensic_data.oracle_limits import (
     OracleTransportLimits,
     build_oracle_fetch_limits,
 )
-from forensic_data.oracle_profile import ORACLE_THIN_3_4_DRIVER_VERSION, OracleRuntimeProfile
+from forensic_data.oracle_profile import OracleRuntimeProfile
 from forensic_data.postgres import (
     PostgresReadDeadline,
     PostgresReadDeadlineExceededError,
@@ -63,6 +63,8 @@ _MAX_ORACLE_PASSWORD_BYTES = 4_096
 _MAX_ORACLE_WALLET_PATH_BYTES = 32_768
 _MAX_ORACLE_RETRY_DELAY_SECONDS = 3_600.0
 _MAX_ORACLE_ERROR_MESSAGE_BYTES = 8_192
+_READ_ONLY_TRANSACTION_STATEMENT = "SET TRANSACTION READ ONLY"
+_ORACLE_SQL_WHITESPACE = frozenset((" ", "\t", "\r", "\n", "\f"))
 
 type OracleBindValue = str | int | Decimal | bytes | None
 type OracleValue = str | Decimal | bytes | None
@@ -431,6 +433,7 @@ class OracleQuery:
                 f"statement_bytes={statement_bytes + _QUERY_ID_PREFIX_BYTES}, "
                 f"maximum={MAX_ORACLE_QUERY_BYTES}"
             )
+        _require_oracle_select_statement(self.statement)
         if type(self.parameters) is not tuple:
             raise TypeError("Oracle query parameters must be a tuple")
         if len(self.parameters) > MAX_ORACLE_BIND_PARAMETERS:
@@ -490,26 +493,12 @@ class OracleQuery:
 
 @final
 @dataclass(frozen=True, slots=True)
-class OracleControlStatement:
+class _OracleReadOnlyTransaction:
     query_id: UUID
-    statement: str
 
     def __post_init__(self) -> None:
         if type(self.query_id) is not UUID:
-            raise TypeError("Oracle control query_id must be a UUID")
-        if type(self.statement) is not str or not self.statement or "\x00" in self.statement:
-            raise ValueError("Oracle control statement must be non-empty text without NUL")
-        try:
-            statement_bytes = _strict_utf8_byte_length(self.statement)
-        except UnicodeEncodeError:
-            raise ValueError(
-                "Oracle control statement must not contain unpaired surrogates"
-            ) from None
-        if statement_bytes > MAX_ORACLE_QUERY_BYTES:
-            raise ValueError(
-                "Oracle control statement exceeds the absolute UTF-8 query limit: "
-                f"statement_bytes={statement_bytes}, maximum={MAX_ORACLE_QUERY_BYTES}"
-            )
+            raise TypeError("Oracle read-only transaction query_id must be a UUID")
 
 
 @final
@@ -820,17 +809,17 @@ class OracleTransport:
             raise OracleTransportError("Oracle transport session identity is already bound")
         self._session_id = session_id
 
-    def execute_control_budgeted(
+    def execute_read_only_transaction_budgeted(
         self,
-        control: OracleControlStatement,
+        control: _OracleReadOnlyTransaction,
         charge: PostgresSourceQueryCharge,
         deadline: PostgresReadDeadline,
     ) -> None:
-        if type(control) is not OracleControlStatement:
-            raise TypeError("Oracle control statement must be OracleControlStatement")
+        if type(control) is not _OracleReadOnlyTransaction:
+            raise TypeError("Oracle transaction control must be _OracleReadOnlyTransaction")
         _require_source_charge(charge)
         _require_deadline(deadline)
-        _validate_control_against_limits(control, self._limits)
+        _validate_read_only_transaction_against_limits(control, self._limits)
         self._require_owner_thread()
         self._require_open()
         cursor: _OracleCursorProtocol | None = None
@@ -851,7 +840,7 @@ class OracleTransport:
             )
             _execute_oracle_statement(
                 cursor,
-                control.statement,
+                _READ_ONLY_TRANSACTION_STATEMENT,
                 control_parameters,
                 "control statement dispatch",
             )
@@ -1575,14 +1564,7 @@ def open_oracle_read_context(
         raise UnsupportedOracleProfileError(
             "Oracle profile requires python-oracledb Thin mode, but Thick mode is initialized"
         )
-    if oracledb.__version__ != ORACLE_THIN_3_4_DRIVER_VERSION:
-        raise UnsupportedOracleProfileError(
-            "Oracle profile requires the exact audited python-oracledb version: "
-            f"required={ORACLE_THIN_3_4_DRIVER_VERSION!r}, "
-            f"actual={oracledb.__version__!r}"
-        )
-
-    transaction_control = OracleControlStatement(uuid4(), "SET TRANSACTION READ ONLY")
+    transaction_control = _OracleReadOnlyTransaction(uuid4())
     profile_query = _profile_query()
     _require_query_owned_capacity(profile_query, transport_limits)
     profile_limits = build_oracle_fetch_limits(
@@ -1593,7 +1575,7 @@ def open_oracle_read_context(
         tuple(projection.max_driver_bytes for projection in profile_query.projections),
         ORACLE_THIN_BASELINE_RETAINED_BYTES,
     )
-    _validate_control_against_limits(transaction_control, transport_limits)
+    _validate_read_only_transaction_against_limits(transaction_control, transport_limits)
     _validate_query_against_limits(profile_query, profile_limits, transport_limits)
     _require_source_capacity(source_budget, profile_limits, 2)
 
@@ -1607,7 +1589,7 @@ def open_oracle_read_context(
     )
     try:
         transaction_charge = source_budget.dispatch_query(source_direction, 0)
-        transport.execute_control_budgeted(
+        transport.execute_read_only_transaction_budgeted(
             transaction_control,
             transaction_charge,
             _source_deadline(source_budget),
@@ -2075,11 +2057,11 @@ def _server_profile_from_row(
     )
 
 
-def _validate_control_against_limits(
-    control: OracleControlStatement,
+def _validate_read_only_transaction_against_limits(
+    control: _OracleReadOnlyTransaction,
     limits: OracleTransportLimits,
 ) -> None:
-    statement_bytes = _strict_utf8_byte_length(control.statement)
+    statement_bytes = _strict_utf8_byte_length(_READ_ONLY_TRANSACTION_STATEMENT)
     if statement_bytes > limits.max_query_bytes:
         raise OracleResultLimitError(
             "Oracle control statement exceeds max_query_bytes before dispatch: "
@@ -2092,7 +2074,10 @@ def _validate_control_against_limits(
             f"query_id={control.query_id}, statement_bytes={statement_bytes}, "
             f"max_request_bytes={limits.max_request_bytes}"
         )
-    coordinator_request_bytes = _control_request_memory_bytes(control, statement_bytes)
+    coordinator_request_bytes = _read_only_transaction_request_memory_bytes(
+        control,
+        statement_bytes,
+    )
     if coordinator_request_bytes > limits.max_coordinator_bytes:
         raise OracleResultLimitError(
             "Oracle control statement exceeds the coordinator memory budget before "
@@ -2108,6 +2093,7 @@ def _validate_query_against_limits(
     fetch_limits: OracleFetchLimits,
     transport_limits: OracleTransportLimits,
 ) -> None:
+    _require_oracle_select_statement(query.statement)
     _require_query_owned_capacity(query, transport_limits)
     if len(query.projections) != len(fetch_limits.projection_max_bytes):
         raise ValueError("Oracle query projections differ from the assembled fetch limits")
@@ -2205,14 +2191,14 @@ def _require_query_owned_capacity(
         )
 
 
-def _control_request_memory_bytes(
-    control: OracleControlStatement,
+def _read_only_transaction_request_memory_bytes(
+    control: _OracleReadOnlyTransaction,
     statement_bytes: int,
 ) -> int:
     return (
         getsizeof(control)
         + getsizeof(control.query_id)
-        + getsizeof(control.statement)
+        + getsizeof(_READ_ONLY_TRANSACTION_STATEMENT)
         + (2 * statement_bytes)
         + _ORACLE_OPERATION_RESERVATION_BYTES
     )
@@ -3041,6 +3027,21 @@ def _oracle_bind_occurrence_names(statement: str) -> tuple[str, ...]:
         names.append(raw_name.lower())
         index = name_end
     return tuple(names)
+
+
+def _require_oracle_select_statement(statement: str) -> None:
+    index = 0
+    while index < len(statement) and statement[index] in _ORACLE_SQL_WHITESPACE:
+        index += 1
+    keyword_end = index + len("SELECT")
+    if (
+        statement[index:keyword_end].upper() != "SELECT"
+        or keyword_end >= len(statement)
+        or statement[keyword_end] not in _ORACLE_SQL_WHITESPACE
+    ):
+        raise ValueError(
+            "Oracle data-query statements must start with SELECT followed by ASCII whitespace"
+        )
 
 
 def _oracle_quoted_section_end(
